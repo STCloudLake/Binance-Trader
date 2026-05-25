@@ -1,0 +1,218 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 class="text-xl mb-4">AI {{ _('控制面板') }}</h2>
+
+<div class="grid grid-cols-3 gap-4 mb-6">
+    <!-- Status card -->
+    <div class="card">
+        <h3 class="text-lg mb-2">AI {{ _('状态') }}</h3>
+        <div class="text-sm space-y-1">
+            <div><span class="text-slate-400">API {{ _('连接') }}：</span>
+                <span class="badge {{ 'badge-green' if api_connected else 'badge-red' }}">{{ _('已连接') if api_connected else _('未连接') }}</span>
+            </div>
+            <div><span class="text-slate-400">{{ _('模型') }}：</span><span class="text-white">{{ ai_model or _('未配置') }}</span></div>
+            <div><span class="text-slate-400">{{ _('运行模式') }}：</span><span class="text-white">{{ mode }}</span></div>
+        </div>
+    </div>
+
+    <!-- Mode selector -->
+    <div class="card">
+        <h3 class="text-lg mb-2">AI {{ _('控制级别') }}</h3>
+        <form hx-post="/api/ai-mode" hx-target="#ai-mode-msg" hx-swap="innerHTML" class="text-sm">
+            <select name="mode" class="bg-slate-800 border border-slate-600 rounded px-3 py-2 w-full text-white mb-2">
+                <option value="suggest" {{ 'selected' if ai_mode == 'suggest' }}>{{ _('建议模式') }} — AI {{ _('仅提供建议') }}，{{ _('需人工确认') }}</option>
+                <option value="semi_auto" {{ 'selected' if ai_mode == 'semi_auto' }}>{{ _('半自动') }} — {{ _('信号权重自动调整') }}，{{ _('交易需确认') }}</option>
+                <option value="full_auto" {{ 'selected' if ai_mode == 'full_auto' }}>{{ _('全自动') }} — {{ _('风控和权重全部自动') }}，{{ _('需监控') }}</option>
+            </select>
+            <button type="submit" class="w-full bg-sky-600 hover:bg-sky-500 text-white px-3 py-2 rounded text-sm">{{ _('应用模式') }}</button>
+            <span id="ai-mode-msg"></span>
+        </form>
+    </div>
+
+    <!-- Market assessment -->
+    <div class="card" id="market-assessment" hx-get="/api/market-state" hx-trigger="load, every 120s">
+        <h3 class="text-lg mb-2">{{ _('最新市场评估') }}</h3>
+        {% if last_assessment %}
+        <div class="text-sm text-slate-200 leading-relaxed max-h-32 overflow-y-auto">{{ last_assessment }}</div>
+        {% else %}
+        <div class="text-sm text-slate-500">{{ _('等待') }} AI {{ _('首次市场评估') }}（{{ _('每小时自动运行') }}）</div>
+        {% endif %}
+    </div>
+</div>
+
+<!-- Strategy Monitor -->
+<div class="card mb-6" id="strategy-monitor">
+    <h3 class="text-lg mb-3">{{ _('策略引擎状态') }} <span class="text-xs text-slate-500">(15s)</span></h3>
+    <div class="text-sm text-slate-500">{{ _('加载中') }}...</div>
+</div>
+
+<script>
+(function() {
+    var monitorEl = document.getElementById('strategy-monitor');
+    if (!monitorEl) return;
+    function renderMonitor(data) {
+        if (!data || !data.strategies) return;
+        var html = '<div class="text-sm mb-2"><span class="badge badge-green">' + data.active_count + ' {{ _("活跃") }}</span><span class="text-slate-400 ml-2">{{ _("共") }} ' + data.total_count + ' {{ _("个策略") }}</span></div>';
+        if (data.strategies.length === 0) {
+            html += '<div class="text-slate-500 text-sm py-2">{{ _("暂无策略配置") }}</div>';
+        } else {
+            html += '<div class="space-y-2">';
+            data.strategies.forEach(function(s) {
+                var badge = s.enabled ? 'badge-green' : 'badge-red';
+                var status = s.enabled ? '{{ _("启用") }}' : '{{ _("禁用") }}';
+                var sigCount = s.signal_count;
+                html += '<div class="bg-slate-800 rounded p-2 border border-slate-700">';
+                html += '<div class="flex justify-between items-center"><b class="text-sm">' + s.name + '</b><span class="badge ' + badge + ' text-xs">' + status + '</span></div>';
+                html += '<div class="text-xs text-slate-500 mt-0.5">' + s.mode + ' | ' + (s.timeframes||[]).join(',') + ' | {{ _("监控") }} ' + sigCount + ' {{ _("个交易对") }}</div>';
+                if (sigCount > 0 && s.signals) {
+                    Object.keys(s.signals).forEach(function(sym) {
+                        var sig = s.signals[sym];
+                        var score = sig.final_score;
+                        var scoreCls = score >= 0.5 ? 'text-green-400 font-bold' : score > 0.3 ? 'text-green-400' : score <= -0.5 ? 'text-red-400 font-bold' : score < -0.3 ? 'text-red-400' : 'text-slate-400';
+                        var exitBlocks = sig.exit_blocks_entry;
+                        var triggered = sig.threshold_met && !exitBlocks;
+                        var statusBadge = triggered ? '<span class=\"badge badge-green text-xs\">{{ _("可入场") }}</span>' : '<span class=\"badge badge-yellow text-xs\">{{ _("未触发") }}</span>';
+                        var exitL = sig.exit_signal_long ? 'L' : '';
+                        var exitS = sig.exit_signal_short ? 'S' : '';
+                        var exitInfo = (exitL || exitS) ? '<span class=\"text-xs text-slate-500 ml-1\">{{ _("出场") }}:' + [exitL, exitS].filter(Boolean).join('/') + '</span>' : '';
+
+                        html += '<div class=\"mt-1 p-1.5 bg-slate-900 rounded text-xs\">';
+                        html += '<div class=\"flex gap-2 items-center flex-wrap\"><span class=\"text-slate-300 font-mono font-bold\">' + sym + '</span>' + statusBadge + exitInfo + '</div>';
+                        html += '<div class=\"flex gap-2 mt-1 flex-wrap\"><span class=\"' + scoreCls + '\">{{ _("总分") }}:' + score.toFixed(4) + '</span>';
+                        html += '<span class=\"text-slate-500\">{{ _("指标") }}:' + sig.indicator.toFixed(2) + ' ML:' + sig.ml_confidence.toFixed(4) + ' {{ _("新闻") }}:' + sig.news_sentiment.toFixed(4) + '</span></div>';
+
+                        // Show why not triggered
+                        if (!triggered) {
+                            var reasons = [];
+                            if (exitBlocks) reasons.push('{{ _("同向出场信号满足") }}，{{ _("入场被抑制") }}（{{ _("无持仓时不抑制") }}）');
+                            if (!sig.threshold_met) reasons.push('{{ _("总分") }} |' + score.toFixed(4) + '| ≤ 0.5 {{ _("阈值") }}');
+                            if (sig.indicator === 0) reasons.push('{{ _("无入场条件被满足") }}（{{ _("查看下方条件详情") }}）');
+                            html += '<div class=\"text-orange-400 mt-0.5\">⛔ ' + reasons.join('；') + '</div>';
+                        }
+
+                        // Entry conditions detail
+                        ['long', 'short'].forEach(function(side) {
+                            var conds = (sig.entry_conditions || {})[side] || [];
+                            if (conds.length === 0) return;
+                            var sideLabel = side === 'long' ? '{{ _("做多条件") }}' : '{{ _("做空条件") }}';
+                            html += '<div class=\"mt-1\"><span class=\"text-slate-500\">' + sideLabel + ':</span>';
+                            conds.forEach(function(c) {
+                                var cls = c.met ? 'text-green-400' : 'text-red-400';
+                                var icon = c.met ? '✓' : '✗';
+                                html += '<div class=\"ml-2 ' + cls + '\">' + icon + ' ' + c.condition + '</div>';
+                            });
+                            html += '</div>';
+                        });
+
+                        // Key indicator values
+                        var inds = sig.indicators || {};
+                        var keys = Object.keys(inds).filter(function(k) { return inds[k] !== null && inds[k] !== undefined; });
+                        if (keys.length > 0) {
+                            html += '<div class=\"mt-1 text-slate-500\">{{ _("指标值") }}: ';
+                            var parts = keys.slice(0, 8).map(function(k) { return k + '=' + inds[k]; });
+                            html += parts.join(' ') + '</div>';
+                        }
+
+                        html += '</div>';
+                    });
+                } else {
+                    html += '<div class="text-xs text-slate-600 mt-1">{{ _("等待") }} K {{ _("线触发评估") }}...</div>';
+                }
+                html += '</div>';
+            });
+            html += '</div>';
+        }
+        monitorEl.innerHTML = '<h3 class="text-lg mb-3">{{ _("策略引擎状态") }} <span class="text-xs text-slate-500">(15s)</span></h3>' + html;
+    }
+    function fetchMonitor() {
+        fetch('/api/strategy-monitor').then(function(r){return r.json();}).then(renderMonitor).catch(function(){});
+    }
+    fetchMonitor();
+    setInterval(fetchMonitor, 15000);
+})();
+</script>
+
+<!-- AI Heartbeat -->
+<div class="card mb-6" id="ai-heartbeat" hx-get="/api/ai-heartbeat" hx-trigger="load, every 60s">
+    <h3 class="text-lg mb-3">AI {{ _('系统活动监控') }}</h3>
+    <div class="text-sm text-slate-500">{{ _('加载中') }}...</div>
+</div>
+
+<!-- Consultation -->
+<div class="card mb-6">
+    <h3 class="text-lg mb-3 text-sky-400">AI {{ _('即时交易咨询') }}</h3>
+    <p class="text-sm text-slate-400 mb-3">{{ _('由') }} DeepSeek {{ _('分析当前') }} K {{ _('线数据') }}，{{ _('给出具体的交易方向') }}、{{ _('支撑阻力位和风险提示') }}</p>
+    <div class="flex gap-2 mb-3 flex-wrap">
+        <select id="consult-symbol" class="bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
+            <option value="BTCUSDT">BTC/USDT</option><option value="ETHUSDT">ETH/USDT</option>
+            <option value="BNBUSDT">BNB/USDT</option><option value="SOLUSDT">SOL/USDT</option>
+            <option value="XRPUSDT">XRP/USDT</option>
+        </select>
+        <select id="consult-tf" class="bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
+            <option value="5m">5{{ _('分') }} {{ _('超短线') }}</option>
+            <option value="15m">15{{ _('分') }} {{ _('日内') }}</option>
+            <option value="1h" selected>1{{ _('时') }} {{ _('日内') }}</option>
+            <option value="4h">4{{ _('时') }} {{ _('波段') }}</option>
+            <option value="1d">{{ _('日线') }} {{ _('趋势') }}</option>
+        </select>
+        <button id="consult-btn" class="bg-sky-600 hover:bg-sky-500 text-white px-6 py-2 rounded text-sm font-bold disabled:opacity-50" onclick="askConsultation()">
+            {{ _('咨询') }} AI：{{ _('现在适合交易吗') }}？
+        </button>
+    </div>
+    <div id="consult-result" class="bg-slate-800 rounded p-4 min-h-16 text-sm"></div>
+</div>
+
+<!-- Suggestions -->
+<div class="card">
+    <h3 class="text-lg mb-3">AI {{ _('自动建议') }} <span class="text-xs text-slate-500">({{ _('来自后台定时分析') }})</span></h3>
+    <div id="ai-pending" hx-get="/partials/ai-suggestions?status=pending&limit=10" hx-trigger="every 60s">
+        {% for s in pending_suggestions %}
+        <div class="py-2 border-b border-slate-800 text-sm">
+            <div class="flex justify-between items-start gap-2">
+                <div class="flex-1 min-w-0">
+                    <span class="badge badge-blue text-xs mr-1">{{ s.category }}</span>
+                    <span class="text-xs text-slate-500">{{ _('置信') }}: {{ "%.0f"|format(s.confidence|float * 100) }}%</span>
+                    <p class="mt-1 text-slate-200 truncate">{{ s.content[:200] }}</p>
+                </div>
+                <div class="flex gap-1 shrink-0" id="btns-{{ s.id }}">
+                    <button class="bg-green-700 hover:bg-green-600 text-white px-2 py-0.5 rounded text-xs"
+                            hx-post="/api/ai-suggestions/{{ s.id }}/approve" hx-target="#btns-{{ s.id }}" hx-swap="outerHTML">{{ _('批准') }}</button>
+                    <button class="bg-red-700 hover:bg-red-600 text-white px-2 py-0.5 rounded text-xs"
+                            hx-post="/api/ai-suggestions/{{ s.id }}/reject" hx-target="#btns-{{ s.id }}" hx-swap="outerHTML">{{ _('拒绝') }}</button>
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+        {% if not pending_suggestions %}
+        <div class="text-slate-500 text-sm py-4 text-center">{{ _('暂无待处理建议') }} — AI {{ _('后台循环运行中') }}（{{ _('市场评估每小时') }}、{{ _('币种选择每') }}4{{ _('小时') }}、{{ _('策略优化每日') }}、{{ _('风控调整每日') }}）</div>
+        {% endif %}
+    </div>
+</div>
+
+<script>
+var consulting = false;
+async function askConsultation() {
+    var btn = document.getElementById('consult-btn');
+    var result = document.getElementById('consult-result');
+    if (consulting) return;
+    consulting = true;
+    btn.disabled = true;
+    btn.textContent = 'DeepSeek {{ _("分析中") }}...';
+    result.innerHTML = '<div class="text-yellow-400 text-sm">{{ _("正在获取") }} K {{ _("线数据并请求") }} DeepSeek {{ _("分析") }}…</div>';
+    var symbol = document.getElementById('consult-symbol').value;
+    var tf = document.getElementById('consult-tf').value;
+    try {
+        var resp = await fetch('/api/kline/' + symbol + '?interval=' + tf + '&limit=50');
+        var kline = await resp.json();
+        if (kline.error) { result.innerHTML = '<div class="text-red-400">{{ _("获取") }}K{{ _("线失败") }}: ' + kline.error + '</div>'; consulting = false; btn.disabled = false; btn.textContent = '{{ _("咨询") }} AI：{{ _("现在适合交易吗") }}？'; return; }
+        var priceData = kline.map(function(k) { return 'O:' + k.open + ' H:' + k.high + ' L:' + k.low + ' C:' + k.close; }).slice(-20).join(' | ');
+        var latest = kline[kline.length - 1];
+        var prompt = 'Symbol: ' + symbol + ' | Timeframe: ' + tf + ' | Current Price: ' + latest.close + ' | Recent candles (O/H/L/C): ' + priceData + '\n\nAnalyze whether now is a good time to trade. Provide specific direction, suggestion, confidence, support/resistance levels, and risk warning.';
+        var aiResp = await fetch('/api/consult', { method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'}, body: 'prompt=' + encodeURIComponent(prompt) });
+        result.innerHTML = await aiResp.text();
+    } catch(e) { result.innerHTML = '<div class="text-red-400 text-sm">{{ _("请求失败") }}: ' + e.message + '</div>'; }
+    consulting = false; btn.disabled = false;
+    btn.textContent = '{{ _("咨询") }} AI：{{ _("现在适合交易吗") }}？';
+}
+</script>
+{% endblock %}

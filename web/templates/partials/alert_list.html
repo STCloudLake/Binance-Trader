@@ -1,0 +1,15 @@
+{% for alert in alerts %}
+<div class="py-2 border-b border-slate-800 flex justify-between items-center">
+    <div>
+        <span class="text-xs {{ 'text-red-400' if alert.level == 'critical' else 'text-yellow-400' if alert.level == 'warning' else 'text-blue-400' }}">
+            {{ _('紧急') if alert.level == 'critical' else _('警告') if alert.level == 'warning' else _('信息') }}</span>
+        <span class="text-xs text-slate-500 ml-2">{{ alert.type }}</span>
+        <span class="text-sm ml-2">{{ alert.message[:150] }}</span>
+        {% if alert.symbol and alert.symbol not in ('RiskManager', 'CircuitBreaker') %}<span class="text-xs text-sky-400 ml-2">{{ alert.symbol }}</span>{% endif %}
+    </div>
+    <div class="text-xs text-slate-500">{{ alert.created_at }}</div>
+</div>
+{% endfor %}
+{% if not alerts %}
+<div class="py-4 text-center text-slate-500">{{ _('暂无告警') }}</div>
+{% endif %}

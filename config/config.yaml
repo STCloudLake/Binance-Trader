@@ -1,0 +1,33 @@
+ai:
+  base_url: https://api.deepseek.com
+  consult_interval_minutes: 15
+  mode: full_auto
+  model: deepseek-v4-pro
+  tasks:
+    coin_selection_minutes: 240
+    market_assessment_minutes: 60
+    risk_adjustment_minutes: 1440
+    strategy_optimization_minutes: 1440
+binance:
+  testnet: true
+core_position:
+  capital_pct: 0.7
+  max_symbols: 5
+language: zh
+mode: sim
+news:
+  anomaly_threshold_pct: 3.0
+  fetch_interval_minutes: 30
+  max_articles_per_symbol: 10
+  volume_spike_multiplier: 3.0
+satellite_position:
+  capital_pct: 0.3
+  max_symbols: 10
+signal_weights:
+  indicator: 0.5
+  ml: 0.3
+  news: 0.2
+trading:
+  futures_enabled: true
+  spot_enabled: true
+web_port: 8899

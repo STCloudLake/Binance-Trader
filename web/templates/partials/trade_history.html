@@ -1,0 +1,61 @@
+{% if not trades %}
+<div class="text-slate-500 text-sm text-center py-4">{{ _('暂无交易记录') }}</div>
+{% else %}
+<table class="w-full text-sm">
+<thead class="text-slate-400 border-b border-slate-700"><tr>
+    <th class="text-left p-2">{{ _('交易对') }}</th>
+    <th class="text-left p-2">{{ _('方向') }}</th>
+    <th class="text-left p-2">{{ _('数量') }}</th>
+    <th class="text-left p-2">{{ _('入场价') }}</th>
+    <th class="text-left p-2">{{ _('出场价') }}</th>
+    <th class="text-left p-2">USDT</th>
+    <th class="text-left p-2">{{ _('盈亏') }}</th>
+    <th class="text-left p-2">{{ _('交易者') }}</th>
+    <th class="text-left p-2">{{ _('策略') }}</th>
+    <th class="text-left p-2">{{ _('操作') }}</th>
+    <th class="text-left p-2">{{ _('时间') }}</th>
+</tr></thead><tbody>
+{% for t in trades %}
+<tr class="border-b border-slate-800 text-sm">
+    <td class="p-2 font-bold">{{ t.symbol }}</td>
+    <td class="p-2 {{ 'text-green-400' if t.side == 'long' else 'text-red-400' }}">{{ _('做多') if t.side == 'long' else _('做空') }}</td>
+    <td class="p-2">{{ "%.6f"|format(t.quantity) }}</td>
+    <td class="p-2">{{ "%.2f"|format(t.entry_price) }}</td>
+    <td class="p-2">{{ "%.2f"|format(t.exit_price) if t.exit_price else '-' }}</td>
+    <td class="p-2">{{ "%.2f"|format(t.quantity * t.entry_price) }}</td>
+    <td class="p-2 {{ 'text-green-400' if t.pnl > 0 else 'text-red-400' if t.pnl < 0 else '' }}">{{ "%+.2f"|format(t.pnl) if t.pnl else '-' }}</td>
+    <td class="p-2">{{ '🤖 AI' if t.trader == 'ai' else '👤 ' + _('手动') }}</td>
+    <td class="p-2 text-xs text-slate-400">{{ t.strategy_name or t.strategy }}</td>
+    <td class="p-2">
+        {% if t.action == 'reduce' %}{{ _('减持') }}({{ t.reduce_pct|int }}%)
+        {% elif t.action == 'close' %}{{ _('平仓') }}
+        {% elif t.status == 'open' %}{{ _('开仓') }}
+        {% else %}{{ _('已平仓') }}
+        {% endif %}
+    </td>
+    <td class="p-2 text-xs text-slate-500">{{ t.opened_at }}</td>
+</tr>
+{% endfor %}
+</tbody></table>
+
+{% if total_pages > 1 %}
+<div class="flex justify-center items-center gap-2 mt-3">
+    {% if page > 1 %}
+    <button class="px-2 py-1 rounded bg-slate-700 text-slate-300 hover:bg-slate-600"
+            hx-get="/partials/trades?page={{ page - 1 }}&per_page={{ per_page }}"
+            hx-target="#trade-history" hx-swap="innerHTML">{{ _('上一页') }}</button>
+    {% else %}
+    <span class="px-2 py-1 rounded bg-slate-800 text-slate-600">{{ _('上一页') }}</span>
+    {% endif %}
+    <span class="text-xs text-slate-500">{{ page }} / {{ total_pages }}</span>
+    {% if page < total_pages %}
+    <button class="px-2 py-1 rounded bg-slate-700 text-slate-300 hover:bg-slate-600"
+            hx-get="/partials/trades?page={{ page + 1 }}&per_page={{ per_page }}"
+            hx-target="#trade-history" hx-swap="innerHTML">{{ _('下一页') }}</button>
+    {% else %}
+    <span class="px-2 py-1 rounded bg-slate-800 text-slate-600">{{ _('下一页') }}</span>
+    {% endif %}
+    <span class="ml-2 text-slate-500">{{ _('共') }} {{ total }} {{ _('条') }}</span>
+</div>
+{% endif %}
+{% endif %}

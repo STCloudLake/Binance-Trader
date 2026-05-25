@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Binance Trader - {{ _('自动化交易系统') }}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/htmx.org@1.9.10/dist/htmx.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: { extend: { colors: { surface: '#0f172a', 'surface-light': '#1e293b', 'border': '#334155', } } }
+        }
+    </script>
+    <style>
+        body { background: #0f172a; color: #e2e8f0; font-family: 'Microsoft YaHei', 'PingFang SC', 'Consolas', 'Monaco', monospace; }
+        .card { background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 1rem; }
+        .nav-link { padding: 0.5rem 1rem; border-radius: 6px; color: #94a3b8; text-decoration: none; }
+        .nav-link.active { background: #1e293b; color: #38bdf8; }
+        .badge { padding: 2px 8px; border-radius: 10px; font-size: 0.75rem; }
+        .badge-green { background: #064e3b; color: #34d399; }
+        .badge-red { background: #7f1d1d; color: #f87171; }
+        .badge-yellow { background: #78350f; color: #fbbf24; }
+        .badge-blue { background: #1e3a5f; color: #60a5fa; }
+    </style>
+</head>
+<body class="min-h-screen">
+    <nav class="border-b border-slate-700 px-6 py-3 flex items-center gap-6">
+        <h1 class="text-lg font-bold text-sky-400">📊 Binance Trader</h1>
+        {% set pages = [('dashboard', _('仪表盘')), ('strategies', _('策略监控')), ('ai', _('AI 面板')), ('alerts', _('预警中心')), ('settings', _('设置'))] %}
+        {% for slug, label in pages %}
+        <a href="/{{ slug }}" class="nav-link {{ 'active' if current_page == slug else '' }}">{{ label }}</a>
+        {% endfor %}
+        <span class="ml-auto text-sm text-slate-500" id="status-indicator">● {{ mode }}</span>
+    </nav>
+    <main class="p-6">
+        {% block content %}{% endblock %}
+    </main>
+</body>
+</html>

@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Secrets — NEVER commit real keys
+**/secrets.yaml
+.env
+*.key
+*.pem
+
+# Database files
+**/*.db
+**/*.db-journal
+**/*.db-wal
+
+# Market data (large binary files, regenerated on demand)
+**/market/
+**/models/
+**/ml_training/
+**/*.parquet
+**/*.pkl
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test cache
+.pytest_cache/
+
+# Claude / AI agent configs (local only)
+.claude/
+.superpowers/
+CLAUDE.md
+GEMINI.md
+AGENTS.md
+
+# Logs
+*.log
+logs/

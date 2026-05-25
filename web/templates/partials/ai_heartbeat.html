@@ -1,0 +1,44 @@
+<h3 class="text-lg mb-3">{{ _('AI 系统活动监控') }}</h3>
+<div class="text-sm mb-2">
+    {% if running %}
+    <span class="badge badge-green">{{ _('运行中') }}</span>
+    {% else %}
+    <span class="badge badge-red">{{ _('已停止') }}</span>
+    {% endif %}
+    <span class="text-slate-400 ml-2">4 {{ _('个后台任务') }}</span>
+</div>
+<table class="w-full text-sm">
+    {% for task in tasks %}
+    <tr class="border-b border-slate-800">
+        <td class="py-1.5">
+            {% if task.last_ts == 0 %}
+            <span class="text-slate-600">●</span>
+            {% elif task.status == 'ok' %}
+            <span class="text-green-400">●</span>
+            {% else %}
+            <span class="text-red-400">●</span>
+            {% endif %}
+            <b>{{ _(task.label) }}</b>
+        </td>
+        <td class="py-1.5 text-xs text-slate-400">{{ _('每') }}{{ task.interval_str }}{{ _(task.interval_unit) }}</td>
+        <td class="py-1.5 text-xs">
+            {% if task.last_ts == 0 %}
+            <span class="text-slate-600">{{ _('等待首次运行') }}</span>
+            {% elif task.ago_mins < 1 %}
+            <span class="text-green-400">{{ _('刚刚') }}</span>
+            {% elif task.ago_mins < 60 %}
+            <span class="text-green-400">{{ task.ago_mins }} {{ _('分钟前') }}</span>
+            {% elif task.status == 'ok' %}
+            <span class="text-yellow-400">{{ task.ago_hrs }} {{ _('小时前') }}</span>
+            {% else %}
+            <span class="text-red-400">{{ task.ago_hrs }} {{ _('小时前') }} ({{ _('超时') }})</span>
+            {% endif %}
+        </td>
+        <td class="py-1.5 text-xs text-slate-400">{{ _('运行') }} {{ task.count }} {{ _('次') }} | {{ _('今日建议') }} {{ task.recent }} {{ _('条') }}</td>
+    </tr>
+    {% endfor %}
+    {% if not tasks %}
+    <tr><td colspan="4" class="py-2 text-slate-500">{{ _('数据库读取中...') }}</td></tr>
+    {% endif %}
+</table>
+<div class="text-xs text-slate-600 mt-2">{{ _('● 绿色 = 正常 &nbsp; ● 红色 = 超时 &nbsp; ● 灰色 = 等待 &nbsp; 60s 刷新') }}</div>

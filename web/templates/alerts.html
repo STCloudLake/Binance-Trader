@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 class="text-xl mb-4">{{ _('预警中心') }}</h2>
+
+<!-- Count cards -->
+<div class="grid grid-cols-4 gap-4 mb-4" id="alert-counts" hx-get="/api/alerts/counts" hx-trigger="every 15s" hx-swap="innerHTML">
+    {% include "partials/alert_counts.html" %}
+</div>
+
+<!-- Category tabs + search -->
+<div class="flex gap-2 mb-4 items-center" id="alert-tabs">
+    <button class="px-3 py-1 rounded text-sm bg-slate-700 text-white" onclick="filterAlerts('')">{{ _('全部') }}</button>
+    <button class="px-3 py-1 rounded text-sm bg-slate-800 text-slate-400" onclick="filterAlerts('signal,risk')">{{ _('风控') }}</button>
+    <button class="px-3 py-1 rounded text-sm bg-slate-800 text-slate-400" onclick="filterAlerts('ai_')">AI</button>
+    <button class="px-3 py-1 rounded text-sm bg-slate-800 text-slate-400" onclick="filterAlerts('news')">{{ _('新闻') }}</button>
+    <div class="flex-1"></div>
+    <button class="px-3 py-1 rounded text-xs bg-red-800 hover:bg-red-700 text-red-300"
+            hx-post="/api/alerts/clear" hx-confirm="{{ _('确定要清除所有告警记录吗？') }}" hx-target="#alert-list" hx-swap="innerHTML"
+            onclick="setTimeout(function(){ htmx.ajax('GET', '/partials/alerts-filtered?limit=50', '#alert-list'); }, 500)">
+            {{ _('清除全部') }}</button>
+    <input type="text" placeholder="{{ _('搜索...') }}" class="bg-slate-800 border border-slate-600 rounded px-3 py-1 text-white text-sm w-40"
+           oninput="filterAlerts(null, this.value)">
+</div>
+
+<!-- Alert list -->
+<div id="alert-list" class="card max-h-[50vh] overflow-y-auto"
+     data-level-critical="{{ _('紧急') }}" data-level-warning="{{ _('警告') }}" data-level-info="{{ _('信息') }}">
+    {% include "partials/alert_list.html" %}
+</div>
+
+<!-- Rules panel -->
+<div class="card mt-4">
+    <div class="flex justify-between items-center mb-3">
+        <h3 class="text-lg">{{ _('预警规则') }}</h3>
+    </div>
+    <div id="rules-list" hx-get="/partials/alert-rules" hx-trigger="every 30s">
+        {% include "partials/alert_rules.html" %}
+    </div>
+</div>
+
+<script>
+var ws = null;
+function connectWS() {
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(proto + '//' + location.host + '/ws/alerts');
+    ws.onmessage = function(e) {
+        var data = JSON.parse(e.data);
+        if (data.ping) return;
+        prependAlert(data);
+    };
+    ws.onclose = function() { setTimeout(connectWS, 3000); };
+}
+connectWS();
+
+function prependAlert(data) {
+    var list = document.getElementById('alert-list');
+    if (!list) return;
+    var levelNames = {
+        critical: list.dataset.levelCritical || 'Critical',
+        warning: list.dataset.levelWarning || 'Warning',
+        info: list.dataset.levelInfo || 'Info'
+    };
+    var div = document.createElement('div');
+    div.className = 'py-2 border-b border-slate-800 flex justify-between items-center';
+    var levelColors = {critical: 'text-red-400', warning: 'text-yellow-400', info: 'text-blue-400'};
+    div.innerHTML = '<div><span class="text-xs ' + (levelColors[data.level] || '') + '">' +
+        (levelNames[data.level] || data.level) + '</span>' +
+        '<span class="text-xs text-slate-500 ml-2">' + (data.rule || data.type || '') + '</span>' +
+        '<span class="text-sm ml-2">' + (data.message || '').substring(0, 120) + '</span>' +
+        (data.symbol ? '<span class="text-xs text-sky-400 ml-2">' + data.symbol + '</span>' : '') + '</div>' +
+        '<div class="text-xs text-slate-500">' + (data.timestamp || '') + '</div>';
+    list.insertBefore(div, list.firstChild);
+}
+
+var currentType = '';
+var currentSearch = '';
+function filterAlerts(type, search) {
+    if (type !== null && type !== undefined) currentType = type;
+    if (search !== null && search !== undefined) currentSearch = search;
+    var btns = document.querySelectorAll('#alert-tabs button');
+    var types = ['', 'signal,risk', 'ai_', 'news'];
+    btns.forEach(function(btn, i) {
+        btn.className = 'px-3 py-1 rounded text-sm ' + (types[i] === currentType ? 'bg-slate-700 text-white' : 'bg-slate-800 text-slate-400');
+    });
+    var url = '/partials/alerts-filtered?limit=50';
+    if (currentType) url += '&type=' + encodeURIComponent(currentType);
+    if (currentSearch) url += '&search=' + encodeURIComponent(currentSearch);
+    htmx.ajax('GET', url, '#alert-list');
+}
+</script>
+
+<style>
+.max-h-\[50vh\] { max-height: 50vh; }
+</style>
+{% endblock %}

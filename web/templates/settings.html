@@ -1,0 +1,174 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 class="text-xl mb-4">{{ _("系统设置") }}</h2>
+
+<div class="grid grid-cols-2 gap-6">
+    <div class="card">
+        <h3 class="text-lg mb-3">Binance API</h3>
+        <form hx-post="/api/settings/binance" hx-target="#binance-msg" hx-swap="innerHTML">
+            <div class="mb-3"><label class="text-sm text-slate-400">API Key</label>
+                <input type="text" name="api_key" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm" value="{{ binance_api_key or '' }}"></div>
+            <div class="mb-3"><label class="text-sm text-slate-400">API Secret</label>
+                <input type="text" name="api_secret" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm" value="{{ binance_api_secret or '' }}"></div>
+            <div class="mb-3"><label class="flex items-center gap-2 text-sm text-slate-400">
+                <input type="checkbox" name="testnet" value="1" {{ 'checked' if binance_testnet else '' }}> {{ _("使用测试网") }}</label></div>
+            <button type="submit" class="bg-sky-600 hover:bg-sky-500 text-white px-4 py-2 rounded text-sm">{{ _("保存 Binance") }}</button>
+            <span id="binance-msg"></span>
+        </form>
+    </div>
+
+    <div class="card">
+        <h3 class="text-lg mb-3">DeepSeek API</h3>
+        <form hx-post="/api/settings/deepseek" hx-target="#deepseek-msg" hx-swap="innerHTML">
+            <div class="mb-3"><label class="text-sm text-slate-400">API Key</label>
+                <input type="text" name="api_key" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm" value="{{ deepseek_key or '' }}" placeholder="sk-..."></div>
+            <div class="mb-3"><label class="text-sm text-slate-400">Base URL</label>
+                <input type="text" name="base_url" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm" value="{{ ai_base_url or 'https://api.deepseek.com' }}"></div>
+            <div class="mb-3"><label class="text-sm text-slate-400">{{ _("模型") }}</label>
+                <select name="model" id="model-select" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
+                    <option value="{{ ai_model }}">{{ ai_model }} ({{ _('当前') }})</option>
+                </select>
+                <button type="button" class="mt-1 text-xs text-sky-400 hover:underline" onclick="fetchModels(true)">🔄 {{ _('从') }} API {{ _('刷新') }}{{ _("模型") }}{{ _('列表') }}</button>
+            </div>
+            <button type="submit" class="bg-purple-600 hover:bg-purple-500 text-white px-4 py-2 rounded text-sm">{{ _("保存 DeepSeek") }}</button>
+            <span id="deepseek-msg"></span>
+        </form>
+    </div>
+</div>
+
+<div class="grid grid-cols-2 gap-6 mt-6">
+    <div class="card">
+        <h3 class="text-lg mb-3">{{ _("AI 与新闻设置") }}</h3>
+        <form hx-post="/api/settings/ai-news" hx-target="#ai-news-msg" hx-swap="innerHTML">
+            <div class="mb-3"><label class="text-sm text-slate-400">{{ _("界面语言") }}</label>
+                <select name="language" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
+                    <option value="zh" {{ 'selected' if language == 'zh' }}>{{ _("中文") }}</option>
+                    <option value="en" {{ 'selected' if language == 'en' }}>English</option>
+                </select></div>
+            <div class="mb-3"><label class="text-sm text-slate-400">{{ _("AI 自动咨询间隔 (分钟)") }}</label>
+                <input type="number" name="ai_consult_interval" value="{{ ai_consult_interval or 60 }}" min="5" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
+                <p class="text-xs text-slate-500 mt-1">{{ _("AI 自动评估当前市场状况的时间间隔") }}</p></div>
+            <div class="mb-3"><label class="text-sm text-slate-400">{{ _("新闻抓取间隔 (分钟)") }}</label>
+                <input type="number" name="news_fetch_interval" value="{{ news_fetch_interval or 30 }}" min="5" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm"></div>
+            <div class="mb-3"><label class="text-sm text-slate-400">{{ _("每币种最大文章数") }}</label>
+                <input type="number" name="max_articles" value="{{ max_articles or 10 }}" min="1" max="50" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm"></div>
+            <div class="mb-3"><label class="text-sm text-slate-400">{{ _("异常触发阈值 (%)") }}</label>
+                <input type="number" name="anomaly_threshold" value="{{ anomaly_threshold or 3.0 }}" step="0.5" min="1" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
+                <p class="text-xs text-slate-500 mt-1">{{ _("价格波动超过此百分比时触发紧急新闻抓取") }}</p></div>
+            <hr class="border-slate-700 my-3">
+            <p class="text-sm text-slate-400 mb-2 font-bold">{{ _("AI 后台任务间隔") }} <span class="text-xs text-slate-500 font-normal">({{ _("修改后需重启生效") }})</span></p>
+            <div class="grid grid-cols-2 gap-2">
+                <div class="mb-2"><label class="text-xs text-slate-400">{{ _("市场评估 (分钟)") }}</label>
+                    <input type="number" name="task_market_assessment" value="{{ ai_task_intervals.get('market_assessment', 60) }}" min="10" class="w-full bg-slate-800 border border-slate-600 rounded px-2 py-1 text-white text-xs"></div>
+                <div class="mb-2"><label class="text-xs text-slate-400">{{ _("币种选择 (分钟)") }}</label>
+                    <input type="number" name="task_coin_selection" value="{{ ai_task_intervals.get('coin_selection', 240) }}" min="30" class="w-full bg-slate-800 border border-slate-600 rounded px-2 py-1 text-white text-xs"></div>
+                <div class="mb-2"><label class="text-xs text-slate-400">{{ _("策略优化 (分钟)") }}</label>
+                    <input type="number" name="task_strategy_optimization" value="{{ ai_task_intervals.get('strategy_optimization', 1440) }}" min="60" class="w-full bg-slate-800 border border-slate-600 rounded px-2 py-1 text-white text-xs"></div>
+                <div class="mb-2"><label class="text-xs text-slate-400">{{ _("风控调整 (分钟)") }}</label>
+                    <input type="number" name="task_risk_adjustment" value="{{ ai_task_intervals.get('risk_adjustment', 1440) }}" min="60" class="w-full bg-slate-800 border border-slate-600 rounded px-2 py-1 text-white text-xs"></div>
+            </div>
+            <button type="submit" class="bg-sky-600 hover:bg-sky-500 text-white px-4 py-2 rounded text-sm">{{ _("保存 AI 与新闻") }}</button>
+            <span id="ai-news-msg"></span>
+        </form>
+    </div>
+
+    <div class="card">
+        <h3 class="text-lg mb-3">{{ _("风险参数") }}</h3>
+        {% if circuit_breaker.is_tripped %}
+        <div class="mb-3 p-3 bg-red-900/30 border border-red-700 rounded">
+            <div class="text-red-400 text-sm font-bold mb-1">{{ _("熔断器已触发") }}</div>
+            <div class="text-red-300 text-xs">{{ circuit_breaker.trip_reason }}</div>
+            <div class="text-xs text-slate-400 mt-1">{{ _("今日盈亏") }}: {{ circuit_breaker.daily_pnl }} USDT | {{ _("连续亏损") }}: {{ circuit_breaker.consecutive_losses }} {{ _("次") }}</div>
+            <button class="mt-2 bg-red-600 hover:bg-red-500 text-white px-3 py-1 rounded text-xs"
+                    hx-post="/api/circuit-breaker/reset" hx-target="#cb-msg" hx-swap="innerHTML">{{ _("重置熔断器") }}</button>
+            <span id="cb-msg"></span>
+        </div>
+        {% endif %}
+        <form hx-post="/api/settings/risk" hx-target="#risk-msg" hx-swap="innerHTML">
+            <div class="mb-3"><label class="text-sm text-slate-400">{{ _("最大日回撤 %") }}</label>
+                <input type="number" name="max_daily_drawdown" value="{{ hard_limits.max_daily_drawdown_pct }}" step="0.5" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm"></div>
+            <div class="mb-3"><label class="text-sm text-slate-400">{{ _("最大日亏损 (USDT)") }}</label>
+                <input type="number" name="max_daily_loss" value="{{ hard_limits.max_daily_loss_usdt }}" step="10" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm"></div>
+            <div class="mb-3"><label class="text-sm text-slate-400">{{ _('最大') }}{{ _("连续亏损") }}{{ _("次") }}{{ _('数') }} <span class="text-yellow-400">({{ _("触发熔断") }})</span></label>
+                <input type="number" name="max_consecutive_losses" value="{{ hard_limits.max_consecutive_losses }}" min="3" max="20" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm"></div>
+            <div class="mb-3"><label class="text-sm text-slate-400">{{ _("熔断自动操作") }}</label>
+                <select name="circuit_breaker_action" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
+                    <option value="block_only" {{ 'selected' if hard_limits.circuit_breaker_action == 'block_only' }}>{{ _("仅阻止新开仓") }}</option>
+                    <option value="tighten_stops" {{ 'selected' if hard_limits.circuit_breaker_action == 'tighten_stops' }}>{{ _("收紧所有止损") }}</option>
+                    <option value="close_all" {{ 'selected' if hard_limits.circuit_breaker_action == 'close_all' }}>{{ _("平掉所有仓位") }}</option>
+                    <option value="close_worst" {{ 'selected' if hard_limits.circuit_breaker_action == 'close_worst' }}>{{ _("平仓亏损最大持仓") }}</option>
+                </select>
+                <p class="text-xs text-slate-500 mt-1">{{ _("半自动模式使用此设置；全自动模式由 AI 实时决定") }}</p></div>
+            <hr class="border-slate-700 my-3">
+            <p class="text-sm text-slate-400 mb-2 font-bold">{{ _("移动止损 & 紧急止损") }} <span class="text-xs text-amber-400">({{ _("独立于策略周期，每15秒检查") }})</span></p>
+            <div class="mb-3"><label class="flex items-center gap-2 text-sm text-slate-400">
+                <input type="checkbox" name="trailing_stop_enabled" value="1" {{ 'checked' if hard_limits.trailing_stop_enabled else '' }}> {{ _("启用移动止损") }}</label>
+                <input type="number" name="trailing_stop_distance_pct" value="{{ hard_limits.trailing_stop_distance_pct }}" step="0.1" min="0.5" max="10" class="w-24 bg-slate-800 border border-slate-600 rounded px-2 py-1 text-white text-xs mt-1">
+                <span class="text-xs text-slate-500 ml-1">{{ _("距当前价格 %") }}</span></div>
+            <div class="mb-3"><label class="flex items-center gap-2 text-sm text-slate-400">
+                <input type="checkbox" name="emergency_stop_enabled" value="1" {{ 'checked' if hard_limits.emergency_stop_enabled else '' }}> {{ _("启用紧急止损") }}</label>
+                <input type="number" name="emergency_stop_threshold_pct" value="{{ hard_limits.emergency_stop_threshold_pct }}" step="0.5" min="-20" max="-1" class="w-24 bg-slate-800 border border-slate-600 rounded px-2 py-1 text-white text-xs mt-1">
+                <span class="text-xs text-slate-500 ml-1">{{ _("浮动亏损阈值 %") }}</span></div>
+            <hr class="border-slate-700 my-3">
+            <div class="mb-3"><label class="text-sm text-slate-400">{{ _("最大同时持仓") }}</label>
+                <input type="number" name="max_open_trades" value="{{ hard_limits.max_open_trades }}" min="1" max="20" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm"></div>
+            <div class="mb-3"><label class="text-sm text-slate-400">{{ _("单笔最大仓位 %") }}</label>
+                <input type="number" name="max_position_size_pct" value="{{ hard_limits.max_position_size_pct }}" step="0.5" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm"></div>
+            <div class="mb-3"><label class="text-sm text-slate-400">{{ _("最大杠杆") }}</label>
+                <input type="number" name="max_leverage" value="{{ hard_limits.max_leverage }}" min="1" max="125" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm"></div>
+            <div class="mb-3"><label class="text-sm text-slate-400">{{ _("现货交易") }}</label>
+                <select name="spot_enabled" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
+                    <option value="1" {{ 'selected' if spot_enabled }}>{{ _("开启") }}</option><option value="0" {{ 'selected' if not spot_enabled }}>{{ _("关闭") }}</option></select></div>
+            <div class="mb-3"><label class="text-sm text-slate-400">{{ _("合约交易") }}</label>
+                <select name="futures_enabled" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
+                    <option value="1" {{ 'selected' if futures_enabled }}>{{ _("开启") }}</option><option value="0" {{ 'selected' if not futures_enabled }}>{{ _("关闭") }}</option></select></div>
+            <button type="submit" class="bg-sky-600 hover:bg-sky-500 text-white px-4 py-2 rounded text-sm">{{ _('保存') }}{{ _("风险参数") }}</button>
+            <span id="risk-msg"></span>
+        </form>
+    </div>
+</div>
+
+<div class="card mt-6 border border-red-800">
+    <h3 class="text-lg mb-3 text-red-400">{{ _("重置模拟交易") }}</h3>
+    <p class="text-sm text-slate-400 mb-3">{{ _("清除所有模拟交易记录") }}（{{ _('交易历史') }}/{{ _('订单') }}/{{ _('持仓') }}），{{ _('并将账户余额恢复为') }} 10000.00 USDT。{{ _('此操作不可撤销') }}。</p>
+    <button class="bg-red-600 hover:bg-red-500 text-white px-4 py-2 rounded text-sm"
+            hx-post="/api/settings/reset-sim" hx-target="#reset-msg" hx-swap="innerHTML"
+            hx-confirm="{{ _('确定要') }}{{ _("清除所有模拟交易记录") }}{{ _('并重置余额吗') }}？{{ _('此操作不可恢复') }}！">
+        {{ _("重置模拟交易") }}
+    </button>
+    <span id="reset-msg"></span>
+</div>
+
+<div class="card mt-6 border border-yellow-700">
+    <h3 class="text-lg mb-3 text-yellow-400">{{ _("重启服务") }}</h3>
+    <p class="text-sm text-slate-400 mb-3">{{ _('重启') }} Binance Trader {{ _('服务进程') }}。{{ _('修改') }} AI {{ _('任务间隔等需要重启才能生效的设置后使用此功能') }}。</p>
+    <button class="bg-yellow-600 hover:bg-yellow-500 text-white px-4 py-2 rounded text-sm"
+            hx-post="/api/settings/restart" hx-target="#restart-msg" hx-swap="innerHTML"
+            hx-confirm="{{ _('确定要') }}{{ _("重启服务") }}{{ _('吗') }}？{{ _('页面刷新后生效') }}。">
+        {{ _("重启服务") }}
+    </button>
+    <span id="restart-msg"></span>
+</div>
+
+<script>
+async function fetchModels(refresh) {
+    var sel = document.getElementById('model-select');
+    var currentModel = '{{ ai_model }}';
+    sel.innerHTML = '<option>{{ _("加载中") }}...</option>';
+    try {
+        var url = '/api/deepseek-models';
+        if (refresh) url += '?refresh=1';
+        var resp = await fetch(url);
+        var data = await resp.json();
+        if (data.error && !data.models) { sel.innerHTML = '<option>' + data.error + '</option>'; return; }
+        sel.innerHTML = data.models.map(function(m) {
+            var sel = (m.id === currentModel) ? ' selected' : '';
+            return '<option value="' + m.id + '"' + sel + '>' + m.id + ' (' + (m.owned_by || 'DeepSeek') + ')</option>';
+        }).join('');
+    } catch(e) {
+        sel.innerHTML = '<option>{{ _("获取失败") }}: ' + e.message + '</option>';
+    }
+}
+document.addEventListener('DOMContentLoaded', function() { fetchModels(false); });
+</script>
+{% endblock %}

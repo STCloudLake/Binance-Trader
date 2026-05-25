@@ -1,0 +1,139 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 class="text-xl mb-4">{{ _('仪表盘') }}</h2>
+
+<div class="grid grid-cols-4 gap-4 mb-4" hx-get="/partials/stats" hx-trigger="every 5s">
+    <div class="card"><div class="text-sm text-slate-400">{{ _('账户余额') }}</div><div class="text-2xl font-bold text-green-400">{{ "%.2f"|format(balance|float) }} USDT</div></div>
+    <div class="card"><div class="text-sm text-slate-400">{{ _('持仓数') }}</div><div class="text-2xl font-bold text-sky-400">{{ positions|length }} / {{ max_trades }}</div></div>
+    <div class="card"><div class="text-sm text-slate-400">{{ _('今日盈亏') }}</div><div class="text-2xl font-bold {{ 'text-green-400' if daily_pnl|float > 0 else 'text-red-400' }}">{{ "%.2f"|format(daily_pnl|float) }} USDT</div></div>
+    <div class="card"><div class="text-sm text-slate-400">AI {{ _('模式') }}</div><div class="text-2xl font-bold text-purple-400">{{ ai_mode }}</div></div>
+</div>
+
+<div class="card mb-4">
+    <div class="flex justify-between items-center mb-2 flex-wrap gap-2">
+        <h3 class="text-lg">K{{ _('线图表') }}</h3>
+        <div class="flex gap-1 items-center flex-wrap">
+            <select id="chart-symbol" class="bg-slate-700 border border-slate-600 rounded px-2 py-1 text-sm text-white" onchange="loadChart()">
+                {% for s in ['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT'] %}<option value="{{s}}">{{s.replace('USDT','/USDT')}}</option>{% endfor %}
+            </select>
+            <span class="text-slate-500">|</span>
+            <button class="timeframe-btn px-2 py-1 rounded text-xs bg-slate-700 text-slate-300" data-tf="1m" onclick="switchTF('1m', this)">1{{ _('分') }}</button>
+            <button class="timeframe-btn px-2 py-1 rounded text-xs bg-sky-700 text-white" data-tf="5m" onclick="switchTF('5m', this)">5{{ _('分') }}</button>
+            <button class="timeframe-btn px-2 py-1 rounded text-xs bg-slate-700 text-slate-300" data-tf="15m" onclick="switchTF('15m', this)">15{{ _('分') }}</button>
+            <button class="timeframe-btn px-2 py-1 rounded text-xs bg-slate-700 text-slate-300" data-tf="1h" onclick="switchTF('1h', this)">1{{ _('时') }}</button>
+            <button class="timeframe-btn px-2 py-1 rounded text-xs bg-slate-700 text-slate-300" data-tf="4h" onclick="switchTF('4h', this)">4{{ _('时') }}</button>
+            <button class="timeframe-btn px-2 py-1 rounded text-xs bg-slate-700 text-slate-300" data-tf="1d" onclick="switchTF('1d', this)">{{ _('日线') }}</button>
+            <span class="text-slate-500">|</span>
+            <label class="text-xs text-slate-400"><input type="checkbox" class="ind-overlay" data-ind="ema" onchange="renderIndicators()" checked> EMA</label>
+            <label class="text-xs text-slate-400"><input type="checkbox" class="ind-overlay" data-ind="bollinger" onchange="renderIndicators()"> BOLL</label>
+            <label class="text-xs text-slate-400"><input type="checkbox" class="ind-overlay" data-ind="macd" onchange="renderIndicators()"> MACD</label>
+            <label class="text-xs text-slate-400"><input type="checkbox" class="ind-overlay" data-ind="rsi" onchange="renderIndicators()"> RSI</label>
+            <label class="text-xs text-slate-400"><input type="checkbox" class="ind-overlay" data-ind="kdj" onchange="renderIndicators()"> KDJ</label>
+            <label class="text-xs text-slate-400"><input type="checkbox" class="ind-overlay" data-ind="volume" onchange="renderIndicators()"> VOL</label>
+        </div>
+    </div>
+    <div id="chart-container" style="width:100%;height:550px;"></div>
+</div>
+
+<div class="grid grid-cols-3 gap-4 mb-4">
+    <div class="card">
+        <h3 class="text-lg mb-3 text-sky-400">{{ _('快速交易') }} ({{ _('模拟') }})</h3>
+        <form hx-post="/api/trade" hx-target="#trade-msg" hx-swap="innerHTML">
+            <div class="mb-3"><label class="text-sm text-slate-400">{{ _('交易对') }}</label>
+                <select name="symbol" id="trade-symbol" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white" onchange="fetchLivePrice()">
+                    {% for s in ['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT'] %}<option value="{{s}}">{{s.replace('USDT','/USDT')}}</option>{% endfor %}
+                </select></div>
+            <div class="mb-3"><label class="text-sm text-slate-400">{{ _('方向') }}</label>
+                <div class="flex gap-4 mt-1"><label class="flex items-center gap-1 text-green-400 cursor-pointer"><input type="radio" name="side" value="long" checked> {{ _('做多') }}</label><label class="flex items-center gap-1 text-red-400 cursor-pointer"><input type="radio" name="side" value="short"> {{ _('做空') }}</label></div></div>
+            <div class="mb-3"><label class="text-sm text-slate-400">{{ _('投入金额') }} (USDT)</label><input type="number" name="amount_usdt" value="100" step="10" min="10" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm"></div>
+            <div class="mb-3"><label class="text-sm text-slate-400">{{ _('仓位类型') }}</label><select name="position_type" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm"><option value="satellite">{{ _('卫星仓位') }} ({{ _('日内短线') }})</option><option value="core">{{ _('核心仓位') }} ({{ _('波段长线') }})</option></select></div>
+            <div class="mb-3"><label class="text-sm text-slate-400">{{ _('止损比例') }} (%)</label><input type="number" name="stop_loss_pct" value="2" step="0.5" min="0.5" max="20" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm"></div>
+            <div class="mb-3 p-2 bg-slate-800 rounded text-xs text-slate-400">{{ _('实时价格') }}: <span id="live-price" class="text-white font-bold">{{ _('获取中') }}...</span></div>
+            <input type="hidden" name="trader" value="manual">
+            <button type="submit" class="w-full bg-sky-600 hover:bg-sky-500 text-white px-3 py-2 rounded text-sm font-bold">{{ _('执行交易') }}</button>
+            <div id="trade-msg" class="mt-2 text-sm"></div>
+        </form>
+    </div>
+    <div class="card col-span-2">
+        <h3 class="text-lg mb-3">{{ _('当前持仓') }}</h3>
+        <div id="positions-table" hx-get="/partials/positions" hx-trigger="every 5s"><div class="text-slate-500 text-sm">{{ _('暂无持仓') }}</div></div>
+    </div>
+</div>
+
+<div class="card mb-4">
+    <h3 class="text-lg mb-2">{{ _('历史交易记录') }}</h3>
+    <div class="max-h-96 overflow-y-auto" id="trade-history" hx-get="/partials/trades?page=1" hx-trigger="load"><div class="text-slate-500 text-sm">{{ _('加载中') }}...</div></div>
+</div>
+
+<div class="grid grid-cols-2 gap-4">
+    <div class="card"><h3 class="text-lg mb-2">{{ _('最近告警') }}</h3><div id="recent-alerts" hx-get="/partials/alerts?limit=5" hx-trigger="every 10s"><div class="text-slate-500 text-sm">{{ _('加载中') }}...</div></div></div>
+    <div class="card"><h3 class="text-lg mb-2">AI {{ _('建议') }}</h3><div id="ai-suggestions" hx-get="/partials/ai-suggestions?limit=5" hx-trigger="every 30s"><div class="text-slate-500 text-sm">{{ _('加载中') }}...</div></div></div>
+</div>
+
+<script>
+var chart = null, rawData = [], currentSymbol = 'BTCUSDT', currentTF = '5m', refreshTimer = null;
+
+function initChart() { chart = echarts.init(document.getElementById('chart-container')); }
+
+function calcEMA(d, p) { var k = 2/(p+1), r = [], e = d[0]; for (var i = 0; i < d.length; i++) { e = d[i]*k + e*(1-k); r.push(e); } return r; }
+function calcSMA(d, p) { var r = []; for (var i = 0; i < d.length; i++) { if (i < p-1) { r.push(null); continue; } var s = 0; for (var j = 0; j < p; j++) s += d[i-j]; r.push(s/p); } return r; }
+function calcBB(d, p, sd) { var m = calcSMA(d, p), u = [], l = []; for (var i = 0; i < d.length; i++) { if (m[i]==null) { u.push(null); l.push(null); continue; } var ss = 0; for (var j = 0; j < p && i-j >= 0; j++) ss += Math.pow(d[i-j]-m[i],2); var std = Math.sqrt(ss/p); u.push(m[i]+sd*std); l.push(m[i]-sd*std); } return [u,m,l]; }
+function calcMACD(d) { var e12 = calcEMA(d,12), e26 = calcEMA(d,26), dif = [], dea = [], hist = []; for (var i = 0; i < d.length; i++) dif.push(e12[i]-e26[i]); var da = calcEMA(dif.filter(function(x){return !isNaN(x);}),9); var pad = d.length - da.length; for (var i = 0; i < d.length; i++) { var idx = i - pad; dea.push(idx >= 0 ? da[idx] : null); hist.push(idx >= 0 ? (dif[i]-dea[i])*2 : null); } return [dif,dea,hist]; }
+function calcRSI(d, p) { var g=[],l=[],r=[]; for (var i=1;i<d.length;i++){var ch=d[i]-d[i-1];g.push(ch>0?ch:0);l.push(ch<0?-ch:0);} var ag=g.slice(0,p).reduce(function(a,b){return a+b;},0)/p; var al=l.slice(0,p).reduce(function(a,b){return a+b;},0)/p; r.push(al>0?100-100/(1+ag/al):100); for (var i=p;i<g.length;i++){ag=(ag*(p-1)+g[i])/p;al=(al*(p-1)+l[i])/p;r.push(al>0?100-100/(1+ag/al):100);} var pd=d.length-r.length; for (var i=0;i<pd;i++) r.unshift(null); return r; }
+function calcKDJ(d, h, l, p) { p=p||9; var k=[],dd=[],j=[],rsv=[]; for (var i=0;i<d.length;i++){if(i<p-1){k.push(null);dd.push(null);j.push(null);continue;} var hh=Math.max.apply(null,h.slice(i-p+1,i+1)); var ll=Math.min.apply(null,l.slice(i-p+1,i+1)); rsv.push(((d[i]-ll)/(hh-ll))*100||50);} k.push(50);dd.push(50);for(var i=1;i<rsv.length;i++){k.push(2/3*k[i-1]+1/3*rsv[i]);dd.push(2/3*dd[i-1]+1/3*k[i]);}for(var i=0;i<k.length;i++)j.push(3*k[i]-2*dd[i]);var pd=d.length-k.length;for(var i=0;i<pd;i++){k.unshift(null);dd.unshift(null);j.unshift(null);}return[k,dd,j];}
+
+function checked(id) { var cb = document.querySelector('.ind-overlay[data-ind="'+id+'"]'); return cb && cb.checked; }
+
+function renderIndicators() {
+    if (!chart || rawData.length === 0) return;
+    var times = rawData.map(function(d){return d.time*1000;}), closes = rawData.map(function(d){return d.close;}), highs = rawData.map(function(d){return d.high;}), lows = rawData.map(function(d){return d.low;}), volumes = rawData.map(function(d){return d.volume;}), ohlc = rawData.map(function(d){return [d.time*1000,d.open,d.close,d.low,d.high];});
+    var series = [{name:'K{{ _("线") }}',type:'candlestick',data:ohlc,itemStyle:{color:'#34d399',color0:'#f87171',borderColor:'#34d399',borderColor0:'#f87171'}}];
+    var grids = [{left:'3%',right:'3%',top:'3%',height:'55%'}], yAxes = [{gridIndex:0,scale:true,splitLine:{lineStyle:{color:'#1e293b'}},axisLabel:{color:'#94a3b8',fontSize:10}}], xAxes = [{gridIndex:0,type:'time',axisLine:{lineStyle:{color:'#334155'}},axisLabel:{color:'#94a3b8',fontSize:10}}], gc = 1;
+    if (checked('ema')) { series.push({name:'EMA9',type:'line',data:calcEMA(closes,9).map(function(v,i){return v!=null?[times[i],v]:null;}),smooth:true,lineStyle:{width:1,color:'#fbbf24'},symbol:'none'}); series.push({name:'EMA21',type:'line',data:calcEMA(closes,21).map(function(v,i){return v!=null?[times[i],v]:null;}),smooth:true,lineStyle:{width:1,color:'#f472b6'},symbol:'none'}); series.push({name:'EMA50',type:'line',data:calcEMA(closes,50).map(function(v,i){return v!=null?[times[i],v]:null;}),smooth:true,lineStyle:{width:1,color:'#818cf8'},symbol:'none'}); }
+    if (checked('bollinger')) { var bb=calcBB(closes,20,2); series.push({name:'BB{{ _("上") }}',type:'line',data:bb[0].map(function(v,i){return v!=null?[times[i],v]:null;}),lineStyle:{width:1,color:'#f87171',type:'dashed'},symbol:'none'}); series.push({name:'BB{{ _("中") }}',type:'line',data:bb[1].map(function(v,i){return v!=null?[times[i],v]:null;}),lineStyle:{width:1,color:'#94a3b8'},symbol:'none'}); series.push({name:'BB{{ _("下") }}',type:'line',data:bb[2].map(function(v,i){return v!=null?[times[i],v]:null;}),lineStyle:{width:1,color:'#34d399',type:'dashed'},symbol:'none'}); }
+    function addGrid(h) { var t=(55+(gc-1)*18)+'%'; grids.push({left:'3%',right:'3%',top:t,height:h}); xAxes.push({gridIndex:gc,type:'time',axisLabel:gc===gridCount-1?{fontSize:9,color:'#94a3b8'}:{show:false},axisLine:{lineStyle:{color:'#334155'}},axisTick:{show:false}}); yAxes.push({gridIndex:gc,axisLabel:{color:'#94a3b8',fontSize:9},splitLine:{lineStyle:{color:'#1e293b'}}}); gc++; }
+    var gridCount = gc;
+    if (checked('volume')) { addGrid('12%'); var vd=volumes.map(function(v,i){return[times[i],v];}); series.push({name:'VOL',type:'bar',xAxisIndex:gc-1,yAxisIndex:gc-1,data:vd,itemStyle:{color:function(p){return rawData[p.dataIndex]&&rawData[p.dataIndex].close>=rawData[p.dataIndex].open?'#34d399':'#f87171';}}}); gridCount=gc; }
+    if (checked('macd')) { addGrid('12%'); var macd=calcMACD(closes); series.push({name:'DIF',type:'line',xAxisIndex:gc-1,yAxisIndex:gc-1,data:macd[0].map(function(v,i){return v!=null?[times[i],v]:null;}),lineStyle:{width:1,color:'#fbbf24'},symbol:'none'}); series.push({name:'DEA',type:'line',xAxisIndex:gc-1,yAxisIndex:gc-1,data:macd[1].map(function(v,i){return v!=null?[times[i],v]:null;}),lineStyle:{width:1,color:'#f472b6'},symbol:'none'}); series.push({name:'HIST',type:'bar',xAxisIndex:gc-1,yAxisIndex:gc-1,data:macd[2].map(function(v,i){return v!=null?[times[i],v]:null;}),itemStyle:{color:function(p){return p.value&&p.value[1]>=0?'#34d399':'#f87171';}}}); gridCount=gc; }
+    if (checked('rsi')) { addGrid('10%'); var rsi=calcRSI(closes,14); yAxes[gc-1].min=0; yAxes[gc-1].max=100; series.push({name:'RSI',type:'line',xAxisIndex:gc-1,yAxisIndex:gc-1,data:rsi.map(function(v,i){return v!=null?[times[i],v]:null;}),lineStyle:{width:1.5,color:'#c084fc'},symbol:'none',markLine:{silent:true,symbol:'none',data:[{yAxis:70,lineStyle:{color:'#f87171',type:'dashed',width:1}},{yAxis:30,lineStyle:{color:'#34d399',type:'dashed',width:1}}]}}); gridCount=gc; }
+    if (checked('kdj')) { addGrid('10%'); var kdj=calcKDJ(closes,highs,lows,9); yAxes[gc-1].min=0; yAxes[gc-1].max=100; series.push({name:'K',type:'line',xAxisIndex:gc-1,yAxisIndex:gc-1,data:kdj[0].map(function(v,i){return v!=null?[times[i],v]:null;}),lineStyle:{width:1,color:'#fbbf24'},symbol:'none'}); series.push({name:'D',type:'line',xAxisIndex:gc-1,yAxisIndex:gc-1,data:kdj[1].map(function(v,i){return v!=null?[times[i],v]:null;}),lineStyle:{width:1,color:'#f472b6'},symbol:'none'}); series.push({name:'J',type:'line',xAxisIndex:gc-1,yAxisIndex:gc-1,data:kdj[2].map(function(v,i){return v!=null?[times[i],v]:null;}),lineStyle:{width:1,color:'#818cf8'},symbol:'none'}); gridCount=gc; }
+
+    // save current zoom state before rebuild
+    var savedStart = null, savedEnd = null;
+    try {
+        var curOpt = chart.getOption();
+        if (curOpt && curOpt.dataZoom && curOpt.dataZoom.length > 0 && curOpt.dataZoom[0].start !== undefined) {
+            savedStart = curOpt.dataZoom[0].start;
+            savedEnd = curOpt.dataZoom[0].end;
+        }
+    } catch(e) {}
+
+    var dzIdx = []; for (var i = 0; i < gridCount; i++) dzIdx.push(i);
+    chart.setOption({
+        backgroundColor:'#0f172a',animation:false,
+        tooltip:{trigger:'axis',axisPointer:{type:'cross'}},
+        dataZoom:[{type:'inside',xAxisIndex:dzIdx,zoomOnMouseWheel:true,moveOnMouseMove:true},{type:'slider',xAxisIndex:dzIdx,bottom:0,height:16,borderColor:'#334155',backgroundColor:'#1e293b',fillerColor:'rgba(56,189,248,0.2)',handleStyle:{color:'#38bdf8'}}],
+        grid:grids,xAxis:xAxes,yAxis:yAxes,series:series
+    },true);
+
+    // restore zoom if user had zoomed in (not at default 0-100)
+    if (savedStart !== null && !(savedStart === 0 && savedEnd === 100)) {
+        chart.setOption({
+            dataZoom: [
+                {start: savedStart, end: savedEnd},
+                {start: savedStart, end: savedEnd}
+            ]
+        });
+    }
+}
+
+function loadChart(){currentSymbol=document.getElementById('chart-symbol').value;fetch('/api/kline/'+currentSymbol+'?interval='+currentTF+'&limit=200').then(function(r){return r.json();}).then(function(d){rawData=d;if(!chart)initChart();renderIndicators();});}
+function switchTF(tf,btn){currentTF=tf;document.querySelectorAll('.timeframe-btn').forEach(function(b){b.className='timeframe-btn px-2 py-1 rounded text-xs bg-slate-700 text-slate-300';});btn.className='timeframe-btn px-2 py-1 rounded text-xs bg-sky-700 text-white';loadChart();startAutoRefresh();}
+
+function startAutoRefresh(){if(refreshTimer)clearInterval(refreshTimer);var i=(currentTF==='1m')?5000:(currentTF==='5m')?10000:30000;refreshTimer=setInterval(loadChart,i);}
+
+async function fetchLivePrice(){var s=document.getElementById('trade-symbol').value;var e=document.getElementById('live-price');e.textContent='{{ _("获取中") }}...';try{var r=await fetch('/api/price/'+s);var d=await r.json();if(d.price)e.textContent='$'+parseFloat(d.price).toFixed(2);else e.textContent=d.error||'N/A';}catch(x){e.textContent='{{ _("错误") }}';}}
+document.addEventListener('DOMContentLoaded',function(){initChart();loadChart();startAutoRefresh();fetchLivePrice();setInterval(fetchLivePrice,15000);});
+document.body.addEventListener('tradeUpdated',function(){htmx.ajax('GET','/partials/trades?page=1',{target:'#trade-history'});htmx.ajax('GET','/partials/positions',{target:'#positions-table'});});
+</script>
+{% endblock %}

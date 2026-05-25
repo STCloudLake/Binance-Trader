@@ -1,0 +1,35 @@
+enabled: true
+entry_conditions:
+  long:
+  - close > ema_fast and ema_fast > ema_slow and volume > volume_sma * 1.5
+  short:
+  - close < ema_fast and ema_fast < ema_slow and volume > volume_sma * 1.5
+exit_conditions:
+  long:
+  - close < ema_slow and volume < volume_sma * 0.8
+  short:
+  - close > ema_slow and volume < volume_sma * 0.8
+indicators:
+  ema:
+    fast_period: 9
+    slow_period: 21
+    source: close
+ml_config:
+  confidence_threshold: 0.65
+  enabled: true
+  features:
+  - volume_ratio
+  - price_momentum_24h
+  weight: 0.25
+mode: trend
+name: EMA+Volume Breakout
+reduce_conditions:
+  long:
+  - condition: close > ema_fast * 1.02
+    reduce_pct: 50
+  short:
+  - condition: close < ema_fast * 0.98
+    reduce_pct: 50
+timeframes:
+- 15m
+- 1h

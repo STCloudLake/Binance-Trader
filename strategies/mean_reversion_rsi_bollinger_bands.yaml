@@ -1,0 +1,40 @@
+enabled: true
+entry_conditions:
+  long:
+  - rsi < 25 and close <= bollinger_lower and volume > volume_sma * 1.2
+  short:
+  - rsi > 75 and close >= bollinger_upper and volume > volume_sma * 1.2
+exit_conditions:
+  long:
+  - rsi > 55
+  short:
+  - rsi < 45
+indicators:
+  bollinger:
+    period: 20
+    stddev: 2
+  rsi:
+    period: 14
+    source: close
+ml_config:
+  confidence_threshold: 0.65
+  enabled: true
+  features:
+  - rsi
+  - bollinger_width
+  - volume_ratio
+  - price_momentum_24h
+  weight: 0.3
+mode: trend
+name: Mean Reversion RSI + Bollinger Bands
+reduce_conditions:
+  long:
+  - condition: rsi > 45 and close > bollinger_middle
+    reduce_pct: 50
+  short:
+  - condition: rsi < 60 and close < bollinger_middle
+    reduce_pct: 50
+timeframes:
+- 15m
+- 1h
+- 4h

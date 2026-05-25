@@ -1,0 +1,4 @@
+<div class="card"><div class="text-sm text-slate-400">{{ _('账户余额') }}</div><div class="text-2xl font-bold text-green-400">{{ "%.4f"|format(balance) }} USDT</div></div>
+<div class="card"><div class="text-sm text-slate-400">{{ _('持仓数') }}</div><div class="text-2xl font-bold text-sky-400">{{ pos_count }} / {{ max_trades }}</div></div>
+<div class="card"><div class="text-sm text-slate-400">{{ _('持仓盈亏') }}</div><div class="text-2xl font-bold {{ 'text-green-400' if total_pnl >= 0 else 'text-red-400' }}">{{ "%+.4f"|format(total_pnl) }}</div></div>
+<div class="card"><div class="text-sm text-slate-400">{{ _('已投入') }}</div><div class="text-2xl font-bold text-yellow-400">{{ "%.4f"|format(invested) }} USDT</div></div>

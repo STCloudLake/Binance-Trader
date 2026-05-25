@@ -1,0 +1,53 @@
+enabled: true
+entry_conditions:
+  long:
+  - rsi < 30 and volume_ratio > 1.5 and close > bollinger_lower
+  - macd_histogram > 0 and close > ema_9 and volume_ratio > 2.0
+  short:
+  - rsi > 70 and volume_ratio > 1.5 and close < bollinger_upper
+  - macd_histogram < 0 and close < ema_9 and volume_ratio > 2.0
+exit_conditions:
+  long:
+  - close > bollinger_upper or rsi > 80
+  - close < ema_9 and rsi < 35
+  short:
+  - close < bollinger_lower or rsi < 25
+  - close > ema_9 and rsi > 55 and macd_histogram > 0
+indicators:
+  bollinger:
+    period: 20
+    stddev: 2
+  ema:
+    period: 9
+    source: close
+  macd:
+    fast: 12
+    signal: 9
+    slow: 26
+  rsi:
+    period: 7
+    source: close
+ml_config:
+  confidence_threshold: 0.55
+  enabled: true
+  features:
+  - rsi
+  - macd_histogram
+  - bollinger_width
+  - volume_ratio
+  - price_momentum_5m
+  weight: 0.4
+mode: scalp
+name: 超短线动量 Scalp Momentum
+reduce_conditions:
+  long:
+  - condition: rsi > 55 and close > bollinger_middle
+    reduce_pct: 50
+  - condition: close > bollinger_upper
+    reduce_pct: 30
+  short:
+  - condition: rsi < 45 and close < bollinger_middle
+    reduce_pct: 50
+timeframes:
+- 1m
+- 5m

@@ -1,0 +1,15 @@
+{% for rule in rules %}
+<div class="flex items-center justify-between py-2 border-b border-slate-800">
+    <div class="flex items-center gap-2">
+        <span class="text-xs {{ 'text-green-400' if rule.enabled else 'text-slate-600' }}">{{ '✅' if rule.enabled else '⬜' }}</span>
+        <span class="text-sm">{{ _(rule.name) }}</span>
+        <span class="text-xs text-slate-500">{{ _(rule.description) }}</span>
+    </div>
+    <div class="flex items-center gap-2">
+        <span class="badge {{ 'badge-red' if rule.level == 'critical' else 'badge-yellow' if rule.level == 'warning' else 'badge-blue' }} text-xs">{{ _('紧急') if rule.level == 'critical' else _('警告') if rule.level == 'warning' else _('信息') }}</span>
+        <button class="text-xs text-sky-400 hover:underline"
+                hx-post="/api/alert-rules/{{ loop.index0 }}/toggle" hx-target="#rules-list" hx-swap="outerHTML">
+            {{ _('停用') if rule.enabled else _('启用') }}</button>
+    </div>
+</div>
+{% endfor %}
