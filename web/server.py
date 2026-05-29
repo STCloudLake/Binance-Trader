@@ -14,7 +14,7 @@ from app.event_bus import EventBus, Event, EventType
 from app.config import Config
 from core.auth.auth import AuthManager, User
 from db.database import get_db, save_sim_balance, atomic_adjust_balance
-import csv, io, os, shutil, secrets
+import csv, io, os, shutil
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,7 @@ _jinja_env = Environment(loader=FileSystemLoader(str(_templates_dir)))
 
 
 def _fmt_time(utc_str):
-    """Convert a UTC timestamp string from SQLite to local time for display."""
+    """Convert a UTC timestamp string from SQLite to CST (UTC+8) for display."""
     if not utc_str:
         return '-'
     try:
@@ -37,6 +37,9 @@ def _fmt_time(utc_str):
         return dt.strftime('%Y-%m-%d %H:%M')
     except Exception:
         return str(utc_str)[:16]
+
+
+_jinja_env.filters["fmt_time"] = _fmt_time
 
 
 from web.i18n import get_translator
@@ -129,7 +132,8 @@ def create_app(config: Config, event_bus: EventBus, auth_manager=None) -> FastAP
         await am.touch_login(user.id)
 
         response = JSONResponse({"ok": True, "token": jwt_token, "role": user.role})
-        response.set_cookie("bt_session", session_token, httponly=True, max_age=am.session_hours * 3600)
+        response.set_cookie("bt_session", session_token, httponly=True, samesite="lax",
+                           secure=False, max_age=am.session_hours * 3600)
         return response
 
     @app.post("/api/auth/logout")
@@ -303,6 +307,9 @@ def create_app(config: Config, event_bus: EventBus, auth_manager=None) -> FastAP
 
     @app.get("/settings", response_class=HTMLResponse)
     async def settings_page(request: Request):
+        user = getattr(request.state, "user", None)
+        if not user or not user.is_trader:
+            return RedirectResponse(url="/dashboard", status_code=302)
         rm = getattr(app.state, "risk_manager", None)
         cb_state = {}
         if rm:
@@ -506,7 +513,8 @@ def create_app(config: Config, event_bus: EventBus, auth_manager=None) -> FastAP
 
     # ---- Clear all alerts ----
     @app.post("/api/alerts/clear")
-    async def clear_all_alerts():
+    async def clear_all_alerts(request: Request):
+        if err := _require_trader(request): return err
         try:
             db = await get_db()
             await db.execute("DELETE FROM alerts")
@@ -525,7 +533,8 @@ def create_app(config: Config, event_bus: EventBus, auth_manager=None) -> FastAP
         return {"rules": mgr.get_rules()}
 
     @app.post("/api/alert-rules/{index}/toggle")
-    async def toggle_alert_rule(index: int):
+    async def toggle_alert_rule(index: int, request: Request):
+        if err := _require_trader(request): return err
         mgr = getattr(app.state, "alert_manager", None)
         if not mgr or index >= len(mgr.get_rules()):
             return {"ok": False}
@@ -535,7 +544,8 @@ def create_app(config: Config, event_bus: EventBus, auth_manager=None) -> FastAP
         return {"ok": True, "enabled": new_enabled}
 
     @app.post("/api/alert-rules/{index}/remove")
-    async def remove_alert_rule(index: int):
+    async def remove_alert_rule(index: int, request: Request):
+        if err := _require_trader(request): return err
         mgr = getattr(app.state, "alert_manager", None)
         if not mgr:
             return {"ok": False}
@@ -659,12 +669,14 @@ def create_app(config: Config, event_bus: EventBus, auth_manager=None) -> FastAP
             if not result.approved:
                 return HTMLResponse(f'<span class="text-red-400">风控拒绝: {result.reason}</span>')
             # Use the risk-adjusted quantity (capped at user's request)
-            final_qty = result.adjusted_quantity or signal["quantity"]
-            if result.adjusted_quantity and result.adjusted_quantity < signal["quantity"]:
+            if result.adjusted_quantity is not None and result.adjusted_quantity < signal["quantity"]:
                 signal["quantity"] = result.adjusted_quantity
                 signal["amount_usdt"] = result.adjusted_quantity * current_price
-            signal["stop_loss"] = result.adjusted_stop_loss or signal["stop_loss"]
-            signal["leverage"] = result.adjusted_leverage or signal.get("leverage", 2)
+            if result.adjusted_stop_loss is not None:
+                signal["stop_loss"] = result.adjusted_stop_loss
+            if result.adjusted_leverage is not None:
+                signal["leverage"] = result.adjusted_leverage
+            final_qty = signal["quantity"]
 
             await event_bus.publish(Event(EventType.ORDER_REQUEST, signal))
             resp = HTMLResponse(
@@ -752,7 +764,8 @@ def create_app(config: Config, event_bus: EventBus, auth_manager=None) -> FastAP
         return _render("partials/positions_table.html", {"request": None, "positions": pos_list})
 
     @app.post("/api/trade/close/{symbol}")
-    async def close_position(symbol: str, reduce_pct: float = Form(100)):
+    async def close_position(symbol: str, request: Request, reduce_pct: float = Form(100)):
+        if err := _require_trader(request): return err
         executor = getattr(app.state, "executor", None)
         if not executor:
             return HTMLResponse(f'<span class="text-red-400">{_T("交易器未就绪")}</span>')
@@ -940,7 +953,8 @@ def create_app(config: Config, event_bus: EventBus, auth_manager=None) -> FastAP
             return JSONResponse({"error": str(e)}, status_code=500)
 
     @app.post("/api/strategy-recommend")
-    async def recommend_strategy():
+    async def recommend_strategy(request: Request):
+        if err := _require_trader(request): return err
         api_key = config.deepseek_api_key
         if not api_key:
             return JSONResponse({"error": "No API key"}, status_code=500)
@@ -1182,7 +1196,8 @@ Return ONLY valid JSON in this exact format:
         })
 
     @app.post("/api/consult")
-    async def consult_ai(prompt: str = Form(...)):
+    async def consult_ai(request: Request, prompt: str = Form(...)):
+        if err := _require_trader(request): return err
         api_key = config.deepseek_api_key
         if not api_key:
             return HTMLResponse('<div class="text-red-400">DeepSeek API key 未配置</div>')

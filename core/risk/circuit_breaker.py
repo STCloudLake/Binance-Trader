@@ -79,6 +79,12 @@ class CircuitBreaker:
         self.daily_start_equity = self.current_equity
         self.peak_equity = self.current_equity
 
+    def clamp_peak_to_current(self):
+        """Only reset peak_equity to current — does NOT reset daily PnL.
+        Used when peak was artificially inflated by stale position tracking."""
+        if self.current_equity > 0 and self.peak_equity > self.current_equity:
+            self.peak_equity = self.current_equity
+
     def reset_weekly(self):
         self.weekly_pnl = 0.0
         self.week_start_equity = self.current_equity

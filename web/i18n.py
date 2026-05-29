@@ -426,6 +426,8 @@ TRANSLATIONS = {
         'Prev': '上一页',
         'Next': '下一页',
         # Users
+        'Users': '用户',
+        'Logout': '退出',
         'User Management': '用户管理',
         'Add User': '添加用户',
         'Username': '用户名',
@@ -447,6 +449,7 @@ TRANSLATIONS = {
         'User enabled': '用户已启用',
         # Login
         'Login': '登录',
+        'Logout': '退出',
         'Login failed': '登录失败',
         'Invalid credentials': '用户名或密码错误',
         'Missing credentials': '请输入用户名和密码',
@@ -886,6 +889,8 @@ TRANSLATIONS = {
         'Prev': 'Prev',
         'Next': 'Next',
         # Users
+        'Users': 'Users',
+        'Logout': 'Logout',
         'User Management': 'User Management',
         'Add User': 'Add User',
         'Username': 'Username',

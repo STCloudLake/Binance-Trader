@@ -1,18 +1,18 @@
 hard_limits:
+  circuit_breaker_action: block_only
+  emergency_stop_enabled: true
+  emergency_stop_threshold_pct: -5.0
   max_consecutive_losses: 10
   max_daily_drawdown_pct: 7.5
   max_daily_loss_usdt: 600.0
   max_leverage: 4
   max_open_trades: 15
-  max_position_size_pct: 20.0
+  max_position_size_pct: 50.0
   max_total_exposure_pct: 80.0
   max_weekly_drawdown_pct: 10.0
   min_stop_loss_distance_pct: 0.5
-  circuit_breaker_action: block_only
-  trailing_stop_enabled: true
   trailing_stop_distance_pct: 2.0
-  emergency_stop_enabled: true
-  emergency_stop_threshold_pct: -5.0
+  trailing_stop_enabled: true
 soft_params:
   leverage: 2
   position_size_pct: 8.0

@@ -55,12 +55,16 @@ async def main():
     if not jwt_secret:
         import secrets
         jwt_secret = secrets.token_hex(32)
-        logger.info(f"Generated JWT secret: {jwt_secret}")
+        import hashlib
+        logger.info(f"JWT secret fingerprint: {hashlib.sha256(jwt_secret.encode()).hexdigest()[:16]}")
     auth_manager = AuthManager(config.db_path, jwt_secret, auth_cfg.get("session_hours", 24))
     if await auth_manager.count_users() == 0:
         admin_pass = AuthManager.generate_random_password()
         await auth_manager.create_user("admin", admin_pass, "admin", "Administrator")
-        logger.warning(f"=== DEFAULT ADMIN CREATED: username=admin, password={admin_pass} ===")
+        logger.warning(f"=== DEFAULT ADMIN CREATED: username=admin (password not logged) ===")
+        # Print to stderr only so it's visible in terminal but not in log files
+        import sys as _sys
+        _sys.stderr.write(f"\n{'='*60}\nDEFAULT ADMIN: admin / {admin_pass}\n{'='*60}\n\n")
 
     # 3. Create event bus
     event_bus = EventBus()
@@ -81,6 +85,7 @@ async def main():
     deepseek_ctl.wire(market_data, order_executor, risk_manager, strategy_engine)
     strategy_engine.wire_executor(order_executor)
     order_executor.wire_risk_manager(risk_manager)
+    risk_manager.wire_executor(order_executor)  # accurate position lookup in update_balance
     position_guard.wire(order_executor, market_data, risk_manager)
 
     # 5. Set DeepSeek key for news analyzer
@@ -192,14 +197,17 @@ async def main():
     async def _circuit_breaker_reset_loop():
         import time as _time
         while True:
-            await asyncio.sleep(3600)  # check every hour
             now = _time.localtime()
-            # Daily reset at ~00:xx
-            if now.tm_hour == 0 and now.tm_min < 5:
+            # Sleep until next hour boundary + 2 minutes
+            seconds_to_next_hour = (60 - now.tm_min) * 60 - now.tm_sec + 120
+            await asyncio.sleep(max(60, seconds_to_next_hour))
+            now = _time.localtime()
+            # Daily reset near 00:xx
+            if now.tm_hour == 0 and now.tm_min < 10:
                 risk_manager.breaker.reset_daily()
                 logger.info("Circuit breaker: daily reset")
-            # Weekly reset on Monday ~00:xx
-            if now.tm_wday == 0 and now.tm_hour == 0 and now.tm_min < 5:
+            # Weekly reset on Monday near 00:xx
+            if now.tm_wday == 0 and now.tm_hour == 0 and now.tm_min < 10:
                 risk_manager.breaker.reset_weekly()
                 logger.info("Circuit breaker: weekly reset")
 

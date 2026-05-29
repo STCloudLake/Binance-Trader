@@ -117,20 +117,20 @@ class PositionGuard:
         # Calculate the trailing stop price
         if side == "long":
             new_sl = price * (1 - distance_pct / 100)
-            # Never move stop below entry -- use entry-based stop as floor
             entry_sl = entry * (1 - distance_pct / 100)
             floor_sl = max(entry_sl, entry * 0.99)  # at worst 1% below entry
             if current_sl:
-                new_sl = max(new_sl, current_sl, entry_sl)  # only move up
+                new_sl = max(new_sl, current_sl, floor_sl)  # only move up, respect floor
             else:
-                new_sl = max(new_sl, entry_sl)
+                new_sl = max(new_sl, floor_sl)
         else:  # short
             new_sl = price * (1 + distance_pct / 100)
             entry_sl = entry * (1 + distance_pct / 100)
+            ceiling_sl = min(entry_sl, entry * 1.01)  # at worst 1% above entry
             if current_sl:
-                new_sl = min(new_sl, current_sl, entry_sl)  # only move down
+                new_sl = min(new_sl, current_sl, ceiling_sl)  # only move down, respect ceiling
             else:
-                new_sl = min(new_sl, entry_sl)
+                new_sl = min(new_sl, ceiling_sl)
 
         new_sl = round(new_sl, 2)
 

@@ -112,6 +112,7 @@ class OrderExecutor:
             "trade_group": trade_group,
             "strategy_name": data.get("strategy_name", ""),
             "strategy": data.get("strategy", "manual"),
+            "trader": data.get("trader", "manual"),
         }
 
         await self.event_bus.publish(Event(EventType.ORDER_UPDATE, {

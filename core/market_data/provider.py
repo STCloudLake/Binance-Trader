@@ -70,6 +70,7 @@ class MarketDataProvider:
             for interval in self._intervals:
                 streams.append(f"{sym_lower}@kline_{interval}")
 
+        msg_count = 0
         while self._running:
             conn_key = self.bsm.multiplex_socket(streams)
             from loguru import logger

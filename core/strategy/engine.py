@@ -271,8 +271,15 @@ class StrategyEngine:
                                 "reason": f"Exit condition met ({pos_side}) on {interval}",
                             }))
 
-    def get_signal(self, symbol: str) -> dict | None:
-        return self._signal_cache.get(symbol)
+    def get_signal(self, symbol: str, strategy_name: str = None) -> dict | None:
+        """Get latest signal for a symbol. If strategy_name is given, match exactly; otherwise return any."""
+        if strategy_name:
+            return self._signal_cache.get(f"{strategy_name}|{symbol}")
+        # Return first matching signal for the symbol
+        for key, sig in self._signal_cache.items():
+            if key.endswith(f"|{symbol}"):
+                return sig
+        return None
 
     def get_strategies(self) -> list[dict]:
         return [s.model_dump() for s in self._strategies.values()]

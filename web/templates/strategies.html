@@ -99,7 +99,7 @@ function loadStrategy(name) {
 async function toggleStrategy(name, enabled) {
     fetch('/api/strategy/' + encodeURIComponent(name) + '/toggle', {method:'POST'})
         .then(r => r.json())
-        .then(d => console.log(name + ' enabled=' + d.enabled));
+        .then(d => { location.reload(); });
 }
 
 function deleteStrategy(name) {

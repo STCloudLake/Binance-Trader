@@ -149,8 +149,8 @@ class NewsAnalyzer:
 
     async def _trigger_emergency_fetch(self, symbol: str, reason: str):
         now = time.time()
-        if symbol in self._last_fetch_time and now - self._last_fetch_time[symbol] < 120:
-            return
+        if symbol in self._last_fetch_time and now - self._last_fetch_time[symbol] < 300:
+            return  # 5 min cooldown per symbol to prevent alert storms
         self._last_fetch_time[symbol] = now
 
         sources = await self.source_manager.get_all_enabled()

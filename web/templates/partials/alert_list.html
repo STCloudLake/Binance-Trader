@@ -7,7 +7,7 @@
         <span class="text-sm ml-2">{{ alert.message[:150] }}</span>
         {% if alert.symbol and alert.symbol not in ('RiskManager', 'CircuitBreaker') %}<span class="text-xs text-sky-400 ml-2">{{ alert.symbol }}</span>{% endif %}
     </div>
-    <div class="text-xs text-slate-500">{{ alert.created_at }}</div>
+    <div class="text-xs text-slate-500">{{ alert.created_at | fmt_time }}</div>
 </div>
 {% endfor %}
 {% if not alerts %}

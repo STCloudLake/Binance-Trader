@@ -94,7 +94,7 @@ DEFAULT_RULES = [
         event_type="news.alert",
         condition={},
         level="warning",
-        cooldown_seconds=120,
+        cooldown_seconds=600,  # 10 min — prevent alert storm on persistent volume spikes
         description="检测到异常波动触发紧急新闻抓取",
     ),
     AlertRule(

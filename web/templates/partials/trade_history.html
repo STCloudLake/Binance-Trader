@@ -33,7 +33,7 @@
         {% else %}{{ _('已平仓') }}
         {% endif %}
     </td>
-    <td class="p-2 text-xs text-slate-500">{{ t.opened_at }}</td>
+    <td class="p-2 text-xs text-slate-500">{{ t.opened_at | fmt_time }}</td>
 </tr>
 {% endfor %}
 </tbody></table>

@@ -38,6 +38,18 @@ async def get_db() -> aiosqlite.Connection:
     return db
 
 
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def db_connection():
+    """Async context manager that ensures DB connection is always closed."""
+    db = await get_db()
+    try:
+        yield db
+    finally:
+        await db.close()
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

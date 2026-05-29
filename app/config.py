@@ -115,6 +115,10 @@ class Config:
             rp = self._get("risk_params", {})
             hard = rp.get("hard_limits", {}) if isinstance(rp, dict) else {}
         self.hard_limits = HardRiskLimits(**hard) if hard else HardRiskLimits()
+        valid_actions = {"block_only", "tighten_stops", "close_all", "close_worst"}
+        if self.hard_limits.circuit_breaker_action not in valid_actions:
+            logger.warning(f"Invalid circuit_breaker_action '{self.hard_limits.circuit_breaker_action}', falling back to 'block_only'")
+            self.hard_limits.circuit_breaker_action = "block_only"
 
         soft = self._get("soft_params", {})
         if not soft:

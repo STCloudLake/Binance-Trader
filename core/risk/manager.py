@@ -33,6 +33,11 @@ class RiskManager:
         self._pending_signals: set[str] = set()  # symbols with approved-but-not-yet-opened positions
         self._account_balance: float = 0.0
         self._last_breaker_alert_time: float = 0.0
+        self._executor = None  # set by wire_executor()
+
+    def wire_executor(self, executor):
+        """Receive executor reference for accurate position valuation."""
+        self._executor = executor
 
     async def start(self):
         self._running = True
@@ -176,11 +181,21 @@ class RiskManager:
 
     def update_balance(self, balance: float):
         self._account_balance = balance
-        # Total equity = cash + sum of open position values (at entry cost).
-        # Using cash alone causes false drawdown trips when positions are opened:
-        # opening a position reduces cash but total portfolio value is unchanged.
-        total_invested = sum(p.get("amount_usdt", 0) for p in self._open_positions.values())
-        self.breaker.set_equity(balance + total_invested)
+        # Read positions DIRECTLY from executor to avoid stale cache.
+        # _open_positions is updated via async events and may lag behind
+        # the actual executor state during rapid open/close cycles.
+        positions = {}
+        if self._executor:
+            positions = self._executor.get_open_positions()
+        if not positions:
+            positions = self._open_positions
+        total_invested = sum(p.get("amount_usdt", 0) for p in positions.values())
+        equity = balance + total_invested
+        self.breaker.set_equity(equity)
+        # When all positions close and peak was artificially inflated,
+        # clamp it down so stale drawdowns don't trigger false alarms.
+        if total_invested == 0 and self.breaker.peak_equity > equity * 1.05:
+            self.breaker.clamp_peak_to_current()
 
     async def _log_risk_event(self, event_type: str, level: str, detail: str, triggered_by: str):
         await self.event_bus.publish(Event(EventType.RISK_BREACH, {

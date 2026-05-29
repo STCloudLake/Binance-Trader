@@ -24,6 +24,9 @@ class DeepSeekController:
         self._executor: Optional[object] = None
         self._risk_manager: Optional[object] = None
         self._strategy_engine: Optional[object] = None
+        # AI decision cache
+        self._last_coin_selection: Optional[dict] = None
+        self._last_market_assessment: Optional[dict] = None
         # Heartbeat tracking
         self._last_run: dict[str, float] = {}
         self._run_count: dict[str, int] = {}
