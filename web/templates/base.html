@@ -32,10 +32,27 @@
         {% for slug, label in pages %}
         <a href="/{{ slug }}" class="nav-link {{ 'active' if current_page == slug else '' }}">{{ label }}</a>
         {% endfor %}
-        <span class="ml-auto text-sm text-slate-500" id="status-indicator">● {{ mode }}</span>
+        {% if current_user and current_user.is_admin %}
+        <span class="text-slate-600 mx-1">|</span>
+        <a href="/users" class="nav-link text-xs {{ 'active' if current_page == 'users' else '' }}">Users</a>
+        <a href="/db-manager" class="nav-link text-xs {{ 'active' if current_page == 'db_manager' else '' }}">DB</a>
+        {% endif %}
+        <span class="flex-1"></span>
+        {% if current_user %}
+        <span class="text-xs text-slate-500">{{ current_user.display_name or current_user.username }}
+            <span class="badge {{ 'badge-yellow' if current_user.role == 'admin' else 'badge-blue' if current_user.role == 'trader' else 'badge-green' }}">{{ current_user.role }}</span>
+        </span>
+        <button class="text-xs text-red-400 hover:underline" onclick="logout()">Logout</button>
+        {% endif %}
     </nav>
     <main class="p-6">
         {% block content %}{% endblock %}
     </main>
+    <script>
+    async function logout() {
+        await fetch('/api/auth/logout', {method:'POST'});
+        window.location.href = '/login';
+    }
+    </script>
 </body>
 </html>

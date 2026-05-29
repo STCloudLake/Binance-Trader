@@ -150,6 +150,31 @@
     <span id="restart-msg"></span>
 </div>
 
+<div class="card mt-6 border border-sky-700">
+    <h3 class="text-lg mb-3">{{ _("Change Password") }}</h3>
+    <form onsubmit="changePassword(event)" class="space-y-2">
+        <input type="password" id="cp-current" placeholder="{{ _('Current Password') }}" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
+        <input type="password" id="cp-new" placeholder="{{ _('New Password') }}" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
+        <button type="submit" class="bg-sky-600 hover:bg-sky-500 text-white px-4 py-2 rounded text-sm"{{ _("Update Password") }}</button>
+        <span id="cp-msg"></span>
+    </form>
+</div>
+<script>
+async function changePassword(e) {
+    e.preventDefault();
+    var resp = await fetch('/api/auth/change-password', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+            current_password: document.getElementById('cp-current').value,
+            new_password: document.getElementById('cp-new').value
+        })
+    });
+    var data = await resp.json();
+    document.getElementById('cp-msg').innerHTML = data.ok
+        ? '<span class="text-green-400 text-xs">{{ _("Password updated") }}</span>'
+        : '<span class="text-red-400 text-xs">' + (data.error || '{{ _("Failed") }}') + '</span>';
+}
+</script>
 <script>
 async function fetchModels(refresh) {
     var sel = document.getElementById('model-select');

@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Binance Trader - {{ _("Login") }}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: { extend: { colors: { surface: '#0f172a', 'surface-light': '#1e293b', 'border': '#334155', } } }
+        }
+    </script>
+    <style>
+        body { background: #0f172a; color: #e2e8f0; font-family: 'Microsoft YaHei', 'Consolas', monospace; }
+        .card { background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 1.5rem; }
+    </style>
+</head>
+<body class="min-h-screen flex items-center justify-center">
+    <div class="w-full max-w-sm">
+        <h1 class="text-2xl font-bold text-sky-400 text-center mb-8">📊 Binance Trader</h1>
+        <div class="card">
+            <form id="login-form" onsubmit="login(event)" class="space-y-4">
+                <div>
+                    <label class="text-sm text-slate-400">{{ _("Username") }}</label>
+                    <input type="text" id="username" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white" autofocus>
+                </div>
+                <div>
+                    <label class="text-sm text-slate-400">{{ _("Password") }}</label>
+                    <input type="password" id="password" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white">
+                </div>
+                <div id="error" class="text-red-400 text-sm hidden"></div>
+                <button type="submit" class="w-full bg-sky-600 hover:bg-sky-500 text-white px-4 py-2 rounded text-sm">{{ _("Login") }}</button>
+            </form>
+        </div>
+    </div>
+    <script>
+    async function login(e) {
+        e.preventDefault();
+        var err = document.getElementById('error');
+        err.classList.add('hidden');
+        var resp = await fetch('/api/auth/login', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                username: document.getElementById('username').value,
+                password: document.getElementById('password').value
+            })
+        });
+        var data = await resp.json();
+        if (data.ok) {
+            window.location.href = '/dashboard';
+        } else {
+            err.textContent = data.error || '{{ _("Login failed") }}';
+            err.classList.remove('hidden');
+        }
+    }
+    </script>
+</body>
+</html>

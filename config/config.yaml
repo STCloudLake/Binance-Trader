@@ -8,6 +8,9 @@ ai:
     market_assessment_minutes: 60
     risk_adjustment_minutes: 1440
     strategy_optimization_minutes: 1440
+auth:
+  jwt_secret: ''
+  session_hours: 24
 binance:
   testnet: true
 core_position:

@@ -1,0 +1,18 @@
+{% for u in users %}
+<div class="flex items-center justify-between py-1 border-b border-slate-800 text-sm">
+    <span>
+        {{ u.username }}
+        <span class="badge {{ 'badge-yellow' if u.role=='admin' else 'badge-blue' if u.role=='trader' else 'badge-green' }} text-xs">{{ _(u.role|capitalize) if u.role in ('viewer','trader','admin') else u.role }}</span>
+        {% if not u.enabled %}<span class="badge badge-red text-xs ml-1">{{ _('Disabled') }}</span>{% endif %}
+    </span>
+    <span class="text-xs text-slate-500">{{ u.last_login or '-' }}</span>
+    {% if u.enabled %}
+    <button class="text-red-400 text-xs hover:underline"
+            hx-post="/api/users/{{ u.id }}/toggle" hx-target="#user-list" hx-swap="outerHTML">{{ _('Disable') }}</button>
+    {% else %}
+    <button class="text-green-400 text-xs hover:underline"
+            hx-post="/api/users/{{ u.id }}/toggle" hx-target="#user-list" hx-swap="outerHTML">{{ _('Enable') }}</button>
+    {% endif %}
+</div>
+{% endfor %}
+<div id="user-msg" class="text-xs mt-1"></div>

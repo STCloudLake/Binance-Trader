@@ -48,6 +48,20 @@ async def main():
     await init_database(config.db_path)
     logger.info("Database initialized")
 
+    # Initialize auth and create default admin if no users exist
+    from core.auth.auth import AuthManager
+    auth_cfg = config._get("auth", {}) if isinstance(config._get("auth", {}), dict) else {}
+    jwt_secret = auth_cfg.get("jwt_secret", "")
+    if not jwt_secret:
+        import secrets
+        jwt_secret = secrets.token_hex(32)
+        logger.info(f"Generated JWT secret: {jwt_secret}")
+    auth_manager = AuthManager(config.db_path, jwt_secret, auth_cfg.get("session_hours", 24))
+    if await auth_manager.count_users() == 0:
+        admin_pass = AuthManager.generate_random_password()
+        await auth_manager.create_user("admin", admin_pass, "admin", "Administrator")
+        logger.warning(f"=== DEFAULT ADMIN CREATED: username=admin, password={admin_pass} ===")
+
     # 3. Create event bus
     event_bus = EventBus()
     await event_bus.start()
@@ -292,13 +306,14 @@ async def main():
     logger.info("Post-ML strategy evaluation complete")
 
     # 7. Start Web UI
-    web_app = create_app(config, event_bus)
+    web_app = create_app(config, event_bus, auth_manager)
     web_app.state.strategy_loader = strategy_engine.loader
     web_app.state.strategy_engine = strategy_engine
     web_app.state.config = config
     web_app.state.executor = order_executor
     web_app.state.ai_controller = deepseek_ctl
     web_app.state.risk_manager = risk_manager
+    web_app.state.auth_manager = auth_manager
     web_app.state.alert_manager = alert_manager
     web_app.state.get_price = market_data.get_current_price
     web_app.state.balance = await load_sim_balance(config.db_path)

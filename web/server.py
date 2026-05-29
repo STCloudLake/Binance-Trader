@@ -2,7 +2,7 @@ import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from fastapi import FastAPI, Request, Form, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse, StreamingResponse
 from jinja2 import Environment, FileSystemLoader
 import aiosqlite
 import asyncio
@@ -12,7 +12,9 @@ import logging
 
 from app.event_bus import EventBus, Event, EventType
 from app.config import Config
+from core.auth.auth import AuthManager, User
 from db.database import get_db, save_sim_balance, atomic_adjust_balance
+import csv, io, os, shutil, secrets
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +42,10 @@ def _fmt_time(utc_str):
 from web.i18n import get_translator
 
 
+def _T(key: str) -> str:
+    """Translate a key for inline HTML usage. Uses current config language."""
+    return get_translator(_get_lang())(key)
+
 
 def _get_lang() -> str:
     try:
@@ -57,12 +63,33 @@ def _render(template_name: str, context: dict, lang: str = None) -> HTMLResponse
     lang = lang or _get_lang()
     context["_"] = get_translator(lang)
     context["lang"] = lang
+    if context.get("request") and hasattr(context["request"], "state"):
+        context["current_user"] = getattr(context["request"].state, "user", None)
     return HTMLResponse(template.render(**context))
 
 
-def create_app(config: Config, event_bus: EventBus) -> FastAPI:
+def create_app(config: Config, event_bus: EventBus, auth_manager=None) -> FastAPI:
     app = FastAPI(title="Binance Trader", docs_url=None, redoc_url=None)
+    if auth_manager:
+        from starlette.middleware.base import BaseHTTPMiddleware
+        app.add_middleware(auth_manager.create_middleware())
+        app.state.auth_manager = auth_manager
+
     _balance_lock = asyncio.Lock()
+
+    def _require_trader(request: Request):
+        """Require trader or admin role. Returns None if OK, error response if denied."""
+        user = getattr(request.state, "user", None)
+        if not user or not user.is_trader:
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+        return None
+
+    def _require_admin(request: Request):
+        """Require admin role. Returns None if OK, error response if denied."""
+        user = getattr(request.state, "user", None)
+        if not user or not user.is_admin:
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+        return None
 
     async def _save_balance():
         await save_sim_balance(getattr(app.state, "balance", DEFAULT_BALANCE), config.db_path)
@@ -70,6 +97,121 @@ def create_app(config: Config, event_bus: EventBus) -> FastAPI:
         rm = getattr(app.state, "risk_manager", None)
         if rm:
             rm.update_balance(app.state.balance)
+
+    # ---- Auth routes ----
+    @app.get("/login", response_class=HTMLResponse)
+    async def login_page(request: Request):
+        return _render("login.html", {"request": request})
+
+    @app.post("/api/auth/login")
+    async def api_login(request: Request):
+        import json as _json
+        body = await request.body()
+        data = _json.loads(body) if body else {}
+        username = data.get("username", "")
+        password = data.get("password", "")
+        if not username or not password:
+            return JSONResponse({"error": "Missing credentials"}, status_code=400)
+
+        am = getattr(app.state, "auth_manager", None)
+        if not am:
+            return JSONResponse({"error": "Auth not configured"}, status_code=500)
+
+        user_data = await am.get_user_by_username(username)
+        if not user_data or not am.verify_password(password, user_data["password_hash"]):
+            return JSONResponse({"error": "Invalid credentials"}, status_code=401)
+
+        user = User(id=user_data["id"], username=user_data["username"],
+                     role=user_data["role"], display_name=user_data.get("display_name", ""),
+                     enabled=bool(user_data.get("enabled", 1)))
+        session_token = am.create_session(user)
+        jwt_token = am.create_jwt(user)
+        await am.touch_login(user.id)
+
+        response = JSONResponse({"ok": True, "token": jwt_token, "role": user.role})
+        response.set_cookie("bt_session", session_token, httponly=True, max_age=am.session_hours * 3600)
+        return response
+
+    @app.post("/api/auth/logout")
+    async def api_logout(request: Request):
+        session_token = request.cookies.get("bt_session")
+        if session_token:
+            am = getattr(app.state, "auth_manager", None)
+            if am:
+                am.destroy_session(session_token)
+        response = JSONResponse({"ok": True})
+        response.delete_cookie("bt_session")
+        return response
+
+    # ---- User management (admin only) ----
+    @app.get("/api/users")
+    async def list_users(request: Request):
+        user = getattr(request.state, "user", None)
+        if not user or not user.is_admin:
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+        am = getattr(app.state, "auth_manager", None)
+        users = await am.list_users() if am else []
+        return [{"id": u["id"], "username": u["username"], "role": u["role"],
+                 "display_name": u.get("display_name",""), "enabled": u.get("enabled",1),
+                 "created_at": u.get("created_at",""), "last_login": u.get("last_login","")} for u in users]
+
+    @app.post("/api/users")
+    async def create_user(request: Request, username: str = Form(...), password: str = Form(...),
+                          role: str = Form("viewer"), display_name: str = Form("")):
+        user = getattr(request.state, "user", None)
+        if not user or not user.is_admin:
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+        am = getattr(app.state, "auth_manager", None)
+        await am.create_user(username, password, role, display_name)
+        users = await am.list_users()
+        return _render("partials/user_list.html", {"request": request, "users": users})
+
+    @app.post("/api/users/{uid}")
+    async def update_user(uid: int, request: Request):
+        user = getattr(request.state, "user", None)
+        if not user or not user.is_admin:
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+        body = await request.json()
+        am = getattr(app.state, "auth_manager", None)
+        await am.update_user(uid, **body)
+        users = await am.list_users()
+        return _render("partials/user_list.html", {"request": request, "users": users})
+
+    @app.delete("/api/users/{uid}")
+    async def delete_user(uid: int, request: Request):
+        user = getattr(request.state, "user", None)
+        if not user or not user.is_admin:
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+        am = getattr(app.state, "auth_manager", None)
+        await am.update_user(uid, enabled=0)
+        users = await am.list_users()
+        return _render("partials/user_list.html", {"request": request, "users": users})
+
+    @app.post("/api/users/{uid}/toggle")
+    async def toggle_user(uid: int, request: Request):
+        user = getattr(request.state, "user", None)
+        if not user or not user.is_admin:
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+        am = getattr(app.state, "auth_manager", None)
+        user_data = await am.get_user_by_id(uid, include_disabled=True)
+        if user_data:
+            new_enabled = 0 if user_data.get("enabled", 1) else 1
+            await am.update_user(uid, enabled=new_enabled)
+        users = await am.list_users()
+        return _render("partials/user_list.html", {"request": request, "users": users})
+
+    @app.post("/api/auth/change-password")
+    async def change_password(request: Request):
+        user = getattr(request.state, "user", None)
+        if not user:
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+        body = await request.json()
+        am = getattr(app.state, "auth_manager", None)
+        user_data = await am.get_user_by_id(user.id)
+        if not am.verify_password(body.get("current_password", ""), user_data["password_hash"]):
+            return JSONResponse({"error": "Current password incorrect"}, status_code=400)
+        await am.change_password(user.id, body["new_password"])
+        return {"ok": True}
 
     @app.get("/dashboard", response_class=HTMLResponse)
     async def dashboard(request: Request):
@@ -194,6 +336,21 @@ def create_app(config: Config, event_bus: EventBus) -> FastAPI:
             "circuit_breaker": cb_state,
         })
 
+    @app.get("/db-manager", response_class=HTMLResponse)
+    async def db_manager_page(request: Request):
+        user = getattr(request.state, "user", None)
+        if not user or not user.is_admin:
+            return RedirectResponse(url="/dashboard", status_code=302)
+        tables = ["trades", "alerts", "ai_suggestions", "orders", "positions", "system_config", "users"]
+        return _render("db_manager.html", {"request": request, "current_page": "db_manager", "tables": tables})
+
+    @app.get("/users", response_class=HTMLResponse)
+    async def users_page(request: Request):
+        user = getattr(request.state, "user", None)
+        if not user or not user.is_admin:
+            return RedirectResponse(url="/dashboard", status_code=302)
+        return _render("users.html", {"request": request, "current_page": "users"})
+
     # API Routes
     @app.get("/api/alerts")
     async def get_alerts(limit: int = 50):
@@ -234,7 +391,8 @@ def create_app(config: Config, event_bus: EventBus) -> FastAPI:
             return []
 
     @app.post("/api/ai-suggestions/{sid}/approve")
-    async def approve_suggestion(sid: int):
+    async def approve_suggestion(sid: int, request: Request):
+        if err := _require_trader(request): return err
         try:
             db = await get_db()
             cursor = await db.execute("SELECT * FROM ai_suggestions WHERE id=?", (sid,))
@@ -271,7 +429,8 @@ def create_app(config: Config, event_bus: EventBus) -> FastAPI:
         return HTMLResponse(f'<span class="text-green-400 text-xs">✓ {_T("已批准并执行")}</span>')
 
     @app.post("/api/ai-suggestions/{sid}/reject")
-    async def reject_suggestion(sid: int):
+    async def reject_suggestion(sid: int, request: Request):
+        if err := _require_trader(request): return err
         try:
             db = await get_db()
             await db.execute("UPDATE ai_suggestions SET status='rejected' WHERE id=?", (sid,))
@@ -397,6 +556,12 @@ def create_app(config: Config, event_bus: EventBus) -> FastAPI:
         rules = mgr.get_rules() if mgr else []
         return _render("partials/alert_rules.html", {"request": request, "rules": rules})
 
+    @app.get("/partials/user-list", response_class=HTMLResponse)
+    async def partial_user_list(request: Request):
+        am = getattr(app.state, "auth_manager", None)
+        users = await am.list_users() if am else []
+        return _render("partials/user_list.html", {"request": request, "users": users})
+
     @app.get("/partials/ai-suggestions", response_class=HTMLResponse)
     async def partial_ai_suggestions(status: str = "pending", limit: int = 5):
         try:
@@ -425,7 +590,8 @@ def create_app(config: Config, event_bus: EventBus) -> FastAPI:
         return HTMLResponse(html or '<div class="text-slate-500 text-sm">No pending suggestions</div>')
 
     @app.post("/api/ai-mode")
-    async def set_ai_mode(mode: str = Form(...)):
+    async def set_ai_mode(request: Request, mode: str = Form(...)):
+        if err := _require_trader(request): return err
         config.ai_mode = mode
         # Persist to config.yaml
         config_path = Path(__file__).parent.parent / "config" / "config.yaml"
@@ -440,16 +606,18 @@ def create_app(config: Config, event_bus: EventBus) -> FastAPI:
         return HTMLResponse(f'<span class="text-green-400">{_T("AI 模式已更新")}</span>')
 
     @app.post("/api/signal-weights")
-    async def update_signal_weights(indicator: float = Form(0.5), ml: float = Form(0.3), news: float = Form(0.2)):
+    async def update_signal_weights(request: Request, indicator: float = Form(0.5), ml: float = Form(0.3), news: float = Form(0.2)):
+        if err := _require_trader(request): return err
         config.update_signal_weights(indicator=indicator, ml=ml, news=news)
         return HTMLResponse('<span class="text-green-400">Weights updated</span>')
 
     # ---- Trading endpoints ----
     @app.post("/api/trade")
-    async def execute_trade(symbol: str = Form(...), side: str = Form(...),
+    async def execute_trade(request: Request, symbol: str = Form(...), side: str = Form(...),
                             amount_usdt: float = Form(100), position_type: str = Form("satellite"),
                             stop_loss_pct: float = Form(2.0), trader: str = Form("manual"),
                             strategy_name: str = Form("")):
+        if err := _require_trader(request): return err
         executor = getattr(app.state, "executor", None)
         risk_manager = getattr(app.state, "risk_manager", None)
         if not executor:
@@ -685,6 +853,7 @@ def create_app(config: Config, event_bus: EventBus) -> FastAPI:
 
     @app.post("/api/strategy")
     async def create_strategy(request: Request):
+        if err := _require_trader(request): return err
         loader = getattr(app.state, "strategy_loader", None)
         if not loader:
             return JSONResponse({"error": "No loader"}, status_code=500)
@@ -702,6 +871,7 @@ def create_app(config: Config, event_bus: EventBus) -> FastAPI:
 
     @app.put("/api/strategy/{name}")
     async def update_strategy(name: str, request: Request):
+        if err := _require_trader(request): return err
         loader = getattr(app.state, "strategy_loader", None)
         if not loader:
             return JSONResponse({"error": "No loader"}, status_code=500)
@@ -722,7 +892,8 @@ def create_app(config: Config, event_bus: EventBus) -> FastAPI:
             return JSONResponse({"error": str(e)}, status_code=400)
 
     @app.post("/api/strategy/{name}/toggle")
-    async def toggle_strategy(name: str):
+    async def toggle_strategy(name: str, request: Request):
+        if err := _require_trader(request): return err
         loader = getattr(app.state, "strategy_loader", None)
         if not loader:
             return JSONResponse({"error": "No loader"}, status_code=500)
@@ -735,7 +906,8 @@ def create_app(config: Config, event_bus: EventBus) -> FastAPI:
             return JSONResponse({"error": str(e)}, status_code=500)
 
     @app.delete("/api/strategy/{name}")
-    async def delete_strategy(name: str):
+    async def delete_strategy(name: str, request: Request):
+        if err := _require_trader(request): return err
         loader = getattr(app.state, "strategy_loader", None)
         if not loader:
             return JSONResponse({"error": "No loader"}, status_code=500)
@@ -746,7 +918,8 @@ def create_app(config: Config, event_bus: EventBus) -> FastAPI:
             return JSONResponse({"error": str(e)}, status_code=500)
 
     @app.post("/api/strategy/reload")
-    async def reload_strategies():
+    async def reload_strategies(request: Request):
+        if err := _require_trader(request): return err
         """Reload all strategy YAML files into the engine without restarting."""
         engine = getattr(app.state, "strategy_engine", None)
         if not engine:
@@ -1069,7 +1242,8 @@ Return ONLY valid JSON in this exact format:
             return HTMLResponse('<div class="text-slate-500">Error loading sources</div>')
 
     @app.post("/api/settings/deepseek")
-    async def save_deepseek_settings(api_key: str = Form(""), base_url: str = Form(""), model: str = Form("")):
+    async def save_deepseek_settings(request: Request, api_key: str = Form(""), base_url: str = Form(""), model: str = Form("")):
+        if err := _require_trader(request): return err
         secrets_path = Path(__file__).parent.parent / "config" / "secrets.yaml"
         data = {}
         if secrets_path.exists():
@@ -1102,12 +1276,13 @@ Return ONLY valid JSON in this exact format:
         return HTMLResponse('<span class="text-green-400 text-sm">✓ DeepSeek 设置已保存</span>')
 
     @app.post("/api/settings/ai-news")
-    async def save_ai_news_settings(
+    async def save_ai_news_settings(request: Request,
         language: str = Form("en"), ai_consult_interval: int = Form(60),
         news_fetch_interval: int = Form(30), max_articles: int = Form(10),
         anomaly_threshold: float = Form(3.0),
         task_market_assessment: int = Form(60), task_coin_selection: int = Form(240),
         task_strategy_optimization: int = Form(1440), task_risk_adjustment: int = Form(1440)):
+        if err := _require_trader(request): return err
         config.language = language
         config.ai_consult_interval = ai_consult_interval
         config.news_fetch_interval = news_fetch_interval
@@ -1141,7 +1316,7 @@ Return ONLY valid JSON in this exact format:
         return HTMLResponse('<span class="text-green-400 text-sm">✓ AI & 新闻设置已保存</span>')
 
     @app.post("/api/settings/risk")
-    async def save_risk_settings(max_daily_drawdown: float = Form(5.0), max_daily_loss: float = Form(500.0),
+    async def save_risk_settings(request: Request, max_daily_drawdown: float = Form(5.0), max_daily_loss: float = Form(500.0),
                                   max_open_trades: int = Form(8), max_position_size_pct: float = Form(10.0),
                                   max_leverage: int = Form(3), max_consecutive_losses: int = Form(5),
                                   circuit_breaker_action: str = Form("block_only"),
@@ -1150,6 +1325,7 @@ Return ONLY valid JSON in this exact format:
                                   emergency_stop_enabled: str = Form("0"),
                                   emergency_stop_threshold_pct: float = Form(-5.0),
                                   spot_enabled: str = Form("1"), futures_enabled: str = Form("0")):
+        if err := _require_trader(request): return err
         config.hard_limits.max_daily_drawdown_pct = max_daily_drawdown
         config.hard_limits.max_daily_loss_usdt = max_daily_loss
         config.hard_limits.max_open_trades = max_open_trades
@@ -1201,7 +1377,8 @@ Return ONLY valid JSON in this exact format:
         return HTMLResponse('<span class="text-green-400 text-sm">✓ Risk settings saved</span>')
 
     @app.post("/api/settings/binance")
-    async def save_binance_settings(api_key: str = Form(""), api_secret: str = Form(""), testnet: str = Form("0")):
+    async def save_binance_settings(request: Request, api_key: str = Form(""), api_secret: str = Form(""), testnet: str = Form("0")):
+        if err := _require_trader(request): return err
         secrets_path = Path(__file__).parent.parent / "config" / "secrets.yaml"
         data = {}
         if secrets_path.exists():
@@ -1227,7 +1404,8 @@ Return ONLY valid JSON in this exact format:
         return HTMLResponse('<span class="text-green-400 text-sm">✓ Binance settings saved</span>')
 
     @app.post("/api/settings/reset-sim")
-    async def reset_sim_trading():
+    async def reset_sim_trading(request: Request):
+        if err := _require_admin(request): return err
         """Clear all sim trading records and reset balance to 10000."""
         try:
             db = await get_db()
@@ -1251,7 +1429,8 @@ Return ONLY valid JSON in this exact format:
         return resp
 
     @app.post("/api/circuit-breaker/reset")
-    async def reset_circuit_breaker():
+    async def reset_circuit_breaker(request: Request):
+        if err := _require_trader(request): return err
         """Reset the circuit breaker trip state (for manual override)."""
         rm = getattr(app.state, "risk_manager", None)
         if not rm:
@@ -1266,7 +1445,8 @@ Return ONLY valid JSON in this exact format:
         return HTMLResponse('<span class="text-green-400 text-sm">✓ 熔断器已重置 — 交易恢复</span>')
 
     @app.post("/api/settings/restart")
-    async def restart_server():
+    async def restart_server(request: Request):
+        if err := _require_admin(request): return err
         """Schedule a server restart by spawning a new process and exiting."""
         import subprocess, sys, os, asyncio
 
@@ -1279,5 +1459,157 @@ Return ONLY valid JSON in this exact format:
 
         asyncio.ensure_future(_do_restart())
         return HTMLResponse('<span class="text-green-400 text-sm">✓ 服务器正在重启，请等待 5 秒后刷新页面...</span>')
+
+    # ---- DB Manager API routes ----
+    @app.get("/api/db/table/{table}")
+    async def db_table_view(request: Request, table: str, search: str = "", page: int = 1, per_page: int = 50):
+        try:
+            user = getattr(request.state, "user", None)
+            if not user or not user.is_admin:
+                return HTMLResponse("Forbidden", status_code=403)
+            allowed = ["trades", "alerts", "ai_suggestions", "orders", "positions", "system_config", "users"]
+            if table not in allowed:
+                return HTMLResponse("Invalid table")
+            db = await get_db()
+            try:
+                cursor = await db.execute(f"PRAGMA table_info({table})")
+                cols = [dict(r) for r in await cursor.fetchall()]
+                columns = [c["name"] for c in cols]
+                # Count total rows
+                count_query = f"SELECT COUNT(*) FROM {table}"
+                count_params = []
+                if search and table in ("trades", "alerts", "orders"):
+                    count_query += " WHERE symbol LIKE ? OR message LIKE ?"
+                    count_params = [f"%{search}%", f"%{search}%"]
+                cursor = await db.execute(count_query, count_params)
+                total_rows = (await cursor.fetchone())[0]
+                total_pages = max(1, (total_rows + per_page - 1) // per_page)
+                page = max(1, min(page, total_pages))
+                # Build page range for display
+                start_p = max(1, page - 2)
+                end_p = min(total_pages, page + 2)
+                page_range = list(range(start_p, end_p + 1))
+                # Query data
+                query = f"SELECT * FROM {table}"
+                params = []
+                if search and table in ("trades", "alerts", "orders"):
+                    query += " WHERE symbol LIKE ? OR message LIKE ?"
+                    params = [f"%{search}%", f"%{search}%"]
+                offset = (page - 1) * per_page
+                query += f" ORDER BY id DESC LIMIT {per_page} OFFSET {offset}"
+                cursor = await db.execute(query, params)
+                rows = [dict(r) for r in await cursor.fetchall()]
+            finally:
+                await db.close()
+            return _render("partials/db_table.html", {
+                "request": None, "table": table, "columns": columns, "rows": rows,
+                "page": page, "total_pages": total_pages, "total_rows": total_rows,
+                "page_range": page_range,
+            })
+        except Exception as e:
+            import traceback
+            logger.error(f"db_table_view error: {e}\n{traceback.format_exc()}")
+            return HTMLResponse(f"Error: {e}", status_code=500)
+
+    @app.delete("/api/db/row/{table}/{row_id}")
+    async def db_delete_row(table: str, row_id: int, request: Request):
+        user = getattr(request.state, "user", None)
+        if not user or not user.is_admin:
+            return JSONResponse({"ok": False, "error": "Forbidden"}, status_code=403)
+        allowed = ["trades", "alerts", "ai_suggestions", "orders", "positions", "system_config", "users"]
+        if table not in allowed:
+            return {"ok": False}
+        db = await get_db()
+        await db.execute(f"DELETE FROM {table} WHERE id=?", (row_id,))
+        await db.commit()
+        await db.close()
+        return {"ok": True}
+
+    @app.get("/api/db/backup")
+    async def db_backup(request: Request):
+        user = getattr(request.state, "user", None)
+        if not user or not user.is_admin:
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+        import time as _time
+        src = config.db_path
+        ts = _time.strftime("%Y%m%d_%H%M%S", _time.localtime())
+        dst = src.replace(".db", f"_backup_{ts}.db")
+        shutil.copy2(src, dst)
+        return FileResponse(dst, filename=f"binance_trader_backup_{ts}.db")
+
+    @app.post("/api/db/restore")
+    async def db_restore(request: Request):
+        user = getattr(request.state, "user", None)
+        if not user or not user.is_admin:
+            return JSONResponse({"ok": False, "error": "Forbidden"}, status_code=403)
+        form = await request.form()
+        file = form.get("file")
+        if not file:
+            return {"ok": False, "error": "No file uploaded"}
+        contents = await file.read()
+        if contents[:16] != b"SQLite format 3\x00":
+            return {"ok": False, "error": "Not a valid SQLite database"}
+        src = config.db_path
+        backup_path = src + ".pre_restore"
+        shutil.copy2(src, backup_path)
+        with open(src, "wb") as f:
+            f.write(contents)
+        return {"ok": True}
+
+    @app.post("/api/db/optimize")
+    async def db_optimize(request: Request):
+        user = getattr(request.state, "user", None)
+        if not user or not user.is_admin:
+            return JSONResponse({"ok": False, "error": "Forbidden"}, status_code=403)
+        before = os.path.getsize(config.db_path)
+        db = await get_db()
+        await db.execute("VACUUM")
+        await db.execute("REINDEX")
+        await db.close()
+        after = os.path.getsize(config.db_path)
+        return {"ok": True, "before": before, "after": after}
+
+    @app.post("/api/db/cleanup")
+    async def db_cleanup(request: Request):
+        user = getattr(request.state, "user", None)
+        if not user or not user.is_admin:
+            return JSONResponse({"ok": False, "error": "Forbidden"}, status_code=403)
+        db = await get_db()
+        await db.execute("DELETE FROM alerts WHERE created_at < datetime('now', '-90 days')")
+        await db.execute("DELETE FROM trades WHERE status='closed' AND closed_at < datetime('now', '-365 days')")
+        await db.execute("DELETE FROM ai_suggestions WHERE created_at < datetime('now', '-90 days')")
+        await db.commit()
+        await db.execute("VACUUM")
+        await db.close()
+        return {"ok": True}
+
+    @app.get("/api/db/export/{table}")
+    async def db_export_csv(table: str, request: Request, search: str = None):
+        user = getattr(request.state, "user", None)
+        if not user or not user.is_admin:
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+        allowed = ["trades", "alerts", "ai_suggestions", "orders", "positions", "system_config", "users"]
+        if table not in allowed:
+            return HTMLResponse("Invalid table", status_code=400)
+        db = await get_db()
+        cursor = await db.execute(f"PRAGMA table_info({table})")
+        cols = [dict(r) for r in await cursor.fetchall()]
+        columns = [c["name"] for c in cols]
+        query = f"SELECT * FROM {table}"
+        params = []
+        if search and table in ("trades", "alerts", "orders"):
+            query += " WHERE symbol LIKE ? OR message LIKE ?"
+            params = [f"%{search}%", f"%{search}%"]
+        cursor = await db.execute(query, params)
+        rows = [dict(r) for r in await cursor.fetchall()]
+        await db.close()
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(columns)
+        for row in rows:
+            writer.writerow([row.get(c, "") for c in columns])
+        output.seek(0)
+        return StreamingResponse(output, media_type="text/csv",
+                                  headers={"Content-Disposition": f"attachment; filename={table}_export.csv"})
 
     return app

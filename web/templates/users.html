@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 class="text-xl mb-4">{{ _("User Management") }}</h2>
+
+<div class="grid grid-cols-2 gap-6">
+    <div class="card">
+        <h3 class="text-lg mb-3">{{ _("Add User") }}</h3>
+        <form hx-post="/api/users" hx-target="#user-list" hx-swap="innerHTML" class="space-y-3">
+            <div><label class="text-sm text-slate-400">{{ _("Username") }}</label>
+                <input type="text" name="username" required class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm"></div>
+            <div><label class="text-sm text-slate-400">{{ _("Password") }}</label>
+                <input type="password" name="password" required class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm"></div>
+            <div><label class="text-sm text-slate-400">{{ _("Role") }}</label>
+                <select name="role" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
+                    <option value="viewer">{{ _("Viewer") }}</option>
+                    <option value="trader">{{ _("Trader") }}</option>
+                    <option value="admin">{{ _("Admin") }}</option>
+                </select></div>
+            <div><label class="text-sm text-slate-400">{{ _("Display Name (optional)") }}</label>
+                <input type="text" name="display_name" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm"></div>
+            <button type="submit" class="bg-sky-600 hover:bg-sky-500 text-white px-4 py-2 rounded text-sm w-full">{{ _("Add User") }}</button>
+        </form>
+    </div>
+
+    <div class="card">
+        <h3 class="text-lg mb-3">{{ _("Users") }}</h3>
+        <div id="user-list" hx-get="/partials/user-list" hx-trigger="load, every 30s">
+            <div class="text-slate-500 text-sm">{{ _("Loading...") }}</div>
+        </div>
+    </div>
+</div>
+
+<div class="card mt-6 border border-sky-700">
+    <h3 class="text-lg mb-3">{{ _("Change Password") }}</h3>
+    <form onsubmit="changePassword(event)" class="grid grid-cols-3 gap-3">
+        <input type="password" id="cp-current" placeholder="{{ _('Current Password') }}" class="bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
+        <input type="password" id="cp-new" placeholder="{{ _('New Password') }}" class="bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
+        <button type="submit" class="bg-sky-600 hover:bg-sky-500 text-white px-4 py-2 rounded text-sm">{{ _("Update Password") }}</button>
+        <span id="cp-msg" class="col-span-3 text-xs"></span>
+    </form>
+</div>
+<script>
+async function changePassword(e) {
+    e.preventDefault();
+    var resp = await fetch('/api/auth/change-password', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+            current_password: document.getElementById('cp-current').value,
+            new_password: document.getElementById('cp-new').value
+        })
+    });
+    var data = await resp.json();
+    document.getElementById('cp-msg').innerHTML = data.ok
+        ? '<span class="text-green-400 text-xs">{{ _("Password updated") }}</span>'
+        : '<span class="text-red-400 text-xs">' + (data.error || '{{ _("Failed") }}') + '</span>';
+}
+</script>
+{% endblock %}

@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 class="text-xl mb-4">{{ _("Database Manager") }}</h2>
+
+<div class="flex gap-2 mb-4 flex-wrap">
+    <button class="px-3 py-1 rounded text-sm bg-sky-700 text-white" onclick="dbAction('backup')">{{ _("Download Backup") }}</button>
+    <button class="px-3 py-1 rounded text-sm bg-slate-700 text-slate-300" onclick="document.getElementById('restore-file').click()">{{ _("Restore Backup") }}</button>
+    <form id="restore-form" class="hidden"><input type="file" id="restore-file" accept=".db" onchange="dbAction('restore')"></form>
+    <button class="px-3 py-1 rounded text-sm bg-yellow-700 text-white" onclick="dbAction('optimize')">{{ _("Optimize (VACUUM)") }}</button>
+    <button class="px-3 py-1 rounded text-sm bg-red-700 text-white" onclick="if(confirm('{{ _("Delete old data?") }}'))dbAction('cleanup')">{{ _("Cleanup Old Data") }}</button>
+    <span id="db-action-msg" class="text-xs"></span>
+</div>
+
+<div class="flex gap-2 mb-4 items-center">
+    <select id="db-table" onchange="loadTable(1)" class="bg-slate-800 border border-slate-600 rounded px-3 py-1 text-white text-sm">
+        {% for t in tables %}
+        <option value="{{ t }}">{{ t }}</option>
+        {% endfor %}
+    </select>
+    <input type="text" id="db-search" placeholder="{{ _('Search...') }}" oninput="loadTable(1)" class="bg-slate-800 border border-slate-600 rounded px-3 py-1 text-white text-sm w-40">
+    <button class="px-3 py-1 rounded text-xs bg-green-700 text-white" onclick="exportCSV()">{{ _("Export CSV") }}</button>
+    <span class="text-xs text-slate-500 ml-2">{{ _('Rows per page') }}:</span>
+    <select id="db-per-page" onchange="loadTable(1)" class="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-white text-xs">
+        <option value="25">25</option>
+        <option value="50" selected>50</option>
+        <option value="100">100</option>
+        <option value="200">200</option>
+    </select>
+</div>
+
+<div id="db-table-content" class="card overflow-x-auto max-h-[60vh]">
+    {{ _("Select a table to browse") }}
+</div>
+
+<script>
+var currentPage = 1;
+async function loadTable(page) {
+    currentPage = page || 1;
+    var table = document.getElementById('db-table').value;
+    var search = document.getElementById('db-search').value;
+    var perPage = document.getElementById('db-per-page').value;
+    var url = '/api/db/table/' + table + '?page=' + currentPage + '&per_page=' + perPage;
+    if (search) url += '&search=' + encodeURIComponent(search);
+    var resp = await fetch(url);
+    document.getElementById('db-table-content').innerHTML = await resp.text();
+}
+async function dbAction(action) {
+    var msg = document.getElementById('db-action-msg');
+    if (action === 'restore') {
+        var file = document.getElementById('restore-file').files[0];
+        if (!file) return;
+        if (!confirm('{{ _("This will REPLACE ALL data. Are you sure?") }}')) return;
+        var form = new FormData(); form.append('file', file);
+        var resp = await fetch('/api/db/restore', {method:'POST', body: form});
+        var data = await resp.json();
+        msg.innerHTML = data.ok ? '<span class="text-green-400">{{ _("Restored. Reloading...") }}</span>' : '<span class="text-red-400">'+data.error+'</span>';
+        if (data.ok) setTimeout(function(){location.reload();}, 3000);
+    } else if (action === 'backup') {
+        window.location.href = '/api/db/backup';
+    } else {
+        var resp = await fetch('/api/db/' + action, {method:'POST'});
+        var data = await resp.json();
+        msg.innerHTML = data.ok ? '<span class="text-green-400">{{ _("OK") }} ' + (data.before ? '('+data.before+' -> '+data.after+' {{ _("bytes") }})' : '') + '</span>' : '<span class="text-red-400">{{ _("Failed") }}</span>';
+        if (data.ok && action === 'optimize') setTimeout(function(){loadTable(currentPage);}, 500);
+    }
+}
+function exportCSV() {
+    var table = document.getElementById('db-table').value;
+    var search = document.getElementById('db-search').value;
+    window.location.href = '/api/db/export/' + table + '?search=' + encodeURIComponent(search);
+}
+async function deleteRow(table, id) {
+    if (!confirm('{{ _("Delete row") }} ' + id + ' {{ _("from") }} ' + table + '?')) return;
+    await fetch('/api/db/row/' + table + '/' + id, {method:'DELETE'});
+    loadTable(currentPage);
+}
+</script>
+{% endblock %}
