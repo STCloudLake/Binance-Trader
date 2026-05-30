@@ -1,0 +1,40 @@
+<div class="card">
+    <h3 class="text-lg mb-3">{{ _("Backtest History") }}</h3>
+    {% if records %}
+    <div class="max-h-64 overflow-y-auto">
+        <table class="w-full text-sm">
+            <thead class="text-slate-400 border-b border-slate-700">
+                <tr>
+                    <th class="text-left p-1">{{ _("Mode") }}</th>
+                    <th class="text-left p-1">{{ _("Strategies") }}</th>
+                    <th class="text-left p-1">{{ _("Date") }}</th>
+                    <th class="text-left p-1">{{ _("Return %") }}</th>
+                    <th class="text-left p-1">{{ _("Trades") }}</th>
+                    <th class="text-left p-1">{{ _("Run At") }}</th>
+                    <th class="text-left p-1">{{ _("Actions") }}</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for r in records %}
+                <tr class="border-b border-slate-800 text-xs">
+                    <td class="p-1">{{ r.mode }}</td>
+                    <td class="p-1 text-slate-400 max-w-40 truncate">{{ r.strategies[:50] }}</td>
+                    <td class="p-1">{{ r.date_start[:10] }}~{{ r.date_end[:10] }}</td>
+                    <td class="p-1 {{ 'text-green-400' if r.final_balance and r.final_balance > r.initial_balance else 'text-red-400' }}">
+                        {{ "%.1f"|format((r.final_balance - r.initial_balance) / r.initial_balance * 100) if r.final_balance else '-' }}%
+                    </td>
+                    <td class="p-1">{{ r.trades_count or '-' }}</td>
+                    <td class="p-1 text-slate-500">{{ r.created_at[:16] if r.created_at else '-' }}</td>
+                    <td class="p-1">
+                        <button class="text-sky-400 text-xs hover:underline" hx-get="/api/backtest/{{ r.id }}" hx-target="#backtest-results">{{ _("View") }}</button>
+                        <button class="text-red-400 text-xs hover:underline ml-1" hx-delete="/api/backtest/{{ r.id }}" hx-target="closest tr" hx-swap="outerHTML">{{ _("Del") }}</button>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <p class="text-slate-500 text-sm">{{ _("No backtest records yet") }}</p>
+    {% endif %}
+</div>

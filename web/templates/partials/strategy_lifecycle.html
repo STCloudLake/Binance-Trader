@@ -1,0 +1,25 @@
+<div class="card">
+    <h3 class="text-lg mb-3">{{ _("Strategy Lifecycle") }}</h3>
+    {% if events %}
+    <div class="max-h-64 overflow-y-auto">
+        {% for e in events %}
+        <div class="py-2 border-b border-slate-800 flex justify-between items-center text-sm">
+            <div>
+                {% if e.action == 'generated' %}<span class="mr-2">🧬</span>
+                {% elif e.action == 'deployed' %}<span class="mr-2">🚀</span>
+                {% elif e.action == 'retired' %}<span class="mr-2">🗑️</span>
+                {% elif e.action == 'optimized' %}<span class="mr-2">⚙️</span>
+                {% elif e.action == 'rejected' %}<span class="mr-2">❌</span>
+                {% else %}<span class="mr-2">📋</span>
+                {% endif %}
+                <span class="font-bold">{{ e.strategy_name }}</span>
+                <span class="text-xs text-slate-500 ml-2">{{ e.trigger_reason[:80] if e.trigger_reason else '' }}</span>
+            </div>
+            <div class="text-xs text-slate-500">{{ e.created_at[:16] if e.created_at else '-' }}</div>
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <p class="text-slate-500 text-sm">{{ _("No lifecycle events yet") }}</p>
+    {% endif %}
+</div>

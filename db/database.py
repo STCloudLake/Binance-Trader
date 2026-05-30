@@ -197,6 +197,31 @@ CREATE INDEX IF NOT EXISTS idx_alerts_created ON alerts(created_at);
 CREATE INDEX IF NOT EXISTS idx_news_symbol ON news_articles(symbol);
 CREATE INDEX IF NOT EXISTS idx_news_fetched ON news_articles(fetched_at);
 CREATE INDEX IF NOT EXISTS idx_ai_status ON ai_suggestions(status);
+
+CREATE TABLE IF NOT EXISTS backtest_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT,
+    mode TEXT NOT NULL DEFAULT 'full',
+    strategies TEXT NOT NULL,
+    symbols TEXT NOT NULL,
+    date_start TEXT NOT NULL,
+    date_end TEXT NOT NULL,
+    initial_balance REAL NOT NULL DEFAULT 10000,
+    final_balance REAL,
+    metrics TEXT,
+    trades_count INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS strategy_lifecycle_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy_name TEXT NOT NULL,
+    action TEXT NOT NULL,
+    trigger_reason TEXT,
+    metrics_snapshot TEXT,
+    backtest_record_id INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 

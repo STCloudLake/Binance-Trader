@@ -88,6 +88,24 @@ async def main():
     risk_manager.wire_executor(order_executor)  # accurate position lookup in update_balance
     position_guard.wire(order_executor, market_data, risk_manager)
 
+    # 4.5 Init backtest engine and strategy lifecycle manager
+    from core.backtest.engine import BacktestEngine
+    from core.ai.strategy_lifecycle import StrategyLifecycleManager
+
+    backtest_engine = BacktestEngine(config, strategy_engine, risk_manager, order_executor)
+
+    lifecycle_manager = StrategyLifecycleManager(
+        config=config,
+        deepseek_ctl=deepseek_ctl,
+        backtest_engine=backtest_engine,
+        strategy_loader=strategy_engine.loader,
+        strategy_engine=strategy_engine,
+        alert_manager=alert_manager,
+        db_path=config.db_path,
+    )
+
+    deepseek_ctl.wire_lifecycle(lifecycle_manager)
+
     # 5. Set DeepSeek key for news analyzer
     if config.deepseek_api_key:
         await news_analyzer.set_deepseek(config.deepseek_api_key, config.ai_base_url)
@@ -322,6 +340,8 @@ async def main():
     web_app.state.ai_controller = deepseek_ctl
     web_app.state.risk_manager = risk_manager
     web_app.state.auth_manager = auth_manager
+    web_app.state.backtest_engine = backtest_engine
+    web_app.state.lifecycle_manager = lifecycle_manager
     web_app.state.alert_manager = alert_manager
     web_app.state.get_price = market_data.get_current_price
     web_app.state.balance = await load_sim_balance(config.db_path)

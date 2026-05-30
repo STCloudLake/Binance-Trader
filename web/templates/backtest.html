@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 class="text-xl mb-4">{{ _("Backtest") }}</h2>
+
+<div hx-get="/partials/backtest-config" hx-trigger="load">
+    <div class="text-slate-500">{{ _("Loading...") }}</div>
+</div>
+
+<hr class="border-slate-700 my-4">
+
+<div id="backtest-results"></div>
+
+<div class="mt-6" hx-get="/partials/backtest-list" hx-trigger="load, every 30s">
+    <div class="text-slate-500">{{ _("Loading...") }}</div>
+</div>
+{% endblock %}

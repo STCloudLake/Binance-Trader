@@ -1627,4 +1627,156 @@ Return ONLY valid JSON in this exact format:
         return StreamingResponse(output, media_type="text/csv",
                                   headers={"Content-Disposition": f"attachment; filename={table}_export.csv"})
 
+    # ---- Backtest routes ----
+    @app.get("/backtest", response_class=HTMLResponse)
+    async def backtest_page(request: Request):
+        user = getattr(request.state, "user", None)
+        if not user or not user.is_trader:
+            return RedirectResponse(url="/dashboard", status_code=302)
+        loader = getattr(app.state, "strategy_loader", None)
+        strategies = loader.list_names() if loader else []
+        return _render("backtest.html", {
+            "request": request,
+            "available_strategies": strategies,
+            "available_symbols": ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"],
+        })
+
+    @app.post("/api/backtest/run")
+    async def run_backtest(request: Request,
+                           strategies: str = Form(...),
+                           symbols: str = Form(...),
+                           date_start: str = Form("2025-01-01"),
+                           date_end: str = Form("2026-01-01"),
+                           mode: str = Form("full"),
+                           initial_balance: float = Form(10000.0)):
+        if err := _require_trader(request): return err
+        engine = getattr(app.state, "backtest_engine", None)
+        if not engine:
+            return HTMLResponse('<div class="text-red-400">Backtest engine not initialized</div>')
+
+        strategy_list = [s.strip() for s in strategies.split(",") if s.strip()]
+        symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
+        if not strategy_list or not symbol_list:
+            return HTMLResponse('<div class="text-red-400">Please select strategies and symbols</div>')
+
+        import concurrent.futures
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, engine.run_with_exit_evaluation,
+                                            strategy_list, symbol_list, date_start, date_end,
+                                            initial_balance)
+
+        if result.get("error"):
+            return _render("partials/backtest_results.html",
+                           {"request": None, "error": result["error"]})
+
+        from core.backtest.report import generate_report
+        report = generate_report(result)
+
+        # Persist to DB
+        try:
+            db = await get_db()
+            await db.execute(
+                "INSERT INTO backtest_records (mode, strategies, symbols, date_start,"
+                " date_end, initial_balance, final_balance, metrics, trades_count)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (mode, json.dumps(strategy_list), json.dumps(symbol_list),
+                 date_start, date_end, initial_balance,
+                 result["final_balance"], json.dumps(report["summary"]),
+                 len(result["trades"])))
+            await db.commit()
+            await db.close()
+        except Exception:
+            pass  # best-effort persist
+
+        return _render("partials/backtest_results.html", {
+            "request": None,
+            "summary": report["summary"],
+            "chart_data": report["chart_data"],
+            "trades": result["trades"],
+            "runtime": result["metrics"].get("runtime_seconds", 0),
+        })
+
+    @app.get("/api/backtest/history")
+    async def backtest_history():
+        db = await get_db()
+        cursor = await db.execute(
+            "SELECT * FROM backtest_records ORDER BY created_at DESC LIMIT 50")
+        records = [dict(r) for r in await cursor.fetchall()]
+        await db.close()
+        return records
+
+    @app.get("/api/backtest/{record_id}")
+    async def get_backtest(record_id: int):
+        db = await get_db()
+        cursor = await db.execute(
+            "SELECT * FROM backtest_records WHERE id=?", (record_id,))
+        row = await cursor.fetchone()
+        await db.close()
+        if not row:
+            return JSONResponse({"error": "Not found"}, status_code=404)
+        rec = dict(row)
+        if rec.get("metrics"):
+            rec["metrics_parsed"] = json.loads(rec["metrics"])
+        return rec
+
+    @app.delete("/api/backtest/{record_id}")
+    async def delete_backtest(record_id: int):
+        db = await get_db()
+        await db.execute("DELETE FROM backtest_records WHERE id=?", (record_id,))
+        await db.commit()
+        await db.close()
+        return {"ok": True}
+
+    @app.get("/partials/backtest-config")
+    async def partial_backtest_config():
+        loader = getattr(app.state, "strategy_loader", None)
+        strategies = loader.list_names() if loader else []
+        return _render("partials/backtest_config.html", {
+            "request": None,
+            "available_strategies": strategies,
+            "available_symbols": ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"],
+        })
+
+    @app.get("/partials/backtest-list")
+    async def partial_backtest_list():
+        db = await get_db()
+        cursor = await db.execute(
+            "SELECT * FROM backtest_records ORDER BY created_at DESC LIMIT 20")
+        records = [dict(r) for r in await cursor.fetchall()]
+        await db.close()
+        return _render("partials/backtest_list.html",
+                       {"request": None, "records": records})
+
+    # ---- Strategy Lifecycle routes ----
+    @app.get("/api/strategy-lifecycle/events")
+    async def lifecycle_events(limit: int = 50):
+        db = await get_db()
+        cursor = await db.execute(
+            "SELECT * FROM strategy_lifecycle_events ORDER BY created_at DESC LIMIT ?",
+            (limit,))
+        events = [dict(r) for r in await cursor.fetchall()]
+        await db.close()
+        return events
+
+    @app.post("/api/strategy-lifecycle/generate")
+    async def lifecycle_generate(request: Request):
+        if err := _require_trader(request): return err
+        mgr = getattr(app.state, "lifecycle_manager", None)
+        if not mgr:
+            return JSONResponse({"error": "Lifecycle manager not initialized"}, status_code=500)
+        config = await mgr.generate_strategy()
+        if not config:
+            return JSONResponse({"ok": False, "error": "AI generation failed"})
+        return JSONResponse({"ok": True, "strategy": config})
+
+    @app.get("/partials/strategy-lifecycle")
+    async def partial_strategy_lifecycle(request: Request):
+        db = await get_db()
+        cursor = await db.execute(
+            "SELECT * FROM strategy_lifecycle_events ORDER BY created_at DESC LIMIT 50")
+        events = [dict(r) for r in await cursor.fetchall()]
+        await db.close()
+        return _render("partials/strategy_lifecycle.html",
+                       {"request": request, "events": events})
+
     return app

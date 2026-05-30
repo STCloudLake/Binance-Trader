@@ -27,6 +27,7 @@ class DeepSeekController:
         # AI decision cache
         self._last_coin_selection: Optional[dict] = None
         self._last_market_assessment: Optional[dict] = None
+        self._lifecycle_manager = None
         # Heartbeat tracking
         self._last_run: dict[str, float] = {}
         self._run_count: dict[str, int] = {}
@@ -37,6 +38,9 @@ class DeepSeekController:
         self._executor = executor
         self._risk_manager = risk_manager
         self._strategy_engine = strategy_engine
+
+    def wire_lifecycle(self, lifecycle_manager):
+        self._lifecycle_manager = lifecycle_manager
 
     def _build_breaker_context(self, breaker_data: dict = None) -> str:
         """Build context string for breaker-related AI decisions."""
@@ -174,6 +178,19 @@ class DeepSeekController:
         self._tasks.append(asyncio.create_task(self._coin_selection_loop()))
         self._tasks.append(asyncio.create_task(self._strategy_optimization_loop()))
         self._tasks.append(asyncio.create_task(self._risk_adjustment_loop()))
+        if self._lifecycle_manager:
+            self._tasks.append(asyncio.create_task(self._lifecycle_loop()))
+
+    async def _lifecycle_loop(self):
+        """Periodic AI strategy generation and retirement evaluation."""
+        while self._running:
+            try:
+                if self._lifecycle_manager:
+                    await self._lifecycle_manager.generate_strategy()
+                    await self._lifecycle_manager.check_and_retire()
+            except Exception as e:
+                logger.warning(f"Lifecycle loop error: {e}")
+            await asyncio.sleep(3600)  # Check every hour
 
     async def _heartbeat(self, task_name: str, success: bool):
         """Record that an AI task just ran."""

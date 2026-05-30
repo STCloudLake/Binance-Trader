@@ -1,0 +1,101 @@
+{% if error %}
+<div class="card border border-red-700">
+    <p class="text-red-400">{{ error }}</p>
+</div>
+{% else %}
+<div class="card mb-4">
+    <h3 class="text-lg mb-3">{{ _("Backtest Results") }} <span class="text-xs text-slate-500">({{ runtime }}s)</span></h3>
+
+    <div class="grid grid-cols-4 gap-3 mb-4">
+        <div class="card text-center">
+            <div class="text-xs text-slate-400">{{ _("Total Return") }}</div>
+            <div class="text-lg font-bold {{ 'text-green-400' if summary.total_return_pct > 0 else 'text-red-400' }}">{{ "%.2f"|format(summary.total_return_pct) }}%</div>
+        </div>
+        <div class="card text-center">
+            <div class="text-xs text-slate-400">{{ _("Max Drawdown") }}</div>
+            <div class="text-lg font-bold text-red-400">{{ "%.2f"|format(summary.max_drawdown_pct) }}%</div>
+        </div>
+        <div class="card text-center">
+            <div class="text-xs text-slate-400">{{ _("Sharpe Ratio") }}</div>
+            <div class="text-lg font-bold text-sky-400">{{ "%.2f"|format(summary.sharpe_ratio) }}</div>
+        </div>
+        <div class="card text-center">
+            <div class="text-xs text-slate-400">{{ _("Win Rate") }}</div>
+            <div class="text-lg font-bold text-yellow-400">{{ "%.1f"|format(summary.win_rate_pct) }}%</div>
+        </div>
+        <div class="card text-center">
+            <div class="text-xs text-slate-400">{{ _("Trades") }}</div>
+            <div class="text-lg font-bold text-slate-300">{{ summary.total_trades }}</div>
+        </div>
+        <div class="card text-center">
+            <div class="text-xs text-slate-400">{{ _("Profit Factor") }}</div>
+            <div class="text-lg font-bold text-green-400">{{ "%.2f"|format(summary.profit_factor) }}</div>
+        </div>
+        <div class="card text-center">
+            <div class="text-xs text-slate-400">{{ _("Avg PnL") }}</div>
+            <div class="text-lg font-bold text-slate-300">{{ "%.2f"|format(summary.avg_pnl) }} USDT</div>
+        </div>
+        <div class="card text-center">
+            <div class="text-xs text-slate-400">ML {{ _("Accuracy") }}</div>
+            <div class="text-lg font-bold text-purple-400">{{ "%.1f"|format(summary.ml_accuracy_pct) }}%</div>
+        </div>
+    </div>
+
+    <div id="bt-equity-chart" style="width:100%;height:350px;" class="mb-4"></div>
+
+    <h4 class="text-md mb-2">{{ _("Trade History") }} ({{ trades|length }} {{ _("trades") }})</h4>
+    <div class="max-h-64 overflow-y-auto">
+        <table class="w-full text-sm">
+            <thead class="text-slate-400 border-b border-slate-700">
+                <tr>
+                    <th class="text-left p-1">{{ _("Symbol") }}</th>
+                    <th class="text-left p-1">{{ _("Side") }}</th>
+                    <th class="text-left p-1">{{ _("Entry") }}</th>
+                    <th class="text-left p-1">{{ _("Exit") }}</th>
+                    <th class="text-left p-1">{{ _("PnL") }}</th>
+                    <th class="text-left p-1">{{ _("Strategy") }}</th>
+                    <th class="text-left p-1">{{ _("Opened") }}</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for t in trades[:200] %}
+                <tr class="border-b border-slate-800 text-xs">
+                    <td class="p-1 font-bold">{{ t.symbol }}</td>
+                    <td class="p-1 {{ 'text-green-400' if t.side == 'long' else 'text-red-400' }}">{{ t.side }}</td>
+                    <td class="p-1">{{ "%.4f"|format(t.entry_price) }}</td>
+                    <td class="p-1">{{ "%.4f"|format(t.exit_price) if t.exit_price else '-' }}</td>
+                    <td class="p-1 {{ 'text-green-400' if t.pnl > 0 else 'text-red-400' }}">{{ "%+.2f"|format(t.pnl) if t.pnl else '-' }}</td>
+                    <td class="p-1 text-slate-400">{{ t.strategy }}</td>
+                    <td class="p-1 text-slate-500">{{ t.opened_at[:16] if t.opened_at else '-' }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<script>
+(function() {
+    var equityData = {{ chart_data.equity_curve | tojson }};
+    var ddData = {{ chart_data.drawdown_curve | tojson }};
+    var el = document.getElementById('bt-equity-chart');
+    if (!el) return;
+    var chart = echarts.init(el);
+    chart.setOption({
+        backgroundColor: '#0f172a',
+        tooltip: { trigger: 'axis' },
+        legend: { data: ['Equity','DD%'], textStyle: { color: '#94a3b8' }, top: 0 },
+        grid: { left: '3%', right: '3%', top: '12%', bottom: '3%' },
+        xAxis: { type: 'time', axisLabel: { color: '#94a3b8', fontSize: 10 } },
+        yAxis: [
+            { type: 'value', axisLabel: { color: '#94a3b8' }, splitLine: { lineStyle: { color: '#1e293b' } } },
+            { type: 'value', axisLabel: { color: '#94a3b8' }, splitLine: { show: false } }
+        ],
+        series: [
+            { name: 'Equity', type: 'line', data: equityData.map(function(d){return [d.time,d.value];}), smooth: true, lineStyle: { width: 2, color: '#38bdf8' }, symbol: 'none' },
+            { name: 'DD%', type: 'line', yAxisIndex: 1, data: ddData.map(function(d){return [d.time,-d.value];}), smooth: true, lineStyle: { width: 1, color: '#f87171', type: 'dashed' }, symbol: 'none', areaStyle: { color: 'rgba(248,113,113,0.1)' } }
+        ]
+    });
+})();
+</script>
+{% endif %}

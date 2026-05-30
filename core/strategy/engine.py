@@ -284,6 +284,50 @@ class StrategyEngine:
     def get_strategies(self) -> list[dict]:
         return [s.model_dump() for s in self._strategies.values()]
 
+    def evaluate_sync(self, df: pd.DataFrame, strategy, symbol: str) -> dict | None:
+        """Synchronous strategy evaluation for backtesting. Returns signal dict or None."""
+        from core.strategy.indicators import compute_all, evaluate_condition
+
+        df = compute_all(df, strategy.indicators)
+
+        long_active = False
+        short_active = False
+        for side in ["long", "short"]:
+            conditions = strategy.entry_conditions.get(side, [])
+            for cond in conditions:
+                mask = evaluate_condition(df, cond)
+                met = bool(hasattr(mask, 'iloc') and mask.iloc[-1])
+                if met and side == "long":
+                    long_active = True
+                elif met and side == "short":
+                    short_active = True
+
+        if long_active and short_active:
+            return None
+
+        side = "long" if long_active else "short" if short_active else None
+        if side is None:
+            return None
+
+        return {
+            "side": side,
+            "score": 1.0 if side == "long" else -1.0,
+            "symbol": symbol,
+            "strategy": strategy.name,
+            "strategy_name": strategy.name,
+            "price": float(df["close"].iloc[-1]),
+        }
+
+    def evaluate_exit_sync(self, df: pd.DataFrame, strategy, pos_side: str) -> bool:
+        """Check if exit conditions are met for an open position. Returns True if should exit."""
+        from core.strategy.indicators import evaluate_condition
+        conditions = strategy.exit_conditions.get(pos_side, [])
+        for cond in conditions:
+            mask = evaluate_condition(df, cond)
+            if hasattr(mask, 'iloc') and mask.iloc[-1]:
+                return True
+        return False
+
     async def evaluate_all_now(self, publish: bool = False):
         """Evaluate all strategies immediately.
         If publish=True, real trade signals fire (used after breaker reset recovery).

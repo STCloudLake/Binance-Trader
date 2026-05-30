@@ -28,7 +28,7 @@
 <body class="min-h-screen">
     <nav class="border-b border-slate-700 px-6 py-3 flex items-center gap-6">
         <h1 class="text-lg font-bold text-sky-400">📊 Binance Trader</h1>
-        {% set pages = [('dashboard', _('仪表盘')), ('strategies', _('策略监控')), ('ai', _('AI 面板')), ('alerts', _('预警中心')), ('settings', _('设置'))] %}
+        {% set pages = [('dashboard', _('仪表盘')), ('strategies', _('策略监控')), ('backtest', _('Backtest')), ('ai', _('AI 面板')), ('alerts', _('预警中心')), ('settings', _('设置'))] %}
         {% for slug, label in pages %}
         <a href="/{{ slug }}" class="nav-link {{ 'active' if current_page == slug else '' }}">{{ label }}</a>
         {% endfor %}
