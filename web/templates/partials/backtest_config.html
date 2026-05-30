@@ -72,7 +72,7 @@ function toggleAll(containerId, checked) {
 async function runBacktest(e) {
     e.preventDefault();
     var status = document.getElementById('bt-status');
-    status.textContent = '{{ _("Running...") }}';
+    status.textContent = '{{ _("Starting...") }}';
 
     // Collect checked strategies and symbols
     var strategies = [];
@@ -98,12 +98,13 @@ async function runBacktest(e) {
     fd.append('mode', form.mode.value);
     fd.append('initial_balance', form.initial_balance.value);
 
+    // Show progress bar immediately
+    document.getElementById('backtest-results').innerHTML = '<div class="card mb-4"><div class="text-slate-400 text-sm">{{ _("Starting backtest...") }}</div><div class="w-full bg-slate-700 rounded-full h-3 mt-2"><div class="bg-sky-500 h-3 rounded-full animate-pulse" style="width:10%"></div></div></div>';
+    switchToResults();
+
     var resp = await fetch('/api/backtest/run', { method: 'POST', body: fd });
     var html = await resp.text();
     document.getElementById('backtest-results').innerHTML = html;
     status.textContent = '';
-
-    // Switch to Results tab
-    switchToResults();
 }
 </script>

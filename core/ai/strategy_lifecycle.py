@@ -109,11 +109,12 @@ class StrategyLifecycleManager:
             return False
 
         # Run backtest (in thread pool to avoid blocking event loop)
-        import asyncio
+        import asyncio, concurrent.futures
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None, self.backtest_engine.run,
-            [strategy_name], ["BTCUSDT", "ETHUSDT"], start, end, "full", 10000.0)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            result = await loop.run_in_executor(
+                pool, self.backtest_engine.run,
+                [strategy_name], ["BTCUSDT", "ETHUSDT"], start, end, "full", 10000.0)
 
         if result.get("error"):
             logger.warning(f"Lifecycle: backtest failed for {strategy_name}: {result['error']}")
@@ -170,15 +171,16 @@ class StrategyLifecycleManager:
 
     async def _evaluate_for_retirement(self, name: str) -> bool:
         """Check if a strategy should be retired."""
-        import asyncio
+        import asyncio, concurrent.futures
         from datetime import datetime, timedelta
         end = datetime.now().strftime("%Y-%m-%d")
         start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
 
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None, self.backtest_engine.run,
-            [name], ["BTCUSDT", "ETHUSDT"], start, end, "full", 10000.0)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            result = await loop.run_in_executor(
+                pool, self.backtest_engine.run,
+                [name], ["BTCUSDT", "ETHUSDT"], start, end, "full", 10000.0)
 
         if result.get("error"):
             return False

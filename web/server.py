@@ -1,4 +1,6 @@
 import json
+import time
+import uuid as _uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from fastapi import FastAPI, Request, Form, WebSocket, WebSocketDisconnect
@@ -77,6 +79,9 @@ def create_app(config: Config, event_bus: EventBus, auth_manager=None) -> FastAP
         from starlette.middleware.base import BaseHTTPMiddleware
         app.add_middleware(auth_manager.create_middleware())
         app.state.auth_manager = auth_manager
+
+    # Track running backtests for progress polling
+    _bt_runs: dict[str, dict] = {}
 
     _balance_lock = asyncio.Lock()
 
@@ -1660,12 +1665,55 @@ Return ONLY valid JSON in this exact format:
         if not strategy_list or not symbol_list:
             return HTMLResponse('<div class="text-red-400">Please select strategies and symbols</div>')
 
-        import concurrent.futures
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, engine.run_with_exit_evaluation,
-                                            strategy_list, symbol_list, date_start, date_end,
-                                            initial_balance)
+        run_id = _uuid.uuid4().hex[:12]
+        _bt_runs[run_id] = {
+            "progress": 0, "total": 100, "done": False,
+            "date_start": date_start, "date_end": date_end,
+            "started": time.time(),
+        }
 
+        def on_progress(current, total, ts):
+            _bt_runs[run_id]["progress"] = current
+            _bt_runs[run_id]["total"] = total
+
+        def _run_bt_blocking():
+            return engine.run_with_exit_evaluation(
+                strategy_list, symbol_list, date_start, date_end,
+                initial_balance, mode, progress_callback=on_progress)
+
+        async def _run_bt():
+            loop = asyncio.get_event_loop()
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                result = await loop.run_in_executor(pool, _run_bt_blocking)
+            _bt_runs[run_id]["result"] = result
+            _bt_runs[run_id]["done"] = True
+
+        asyncio.create_task(_run_bt())
+
+        return _render("partials/backtest_progress.html", {
+            "request": None, "run_id": run_id,
+            "date_start": date_start, "date_end": date_end,
+        })
+
+    @app.get("/api/backtest/progress/{run_id}")
+    async def backtest_progress(run_id: str):
+        run = _bt_runs.get(run_id)
+        if not run:
+            return JSONResponse({"error": "Unknown run"}, status_code=404)
+        return {
+            "progress": run["progress"],
+            "total": run["total"],
+            "pct": round(run["progress"] / max(run["total"], 1) * 100, 1),
+            "done": run["done"],
+        }
+
+    @app.get("/api/backtest/result/{run_id}")
+    async def backtest_result(run_id: str):
+        run = _bt_runs.get(run_id)
+        if not run or not run.get("done"):
+            return HTMLResponse('<div class="text-yellow-400">Still running...</div>')
+        result = run["result"]
         if result.get("error"):
             return _render("partials/backtest_results.html",
                            {"request": None, "error": result["error"]})
@@ -1673,7 +1721,14 @@ Return ONLY valid JSON in this exact format:
         from core.backtest.report import generate_report
         report = generate_report(result)
 
-        # Persist to DB + save full result as JSON file for later viewing
+        # Persist to DB
+        mode = "full"
+        strategy_list = result.get("strategies", [])
+        symbol_list = result.get("symbols", [])
+        date_start = result.get("date_start", "")
+        date_end = result.get("date_end", "")
+        initial_balance = result.get("initial_balance", 10000)
+
         record_id = None
         try:
             db = await get_db()
@@ -1689,14 +1744,16 @@ Return ONLY valid JSON in this exact format:
             record_id = cursor.lastrowid
             await db.close()
 
-            # Save full result for later replay
             result_dir = Path(config.data_dir) / "backtest"
             result_dir.mkdir(parents=True, exist_ok=True)
             result_path = result_dir / f"{record_id}.json"
             with open(result_path, "w", encoding="utf-8") as f:
                 json.dump(result, f, ensure_ascii=False, default=str)
         except Exception:
-            pass  # best-effort persist
+            pass
+
+        # Clean up
+        _bt_runs.pop(run_id, None)
 
         return _render("partials/backtest_results.html", {
             "request": None,

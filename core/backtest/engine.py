@@ -20,13 +20,16 @@ class BacktestEngine:
 
     def run(self, strategies: list[str], symbols: list[str],
             date_start: str, date_end: str, mode: str = "full",
-            initial_balance: float = 10000.0) -> dict:
+            initial_balance: float = 10000.0,
+            progress_callback=None) -> dict:
         """Alias for run_with_exit_evaluation."""
         return self.run_with_exit_evaluation(
-            strategies, symbols, date_start, date_end, initial_balance, mode)
+            strategies, symbols, date_start, date_end, initial_balance,
+            mode, progress_callback)
 
     def run_with_exit_evaluation(self, strategies, symbols, date_start, date_end,
-                                  initial_balance=10000.0, mode="full"):
+                                  initial_balance=10000.0, mode="full",
+                                  progress_callback=None):
         """Full backtest with ML predictions, signal fusion, and risk controls.
 
         Walk-forward approach: at each timestamp, we only use data available up to
@@ -90,10 +93,16 @@ class BacktestEngine:
         max_positions = self.config.hard_limits.max_open_trades
 
         pos_counter = 0  # unique position ID
+        total_steps = len(feeder)
+        step = 0
 
         # ---- Main Loop ----
         for slice_data in feeder:
+            step += 1
             ts = slice_data["timestamp"]
+            # Report progress every 10 steps or at start/end
+            if progress_callback and (step % 10 == 0 or step == 1 or step == total_steps):
+                progress_callback(step, total_steps, ts)
 
             # --- ML PREDICTION (walk-forward) ---
             for sym in symbols:
