@@ -183,6 +183,7 @@ class DeepSeekController:
 
     async def _lifecycle_loop(self):
         """Periodic AI strategy generation and retirement evaluation."""
+        await asyncio.sleep(300)  # Wait 5 min after startup before first check
         while self._running:
             try:
                 if self._lifecycle_manager:

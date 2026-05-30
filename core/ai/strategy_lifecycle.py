@@ -108,13 +108,12 @@ class StrategyLifecycleManager:
             logger.warning(f"Lifecycle: failed to save generated strategy {strategy_name}: {e}")
             return False
 
-        # Run backtest
-        result = self.backtest_engine.run(
-            strategies=[strategy_name],
-            symbols=["BTCUSDT", "ETHUSDT"],
-            date_start=start, date_end=end,
-            mode="full", initial_balance=10000.0,
-        )
+        # Run backtest (in thread pool to avoid blocking event loop)
+        import asyncio
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, self.backtest_engine.run,
+            [strategy_name], ["BTCUSDT", "ETHUSDT"], start, end, "full", 10000.0)
 
         if result.get("error"):
             logger.warning(f"Lifecycle: backtest failed for {strategy_name}: {result['error']}")
@@ -171,15 +170,15 @@ class StrategyLifecycleManager:
 
     async def _evaluate_for_retirement(self, name: str) -> bool:
         """Check if a strategy should be retired."""
+        import asyncio
         from datetime import datetime, timedelta
         end = datetime.now().strftime("%Y-%m-%d")
         start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
 
-        result = self.backtest_engine.run(
-            strategies=[name], symbols=["BTCUSDT", "ETHUSDT"],
-            date_start=start, date_end=end,
-            mode="full", initial_balance=10000.0,
-        )
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, self.backtest_engine.run,
+            [name], ["BTCUSDT", "ETHUSDT"], start, end, "full", 10000.0)
 
         if result.get("error"):
             return False
