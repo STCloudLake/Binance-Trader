@@ -18,26 +18,32 @@
 <script>
 (function() {
     var runId = '{{ run_id }}';
-    var pollTimer = setInterval(async function() {
-        try {
-            var resp = await fetch('/api/backtest/progress/' + runId);
-            var data = await resp.json();
+    window._btActiveRunId = runId;
+
+    function updateProgressBar() {
+        var fill = document.getElementById('bt-progress-fill');
+        var text = document.getElementById('bt-progress-text');
+        var steps = document.getElementById('bt-progress-steps');
+        if (!fill || !text) return; // element not in DOM (tab switched away)
+
+        fetch('/api/backtest/progress/' + runId).then(function(r) { return r.json(); }).then(function(data) {
+            if (!document.getElementById('bt-progress-fill')) return; // DOM state changed
             var pct = data.pct || 0;
-            document.getElementById('bt-progress-fill').style.width = pct + '%';
-            document.getElementById('bt-progress-text').textContent = pct + '%';
-            document.getElementById('bt-progress-steps').textContent = data.progress + ' / ' + data.total;
+            fill.style.width = pct + '%';
+            text.textContent = pct + '%';
+            if (steps) steps.textContent = data.progress + ' / ' + data.total;
 
             if (data.done) {
-                clearInterval(pollTimer);
-                // Load results
-                var resultResp = await fetch('/api/backtest/result/' + runId);
-                var html = await resultResp.text();
-                document.getElementById('backtest-results').innerHTML = html;
-                switchToResults();
+                window._btActiveRunId = null;
+                fetch('/api/backtest/result/' + runId).then(function(r) { return r.text(); }).then(function(html) {
+                    var results = document.getElementById('backtest-results');
+                    if (results) results.innerHTML = html;
+                });
             }
-        } catch(e) {
-            console.error('Progress poll error:', e);
-        }
-    }, 1500);
+        }).catch(function(e) { console.error('Progress poll error:', e); });
+    }
+
+    var pollTimer = setInterval(updateProgressBar, 1500);
+    updateProgressBar(); // immediate first call
 })();
 </script>

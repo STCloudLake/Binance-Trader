@@ -1865,7 +1865,27 @@ Return ONLY valid JSON in this exact format:
         config = await mgr.generate_strategy()
         if not config:
             return JSONResponse({"ok": False, "error": "AI generation failed"})
-        return JSONResponse({"ok": True, "strategy": config})
+
+        # Save to strategy YAML and reload engine
+        from core.strategy.loader import StrategyConfig
+        try:
+            strategy_config = StrategyConfig(**config)
+            loader = getattr(app.state, "strategy_loader", None)
+            engine = getattr(app.state, "strategy_engine", None)
+            if loader:
+                loader.save(strategy_config)
+            if engine and loader:
+                all_s = loader.load_all()
+                engine._strategies = {s.name: s for s in all_s}
+                await engine.evaluate_all_now()
+            # Log lifecycle event
+            if mgr:
+                await mgr.log_event(strategy_config.name, "generated",
+                                     "Manually generated via Web UI")
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": f"Failed to save strategy: {e}"})
+
+        return JSONResponse({"ok": True, "strategy": config, "saved": True})
 
     @app.get("/partials/strategy-lifecycle")
     async def partial_strategy_lifecycle(request: Request):

@@ -59,17 +59,22 @@ class StrategyLifecycleManager:
             f"Market state: trending\n"
             f"Existing strategies: {', '.join(existing)}\n"
             f"Coverage gaps: {', '.join(gaps) if gaps else 'none detected'}\n\n"
-            f"Output a complete strategy with:\n"
-            f"- A descriptive name\n"
-            f"- 1-2 timeframes (1m/5m/15m/1h/4h)\n"
-            f"- 2-3 indicators with parameters\n"
-            f"- Entry conditions for long and short\n"
-            f"- Exit conditions\n\n"
-            f'Respond in valid JSON matching this schema:\n'
-            f'{{"name": "...", "enabled": true, "mode": "trend", "timeframes": ["1h"], '
-            f'"indicators": {{"rsi": {{"period": 14}}}}, '
-            f'"entry_conditions": {{"long": ["rsi < 30"], "short": ["rsi > 70"]}}, '
-            f'"exit_conditions": {{"long": [], "short": []}}, '
+            f"REQUIRED fields:\n"
+            f"- name: a descriptive English name (no spaces, use underscores)\n"
+            f"- timeframes: MUST be a non-empty list from [\"1m\",\"5m\",\"15m\",\"1h\",\"4h\"]. "
+            f"At minimum include \"1h\".\n"
+            f"- mode: one of \"trend\", \"mean_reversion\", \"momentum\", \"breakout\"\n"
+            f"- indicators: 2-3 indicators with parameters (rsi, macd, ema, bollinger, adx, etc.)\n"
+            f"- entry_conditions: at least one condition each for \"long\" and \"short\"\n"
+            f"- exit_conditions: at least one condition each for \"long\" and \"short\"\n\n"
+            f'Respond ONLY with valid JSON:\n'
+            f'{{"name": "my_strategy", "enabled": true, "mode": "trend", '
+            f'"timeframes": ["1h"], '
+            f'"indicators": {{"rsi": {{"period": 14}}, "macd": {{"fast": 12, "slow": 26, "signal": 9}}}}, '
+            f'"entry_conditions": {{"long": ["rsi < 30 and close > ema21"], '
+            f'"short": ["rsi > 70 and close < ema21"]}}, '
+            f'"exit_conditions": {{"long": ["rsi > 70 or close < ema50"], '
+            f'"short": ["rsi < 30 or close > ema50"]}}, '
             f'"reduce_conditions": {{}}, "ml_config": {{"enabled": false}}}}'
         )
 
@@ -87,6 +92,16 @@ class StrategyLifecycleManager:
                 result.strip().removeprefix("```json").removesuffix("```").strip())
         except json.JSONDecodeError:
             logger.warning(f"Lifecycle: failed to parse AI output: {result[:200]}")
+            return None
+
+        # Validate required fields
+        if not strategy_config.get("timeframes"):
+            logger.warning(f"Lifecycle: AI generated strategy missing timeframes, defaulting to ['1h']")
+            strategy_config["timeframes"] = ["1h"]
+        if not strategy_config.get("entry_conditions"):
+            logger.warning("Lifecycle: AI generated strategy missing entry_conditions")
+            return None
+        if not isinstance(strategy_config["entry_conditions"], dict):
             return None
 
         return strategy_config
