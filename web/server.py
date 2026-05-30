@@ -1637,6 +1637,7 @@ Return ONLY valid JSON in this exact format:
         strategies = loader.list_names() if loader else []
         return _render("backtest.html", {
             "request": request,
+            "current_page": "backtest",
             "available_strategies": strategies,
             "available_symbols": ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"],
         })
@@ -1672,10 +1673,11 @@ Return ONLY valid JSON in this exact format:
         from core.backtest.report import generate_report
         report = generate_report(result)
 
-        # Persist to DB
+        # Persist to DB + save full result as JSON file for later viewing
+        record_id = None
         try:
             db = await get_db()
-            await db.execute(
+            cursor = await db.execute(
                 "INSERT INTO backtest_records (mode, strategies, symbols, date_start,"
                 " date_end, initial_balance, final_balance, metrics, trades_count)"
                 " VALUES (?,?,?,?,?,?,?,?,?)",
@@ -1684,7 +1686,15 @@ Return ONLY valid JSON in this exact format:
                  result["final_balance"], json.dumps(report["summary"]),
                  len(result["trades"])))
             await db.commit()
+            record_id = cursor.lastrowid
             await db.close()
+
+            # Save full result for later replay
+            result_dir = Path(config.data_dir) / "backtest"
+            result_dir.mkdir(parents=True, exist_ok=True)
+            result_path = result_dir / f"{record_id}.json"
+            with open(result_path, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, default=str)
         except Exception:
             pass  # best-effort persist
 
@@ -1696,6 +1706,7 @@ Return ONLY valid JSON in this exact format:
             "runtime": result["metrics"].get("runtime_seconds", 0),
             "date_start": date_start,
             "date_end": date_end,
+            "record_id": record_id,
         })
 
     @app.get("/api/backtest/history")
@@ -1709,17 +1720,40 @@ Return ONLY valid JSON in this exact format:
 
     @app.get("/api/backtest/{record_id}")
     async def get_backtest(record_id: int):
-        db = await get_db()
-        cursor = await db.execute(
-            "SELECT * FROM backtest_records WHERE id=?", (record_id,))
-        row = await cursor.fetchone()
-        await db.close()
-        if not row:
-            return JSONResponse({"error": "Not found"}, status_code=404)
-        rec = dict(row)
-        if rec.get("metrics"):
-            rec["metrics_parsed"] = json.loads(rec["metrics"])
-        return rec
+        """Return stored backtest result — reloads full data from JSON file."""
+        result_path = Path(config.data_dir) / "backtest" / f"{record_id}.json"
+        if not result_path.exists():
+            # Fallback: return DB summary only
+            db = await get_db()
+            cursor = await db.execute(
+                "SELECT * FROM backtest_records WHERE id=?", (record_id,))
+            row = await cursor.fetchone()
+            await db.close()
+            if not row:
+                return JSONResponse({"error": "Not found"}, status_code=404)
+            rec = dict(row)
+            if rec.get("metrics"):
+                rec["metrics_parsed"] = json.loads(rec["metrics"])
+            return rec
+
+        try:
+            with open(result_path, encoding="utf-8") as f:
+                result = json.load(f)
+        except Exception:
+            return JSONResponse({"error": "Failed to load result file"}, status_code=500)
+
+        from core.backtest.report import generate_report
+        report = generate_report(result)
+
+        return _render("partials/backtest_results.html", {
+            "request": None,
+            "summary": report["summary"],
+            "chart_data": report["chart_data"],
+            "trades": result.get("trades", []),
+            "runtime": result.get("metrics", {}).get("runtime_seconds", 0),
+            "date_start": result.get("date_start", ""),
+            "date_end": result.get("date_end", ""),
+        })
 
     @app.delete("/api/backtest/{record_id}")
     async def delete_backtest(record_id: int):

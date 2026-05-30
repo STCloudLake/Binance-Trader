@@ -33,7 +33,10 @@
                     <td class="p-2 text-slate-500">{{ r.created_at[:16] if r.created_at else '-' }}</td>
                     <td class="p-2">
                         <button class="text-sky-400 text-xs hover:underline"
-                                onclick="loadBtRecord({{ r.id }})">{{ _("View") }}</button>
+                                hx-get="/api/backtest/{{ r.id }}"
+                                hx-target="#backtest-results"
+                                hx-swap="innerHTML"
+                                onclick="switchToResults()">{{ _("View") }}</button>
                         <button class="text-red-400 text-xs hover:underline ml-2"
                                 hx-delete="/api/backtest/{{ r.id }}"
                                 hx-target="closest tr" hx-swap="outerHTML">{{ _("Del") }}</button>
@@ -48,20 +51,3 @@
     {% endif %}
 </div>
 
-<script>
-async function loadBtRecord(id) {
-    var resp = await fetch('/api/backtest/' + id);
-    var data = await resp.json();
-    if (data.metrics_parsed && data.metrics) {
-        // For persisted records, load the partial via HTMX
-        htmx.ajax('GET', '/api/backtest/' + id + '?format=html', {target: '#backtest-results'}).then(function() {
-            switchToResults();
-        }).catch(function() {
-            // Fallback: just show metrics
-            var html = '<div class="card"><h3>Backtest #' + id + '</h3><p>Return: ' + (data.metrics_parsed ? data.metrics_parsed.total_return_pct : 'N/A') + '%</p></div>';
-            document.getElementById('backtest-results').innerHTML = html;
-            switchToResults();
-        });
-    }
-}
-</script>
