@@ -1706,6 +1706,8 @@ Return ONLY valid JSON in this exact format:
             "total": run["total"],
             "pct": round(run["progress"] / max(run["total"], 1) * 100, 1),
             "done": run["done"],
+            "date_start": run.get("date_start", ""),
+            "date_end": run.get("date_end", ""),
         }
 
     @app.get("/api/backtest/result/{run_id}")
