@@ -1,39 +1,109 @@
 <div class="card mb-4">
     <h3 class="text-lg mb-3">{{ _("Backtest Configuration") }}</h3>
-    <form hx-post="/api/backtest/run" hx-target="#backtest-results" hx-swap="innerHTML" class="space-y-3">
+    <form id="bt-form" onsubmit="runBacktest(event)" class="space-y-4">
+        <!-- Strategies — checkboxes -->
+        <div>
+            <label class="text-sm text-slate-400 mb-1 block">{{ _("Strategies") }}
+                <button type="button" class="text-xs text-sky-400 hover:underline ml-2" onclick="toggleAll('bt-strategies', true)">{{ _("Select All") }}</button>
+                <button type="button" class="text-xs text-slate-500 hover:underline ml-1" onclick="toggleAll('bt-strategies', false)">{{ _("Clear") }}</button>
+            </label>
+            <div id="bt-strategies" class="grid grid-cols-2 gap-1 max-h-32 overflow-y-auto bg-slate-800 rounded p-2 border border-slate-600">
+                {% for s in available_strategies %}
+                <label class="flex items-center gap-2 text-sm text-slate-300 hover:bg-slate-700 rounded px-2 py-1 cursor-pointer">
+                    <input type="checkbox" name="strategy" value="{{ s }}" checked class="accent-sky-500">
+                    {{ s }}
+                </label>
+                {% endfor %}
+            </div>
+        </div>
+
+        <!-- Symbols — checkboxes -->
+        <div>
+            <label class="text-sm text-slate-400 mb-1 block">{{ _("Symbols") }}
+                <button type="button" class="text-xs text-sky-400 hover:underline ml-2" onclick="toggleAll('bt-symbols', true)">{{ _("Select All") }}</button>
+                <button type="button" class="text-xs text-slate-500 hover:underline ml-1" onclick="toggleAll('bt-symbols', false)">{{ _("Clear") }}</button>
+            </label>
+            <div id="bt-symbols" class="flex flex-wrap gap-2 bg-slate-800 rounded p-2 border border-slate-600">
+                {% for s in available_symbols %}
+                <label class="flex items-center gap-2 text-sm text-slate-300 hover:bg-slate-700 rounded px-3 py-1 cursor-pointer">
+                    <input type="checkbox" name="symbol" value="{{ s }}" checked class="accent-sky-500">
+                    {{ s.replace('USDT','/USDT') }}
+                </label>
+                {% endfor %}
+            </div>
+        </div>
+
+        <!-- Date Range + Mode + Balance -->
         <div class="grid grid-cols-4 gap-3">
             <div>
-                <label class="text-sm text-slate-400">{{ _("Strategies") }}</label>
-                <select name="strategies" multiple class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm h-24">
-                    {% for s in available_strategies %}
-                    <option value="{{ s }}" selected>{{ s }}</option>
-                    {% endfor %}
-                </select>
+                <label class="text-sm text-slate-400">{{ _("Start Date") }}</label>
+                <input type="date" name="date_start" value="{{ default_start }}" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
             </div>
             <div>
-                <label class="text-sm text-slate-400">{{ _("Symbols") }}</label>
-                <select name="symbols" multiple class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm h-24">
-                    {% for s in available_symbols %}
-                    <option value="{{ s }}" selected>{{ s }}</option>
-                    {% endfor %}
-                </select>
-            </div>
-            <div>
-                <label class="text-sm text-slate-400">{{ _("Date Range") }}</label>
-                <input type="date" name="date_start" value="2025-01-01" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm mb-1">
-                <input type="date" name="date_end" value="2026-01-01" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
+                <label class="text-sm text-slate-400">{{ _("End Date") }}</label>
+                <input type="date" name="date_end" value="{{ default_end }}" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
             </div>
             <div>
                 <label class="text-sm text-slate-400">{{ _("Mode") }}</label>
-                <select name="mode" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm mb-2">
+                <select name="mode" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
                     <option value="full">{{ _("Full Simulation") }}</option>
                     <option value="quick">{{ _("Quick (Signal Only)") }}</option>
                 </select>
+            </div>
+            <div>
                 <label class="text-sm text-slate-400">{{ _("Initial Balance") }}</label>
                 <input type="number" name="initial_balance" value="10000" min="100" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
             </div>
         </div>
-        <button type="submit" class="bg-sky-600 hover:bg-sky-500 text-white px-6 py-2 rounded text-sm">{{ _("Run Backtest") }}</button>
-        <span class="htx-indicator text-xs text-slate-500 ml-2"></span>
+
+        <button type="submit" class="bg-sky-600 hover:bg-sky-500 text-white px-6 py-2 rounded text-sm font-bold">
+            {{ _("Run Backtest") }}
+        </button>
+        <span id="bt-status" class="text-xs text-slate-500 ml-2"></span>
     </form>
 </div>
+
+<script>
+function toggleAll(containerId, checked) {
+    var cbs = document.querySelectorAll('#' + containerId + ' input[type="checkbox"]');
+    cbs.forEach(function(cb) { cb.checked = checked; });
+}
+
+async function runBacktest(e) {
+    e.preventDefault();
+    var status = document.getElementById('bt-status');
+    status.textContent = '{{ _("Running...") }}';
+
+    // Collect checked strategies and symbols
+    var strategies = [];
+    document.querySelectorAll('#bt-strategies input[type="checkbox"]:checked').forEach(function(cb) {
+        strategies.push(cb.value);
+    });
+    var symbols = [];
+    document.querySelectorAll('#bt-symbols input[type="checkbox"]:checked').forEach(function(cb) {
+        symbols.push(cb.value);
+    });
+
+    if (strategies.length === 0 || symbols.length === 0) {
+        status.textContent = '{{ _("Please select at least one strategy and symbol") }}';
+        return;
+    }
+
+    var form = document.getElementById('bt-form');
+    var fd = new FormData();
+    fd.append('strategies', strategies.join(','));
+    fd.append('symbols', symbols.join(','));
+    fd.append('date_start', form.date_start.value);
+    fd.append('date_end', form.date_end.value);
+    fd.append('mode', form.mode.value);
+    fd.append('initial_balance', form.initial_balance.value);
+
+    var resp = await fetch('/api/backtest/run', { method: 'POST', body: fd });
+    var html = await resp.text();
+    document.getElementById('backtest-results').innerHTML = html;
+    status.textContent = '';
+
+    // Switch to Results tab
+    switchToResults();
+}
+</script>

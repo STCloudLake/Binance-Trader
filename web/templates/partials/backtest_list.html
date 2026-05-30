@@ -1,33 +1,42 @@
 <div class="card">
     <h3 class="text-lg mb-3">{{ _("Backtest History") }}</h3>
     {% if records %}
-    <div class="max-h-64 overflow-y-auto">
+    <div class="max-h-96 overflow-y-auto">
         <table class="w-full text-sm">
-            <thead class="text-slate-400 border-b border-slate-700">
+            <thead class="text-slate-400 border-b border-slate-700 sticky top-0 bg-surface-light">
                 <tr>
-                    <th class="text-left p-1">{{ _("Mode") }}</th>
-                    <th class="text-left p-1">{{ _("Strategies") }}</th>
-                    <th class="text-left p-1">{{ _("Date") }}</th>
-                    <th class="text-left p-1">{{ _("Return %") }}</th>
-                    <th class="text-left p-1">{{ _("Trades") }}</th>
-                    <th class="text-left p-1">{{ _("Run At") }}</th>
-                    <th class="text-left p-1">{{ _("Actions") }}</th>
+                    <th class="text-left p-2">{{ _("Mode") }}</th>
+                    <th class="text-left p-2">{{ _("Strategies") }}</th>
+                    <th class="text-left p-2">{{ _("Symbols") }}</th>
+                    <th class="text-left p-2">{{ _("Date") }}</th>
+                    <th class="text-left p-2">{{ _("Return %") }}</th>
+                    <th class="text-left p-2">{{ _("Trades") }}</th>
+                    <th class="text-left p-2">{{ _("Time") }}</th>
+                    <th class="text-left p-2">{{ _("Actions") }}</th>
                 </tr>
             </thead>
             <tbody>
                 {% for r in records %}
-                <tr class="border-b border-slate-800 text-xs">
-                    <td class="p-1">{{ r.mode }}</td>
-                    <td class="p-1 text-slate-400 max-w-40 truncate">{{ r.strategies[:50] }}</td>
-                    <td class="p-1">{{ r.date_start[:10] }}~{{ r.date_end[:10] }}</td>
-                    <td class="p-1 {{ 'text-green-400' if r.final_balance and r.final_balance > r.initial_balance else 'text-red-400' }}">
-                        {{ "%.1f"|format((r.final_balance - r.initial_balance) / r.initial_balance * 100) if r.final_balance else '-' }}%
+                {% set ret_pct = ((r.final_balance - r.initial_balance) / r.initial_balance * 100) if r.final_balance else 0 %}
+                <tr class="border-b border-slate-800 text-xs hover:bg-slate-800/50">
+                    <td class="p-2">
+                        <span class="badge {{ 'badge-blue' if r.mode == 'full' else 'badge-green' }}">{{ _("Full") if r.mode == 'full' else _("Quick") }}</span>
                     </td>
-                    <td class="p-1">{{ r.trades_count or '-' }}</td>
-                    <td class="p-1 text-slate-500">{{ r.created_at[:16] if r.created_at else '-' }}</td>
-                    <td class="p-1">
-                        <button class="text-sky-400 text-xs hover:underline" hx-get="/api/backtest/{{ r.id }}" hx-target="#backtest-results">{{ _("View") }}</button>
-                        <button class="text-red-400 text-xs hover:underline ml-1" hx-delete="/api/backtest/{{ r.id }}" hx-target="closest tr" hx-swap="outerHTML">{{ _("Del") }}</button>
+                    <td class="p-2 text-slate-400 max-w-32 truncate" title="{{ r.strategies }}">{{ r.strategies[:40] }}</td>
+                    <td class="p-2 text-slate-400 max-w-24 truncate" title="{{ r.symbols }}">
+                        {% set syms = (r.symbols or '[]') %}
+                        {{ syms[:30] }}
+                    </td>
+                    <td class="p-2">{{ r.date_start[:10] }} ~ {{ r.date_end[:10] }}</td>
+                    <td class="p-2 font-bold {{ 'text-green-400' if ret_pct > 0 else 'text-red-400' }}">{{ "%.2f"|format(ret_pct) }}%</td>
+                    <td class="p-2">{{ r.trades_count or '-' }}</td>
+                    <td class="p-2 text-slate-500">{{ r.created_at[:16] if r.created_at else '-' }}</td>
+                    <td class="p-2">
+                        <button class="text-sky-400 text-xs hover:underline"
+                                onclick="loadBtRecord({{ r.id }})">{{ _("View") }}</button>
+                        <button class="text-red-400 text-xs hover:underline ml-2"
+                                hx-delete="/api/backtest/{{ r.id }}"
+                                hx-target="closest tr" hx-swap="outerHTML">{{ _("Del") }}</button>
                     </td>
                 </tr>
                 {% endfor %}
@@ -35,6 +44,24 @@
         </table>
     </div>
     {% else %}
-    <p class="text-slate-500 text-sm">{{ _("No backtest records yet") }}</p>
+    <p class="text-slate-500 text-sm text-center py-4">{{ _("No backtest records yet") }}</p>
     {% endif %}
 </div>
+
+<script>
+async function loadBtRecord(id) {
+    var resp = await fetch('/api/backtest/' + id);
+    var data = await resp.json();
+    if (data.metrics_parsed && data.metrics) {
+        // For persisted records, load the partial via HTMX
+        htmx.ajax('GET', '/api/backtest/' + id + '?format=html', {target: '#backtest-results'}).then(function() {
+            switchToResults();
+        }).catch(function() {
+            // Fallback: just show metrics
+            var html = '<div class="card"><h3>Backtest #' + id + '</h3><p>Return: ' + (data.metrics_parsed ? data.metrics_parsed.total_return_pct : 'N/A') + '%</p></div>';
+            document.getElementById('backtest-results').innerHTML = html;
+            switchToResults();
+        });
+    }
+}
+</script>

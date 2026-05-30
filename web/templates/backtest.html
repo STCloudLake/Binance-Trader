@@ -2,15 +2,59 @@
 {% block content %}
 <h2 class="text-xl mb-4">{{ _("Backtest") }}</h2>
 
-<div hx-get="/partials/backtest-config" hx-trigger="load">
-    <div class="text-slate-500">{{ _("Loading...") }}</div>
+<!-- Tab Navigation -->
+<div class="flex gap-1 mb-4 border-b border-slate-700">
+    <button class="bt-tab px-4 py-2 rounded-t text-sm bg-sky-700 text-white" data-tab="config" onclick="switchBtTab('config')">{{ _("Config") }}</button>
+    <button class="bt-tab px-4 py-2 rounded-t text-sm bg-slate-700 text-slate-400" data-tab="results" onclick="switchBtTab('results')">{{ _("Results") }}</button>
+    <button class="bt-tab px-4 py-2 rounded-t text-sm bg-slate-700 text-slate-400" data-tab="history" onclick="switchBtTab('history')">{{ _("History") }}</button>
 </div>
 
-<hr class="border-slate-700 my-4">
-
-<div id="backtest-results"></div>
-
-<div class="mt-6" hx-get="/partials/backtest-list" hx-trigger="load, every 30s">
-    <div class="text-slate-500">{{ _("Loading...") }}</div>
+<!-- Tab: Config -->
+<div id="bt-tab-config" class="bt-tab-content">
+    <div hx-get="/partials/backtest-config" hx-trigger="load">
+        <div class="text-slate-500">{{ _("Loading...") }}</div>
+    </div>
 </div>
+
+<!-- Tab: Results -->
+<div id="bt-tab-results" class="bt-tab-content hidden">
+    <div id="backtest-results">
+        <div class="text-slate-500 text-center py-8">{{ _("Run a backtest to see results") }}</div>
+    </div>
+</div>
+
+<!-- Tab: History -->
+<div id="bt-tab-history" class="bt-tab-content hidden">
+    <div hx-get="/partials/backtest-list" hx-trigger="load, every 30s">
+        <div class="text-slate-500">{{ _("Loading...") }}</div>
+    </div>
+</div>
+
+<style>
+.bt-tab-content.hidden { display: none; }
+</style>
+<script>
+function switchBtTab(tab) {
+    document.querySelectorAll('.bt-tab').forEach(function(b) {
+        if (b.dataset.tab === tab) {
+            b.className = 'bt-tab px-4 py-2 rounded-t text-sm bg-sky-700 text-white';
+        } else {
+            b.className = 'bt-tab px-4 py-2 rounded-t text-sm bg-slate-700 text-slate-400';
+        }
+    });
+    document.querySelectorAll('.bt-tab-content').forEach(function(c) {
+        c.classList.add('hidden');
+    });
+    var el = document.getElementById('bt-tab-' + tab);
+    if (el) el.classList.remove('hidden');
+}
+function switchToResults() {
+    switchBtTab('results');
+    // Scroll to results
+    setTimeout(function() {
+        var el = document.getElementById('bt-tab-results');
+        if (el) el.scrollIntoView({behavior:'smooth'});
+    }, 100);
+}
+</script>
 {% endblock %}

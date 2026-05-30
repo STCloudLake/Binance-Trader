@@ -1694,6 +1694,8 @@ Return ONLY valid JSON in this exact format:
             "chart_data": report["chart_data"],
             "trades": result["trades"],
             "runtime": result["metrics"].get("runtime_seconds", 0),
+            "date_start": date_start,
+            "date_end": date_end,
         })
 
     @app.get("/api/backtest/history")
@@ -1731,10 +1733,15 @@ Return ONLY valid JSON in this exact format:
     async def partial_backtest_config():
         loader = getattr(app.state, "strategy_loader", None)
         strategies = loader.list_names() if loader else []
+        from datetime import datetime, timedelta
+        default_end = datetime.now().strftime("%Y-%m-%d")
+        default_start = (datetime.now() - timedelta(days=14)).strftime("%Y-%m-%d")
         return _render("partials/backtest_config.html", {
             "request": None,
             "available_strategies": strategies,
             "available_symbols": ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"],
+            "default_start": default_start,
+            "default_end": default_end,
         })
 
     @app.get("/partials/backtest-list")
