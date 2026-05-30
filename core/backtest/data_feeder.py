@@ -4,7 +4,11 @@ from pathlib import Path
 
 
 class DataFeeder:
-    """Provides time-aligned historical OHLCV data from Parquet cache files."""
+    """Provides time-aligned historical OHLCV data from Parquet cache files.
+
+    Expects data layout: {cache_dir}/{symbol}/{interval}.parquet
+    (the same layout used by MarketDataProvider's OHLCV cache).
+    """
 
     def __init__(self, cache_dir: str, symbols: list[str], intervals: list[str],
                  date_start: str, date_end: str):
@@ -21,11 +25,16 @@ class DataFeeder:
         """Load all OHLCV data from Parquet cache, filter to date range, build unified timeline."""
         for symbol in self.symbols:
             self._data[symbol] = {}
+            sym_dir = self.cache_dir / symbol
             for interval in self.intervals:
-                path = self.cache_dir / f"{symbol}_{interval}.parquet"
+                path = sym_dir / f"{interval}.parquet"
                 if path.exists():
                     df = pd.read_parquet(path)
+                    # Normalize index: Parquet may store close_time as index name
+                    if df.index.name in ("close_time", "timestamp", "time"):
+                        df.index.name = "time"
                     df.index = pd.to_datetime(df.index)
+                    # Filter to requested date range
                     mask = (df.index >= self.date_start) & (df.index <= self.date_end)
                     self._data[symbol][interval] = df[mask].copy()
                 else:
@@ -40,6 +49,26 @@ class DataFeeder:
                     all_times.update(df.index)
         self._timestamps = sorted(all_times)
         self._cursor = 0
+
+        # If we found no data, try auto-adjusting the date range to match
+        # what's actually in the cache.
+        if not self._timestamps and self._data:
+            earliest = None
+            latest = None
+            for sym_data in self._data.values():
+                for df in sym_data.values():
+                    if len(df) > 0:
+                        t0 = pd.Timestamp(df.index.min())
+                        t1 = pd.Timestamp(df.index.max())
+                        if earliest is None or t0 < earliest:
+                            earliest = t0
+                        if latest is None or t1 > latest:
+                            latest = t1
+            if earliest is not None:
+                self.date_start = earliest - pd.Timedelta(hours=1)
+                self.date_end = latest + pd.Timedelta(hours=1)
+                # Reload with corrected range
+                return self.load()
 
     def __len__(self):
         return len(self._timestamps)

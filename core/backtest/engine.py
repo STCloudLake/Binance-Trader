@@ -81,7 +81,14 @@ class BacktestEngine:
                         if len(df) < 50:
                             continue
                         df = df[df.index <= ts].copy()
-                        df = compute_all(df, strategy.indicators)
+                        if len(df) < 20:
+                            continue
+                        try:
+                            df = compute_all(df, strategy.indicators)
+                        except Exception:
+                            continue
+                        if len(df) == 0:
+                            continue
 
                         exit_conditions = strategy.exit_conditions.get(pos["side"], [])
                         for cond in exit_conditions:
@@ -132,7 +139,14 @@ class BacktestEngine:
                         if len(df) < 50:
                             continue
                         df = df[df.index <= ts].copy()
-                        df = compute_all(df, strategy.indicators)
+                        if len(df) < 20:
+                            continue
+                        try:
+                            df = compute_all(df, strategy.indicators)
+                        except Exception:
+                            continue
+                        if len(df) == 0:
+                            continue
 
                         long_active = False
                         short_active = False
