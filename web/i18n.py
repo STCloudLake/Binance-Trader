@@ -467,6 +467,9 @@ TRANSLATIONS = {
         'Running Backtest': '回测运行中',
         'Loading data...': '正在加载数据...',
         '模拟AI动态调整信号权重': '模拟AI动态调整信号权重',
+        'ML引擎': 'ML引擎',
+        '跳过ML训练，复用缓存模型': '跳过ML训练，复用缓存模型',
+        '需先完成至少一次回测': '需先完成至少一次回测',
         # Users
         'Users': '用户',
         'Logout': '退出',
@@ -972,6 +975,9 @@ TRANSLATIONS = {
         'Running Backtest': 'Running Backtest',
         'Loading data...': 'Loading data...',
         '模拟AI动态调整信号权重': 'Simulate AI dynamic weight adjustment',
+        'ML引擎': 'ML Engine',
+        '跳过ML训练，复用缓存模型': 'Skip ML training, reuse cached models',
+        '需先完成至少一次回测': 'Requires at least one prior backtest',
         # Users
         'Users': 'Users',
         'Logout': 'Logout',

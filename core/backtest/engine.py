@@ -85,13 +85,16 @@ class BacktestEngine:
                                   progress_callback=None,
                                   strategy_symbols: dict[str, list[str]] = None,
                                   simulate_ai_weights: bool = True,
-                                  ml_engine: str = "lightgbm"):
+                                  ml_engine: str = "lightgbm",
+                                  skip_ml_training: bool = False):
         """Full backtest with ML predictions, signal fusion, and risk controls.
 
         Args:
             simulate_ai_weights: If True, adjust signal weights based on detected
                 market regime (mimicking what the live AI market assessment does).
             ml_engine: 'lightgbm' (default tree model) or 'tft' (sequence transformer).
+            skip_ml_training: If True, load pre-trained models from disk instead of
+                training. Useful for repeat backtests over the same period.
         """
         t0 = time.time()
 
@@ -143,6 +146,30 @@ class BacktestEngine:
                 data_dir=str(self.config.data_dir),
                 seq_len=100, d_model=64, num_heads=4,
                 lstm_layers=2, dropout=0.2)
+
+        # ── Skip training: preload cached models from disk ──
+        if skip_ml_training:
+            from core.ml.trainer import MLTrainer as _MLTrainer
+            _disk_trainer = _MLTrainer(str(self.config.data_dir))
+            models_dir = Path(self.config.data_dir) / "models"
+            for strategy in strategy_configs:
+                if not (strategy.ml_config and strategy.ml_config.enabled):
+                    continue
+                for sym in symbols:
+                    key = f"{strategy.name}|{sym}"
+                    if ml_engine == "tft" and tft_trainer is not None:
+                        model = tft_trainer.load(sym, strategy.name)
+                        if model is not None:
+                            ml_models[key] = model
+                    else:
+                        pkl_path = models_dir / f"{sym}_{strategy.name}_binary.pkl"
+                        if pkl_path.exists():
+                            model = _disk_trainer.load_model(str(pkl_path))
+                            if model is not None:
+                                ml_models[key] = model
+            preloaded = len(ml_models)
+            if preloaded > 0:
+                logger.info(f"Preloaded {preloaded} cached ML models from disk")
 
         # ── Indicator cache: precompute each unique indicator config once ──
         # Key: (json_hash_of_indicators, symbol, interval) → full DataFrame

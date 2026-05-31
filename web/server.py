@@ -1683,7 +1683,9 @@ Return ONLY valid JSON in this exact format:
                            mode: str = Form("full"),
                            initial_balance: float = Form(10000.0),
                            strategy_symbols: str = Form("{}"),
-                           simulate_ai_weights: str = Form("1")):
+                           simulate_ai_weights: str = Form("1"),
+                           ml_engine: str = Form("lightgbm"),
+                           skip_ml_training: str = Form("0")):
         if err := _require_trader(request): return err
         engine = getattr(app.state, "backtest_engine", None)
         if not engine:
@@ -1717,7 +1719,9 @@ Return ONLY valid JSON in this exact format:
                 strategy_list, symbol_list, date_start, date_end,
                 initial_balance, mode, progress_callback=on_progress,
                 strategy_symbols=bt_strategy_symbols,
-                simulate_ai_weights=(simulate_ai_weights == "1"))
+                simulate_ai_weights=(simulate_ai_weights == "1"),
+                ml_engine=ml_engine,
+                skip_ml_training=(skip_ml_training == "1"))
 
         async def _run_bt():
             loop = asyncio.get_event_loop()
