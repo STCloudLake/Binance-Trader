@@ -191,13 +191,23 @@ async function runBacktest(e) {
     // Include the backtest-only matrix mapping
     fd.append('strategy_symbols', JSON.stringify(getMatrixMapping()));
 
-    // Show progress bar immediately
+    // Show progress bar immediately (static placeholder before real progress loads)
     document.getElementById('backtest-results').innerHTML = '<div class="card mb-4"><div class="text-slate-400 text-sm">{{ _("Starting backtest...") }}</div><div class="w-full bg-slate-700 rounded-full h-3 mt-2"><div class="bg-sky-500 h-3 rounded-full animate-pulse" style="width:10%"></div></div></div>';
     switchToResults();
 
     var resp = await fetch('/api/backtest/run', { method: 'POST', body: fd });
     var html = await resp.text();
     document.getElementById('backtest-results').innerHTML = html;
+
+    // Execute scripts in the response (innerHTML doesn't run <script> tags)
+    var container = document.getElementById('backtest-results');
+    var scripts = container.querySelectorAll('script');
+    scripts.forEach(function(s) {
+        var newScript = document.createElement('script');
+        newScript.textContent = s.textContent;
+        document.body.appendChild(newScript);
+    });
+
     status.textContent = '';
 }
 </script>

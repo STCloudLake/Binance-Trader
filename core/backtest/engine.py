@@ -883,10 +883,22 @@ class BacktestEngine:
 
             feature_cols = [c for c in X.columns if c != "label"
                           and X[c].dtype in ('float64', 'float32', 'int64')]
+
+            t0 = time.time()
             model, metrics = tft_trainer.train(
                 X, feature_cols=feature_cols, label_col="label",
                 epochs=60, batch_size=64, learning_rate=1e-3,
                 validation_split=0.2, patience=15)
+            elapsed = time.time() - t0
+
+            if model is not None:
+                dev = next(model.parameters()).device
+                logger.info(
+                    f"TFT trained {symbol} {interval} | "
+                    f"device={dev} rows={len(X)} "
+                    f"acc={metrics.get('val_accuracy', 0):.1%} "
+                    f"epochs={metrics.get('epochs_trained', 0)} "
+                    f"time={elapsed:.1f}s")
             return model
         except Exception as e:
             logger.debug(f"TFT train failed for {symbol}: {e}")

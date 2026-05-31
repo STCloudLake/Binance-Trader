@@ -1703,10 +1703,26 @@ Return ONLY valid JSON in this exact format:
         except (json.JSONDecodeError, TypeError):
             pass
 
+        # Detect GPU for display
+        bt_device = "cpu"
+        if ml_engine == "tft":
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    _t = torch.zeros(1).cuda()
+                    bt_device = "cuda"
+            except Exception:
+                pass
+
         run_id = _uuid.uuid4().hex[:12]
         _bt_runs[run_id] = {
             "progress": 0, "total": 0, "done": False,
             "date_start": date_start, "date_end": date_end,
+            "strategies": strategies,
+            "symbols": symbols,
+            "ml_engine": ml_engine,
+            "device": bt_device,
+            "skip_training": (skip_ml_training == "1"),
             "started": time.time(),
         }
 
@@ -1742,6 +1758,11 @@ Return ONLY valid JSON in this exact format:
         resp = _render("partials/backtest_progress.html", {
             "request": None, "run_id": run_id,
             "date_start": date_start, "date_end": date_end,
+            "strategies": strategies,
+            "symbols": symbols,
+            "ml_engine": ml_engine,
+            "device": bt_device,
+            "skip_training": (skip_ml_training == "1"),
         })
         resp.set_cookie("bt_active_run", run_id, max_age=3600, httponly=False)
         return resp
