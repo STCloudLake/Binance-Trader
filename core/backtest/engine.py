@@ -130,8 +130,37 @@ class BacktestEngine:
         ml_correct = 0
         ml_total = 0
         ml_retrain_counter: dict[str, int] = {}
-        ml_retrain_interval = 50
+        ml_retrain_interval = 100  # extended from 50 — less frequent retraining
         market_regime: dict[str, str] = {}
+
+        # ── Indicator cache: precompute each unique indicator config once ──
+        # Key: (json_hash_of_indicators, symbol, interval) → full DataFrame
+        # Eliminates ~1.25M compute_all calls (hottest path in the engine).
+        _indicator_cache: dict[tuple[str, str, str], pd.DataFrame] = {}
+        import json as _json
+        for strategy in strategy_configs:
+            config_hash = _json.dumps(strategy.indicators, sort_keys=True, ensure_ascii=True)
+            for sym in symbols:
+                for tf in strategy.timeframes:
+                    cache_key = (config_hash, sym, tf)
+                    if cache_key in _indicator_cache:
+                        continue
+                    df_full = feeder.get_all_data_for_symbol(sym, tf)
+                    if len(df_full) >= 20:
+                        _indicator_cache[cache_key] = compute_all(df_full.copy(), strategy.indicators)
+
+        def _get_cached_df(sym: str, interval: str, indicators: dict, ts) -> pd.DataFrame | None:
+            """Return indicator DataFrame sliced to ≤ ts, from cache if possible."""
+            config_hash = _json.dumps(indicators, sort_keys=True, ensure_ascii=True)
+            cached = _indicator_cache.get((config_hash, sym, interval))
+            if cached is not None:
+                return cached[cached.index <= ts]
+            # Fallback: compute on the fly
+            df = feeder.get_all_data_for_symbol(sym, interval)
+            if len(df) < 20:
+                return None
+            df = df[df.index <= ts].copy()
+            return compute_all(df, indicators)
 
         # Per-timeframe ML parameters: forward_periods and threshold
         # Shorter TFs need more lookahead periods to capture a meaningful move
@@ -303,17 +332,11 @@ class BacktestEngine:
                         continue
 
                     for interval in strategy.timeframes:
-                        df = feeder.get_all_data_for_symbol(sym, interval)
-                        if len(df) < 50:
-                            continue
-                        df = df[df.index <= ts].copy()
-                        if len(df) < 20:
-                            continue
                         try:
-                            df = compute_all(df, strategy.indicators)
+                            df = _get_cached_df(sym, interval, strategy.indicators, ts)
                         except Exception:
                             continue
-                        if len(df) == 0:
+                        if df is None or len(df) < 20:
                             continue
 
                         for rc in conditions:
@@ -419,17 +442,11 @@ class BacktestEngine:
                     if strategy.name != pos.get("strategy_name"):
                         continue
                     for interval in strategy.timeframes:
-                        df = feeder.get_all_data_for_symbol(sym, interval)
-                        if len(df) < 50:
-                            continue
-                        df = df[df.index <= ts].copy()
-                        if len(df) < 20:
-                            continue
                         try:
-                            df = compute_all(df, strategy.indicators)
+                            df = _get_cached_df(sym, interval, strategy.indicators, ts)
                         except Exception:
                             continue
-                        if len(df) == 0:
+                        if df is None or len(df) < 20:
                             continue
 
                         exit_conds = strategy.exit_conditions.get(pos["side"], [])
@@ -477,17 +494,11 @@ class BacktestEngine:
                     higher_tfs = sorted_tfs[1:]
 
                     # --- Evaluate primary (shortest) timeframe for entry signal ---
-                    df_primary = feeder.get_all_data_for_symbol(sym, primary_tf)
-                    if len(df_primary) < 50:
-                        continue
-                    df_primary = df_primary[df_primary.index <= ts].copy()
-                    if len(df_primary) < 20:
-                        continue
                     try:
-                        df_primary = compute_all(df_primary, strategy.indicators)
+                        df_primary = _get_cached_df(sym, primary_tf, strategy.indicators, ts)
                     except Exception:
                         continue
-                    if len(df_primary) == 0:
+                    if df_primary is None or len(df_primary) < 20:
                         continue
 
                     # Evaluate entry conditions on primary timeframe
