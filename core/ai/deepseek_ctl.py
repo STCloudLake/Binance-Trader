@@ -182,13 +182,15 @@ class DeepSeekController:
             self._tasks.append(asyncio.create_task(self._lifecycle_loop()))
 
     async def _lifecycle_loop(self):
-        """Periodic AI strategy generation and retirement evaluation."""
+        """Periodic AI strategy generation, retirement, and matrix-based optimization."""
         await asyncio.sleep(300)  # Wait 5 min after startup before first check
         while self._running:
             try:
                 if self._lifecycle_manager:
                     await self._lifecycle_manager.generate_strategy()
                     await self._lifecycle_manager.check_and_retire()
+                    # Matrix-based analysis: runs every 12h internally (rate-limited)
+                    await self._lifecycle_manager.analyze_and_optimize()
             except Exception as e:
                 logger.warning(f"Lifecycle loop error: {e}")
             await asyncio.sleep(3600)  # Check every hour

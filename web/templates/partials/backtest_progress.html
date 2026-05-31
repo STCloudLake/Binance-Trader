@@ -3,54 +3,50 @@
     <p class="text-xs text-slate-500 mb-2">{{ date_start }} ~ {{ date_end }}</p>
 
     <div class="w-full bg-slate-700 rounded-full h-4 mb-2 overflow-hidden">
-        <div id="bt-progress-fill" class="bg-sky-500 h-4 rounded-full transition-all duration-300" style="width: 0%"></div>
+        <div id="bt-progress-fill" class="bg-sky-500 h-4 rounded-full transition-all duration-300" style="width: {{ initial_pct|default(0) }}%"></div>
     </div>
     <div class="flex justify-between text-xs text-slate-400">
         <span id="bt-progress-text">0%</span>
-        <span id="bt-progress-steps">0 / ?</span>
+        <span id="bt-progress-steps">{{ _("Loading data...") }}</span>
     </div>
-
-    <div id="backtest-results" class="mt-4"></div>
 </div>
 
 <script>
 (function() {
     var runId = '{{ run_id }}';
-    // Persist across page navigations
-    try { sessionStorage.setItem('_bt_runId', runId); } catch(e) {}
-    window._btActiveRunId = runId;
 
     function updateProgressBar() {
         var fill = document.getElementById('bt-progress-fill');
-        // If progress bar is not in DOM, stop polling (page navigated away)
-        if (!fill) { clearInterval(pollTimer); return; }
+        if (!fill) { return; }  // element gone from DOM (page navigated away)
 
         fetch('/api/backtest/progress/' + runId).then(function(r) { return r.json(); }).then(function(data) {
             fill = document.getElementById('bt-progress-fill');
             if (!fill) return;
-            fill.style.width = (data.pct || 0) + '%';
             var text = document.getElementById('bt-progress-text');
             var steps = document.getElementById('bt-progress-steps');
-            if (text) text.textContent = (data.pct || 0) + '%';
-            if (steps) steps.textContent = data.progress + ' / ' + data.total;
+
+            if (data.total === 0) {
+                // Still loading data
+                fill.style.width = '5%';
+                if (text) text.textContent = '...';
+                if (steps) steps.textContent = 'Loading data...';
+            } else {
+                fill.style.width = (data.pct || 0) + '%';
+                if (text) text.textContent = (data.pct || 0) + '%';
+                if (steps) steps.textContent = data.progress + ' / ' + data.total;
+            }
 
             if (data.done) {
-                clearInterval(pollTimer);
-                window._btActiveRunId = null;
-                try { sessionStorage.removeItem('_bt_runId'); } catch(e) {}
+                // Load final results
                 fetch('/api/backtest/result/' + runId).then(function(r) { return r.text(); }).then(function(html) {
                     var results = document.getElementById('backtest-results');
                     if (results) results.innerHTML = html;
                 });
             }
-        }).catch(function(e) {
-            if (fill && !document.getElementById('bt-progress-fill')) {
-                clearInterval(pollTimer);
-            }
         });
     }
 
-    var pollTimer = setInterval(updateProgressBar, 1500);
+    setInterval(updateProgressBar, 1500);
     updateProgressBar();
 })();
 </script>

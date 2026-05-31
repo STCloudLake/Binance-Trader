@@ -56,6 +56,7 @@ class MLPredictor:
             "rsi": {"period": 14, "source": "close"},
             "macd": {"fast": 12, "slow": 26, "signal": 9},
             "bollinger": {"period": 20, "stddev": 2},
+            "adx": {"period": 14},
         }
         df = compute_all(df, indicator_configs)
 
@@ -96,12 +97,13 @@ class MLPredictor:
             "rsi": {"period": 14, "source": "close"},
             "macd": {"fast": 12, "slow": 26, "signal": 9},
             "bollinger": {"period": 20, "stddev": 2},
+            "adx": {"period": 14},
         }
         df = compute_all(df, indicator_configs)
 
-        features = ["rsi", "macd_histogram", "bollinger_width", "volume_ratio", "price_momentum_24h"]
+        features = ["rsi", "macd_histogram", "bollinger_width", "volume_ratio", "price_momentum_24h", "adx"]
         X = build_features(df, features)
-        y = create_binary_label(df, forward_periods=4)
+        y = create_binary_label(df, forward_periods=4, threshold=0.005)
 
         self.trainer.save_training_data(symbol, strategy_name, X, y)
         result = self.trainer.train_binary(symbol, strategy_name, X, y)

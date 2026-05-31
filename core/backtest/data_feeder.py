@@ -21,8 +21,10 @@ class DataFeeder:
         self._timestamps: list[pd.Timestamp] = []
         self._cursor = 0
 
-    def load(self):
+    def load(self, _depth: int = 0):
         """Load all OHLCV data from Parquet cache, filter to date range, build unified timeline."""
+        if _depth > 1:
+            return  # safety guard against infinite recursion
         for symbol in self.symbols:
             self._data[symbol] = {}
             sym_dir = self.cache_dir / symbol
@@ -67,8 +69,8 @@ class DataFeeder:
             if earliest is not None:
                 self.date_start = earliest - pd.Timedelta(hours=1)
                 self.date_end = latest + pd.Timedelta(hours=1)
-                # Reload with corrected range
-                return self.load()
+                # Reload with corrected range (guarded against recursion)
+                return self.load(_depth + 1)
 
     def __len__(self):
         return len(self._timestamps)

@@ -41,6 +41,7 @@ def generate_report(backtest_result: dict) -> dict:
         "chart_data": chart_data,
         "monthly_returns": monthly,
         "pnl_distribution": pnl_values,
+        "per_matrix": backtest_result.get("per_matrix", {}),
         "config": {
             "strategies": backtest_result.get("strategies", []),
             "symbols": backtest_result.get("symbols", []),

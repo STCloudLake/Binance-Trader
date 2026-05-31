@@ -39,27 +39,61 @@ class MarketDataProvider:
         self._tasks.append(asyncio.create_task(self._run_cache_flush()))
 
     async def _prefetch_history(self, symbols: list[str], intervals: list[str]):
-        """Fetch 200 historical candles per symbol/interval via REST."""
+        """Fetch historical candles for backtesting via REST.
+
+        Skips intervals that already have sufficient data on disk (e.g. from
+        the download_history script) to avoid overwriting larger datasets.
+        """
         from loguru import logger
+
+        # Minimum candles we consider "sufficient" per interval
+        MIN_CANDLES = {"1m": 10000, "5m": 3000, "15m": 2000, "30m": 1000,
+                       "1h": 500, "2h": 300, "4h": 200}
+        LIMIT = 1000
+        BATCHES = {"1m": 4, "5m": 2, "15m": 1, "30m": 1, "1h": 1,
+                   "2h": 1, "4h": 1, "6h": 1, "8h": 1, "12h": 1, "1d": 1}
+
         for symbol in symbols:
             for interval in intervals:
-                try:
-                    klines = await self.client.get_klines(symbol=symbol, interval=interval, limit=200)
-                    if klines:
-                        df = pd.DataFrame([{
-                            "close_time": k[6],
-                            "open": float(k[1]),
-                            "high": float(k[2]),
-                            "low": float(k[3]),
-                            "close": float(k[4]),
-                            "volume": float(k[5]),
-                        } for k in klines])
-                        df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
-                        df.set_index("close_time", inplace=True)
-                        self.cache.update(symbol, interval, df)
-                        self.cache.save(symbol, interval)
-                except Exception:
-                    pass
+                # Check existing data
+                existing = self.cache.get(symbol, interval)
+                min_candles = MIN_CANDLES.get(interval, 200)
+                if existing is not None and len(existing) >= min_candles:
+                    continue  # already has enough data
+
+                batches = BATCHES.get(interval, 1)
+                all_klines = []
+                end_time = None
+
+                for batch in range(batches):
+                    try:
+                        params = {"symbol": symbol, "interval": interval, "limit": LIMIT}
+                        if end_time is not None:
+                            params["endTime"] = end_time
+                        klines = await self.client.get_klines(**params)
+                        if not klines or len(klines) <= 1:
+                            break
+                        all_klines = klines + all_klines
+                        end_time = klines[0][0] - 1
+                        if batch < batches - 1:
+                            await asyncio.sleep(0.2)
+                    except Exception:
+                        break
+
+                if all_klines:
+                    df = pd.DataFrame([{
+                        "close_time": k[6],
+                        "open": float(k[1]), "high": float(k[2]),
+                        "low": float(k[3]), "close": float(k[4]),
+                        "volume": float(k[5]),
+                    } for k in all_klines])
+                    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
+                    df.set_index("close_time", inplace=True)
+                    df = df[~df.index.duplicated(keep='last')]
+                    df.sort_index(inplace=True)
+                    self.cache.update(symbol, interval, df)
+                    self.cache.save(symbol, interval)
+
         logger.info(f"Pre-fetched history for {len(symbols)} symbols x {len(intervals)} intervals")
 
     async def _run_websocket(self):

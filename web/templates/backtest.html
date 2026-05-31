@@ -18,7 +18,12 @@
 
 <!-- Tab: Results -->
 <div id="bt-tab-results" class="bt-tab-content hidden">
-    <div id="backtest-results">
+    <!-- Auto-reconnect: cookie bt_active_run is set when a backtest runs.
+         This HTMX div checks for it and auto-loads progress if found. -->
+    <div id="backtest-results"
+         hx-get="/partials/backtest-active"
+         hx-trigger="load"
+         hx-swap="innerHTML">
         <div class="text-slate-500 text-center py-8">{{ _("Run a backtest to see results") }}</div>
     </div>
 </div>
@@ -48,50 +53,13 @@ function switchBtTab(tab) {
     var el = document.getElementById('bt-tab-' + tab);
     if (el) el.classList.remove('hidden');
 }
+
 function switchToResults() {
     switchBtTab('results');
-    // Scroll to results
     setTimeout(function() {
         var el = document.getElementById('bt-tab-results');
         if (el) el.scrollIntoView({behavior:'smooth'});
     }, 100);
 }
-
-// Reconnect to running backtest after page navigation
-(function() {
-    var saved = sessionStorage.getItem('_bt_runId');
-    if (!saved) return;
-    fetch('/api/backtest/progress/' + saved).then(function(r){return r.json();}).then(function(d){
-        if (d.done) {
-            sessionStorage.removeItem('_bt_runId');
-            fetch('/api/backtest/result/' + saved).then(function(r){return r.text();}).then(function(h){
-                var el = document.getElementById('backtest-results');
-                if (el) el.innerHTML = h;
-            });
-        } else {
-            window._btActiveRunId = saved;
-            var el = document.getElementById('backtest-results');
-            if (!el) return;
-            el.innerHTML = '<div class="card mb-4" id="bt-progress-card"><h3 class="text-lg mb-3">Running Backtest...</h3><div class="w-full bg-slate-700 rounded-full h-4 mb-2"><div id="bt-progress-fill" class="bg-sky-500 h-4 rounded-full" style="width:'+(d.pct||0)+'%"></div></div><span id="bt-progress-text" class="text-xs text-slate-400">'+(d.pct||0)+'%</span></div>';
-            var timer = setInterval(function(){
-                var f = document.getElementById('bt-progress-fill');
-                if (!f) { clearInterval(timer); return; }
-                fetch('/api/backtest/progress/' + saved).then(function(r){return r.json();}).then(function(d2){
-                    f.style.width = (d2.pct||0) + '%';
-                    var t = document.getElementById('bt-progress-text');
-                    if (t) t.textContent = (d2.pct||0) + '%';
-                    if (d2.done) {
-                        clearInterval(timer);
-                        sessionStorage.removeItem('_bt_runId');
-                        fetch('/api/backtest/result/' + saved).then(function(r){return r.text();}).then(function(h){
-                            var rs = document.getElementById('backtest-results');
-                            if (rs) rs.innerHTML = h;
-                        });
-                    }
-                });
-            }, 1500);
-        }
-    });
-})();
 </script>
 {% endblock %}

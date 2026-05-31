@@ -8,6 +8,54 @@ from core.backtest.data_feeder import DataFeeder
 from core.backtest.metrics import calculate_metrics
 from core.strategy.indicators import compute_all, evaluate_condition
 
+# Timeframe → minutes mapping for sorting and trend-filter logic
+_TIMEFRAME_MINUTES = {
+    "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
+    "1h": 60, "2h": 120, "4h": 240, "6h": 360, "8h": 480,
+    "12h": 720, "1d": 1440, "3d": 4320, "1w": 10080,
+}
+
+def _tf_minutes(tf: str) -> int:
+    """Convert a timeframe string to minutes for comparison/sorting."""
+    return _TIMEFRAME_MINUTES.get(tf, 60)
+
+def _check_higher_tf_trend(df: pd.DataFrame, entry_side: str) -> float:
+    """Return a confidence multiplier (0.0–1.0) based on higher-TF trend alignment.
+
+    Instead of a hard block, this penalises counter-trend entries:
+    - 1.0 = strongly aligned (boost confidence)
+    - 0.6 = weakly counter-trend (reduced but not blocked)
+    - 0.0 = extreme counter-trend (should not enter)
+
+    Formula: compare close to EMA(50). The farther the price is against the
+    trend direction, the lower the multiplier.
+    """
+    if len(df) < 50:
+        return 1.0  # not enough data — no penalty
+    close = df["close"].values
+    ema50 = float(pd.Series(close).ewm(span=50, adjust=False).mean().iloc[-1])
+    last_close = float(close[-1])
+    if ema50 <= 0:
+        return 1.0
+
+    # deviation = how far price is from EMA, as a fraction
+    deviation = (last_close - ema50) / ema50  # positive = above EMA, negative = below
+
+    if entry_side == "long":
+        if deviation >= 0:
+            return 1.0                          # price above EMA — aligned
+        elif deviation > -0.02:                  # within 2% below EMA
+            return 0.6                           # mild penalty
+        else:
+            return 0.0                           # extreme counter-trend
+    else:  # short
+        if deviation <= 0:
+            return 1.0                          # price below EMA — aligned
+        elif deviation < 0.02:                   # within 2% above EMA
+            return 0.6                           # mild penalty
+        else:
+            return 0.0                           # extreme counter-trend
+
 
 class BacktestEngine:
     """Synchronous backtesting engine with ML prediction and signal fusion."""
@@ -19,21 +67,30 @@ class BacktestEngine:
         self.order_executor = order_executor
 
     def run(self, strategies: list[str], symbols: list[str],
-            date_start: str, date_end: str, mode: str = "full",
-            initial_balance: float = 10000.0,
-            progress_callback=None) -> dict:
-        """Alias for run_with_exit_evaluation."""
+            date_start: str, date_end: str,
+            initial_balance: float = 10000.0, mode: str = "full",
+            progress_callback=None,
+            strategy_symbols: dict[str, list[str]] = None,
+            simulate_ai_weights: bool = True) -> dict:
+        """Alias for run_with_exit_evaluation (parameter order matches)."""
         return self.run_with_exit_evaluation(
-            strategies, symbols, date_start, date_end, initial_balance,
-            mode, progress_callback)
+            strategies, symbols, date_start, date_end,
+            initial_balance, mode,
+            progress_callback=progress_callback,
+            strategy_symbols=strategy_symbols,
+            simulate_ai_weights=simulate_ai_weights)
 
     def run_with_exit_evaluation(self, strategies, symbols, date_start, date_end,
                                   initial_balance=10000.0, mode="full",
-                                  progress_callback=None):
+                                  progress_callback=None,
+                                  strategy_symbols: dict[str, list[str]] = None,
+                                  simulate_ai_weights: bool = True):
         """Full backtest with ML predictions, signal fusion, and risk controls.
 
-        Walk-forward approach: at each timestamp, we only use data available up to
-        that point (no look-ahead bias). ML models are retrained every 50 candles.
+        Args:
+            simulate_ai_weights: If True, adjust signal weights based on detected
+                market regime (mimicking what the live AI market assessment does).
+                Default True so backtest reflects realistic AI-driven weight dynamics.
         """
         t0 = time.time()
 
@@ -67,13 +124,27 @@ class BacktestEngine:
         equity_curve: list[dict] = []
         events: list[dict] = []
 
-        # ML state — per-symbol models and predictions
-        ml_models: dict[str, object] = {}  # symbol -> trained XGBoost model
-        ml_predictions: dict[str, float] = {}  # symbol -> latest confidence (0-1)
+        # ML state — per-strategy×symbol models, each matched to the strategy's timeframe
+        ml_models: dict[str, object] = {}  # "strategy_name|symbol" -> trained model
+        ml_predictions: dict[str, float] = {}  # "strategy_name|symbol" -> latest confidence
         ml_correct = 0
         ml_total = 0
-        ml_retrain_counter: dict[str, int] = {}  # symbol -> candles since last retrain
-        ml_retrain_interval = 50  # retrain every 50 candles
+        ml_retrain_counter: dict[str, int] = {}
+        ml_retrain_interval = 50
+        market_regime: dict[str, str] = {}
+
+        # Per-timeframe ML parameters: forward_periods and threshold
+        # Shorter TFs need more lookahead periods to capture a meaningful move
+        _ML_TF_PARAMS = {
+            "1m":  {"forward": 20, "threshold": 0.003, "min_candles": 300},
+            "3m":  {"forward": 15, "threshold": 0.004, "min_candles": 200},
+            "5m":  {"forward": 12, "threshold": 0.005, "min_candles": 200},
+            "15m": {"forward": 8,  "threshold": 0.005, "min_candles": 150},
+            "30m": {"forward": 6,  "threshold": 0.005, "min_candles": 120},
+            "1h":  {"forward": 4,  "threshold": 0.005, "min_candles": 100},
+            "2h":  {"forward": 4,  "threshold": 0.006, "min_candles": 80},
+            "4h":  {"forward": 4,  "threshold": 0.008, "min_candles": 60},
+        }
 
         # Position sizing
         from core.risk.position_sizer import PositionSizer
@@ -81,16 +152,74 @@ class BacktestEngine:
             self.config.hard_limits, self.config.soft_params,
             self.config.core_capital_pct, self.config.satellite_capital_pct)
 
-        # Signal weights
-        w = self.config.signal_weights
-        w_ind = w.indicator
-        w_ml = w.ml
+        # Signal weights — dynamically adjustable to simulate AI market assessment.
+        # In live trading, the DeepSeek AI can change these hourly. The backtest
+        # re-evaluates weights periodically based on detected market regime.
+        base_weights = self.config.signal_weights
+        w_ind = base_weights.indicator
+        w_ml = base_weights.ml
+        w_news = base_weights.news  # included in divisor, not numerator
+        _last_weight_update = 0
+        _weight_update_interval = 24  # update weights every 24 candles (~24h for 1h)
+
+        def _update_weights(regime: str, step_num: int) -> tuple[float, float, float]:
+            """Adjust indicator/ML weights based on market regime.
+
+            Mimics what the live AI market assessment does:
+            - Bull market: increase indicator weight (trend is clear), decrease ML
+            - Bear market: increase ML weight (need more confirmation), decrease indicator
+            - Range market: balanced weights
+            """
+            nonlocal w_ind, w_ml, w_news, _last_weight_update
+            if not simulate_ai_weights:
+                return w_ind, w_ml, w_news
+            if step_num - _last_weight_update < _weight_update_interval:
+                return w_ind, w_ml, w_news
+            _last_weight_update = step_num
+
+            base = base_weights
+            if regime == "bull":
+                # Trend is clear — trust indicators more
+                w_ind = max(0.3, base.indicator + 0.1)
+                w_ml = max(0.1, base.ml - 0.05)
+                w_news = base.news
+            elif regime == "bear":
+                # Downtrend — indicators can give false reversal signals, trust ML more
+                w_ind = max(0.3, base.indicator - 0.05)
+                w_ml = min(0.5, base.ml + 0.1)
+                w_news = base.news
+            else:  # range
+                # Choppy — balanced, slightly favor mean-reversion (indicators)
+                w_ind = base.indicator
+                w_ml = base.ml
+                w_news = base.news
+            return w_ind, w_ml, w_news
 
         # Entry threshold
         ENTRY_THRESHOLD = 0.5
 
         # Max positions
         max_positions = self.config.hard_limits.max_open_trades
+
+        # Per-strategy×symbol results matrix (use YAML config names as keys)
+        per_matrix: dict[str, dict[str, dict]] = {}
+        for s_cfg in strategy_configs:
+            s_name = s_cfg.name
+            per_matrix[s_name] = {}
+            # Determine effective symbols for this strategy
+            bt_override2 = (strategy_symbols or {}).get(s_name)
+            if bt_override2 is not None:
+                eff = bt_override2 if bt_override2 else symbols
+            else:
+                cfg_s = getattr(s_cfg, 'symbols', None)
+                eff = cfg_s if cfg_s else symbols
+            for sym in eff:
+                if sym not in symbols:
+                    continue
+                per_matrix[s_name][sym] = {
+                    "trades": 0, "pnl": 0.0, "winning": 0, "losing": 0,
+                    "long_trades": 0, "short_trades": 0,
+                }
 
         pos_counter = 0  # unique position ID
         total_steps = len(feeder)
@@ -104,46 +233,188 @@ class BacktestEngine:
             if progress_callback and (step % 10 == 0 or step == 1 or step == total_steps):
                 progress_callback(step, total_steps, ts)
 
-            # --- ML PREDICTION (walk-forward) ---
-            for sym in symbols:
-                df_1h = feeder.get_all_data_for_symbol(sym, "1h")
-                if len(df_1h) < 100:
+            # --- ML PREDICTION (walk-forward, per-strategy×symbol) ---
+            # Each strategy gets its own ML model matched to its primary timeframe.
+            for strategy in strategy_configs:
+                primary_tf = min(strategy.timeframes, key=_tf_minutes) if strategy.timeframes else "1h"
+                tf_params = _ML_TF_PARAMS.get(primary_tf, _ML_TF_PARAMS["1h"])
+                if not (strategy.ml_config and strategy.ml_config.enabled):
                     continue
 
-                # Retrain periodically
-                key = sym
-                counter = ml_retrain_counter.get(key, 0)
-                if counter >= ml_retrain_interval or key not in ml_models:
-                    model = self._train_ml_model(df_1h[df_1h.index <= ts])
+                for sym in symbols:
+                    df_tf = feeder.get_all_data_for_symbol(sym, primary_tf)
+                    if len(df_tf) < tf_params["min_candles"]:
+                        continue
+
+                    key = f"{strategy.name}|{sym}"
+                    counter = ml_retrain_counter.get(key, 0) + 1
+                    ml_retrain_counter[key] = counter
+                    if counter >= ml_retrain_interval or key not in ml_models:
+                        sliced = df_tf[df_tf.index <= ts]
+                        model = self._train_ml_model(sliced, tf_params)
+                        if model is not None:
+                            ml_models[key] = model
+                        ml_retrain_counter[key] = 0
+                        # Regime detection on 1h for this symbol
+                        if sym not in market_regime:
+                            df_1h = feeder.get_all_data_for_symbol(sym, "1h")
+                            market_regime[sym] = self._detect_market_regime(df_1h[df_1h.index <= ts])
+
+                    # Predict
+                    model = ml_models.get(key)
                     if model is not None:
-                        ml_models[key] = model
-                    ml_retrain_counter[key] = 0
-                ml_retrain_counter[key] = counter + 1
+                        try:
+                            conf = self._predict_ml(model, df_tf[df_tf.index <= ts])
+                            if conf is not None:
+                                ml_predictions[key] = conf
 
-                # Predict using latest trained model
-                model = ml_models.get(key)
-                if model is not None:
-                    try:
-                        conf = self._predict_ml(model, df_1h[df_1h.index <= ts])
-                        if conf is not None:
-                            ml_predictions[sym] = conf
+                                # Accuracy tracking
+                                fwd = tf_params["forward"]
+                                th = tf_params["threshold"]
+                                future_df = df_tf[df_tf.index > ts]
+                                if len(future_df) >= fwd:
+                                    cur_close = float(df_tf[df_tf.index <= ts].iloc[-1]["close"])
+                                    fut_close = float(future_df.iloc[fwd - 1]["close"])
+                                    ret = (fut_close - cur_close) / cur_close
+                                    if abs(ret) >= th:
+                                        ml_total += 1
+                                        if (ret >= th and conf >= 0.5) or (ret <= -th and conf < 0.5):
+                                            ml_correct += 1
+                        except Exception:
+                            pass
 
-                            # Track accuracy: compare prediction to actual future movement
-                            future_df = df_1h[df_1h.index > ts]
-                            if len(future_df) >= 1:
-                                actual_close = float(future_df.iloc[0]["close"])
-                                current_close = float(df_1h[df_1h.index <= ts].iloc[-1]["close"])
-                                actual_direction = "up" if actual_close > current_close else "down"
-                                pred_direction = "up" if conf >= 0.5 else "down"
-                                ml_total += 1
-                                if actual_direction == pred_direction:
-                                    ml_correct += 1
-                    except Exception:
-                        pass
+            # --- CHECK REDUCE CONDITIONS (partial profit-taking) ---
+            # Mirror live engine: reduce fires before full exit, max 4 reduces per position.
+            for sym in list(positions.keys()):
+                pos = positions[sym]
+                reduce_key = f"reduce_{sym}_{pos.get('side','')}"
+                reduce_count = positions[sym].get("reduce_count", 0)
+                if reduce_count >= 4:
+                    continue
+
+                for strategy in strategy_configs:
+                    if strategy.name != pos.get("strategy_name"):
+                        continue
+                    reduce_cfg = strategy.reduce_conditions
+                    if not reduce_cfg:
+                        continue
+                    conditions = reduce_cfg.get(pos["side"], [])
+                    if not conditions:
+                        continue
+
+                    for interval in strategy.timeframes:
+                        df = feeder.get_all_data_for_symbol(sym, interval)
+                        if len(df) < 50:
+                            continue
+                        df = df[df.index <= ts].copy()
+                        if len(df) < 20:
+                            continue
+                        try:
+                            df = compute_all(df, strategy.indicators)
+                        except Exception:
+                            continue
+                        if len(df) == 0:
+                            continue
+
+                        for rc in conditions:
+                            cond_str = rc.get("condition", "") if isinstance(rc, dict) else str(rc)
+                            rpct = rc.get("reduce_pct", 50) if isinstance(rc, dict) else 50
+                            if not cond_str:
+                                continue
+                            try:
+                                mask = evaluate_condition(df, cond_str)
+                                if hasattr(mask, 'iloc') and mask.iloc[-1]:
+                                    price = float(df["close"].iloc[-1])
+                                    qty = pos["quantity"]
+                                    reduce_qty = qty * rpct / 100.0
+                                    if reduce_qty <= 0:
+                                        continue
+
+                                    # Reduce the position
+                                    reduce_amount = reduce_qty * price
+                                    if pos["side"] == "long":
+                                        reduce_pnl = (price - pos["entry_price"]) * reduce_qty
+                                    else:
+                                        reduce_pnl = (pos["entry_price"] - price) * reduce_qty
+
+                                    pos["quantity"] -= reduce_qty
+                                    pos["amount_usdt"] -= reduce_amount
+                                    pos["reduce_count"] = reduce_count + 1
+                                    balance += reduce_amount + reduce_pnl
+
+                                    events.append({
+                                        "time": str(ts), "type": "reduce",
+                                        "symbol": sym, "side": pos["side"],
+                                        "price": round(price, 4),
+                                        "reduce_pct": rpct,
+                                        "reduce_qty": round(reduce_qty, 6),
+                                        "pnl": round(reduce_pnl, 2),
+                                        "strategy": strategy.name,
+                                    })
+                                    trades.append({
+                                        "symbol": sym, "side": pos["side"],
+                                        "entry_price": round(pos["entry_price"], 4),
+                                        "exit_price": round(price, 4),
+                                        "quantity": round(reduce_qty, 6),
+                                        "pnl": round(reduce_pnl, 2),
+                                        "pnl_pct": round(reduce_pnl / (pos["entry_price"] * reduce_qty) * 100, 2) if pos["entry_price"] > 0 else 0,
+                                        "strategy": strategy.name,
+                                        "opened_at": str(pos.get("opened_at", ts)),
+                                        "closed_at": str(ts),
+                                        "amount_usdt": round(reduce_amount, 2),
+                                        "is_reduce": True,
+                                    })
+                                    # Track per-strategy×symbol
+                                    cell = per_matrix[strategy.name][sym]
+                                    cell["trades"] += 1
+                                    cell["pnl"] += reduce_pnl
+                                    if reduce_pnl > 0:
+                                        cell["winning"] += 1
+                                    else:
+                                        cell["losing"] += 1
+                                    break  # one reduce per timestamp
+                            except Exception:
+                                pass
+                        break  # one interval is enough
 
             # --- CHECK EXITS ---
             for sym in list(positions.keys()):
                 pos = positions[sym]
+
+                # Get current close price from the feeder data (using primary TF)
+                price_now = 0.0
+                try:
+                    df_1m = feeder.get_all_data_for_symbol(sym, "1m")
+                    df_slice = df_1m[df_1m.index <= ts]
+                    if len(df_slice) > 0:
+                        price_now = float(df_slice.iloc[-1]["close"])
+                except Exception:
+                    pass
+
+                if price_now > 0:
+                    # ---- STOP-LOSS CHECK ----
+                    sl_price = pos.get("stop_loss", 0)
+                    if sl_price > 0:
+                        if (pos["side"] == "long" and price_now <= sl_price) or \
+                           (pos["side"] == "short" and price_now >= sl_price):
+                            balance = self._close_position(
+                                sym, pos, price_now, ts, "stop_loss",
+                                trades, events, balance, positions, per_matrix)
+                            continue
+
+                    # ---- TAKE-PROFIT CHECK ----
+                    tp_levels = pos.get("take_profits", [])
+                    for tp_price, tp_pct in tp_levels:
+                        if (pos["side"] == "long" and price_now >= tp_price) or \
+                           (pos["side"] == "short" and price_now <= tp_price):
+                            balance = self._close_position(
+                                sym, pos, price_now, ts, f"tp_{int(tp_pct*100)}pct",
+                                trades, events, balance, positions, per_matrix)
+                            break
+
+                if sym not in positions:
+                    continue
+
                 for strategy in strategy_configs:
                     if strategy.name != pos.get("strategy_name"):
                         continue
@@ -166,140 +437,161 @@ class BacktestEngine:
                             mask = evaluate_condition(df, cond)
                             if hasattr(mask, 'iloc') and mask.iloc[-1]:
                                 exit_price = float(df["close"].iloc[-1])
-                                entry_price = pos["entry_price"]
-                                qty = pos["quantity"]
-                                amount = pos["amount_usdt"]
-                                if pos["side"] == "long":
-                                    pnl = (exit_price - entry_price) * qty
-                                    pnl_pct = (exit_price - entry_price) / entry_price * 100
-                                else:
-                                    pnl = (entry_price - exit_price) * qty
-                                    pnl_pct = (entry_price - exit_price) / entry_price * 100
-
-                                trades.append({
-                                    "symbol": sym, "side": pos["side"],
-                                    "entry_price": round(entry_price, 4),
-                                    "exit_price": round(exit_price, 4),
-                                    "quantity": round(qty, 6),
-                                    "pnl": round(pnl, 2),
-                                    "pnl_pct": round(pnl_pct, 2),
-                                    "strategy": strategy.name,
-                                    "opened_at": str(pos.get("opened_at", ts)),
-                                    "closed_at": str(ts),
-                                    "amount_usdt": round(amount, 2),
-                                })
-                                balance += amount + pnl
-                                events.append({
-                                    "time": str(ts), "type": "exit",
-                                    "symbol": sym, "price": exit_price,
-                                    "pnl": round(pnl, 2),
-                                    "strategy": strategy.name,
-                                })
-                                del positions[sym]
+                                balance = self._close_position(
+                                    sym, pos, exit_price, ts, "indicator",
+                                    trades, events, balance, positions, per_matrix)
                                 break
                         if sym not in positions:
                             break
                     if sym not in positions:
                         break
 
+            # --- UPDATE SIGNAL WEIGHTS (simulate AI market assessment) ---
+            # Use BTC regime as the broad market indicator
+            dominant_regime = market_regime.get("BTCUSDT", "range")
+            w_ind, w_ml, w_news = _update_weights(dominant_regime, step)
+
             # --- CHECK ENTRIES ---
             for strategy in strategy_configs:
+                # Backtest-run mapping override takes priority; else fall back to strategy config
+                bt_override = (strategy_symbols or {}).get(strategy.name) if strategy_symbols else None
+                if bt_override is not None:
+                    effective_symbols = bt_override if bt_override else symbols
+                else:
+                    cfg_syms = getattr(strategy, 'symbols', None)
+                    effective_symbols = cfg_syms if cfg_syms else symbols
+
                 for sym in symbols:
+                    if sym not in effective_symbols:
+                        continue  # strategy not assigned to this symbol
                     if sym in positions:
                         continue
                     if len(positions) >= max_positions:
                         break
 
-                    for interval in strategy.timeframes:
-                        df = feeder.get_all_data_for_symbol(sym, interval)
-                        if len(df) < 50:
+                    # Sort timeframes: shortest first (primary signal), rest act as filters
+                    sorted_tfs = sorted(strategy.timeframes, key=_tf_minutes)
+                    if not sorted_tfs:
+                        continue
+                    primary_tf = sorted_tfs[0]
+                    higher_tfs = sorted_tfs[1:]
+
+                    # --- Evaluate primary (shortest) timeframe for entry signal ---
+                    df_primary = feeder.get_all_data_for_symbol(sym, primary_tf)
+                    if len(df_primary) < 50:
+                        continue
+                    df_primary = df_primary[df_primary.index <= ts].copy()
+                    if len(df_primary) < 20:
+                        continue
+                    try:
+                        df_primary = compute_all(df_primary, strategy.indicators)
+                    except Exception:
+                        continue
+                    if len(df_primary) == 0:
+                        continue
+
+                    # Evaluate entry conditions on primary timeframe
+                    long_active = False
+                    short_active = False
+                    for side in ["long", "short"]:
+                        for cond in strategy.entry_conditions.get(side, []):
+                            mask = evaluate_condition(df_primary, cond)
+                            met = bool(hasattr(mask, 'iloc') and mask.iloc[-1])
+                            if met and side == "long":
+                                long_active = True
+                            elif met and side == "short":
+                                short_active = True
+
+                    if long_active and short_active:
+                        continue
+                    indicator_signal = 1.0 if long_active else -1.0 if short_active else 0.0
+                    if indicator_signal == 0.0:
+                        continue
+
+                    entry_side = "long" if indicator_signal > 0 else "short"
+
+                    # ---- SIGNAL FUSION ----
+                    ml_key = f"{strategy.name}|{sym}"
+                    ml_conf = ml_predictions.get(ml_key, 0.5)
+                    ml_directional = (ml_conf - 0.5) * 2  # -1 to +1
+
+                    # Per-strategy ML weight override
+                    strategy_ml_weight = w_ml
+                    if strategy.ml_config and strategy.ml_config.enabled:
+                        strategy_ml_weight = strategy.ml_config.weight
+
+                    total_weight = w_ind + strategy_ml_weight + w_news
+                    if total_weight > 0:
+                        final_score = (indicator_signal * w_ind +
+                                       ml_directional * strategy_ml_weight) / total_weight
+                    else:
+                        final_score = indicator_signal
+
+                    # --- Higher-timeframe trend alignment ---
+                    # Apply a confidence multiplier instead of a hard block.
+                    # Mild counter-trend trades get a penalty but can still pass.
+                    tf_multiplier = 1.0
+                    for htf in higher_tfs:
+                        df_htf = feeder.get_all_data_for_symbol(sym, htf)
+                        if len(df_htf) < 50:
                             continue
-                        df = df[df.index <= ts].copy()
-                        if len(df) < 20:
-                            continue
-                        try:
-                            df = compute_all(df, strategy.indicators)
-                        except Exception:
-                            continue
-                        if len(df) == 0:
-                            continue
+                        df_htf = df_htf[df_htf.index <= ts].copy()
+                        mult = _check_higher_tf_trend(df_htf, entry_side)
+                        tf_multiplier = min(tf_multiplier, mult)
+                    final_score *= tf_multiplier
 
-                        # Evaluate entry conditions (indicator signal)
-                        long_active = False
-                        short_active = False
-                        for side in ["long", "short"]:
-                            for cond in strategy.entry_conditions.get(side, []):
-                                mask = evaluate_condition(df, cond)
-                                met = bool(hasattr(mask, 'iloc') and mask.iloc[-1])
-                                if met and side == "long":
-                                    long_active = True
-                                elif met and side == "short":
-                                    short_active = True
+                    # Regime-aware threshold: counter-trend trades need stronger signals
+                    regime = market_regime.get(sym, "range")
+                    effective_threshold = ENTRY_THRESHOLD
+                    if (entry_side == "long" and regime == "bear") or (entry_side == "short" and regime == "bull"):
+                        effective_threshold = 0.65  # harder to counter-trend
 
-                        if long_active and short_active:
-                            continue
-                        indicator_signal = 1.0 if long_active else -1.0 if short_active else 0.0
-                        if indicator_signal == 0.0:
-                            continue
+                    if abs(final_score) < effective_threshold:
+                        continue
 
-                        # ---- SIGNAL FUSION ----
-                        ml_conf = ml_predictions.get(sym, 0.5)
-                        ml_directional = (ml_conf - 0.5) * 2  # -1 to +1
+                    side = "long" if final_score > 0 else "short"
+                    price = float(df_primary["close"].iloc[-1])
 
-                        # Per-strategy ML weight override
-                        strategy_ml_weight = w_ml
-                        if strategy.ml_config and strategy.ml_config.enabled:
-                            strategy_ml_weight = strategy.ml_config.weight
+                    # ---- POSITION SIZING ----
+                    qty, risk_amount = sizer.calculate_position_size(
+                        balance, price, "satellite")
+                    if qty <= 0:
+                        continue
 
-                        total_weight = w_ind + strategy_ml_weight
-                        if total_weight > 0:
-                            final_score = (indicator_signal * w_ind +
-                                           ml_directional * strategy_ml_weight) / total_weight
-                        else:
-                            final_score = indicator_signal
+                    # Check max position size
+                    max_amount = balance * (self.config.hard_limits.max_position_size_pct / 100)
+                    if risk_amount > max_amount:
+                        risk_amount = max_amount
+                        qty = risk_amount / price
 
-                        if abs(final_score) < ENTRY_THRESHOLD:
-                            continue
+                    amount_usdt = qty * price
+                    if amount_usdt > balance * 0.95:
+                        continue  # don't use >95% of balance
 
-                        side = "long" if final_score > 0 else "short"
-                        price = float(df["close"].iloc[-1])
+                    pos_counter += 1
+                    trade_group = f"bt_{pos_counter}_{int(ts.timestamp())}"
+                    balance -= amount_usdt
 
-                        # ---- POSITION SIZING ----
-                        qty, risk_amount = sizer.calculate_position_size(
-                            balance, price, "satellite")
-                        if qty <= 0:
-                            continue
-
-                        # Check max position size
-                        max_amount = balance * (self.config.hard_limits.max_position_size_pct / 100)
-                        if risk_amount > max_amount:
-                            risk_amount = max_amount
-                            qty = risk_amount / price
-
-                        amount_usdt = qty * price
-                        if amount_usdt > balance * 0.95:
-                            continue  # don't use >95% of balance
-
-                        pos_counter += 1
-                        trade_group = f"bt_{pos_counter}_{int(ts.timestamp())}"
-                        balance -= amount_usdt
-
-                        positions[sym] = {
-                            "symbol": sym, "side": side,
-                            "quantity": qty, "entry_price": price,
-                            "amount_usdt": amount_usdt,
-                            "strategy_name": strategy.name,
-                            "opened_at": str(ts), "trade_group": trade_group,
-                        }
-                        events.append({
-                            "time": str(ts), "type": "entry",
-                            "symbol": sym, "side": side, "price": price,
-                            "qty": round(qty, 6), "amount_usdt": round(amount_usdt, 2),
-                            "strategy": strategy.name,
-                            "signal_score": round(final_score, 3),
-                            "ml_confidence": round(ml_conf, 3),
-                        })
-                        break  # one entry per symbol per timestamp
+                    positions[sym] = {
+                        "symbol": sym, "side": side,
+                        "quantity": qty, "entry_price": price,
+                        "amount_usdt": amount_usdt,
+                        "strategy_name": strategy.name,
+                        "opened_at": str(ts), "trade_group": trade_group,
+                        "stop_loss": sizer.calculate_stop_loss(price, side),
+                        "take_profits": sizer.calculate_take_profits(price, side),
+                        "reduce_count": 0,
+                    }
+                    events.append({
+                        "time": str(ts), "type": "entry",
+                        "symbol": sym, "side": side, "price": price,
+                        "qty": round(qty, 6), "amount_usdt": round(amount_usdt, 2),
+                        "strategy": strategy.name,
+                        "signal_score": round(final_score, 3),
+                        "ml_confidence": round(ml_conf, 3),
+                        "timeframe": primary_tf,
+                    })
+                    break  # one entry per symbol per timestamp
 
             # --- EQUITY CURVE ---
             invested = sum(p.get("amount_usdt", 0) for p in positions.values())
@@ -314,61 +606,159 @@ class BacktestEngine:
             ml_correct / ml_total * 100 if ml_total > 0 else 0, 1)
         metrics["runtime_seconds"] = round(time.time() - t0, 1)
 
+        # Compute per-cell metrics
+        for s_name in per_matrix:
+            for sym in per_matrix[s_name]:
+                cell = per_matrix[s_name][sym]
+                n = cell["trades"]
+                cell["win_rate_pct"] = round(cell["winning"] / n * 100, 1) if n > 0 else 0.0
+                cell["pnl"] = round(cell["pnl"], 2)
+
         return {
             "trades": trades, "equity_curve": equity_curve, "events": events,
             "metrics": metrics, "final_balance": round(final_balance, 2),
             "initial_balance": initial_balance,
             "strategies": strategies, "symbols": symbols,
             "date_start": date_start, "date_end": date_end, "mode": mode,
+            "per_matrix": per_matrix,
         }
+
+    def _close_position(self, sym, pos, exit_price, ts, reason, trades, events,
+                         balance, positions, per_matrix):
+        """Close a position and record the trade. Used for SL/TP/indicator exits."""
+        entry_price = pos["entry_price"]
+        qty = pos["quantity"]
+        amount = pos.get("amount_usdt", qty * entry_price)
+        side = pos["side"]
+        strategy_name = pos.get("strategy_name", "")
+
+        if side == "long":
+            pnl = (exit_price - entry_price) * qty
+        else:
+            pnl = (entry_price - exit_price) * qty
+
+        trades.append({
+            "symbol": sym, "side": side,
+            "entry_price": round(entry_price, 4),
+            "exit_price": round(exit_price, 4),
+            "quantity": round(qty, 6),
+            "pnl": round(pnl, 2),
+            "pnl_pct": round(pnl / (entry_price * qty) * 100, 2) if entry_price > 0 else 0,
+            "strategy": strategy_name,
+            "opened_at": str(pos.get("opened_at", ts)),
+            "closed_at": str(ts),
+            "amount_usdt": round(amount, 2),
+            "exit_reason": reason,
+        })
+        balance += amount + pnl
+        events.append({
+            "time": str(ts), "type": "exit", "reason": reason,
+            "symbol": sym, "price": exit_price,
+            "pnl": round(pnl, 2), "strategy": strategy_name,
+        })
+
+        # Track per-strategy×symbol
+        if strategy_name in per_matrix and sym in per_matrix[strategy_name]:
+            cell = per_matrix[strategy_name][sym]
+            cell["trades"] += 1
+            cell["pnl"] += pnl
+            if pnl > 0:
+                cell["winning"] += 1
+            else:
+                cell["losing"] += 1
+            if side == "long":
+                cell["long_trades"] += 1
+            else:
+                cell["short_trades"] += 1
+
+        del positions[sym]
+        return balance
 
     # ---- ML Helpers ----
 
-    # Indicator config used for ML feature computation (same as live system)
+    # Indicator config used for ML feature computation
     _ML_INDICATORS = {
         "rsi": {"period": 14},
         "macd": {"fast": 12, "slow": 26, "signal": 9},
         "bollinger": {"period": 20, "stddev": 2},
+        "adx": {"period": 14},
     }
-    _ML_FEATURE_NAMES = ["rsi", "macd_histogram", "bollinger_width",
-                         "volume_ratio", "price_momentum_24h"]
+    _ML_FEATURE_NAMES = [
+        "rsi", "macd_histogram", "bollinger_width",
+        "volume_ratio", "price_momentum_24h", "adx",
+    ]
 
     def _compute_ml_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Compute indicators then extract ML feature columns."""
+        """Compute indicators then extract ML feature columns.
+
+        Builds a richer feature set including multi-period returns and volatility.
+        """
         from core.strategy.indicators import compute_all
         from core.ml.features import build_features
 
         df_ind = compute_all(df.copy(), self._ML_INDICATORS)
         feature_df = build_features(df_ind, self._ML_FEATURE_NAMES)
-        # Add returns and volatility as basic features
         if len(df_ind) > 5:
-            feature_df["returns_1"] = df_ind["close"].pct_change()
-            feature_df["returns_5"] = df_ind["close"].pct_change(5)
-            feature_df["volatility_20"] = feature_df["returns_1"].rolling(20).std()
+            close = df_ind["close"]
+            # Multi-period returns
+            feature_df["ret_1"] = close.pct_change(1)
+            feature_df["ret_5"] = close.pct_change(5)
+            feature_df["ret_20"] = close.pct_change(20)
+            # Volatility
+            rets = feature_df["ret_1"]
+            feature_df["vol_10"] = rets.rolling(10).std()
+            feature_df["vol_20"] = rets.rolling(20).std()
+            # Volume features
+            if "volume" in df_ind.columns:
+                vol = df_ind["volume"]
+                feature_df["vol_chg_5"] = vol.pct_change(5)
+                feature_df["vol_chg_20"] = vol.pct_change(20)
+            # Price position relative to recent range
+            feature_df["pos_20"] = (close - close.rolling(20).min()) / (
+                close.rolling(20).max() - close.rolling(20).min() + 1e-9)
+            # Trend strength: close vs multiple EMAs
+            ema20 = close.ewm(span=20, adjust=False).mean()
+            ema50 = close.ewm(span=50, adjust=False).mean()
+            feature_df["ema20_dist"] = (close - ema20) / (ema20 + 1e-9)
+            feature_df["ema50_dist"] = (close - ema50) / (ema50 + 1e-9)
         feature_df = feature_df.replace([np.inf, -np.inf], np.nan)
         feature_df = feature_df.ffill().fillna(0)
         return feature_df
 
-    def _train_ml_model(self, df: pd.DataFrame):
-        """Train an XGBoost binary classifier on indicator features. Returns the model or None."""
-        if len(df) < 100:
+    def _train_ml_model(self, df: pd.DataFrame, tf_params: dict = None):
+        """Train an XGBoost classifier with timeframe-appropriate labels.
+
+        Each strategy's primary timeframe gets its own model with matched
+        forward_periods and threshold (e.g., 1m→20 periods, 1h→4 periods).
+        """
+        if tf_params is None:
+            tf_params = {"forward": 4, "threshold": 0.005, "min_candles": 100}
+        min_candles = tf_params.get("min_candles", 100)
+        min_samples = max(40, min_candles // 3)
+        if len(df) < min_candles:
             return None
         try:
             from core.ml.features import create_binary_label
             import xgboost as xgb
 
             feature_df = self._compute_ml_features(df)
-            labels = create_binary_label(df)
+            labels = create_binary_label(
+                df, forward_periods=tf_params["forward"],
+                threshold=tf_params["threshold"])
 
             common_idx = feature_df.index.intersection(labels.dropna().index)
-            if len(common_idx) < 50:
+            if len(common_idx) < min_samples:
                 return None
             X = feature_df.loc[common_idx].values.astype(float)
             y = labels.loc[common_idx].values
 
+            n_up = int(y.sum())
+            n_down = len(y) - n_up
+
             model = xgb.XGBClassifier(
-                n_estimators=80, max_depth=4, learning_rate=0.05,
+                n_estimators=100, max_depth=5, learning_rate=0.05,
                 subsample=0.8, colsample_bytree=0.8,
+                scale_pos_weight=max(1.0, n_down / max(n_up, 1)),
                 eval_metric='logloss', verbosity=0, random_state=42)
             model.fit(X, y)
             return model
@@ -377,7 +767,11 @@ class BacktestEngine:
             return None
 
     def _predict_ml(self, model, df: pd.DataFrame) -> float | None:
-        """Predict probability(price up) using the trained model. Returns confidence 0-1 or None."""
+        """Predict probability(price up >= 0.5%) using the trained model.
+
+        Returns confidence in [0,1] or None if data is insufficient.
+        If the model is too uncertain (0.4–0.6), returns 0.5 (neutral).
+        """
         if len(df) < 50:
             return None
         try:
@@ -387,8 +781,30 @@ class BacktestEngine:
             X = feature_df.iloc[-1:].values.astype(float)
             proba = model.predict_proba(X)
             if proba.shape[1] >= 2:
-                return float(proba[0][1])  # P(up)
+                conf = float(proba[0][1])
+                # Shrink toward 0.5 if model is uncertain
+                if 0.40 <= conf <= 0.60:
+                    return 0.5  # neutral — model doesn't know
+                return conf
             return 0.5
         except Exception as e:
             logger.debug(f"ML predict failed: {e}")
             return None
+
+    def _detect_market_regime(self, df: pd.DataFrame) -> str:
+        """Detect the prevailing market regime from 1h data.
+
+        Returns 'bull', 'bear', or 'range' based on EMA alignment and ADX.
+        """
+        if len(df) < 100:
+            return "range"
+        close = df["close"].values
+        ema20 = float(pd.Series(close).ewm(span=20, adjust=False).mean().iloc[-1])
+        ema50 = float(pd.Series(close).ewm(span=50, adjust=False).mean().iloc[-1])
+        last_close = float(close[-1])
+        if last_close > ema20 > ema50:
+            return "bull"
+        elif last_close < ema20 < ema50:
+            return "bear"
+        else:
+            return "range"

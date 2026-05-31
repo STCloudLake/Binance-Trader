@@ -37,6 +37,9 @@ env/
 **/*.parquet
 **/*.pkl
 
+# Backtest result JSONs (large generated files)
+data/backtest/
+
 # OS
 .DS_Store
 Thumbs.db

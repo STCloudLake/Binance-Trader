@@ -16,6 +16,7 @@ class StrategyConfig(BaseModel):
     enabled: bool = True
     mode: str = "trend"
     timeframes: list[str] = ["1h"]
+    symbols: list[str] = []  # empty = all symbols; otherwise restrict to these
     indicators: dict[str, Any] = {}
     entry_conditions: dict[str, list[str]] = {}
     exit_conditions: dict[str, list[str]] = {}

@@ -50,6 +50,43 @@
 
     <div id="bt-equity-chart" style="width:100%;height:350px;" class="mb-4"></div>
 
+    {% if per_matrix %}
+    <!-- Strategy × Symbol Results Matrix -->
+    <h4 class="text-md mb-2">{{ _("Strategy × Symbol Matrix") }}</h4>
+    <div class="max-h-80 overflow-auto mb-4">
+        {% set symbols_list = per_matrix.values()|first|list if per_matrix else [] %}
+        <table class="w-full text-sm border-collapse">
+            <thead class="text-slate-400 border-b border-slate-700 sticky top-0 bg-surface-light">
+                <tr>
+                    <th class="text-left p-2">{{ _("Strategy") }}</th>
+                    {% for sym in config.symbols %}
+                    <th class="text-center p-2">{{ sym.replace('USDT','') }}</th>
+                    {% endfor %}
+                </tr>
+            </thead>
+            <tbody>
+                {% for s_name, sym_data in per_matrix.items() %}
+                <tr class="border-b border-slate-800 text-xs">
+                    <td class="p-2 font-bold text-slate-300">{{ s_name }}</td>
+                    {% for sym in config.symbols %}
+                    {% set cell = sym_data.get(sym, {}) %}
+                    <td class="p-2 text-center {{ 'bg-green-900/30' if cell.pnl|default(0) > 0 else 'bg-red-900/30' if cell.pnl|default(0) < 0 else '' }}">
+                        {% if cell.trades|default(0) > 0 %}
+                        <div class="{{ 'text-green-400' if cell.pnl|default(0) > 0 else 'text-red-400' }} font-bold">{{ "%+.2f"|format(cell.pnl|default(0)) }}</div>
+                        <div class="text-slate-500">{{ cell.trades|default(0) }}T | {{ cell.win_rate_pct|default(0)|int }}%W</div>
+                        <div class="text-slate-600">{{ _("Long") }}:{{ cell.long_trades|default(0) }} {{ _("Short") }}:{{ cell.short_trades|default(0) }}</div>
+                        {% else %}
+                        <div class="text-slate-600">-</div>
+                        {% endif %}
+                    </td>
+                    {% endfor %}
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+
     <h4 class="text-md mb-2">{{ _("Trade History") }} ({{ trades|length }} {{ _("trades") }})</h4>
     <div class="max-h-64 overflow-y-auto">
         <table class="w-full text-sm">

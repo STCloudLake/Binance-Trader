@@ -51,13 +51,21 @@ def calculate_metrics(trades: list[dict], equity_curve: list[dict],
     total_losses = abs(sum(t.get("pnl", 0) for t in losing))
     profit_factor = total_gains / total_losses if total_losses > 0 else float("inf")
 
-    # Sharpe ratio (annualized, using equity curve daily returns)
+    # Sharpe ratio (annualized)
+    # Resample to daily equity first to get correct annualization regardless
+    # of the backtest's candle interval (1m, 5m, 1h, etc.)
     sharpe = 0.0
     if equity_curve and len(equity_curve) >= 2:
-        eq_series = pd.Series([p["equity"] for p in equity_curve])
-        daily_returns = eq_series.pct_change().dropna()
-        if len(daily_returns) > 1 and daily_returns.std() > 0:
-            sharpe = (daily_returns.mean() / daily_returns.std()) * np.sqrt(365)
+        eq_series = pd.Series(
+            [p["equity"] for p in equity_curve],
+            index=pd.DatetimeIndex([p["time"] for p in equity_curve]),
+        )
+        # Resample to daily: take last equity value of each day
+        daily_eq = eq_series.resample("1D").last().dropna()
+        if len(daily_eq) >= 2:
+            daily_returns = daily_eq.pct_change().dropna()
+            if len(daily_returns) > 1 and daily_returns.std() > 0:
+                sharpe = (daily_returns.mean() / daily_returns.std()) * np.sqrt(365)
 
     # Avg PnL and hold time
     avg_pnl = sum(t.get("pnl", 0) for t in trades) / n_trades if n_trades > 0 else 0

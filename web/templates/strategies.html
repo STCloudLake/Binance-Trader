@@ -75,11 +75,12 @@ var availableIndicators = [
 ];
 var allTimeframes = ['1m','5m','15m','1h','4h','1d'];
 var allModes = ['trend','grid','momentum','scalp'];
+var allSymbols = ['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT'];
 
 function newStrategy() {
     currentStrategy = null;
     document.getElementById('editor-title').textContent = '({{ _("新建") }})';
-    renderEditor({name:'', mode:'trend', timeframes:['1h'], indicators:{}, entry_conditions:{long:[],short:[]}, exit_conditions:{long:[],short:[]}, reduce_conditions:{long:[],short:[]}, ml_config:{enabled:false, confidence_threshold:0.6, features:[], weight:0.3}});
+    renderEditor({name:'', mode:'trend', timeframes:['1h'], symbols:[], indicators:{}, entry_conditions:{long:[],short:[]}, exit_conditions:{long:[],short:[]}, reduce_conditions:{long:[],short:[]}, ml_config:{enabled:false, confidence_threshold:0.6, features:[], weight:0.3}});
 }
 
 function loadStrategy(name) {
@@ -125,6 +126,14 @@ function renderEditor(s) {
     allTimeframes.forEach(function(tf) {
         var checked = (s.timeframes || []).indexOf(tf) >= 0 ? 'checked' : '';
         h += '<label class="text-xs px-2 py-1 rounded border border-slate-600 ' + (checked ? 'bg-sky-900 border-sky-500 text-sky-300' : 'text-slate-400') + '"><input type="checkbox" value="' + tf + '" ' + checked + ' onchange="this.parentElement.classList.toggle(\'bg-sky-900\');this.parentElement.classList.toggle(\'border-sky-500\');this.parentElement.classList.toggle(\'text-sky-300\')"> ' + tf + '</label>';
+    });
+    h += '</div></div>';
+
+    // Symbols (strategy-symbol mapping)
+    h += '<div class="mb-4"><label class="text-slate-400">{{ _("交易对") }} <span class="text-xs text-slate-600">({{ _("空=全部交易对") }})</span></label><div class="flex gap-2 mt-1" id="sym-checkboxes">';
+    allSymbols.forEach(function(sym) {
+        var checked = (s.symbols || []).indexOf(sym) >= 0;
+        h += '<label class="text-xs px-2 py-1 rounded border border-slate-600 ' + (checked ? 'bg-emerald-900 border-emerald-500 text-emerald-300' : 'text-slate-400') + '"><input type="checkbox" value="' + sym + '" ' + (checked ? 'checked' : '') + ' onchange="this.parentElement.classList.toggle(\'bg-emerald-900\');this.parentElement.classList.toggle(\'border-emerald-500\');this.parentElement.classList.toggle(\'text-emerald-300\')"> ' + sym.replace('USDT','/USDT') + '</label>';
     });
     h += '</div></div>';
 
@@ -267,6 +276,10 @@ function saveStrategy() {
     var tfs = [];
     document.querySelectorAll('#tf-checkboxes input[type=checkbox]:checked').forEach(function(cb) { tfs.push(cb.value); });
 
+    // Gather symbols (strategy-symbol mapping)
+    var syms = [];
+    document.querySelectorAll('#sym-checkboxes input[type=checkbox]:checked').forEach(function(cb) { syms.push(cb.value); });
+
     // Gather indicators
     var indicators = {};
     document.querySelectorAll('.ind-cb:checked').forEach(function(cb) {
@@ -313,6 +326,7 @@ function saveStrategy() {
         name: name,
         mode: document.getElementById('smode').value,
         timeframes: tfs,
+        symbols: syms,
         indicators: indicators,
         entry_conditions: entry,
         exit_conditions: exit,

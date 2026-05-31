@@ -1,8 +1,11 @@
+enabled: false
 entry_conditions:
   long:
-  - bollinger_width < bollinger_width_sma * 0.8 and volume > volume_sma * 1.8 and adx > 25 and close > bollinger_middle
+  - bollinger_width < bollinger_width_sma * 0.8 and volume > volume_sma * 1.8 and
+    adx > 25 and close > bollinger_middle
   short:
-  - bollinger_width < bollinger_width_sma * 0.8 and volume > volume_sma * 1.8 and adx > 25 and close < bollinger_middle
+  - bollinger_width < bollinger_width_sma * 0.8 and volume > volume_sma * 1.8 and
+    adx > 25 and close < bollinger_middle
 exit_conditions:
   long:
   - close < bollinger_middle and volume < volume_sma * 0.7
@@ -24,6 +27,10 @@ ml_config:
   weight: 0.35
 mode: trend
 name: Bollinger Squeeze + Volume Momentum
+reduce_conditions:
+  long: []
+  short: []
+symbols: []
 timeframes:
 - 15m
 - 4h

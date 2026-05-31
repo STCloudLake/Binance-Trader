@@ -24,7 +24,28 @@ class StrategyEngine:
     def wire_executor(self, executor):
         self._executor = executor
 
+    def _purge_stale_cache(self):
+        """Remove signal cache entries for strategies/symbols that no longer apply."""
+        stale_keys = []
+        for key in self._signal_cache:
+            # key format: "strategy_name|symbol"
+            if "|" not in key:
+                continue
+            s_name, sym = key.split("|", 1)
+            strategy = self._strategies.get(s_name)
+            if not strategy:
+                stale_keys.append(key)
+                continue
+            if strategy.symbols and sym not in strategy.symbols:
+                stale_keys.append(key)
+        for k in stale_keys:
+            self._signal_cache.pop(k, None)
+        if stale_keys:
+            from loguru import logger
+            logger.info(f"Purged {len(stale_keys)} stale signal cache entries")
+
     async def start(self):
+        from loguru import logger
         self._running = True
         self.event_bus.subscribe(EventType.MARKET_KLINE, self._on_kline)
         self.event_bus.subscribe(EventType.ML_PREDICTION, self._on_ml_prediction)
@@ -32,9 +53,11 @@ class StrategyEngine:
         all_strategies = self.loader.load_all()
         for s in all_strategies:
             if not s.timeframes:
-                from loguru import logger
                 logger.warning(f"Strategy '{s.name}' has no timeframes configured — will never evaluate!")
+            if s.symbols:
+                logger.info(f"Strategy '{s.name}' restricted to symbols: {s.symbols}")
         self._strategies = {s.name: s for s in all_strategies}
+        self._purge_stale_cache()
 
     async def _on_kline(self, event: Event):
         if not self._running:
@@ -54,6 +77,9 @@ class StrategyEngine:
             if not strategy.enabled:
                 continue
             if interval not in strategy.timeframes:
+                continue
+            # Respect strategy→symbol mapping
+            if strategy.symbols and symbol not in strategy.symbols:
                 continue
             await self._evaluate(symbol, interval, strategy)
 
@@ -135,6 +161,41 @@ class StrategyEngine:
 
         # Determine entry side from the signal
         entry_side = "long" if final_score > 0 else "short"
+
+        # --- Higher-timeframe trend alignment ---
+        # Apply confidence multiplier instead of hard block.
+        if indicator_signal != 0.0 and len(strategy.timeframes) > 1:
+            _TF_MIN = {"1m":1,"3m":3,"5m":5,"15m":15,"30m":30,"1h":60,"2h":120,"4h":240,"6h":360,"8h":480,"12h":720,"1d":1440}
+            current_min = _TF_MIN.get(interval, 60)
+            higher_tfs = [tf for tf in strategy.timeframes if _TF_MIN.get(tf, 60) > current_min]
+            tf_multiplier = 1.0
+            for htf in higher_tfs:
+                try:
+                    df_htf = await self.market_data.get_historical(symbol, htf)
+                    if df_htf is not None and len(df_htf) >= 50:
+                        close = df_htf["close"].values
+                        ema50 = float(pd.Series(close).ewm(span=50, adjust=False).mean().iloc[-1])
+                        last_close = float(close[-1])
+                        if ema50 > 0:
+                            deviation = (last_close - ema50) / ema50
+                            if entry_side == "long":
+                                if deviation >= 0:
+                                    mult = 1.0
+                                elif deviation > -0.02:
+                                    mult = 0.6
+                                else:
+                                    mult = 0.0
+                            else:
+                                if deviation <= 0:
+                                    mult = 1.0
+                                elif deviation < 0.02:
+                                    mult = 0.6
+                                else:
+                                    mult = 0.0
+                            tf_multiplier = min(tf_multiplier, mult)
+                except Exception:
+                    pass
+            final_score *= tf_multiplier
 
         # An exit signal only blocks entry on the SAME side, and only when a position exists
         # for that side (or would be opened). No position open → exit signals are advisory only.
@@ -336,7 +397,8 @@ class StrategyEngine:
             if not strategy.enabled:
                 continue
             for interval in strategy.timeframes:
-                for symbol in self.market_data._watched_symbols:
+                effective_symbols = strategy.symbols if strategy.symbols else self.market_data._watched_symbols
+                for symbol in effective_symbols:
                     try:
                         await self._evaluate(symbol, interval, strategy, publish=publish)
                     except Exception:
@@ -401,6 +463,7 @@ class StrategyEngine:
                 "enabled": s.enabled,
                 "mode": s.mode,
                 "timeframes": s.timeframes,
+                "symbols": s.symbols if s.symbols else [],
                 "signal_count": len(signals),
                 "signals": strat_signals,
             })

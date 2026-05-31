@@ -22,10 +22,19 @@ def create_label(df: pd.DataFrame, forward_periods: int = 4, threshold: float = 
     return labels
 
 
-def create_binary_label(df: pd.DataFrame, forward_periods: int = 4) -> pd.Series:
+def create_binary_label(df: pd.DataFrame, forward_periods: int = 4,
+                         threshold: float = 0.005) -> pd.Series:
+    """Create binary labels with a minimum significance threshold.
+
+    Returns 1 if price rises >= threshold, 0 if price falls >= threshold,
+    NaN if the movement is insignificant (noise).
+    This filters out random micro-movements that are impossible to predict.
+    """
     future_close = df["close"].shift(-forward_periods)
-    labels = (future_close > df["close"]).astype(float)
-    labels[labels.isna()] = np.nan
+    return_pct = (future_close - df["close"]) / df["close"]
+    labels = pd.Series(np.nan, index=df.index)
+    labels[return_pct >= threshold] = 1.0
+    labels[return_pct <= -threshold] = 0.0
     return labels.astype("Int64")
 
 

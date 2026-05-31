@@ -901,9 +901,9 @@ def create_app(config: Config, event_bus: EventBus, auth_manager=None) -> FastAP
             if ml:
                 body["ml_config"] = MLConfig(**ml)
             config = StrategyConfig(**body)
-            # Save new config first; only delete old file after save succeeds
+            # Save new config first; only delete old file if normalized names differ
             loader.save(config)
-            if new_name != name:
+            if loader._normalize(new_name) != loader._normalize(name):
                 loader.delete(name)
             return JSONResponse({"ok": True, "name": config.name})
         except Exception as e:
@@ -919,7 +919,33 @@ def create_app(config: Config, event_bus: EventBus, auth_manager=None) -> FastAP
             s = loader.load(name)
             s.enabled = not s.enabled
             loader.save(s)
+            # Sync engine's in-memory strategies so monitor panel reflects change
+            engine = getattr(app.state, "strategy_engine", None)
+            if engine and name in engine._strategies:
+                engine._strategies[name] = s
+                engine._purge_stale_cache()
             return JSONResponse({"ok": True, "enabled": s.enabled})
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.post("/api/strategy-symbols/{name}")
+    async def update_strategy_symbols(name: str, request: Request):
+        """Update which symbols a strategy applies to."""
+        if err := _require_trader(request): return err
+        loader = getattr(app.state, "strategy_loader", None)
+        if not loader:
+            return JSONResponse({"error": "No loader"}, status_code=500)
+        try:
+            body = await request.json()
+            symbols = body.get("symbols", [])
+            s = loader.load(name)
+            s.symbols = list(symbols)
+            loader.save(s)
+            # Sync engine
+            engine = getattr(app.state, "strategy_engine", None)
+            if engine and name in engine._strategies:
+                engine._strategies[name] = s
+            return JSONResponse({"ok": True, "symbols": s.symbols})
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -949,6 +975,7 @@ def create_app(config: Config, event_bus: EventBus, auth_manager=None) -> FastAP
                     from loguru import logger
                     logger.warning(f"Strategy '{s.name}' has no timeframes — will never evaluate!")
             engine._strategies = {s.name: s for s in all_s}
+            engine._purge_stale_cache()
             # Re-evaluate to populate signal cache immediately
             await engine.evaluate_all_now()
             count = len(engine._strategies)
@@ -1654,7 +1681,9 @@ Return ONLY valid JSON in this exact format:
                            date_start: str = Form("2025-01-01"),
                            date_end: str = Form("2026-01-01"),
                            mode: str = Form("full"),
-                           initial_balance: float = Form(10000.0)):
+                           initial_balance: float = Form(10000.0),
+                           strategy_symbols: str = Form("{}"),
+                           simulate_ai_weights: str = Form("1")):
         if err := _require_trader(request): return err
         engine = getattr(app.state, "backtest_engine", None)
         if not engine:
@@ -1665,9 +1694,16 @@ Return ONLY valid JSON in this exact format:
         if not strategy_list or not symbol_list:
             return HTMLResponse('<div class="text-red-400">Please select strategies and symbols</div>')
 
+        # Parse backtest-only strategy→symbol mapping (does NOT modify live config)
+        bt_strategy_symbols = {}
+        try:
+            bt_strategy_symbols = json.loads(strategy_symbols) if strategy_symbols else {}
+        except (json.JSONDecodeError, TypeError):
+            pass
+
         run_id = _uuid.uuid4().hex[:12]
         _bt_runs[run_id] = {
-            "progress": 0, "total": 100, "done": False,
+            "progress": 0, "total": 0, "done": False,
             "date_start": date_start, "date_end": date_end,
             "started": time.time(),
         }
@@ -1679,21 +1715,50 @@ Return ONLY valid JSON in this exact format:
         def _run_bt_blocking():
             return engine.run_with_exit_evaluation(
                 strategy_list, symbol_list, date_start, date_end,
-                initial_balance, mode, progress_callback=on_progress)
+                initial_balance, mode, progress_callback=on_progress,
+                strategy_symbols=bt_strategy_symbols,
+                simulate_ai_weights=(simulate_ai_weights == "1"))
 
         async def _run_bt():
             loop = asyncio.get_event_loop()
             import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                result = await loop.run_in_executor(pool, _run_bt_blocking)
-            _bt_runs[run_id]["result"] = result
-            _bt_runs[run_id]["done"] = True
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    result = await loop.run_in_executor(pool, _run_bt_blocking)
+                _bt_runs[run_id]["result"] = result
+            except Exception as e:
+                from loguru import logger
+                logger.error(f"Backtest run {run_id} failed: {e}")
+                _bt_runs[run_id]["result"] = {"error": str(e)}
+            finally:
+                _bt_runs[run_id]["done"] = True
 
         asyncio.create_task(_run_bt())
 
-        return _render("partials/backtest_progress.html", {
+        resp = _render("partials/backtest_progress.html", {
             "request": None, "run_id": run_id,
             "date_start": date_start, "date_end": date_end,
+        })
+        resp.set_cookie("bt_active_run", run_id, max_age=3600, httponly=False)
+        return resp
+
+    @app.get("/partials/backtest-active")
+    async def backtest_active(request: Request):
+        """Check cookie for active backtest and return progress bar if running."""
+        run_id = request.cookies.get("bt_active_run", "")
+        if not run_id or run_id not in _bt_runs:
+            return HTMLResponse("")  # no active run, return empty
+        run = _bt_runs[run_id]
+        if run.get("done"):
+            return HTMLResponse("")  # already finished
+        total = run.get("total", 100)
+        current = run.get("progress", 0)
+        pct = round(current / max(total, 1) * 100, 1)
+        return _render("partials/backtest_progress.html", {
+            "request": None, "run_id": run_id,
+            "date_start": run.get("date_start", ""),
+            "date_end": run.get("date_end", ""),
+            "initial_pct": pct,
         })
 
     @app.get("/api/backtest/progress/{run_id}")
@@ -1757,7 +1822,7 @@ Return ONLY valid JSON in this exact format:
         # Clean up
         _bt_runs.pop(run_id, None)
 
-        return _render("partials/backtest_results.html", {
+        resp = _render("partials/backtest_results.html", {
             "request": None,
             "summary": report["summary"],
             "chart_data": report["chart_data"],
@@ -1766,7 +1831,11 @@ Return ONLY valid JSON in this exact format:
             "date_start": date_start,
             "date_end": date_end,
             "record_id": record_id,
+            "per_matrix": report.get("per_matrix", {}),
+            "config": {"symbols": symbol_list},
         })
+        resp.delete_cookie("bt_active_run")
+        return resp
 
     @app.get("/api/backtest/history")
     async def backtest_history():
@@ -1812,6 +1881,8 @@ Return ONLY valid JSON in this exact format:
             "runtime": result.get("metrics", {}).get("runtime_seconds", 0),
             "date_start": result.get("date_start", ""),
             "date_end": result.get("date_end", ""),
+            "per_matrix": report.get("per_matrix", {}),
+            "config": {"symbols": result.get("symbols", [])},
         })
 
     @app.delete("/api/backtest/{record_id}")
@@ -1825,7 +1896,15 @@ Return ONLY valid JSON in this exact format:
     @app.get("/partials/backtest-config")
     async def partial_backtest_config():
         loader = getattr(app.state, "strategy_loader", None)
-        strategies = loader.list_names() if loader else []
+        strategy_configs = []
+        if loader:
+            try:
+                strategy_configs = loader.load_all()
+            except Exception:
+                pass
+        strategies = [s.name for s in strategy_configs]
+        # Build strategy-symbol mapping for the matrix view
+        strategy_symbols = {s.name: (s.symbols if s.symbols else []) for s in strategy_configs}
         from datetime import datetime, timedelta
         default_end = datetime.now().strftime("%Y-%m-%d")
         default_start = (datetime.now() - timedelta(days=14)).strftime("%Y-%m-%d")
@@ -1833,6 +1912,8 @@ Return ONLY valid JSON in this exact format:
             "request": None,
             "available_strategies": strategies,
             "available_symbols": ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"],
+            "strategy_symbols": strategy_symbols,
+            "strategy_configs": strategy_configs,
             "default_start": default_start,
             "default_end": default_end,
         })
@@ -1879,6 +1960,7 @@ Return ONLY valid JSON in this exact format:
             if engine and loader:
                 all_s = loader.load_all()
                 engine._strategies = {s.name: s for s in all_s}
+                engine._purge_stale_cache()
                 await engine.evaluate_all_now()
             # Log lifecycle event
             if mgr:
@@ -1888,6 +1970,19 @@ Return ONLY valid JSON in this exact format:
             return JSONResponse({"ok": False, "error": f"Failed to save strategy: {e}"})
 
         return JSONResponse({"ok": True, "strategy": config, "saved": True})
+
+    @app.post("/api/strategy-lifecycle/optimize")
+    async def lifecycle_optimize(request: Request):
+        """Manually trigger matrix-based strategy analysis and optimization."""
+        if err := _require_trader(request): return err
+        mgr = getattr(app.state, "lifecycle_manager", None)
+        if not mgr:
+            return JSONResponse({"error": "Lifecycle manager not initialized"}, status_code=500)
+        try:
+            result = await mgr.analyze_and_optimize()
+            return JSONResponse({"ok": True, "actions": result})
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": str(e)})
 
     @app.get("/partials/strategy-lifecycle")
     async def partial_strategy_lifecycle(request: Request):

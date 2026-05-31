@@ -1,4 +1,4 @@
-enabled: true
+enabled: false
 entry_conditions:
   long:
   - rsi < 30 and volume_ratio > 1.5 and close > bollinger_lower
@@ -48,6 +48,7 @@ reduce_conditions:
   short:
   - condition: rsi < 45 and close < bollinger_middle
     reduce_pct: 50
+symbols: []
 timeframes:
 - 1m
 - 5m
