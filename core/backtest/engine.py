@@ -84,13 +84,14 @@ class BacktestEngine:
                                   initial_balance=10000.0, mode="full",
                                   progress_callback=None,
                                   strategy_symbols: dict[str, list[str]] = None,
-                                  simulate_ai_weights: bool = True):
+                                  simulate_ai_weights: bool = True,
+                                  ml_engine: str = "lightgbm"):
         """Full backtest with ML predictions, signal fusion, and risk controls.
 
         Args:
             simulate_ai_weights: If True, adjust signal weights based on detected
                 market regime (mimicking what the live AI market assessment does).
-                Default True so backtest reflects realistic AI-driven weight dynamics.
+            ml_engine: 'lightgbm' (default tree model) or 'tft' (sequence transformer).
         """
         t0 = time.time()
 
@@ -130,8 +131,18 @@ class BacktestEngine:
         ml_correct = 0
         ml_total = 0
         ml_retrain_counter: dict[str, int] = {}
-        ml_retrain_interval = 100  # extended from 50 — less frequent retraining
+        ml_retrain_interval = 200 if ml_engine == "tft" else 100
         market_regime: dict[str, str] = {}
+
+        # TFT state (only when ml_engine == 'tft')
+        tft_trainer = None
+        tft_feature_cache: dict[str, pd.DataFrame] = {}  # sym -> feature df with label
+        if ml_engine == "tft":
+            from core.ml.tft_trainer import TFTTrainer as _TFTTrainer
+            tft_trainer = _TFTTrainer(
+                data_dir=str(self.config.data_dir),
+                seq_len=100, d_model=64, num_heads=4,
+                lstm_layers=2, dropout=0.2)
 
         # ── Indicator cache: precompute each unique indicator config once ──
         # Key: (json_hash_of_indicators, symbol, interval) → full DataFrame
@@ -278,39 +289,75 @@ class BacktestEngine:
                     key = f"{strategy.name}|{sym}"
                     counter = ml_retrain_counter.get(key, 0) + 1
                     ml_retrain_counter[key] = counter
-                    if counter >= ml_retrain_interval or key not in ml_models:
-                        sliced = df_tf[df_tf.index <= ts]
-                        model = self._train_ml_model(sliced, tf_params)
+
+                    # Regime detection on 1h for this symbol (once)
+                    if sym not in market_regime:
+                        df_1h = feeder.get_all_data_for_symbol(sym, "1h")
+                        market_regime[sym] = self._detect_market_regime(df_1h[df_1h.index <= ts])
+
+                    # ── TFT path ──
+                    if ml_engine == "tft" and tft_trainer is not None:
+                        if counter >= ml_retrain_interval or key not in ml_models:
+                            sliced = df_tf[df_tf.index <= ts]
+                            if len(sliced) >= 150:
+                                model = self._train_tft_model(
+                                    tft_trainer, sliced, sym, primary_tf)
+                                if model is not None:
+                                    ml_models[key] = model
+                            ml_retrain_counter[key] = 0
+
+                        model = ml_models.get(key)
                         if model is not None:
-                            ml_models[key] = model
-                        ml_retrain_counter[key] = 0
-                        # Regime detection on 1h for this symbol
-                        if sym not in market_regime:
-                            df_1h = feeder.get_all_data_for_symbol(sym, "1h")
-                            market_regime[sym] = self._detect_market_regime(df_1h[df_1h.index <= ts])
+                            try:
+                                conf = self._predict_tft(
+                                    tft_trainer, model, df_tf[df_tf.index <= ts])
+                                if conf is not None:
+                                    ml_predictions[key] = conf
+                                    # Accuracy tracking
+                                    fwd = tf_params["forward"]
+                                    th = tf_params["threshold"]
+                                    future_df = df_tf[df_tf.index > ts]
+                                    if len(future_df) >= fwd:
+                                        cur_close = float(df_tf[df_tf.index <= ts].iloc[-1]["close"])
+                                        fut_close = float(future_df.iloc[fwd - 1]["close"])
+                                        ret = (fut_close - cur_close) / cur_close
+                                        if abs(ret) >= th:
+                                            ml_total += 1
+                                            if (ret >= th and conf >= 0.5) or (ret <= -th and conf < 0.5):
+                                                ml_correct += 1
+                            except Exception:
+                                pass
 
-                    # Predict
-                    model = ml_models.get(key)
-                    if model is not None:
-                        try:
-                            conf = self._predict_ml(model, df_tf[df_tf.index <= ts])
-                            if conf is not None:
-                                ml_predictions[key] = conf
+                    # ── LightGBM path ──
+                    else:
+                        if counter >= ml_retrain_interval or key not in ml_models:
+                            sliced = df_tf[df_tf.index <= ts]
+                            model = self._train_ml_model(sliced, tf_params)
+                            if model is not None:
+                                ml_models[key] = model
+                            ml_retrain_counter[key] = 0
 
-                                # Accuracy tracking
-                                fwd = tf_params["forward"]
-                                th = tf_params["threshold"]
-                                future_df = df_tf[df_tf.index > ts]
-                                if len(future_df) >= fwd:
-                                    cur_close = float(df_tf[df_tf.index <= ts].iloc[-1]["close"])
-                                    fut_close = float(future_df.iloc[fwd - 1]["close"])
-                                    ret = (fut_close - cur_close) / cur_close
-                                    if abs(ret) >= th:
-                                        ml_total += 1
-                                        if (ret >= th and conf >= 0.5) or (ret <= -th and conf < 0.5):
-                                            ml_correct += 1
-                        except Exception:
-                            pass
+                        model = ml_models.get(key)
+                        if model is not None:
+                            try:
+                                conf = self._predict_ml(model, df_tf[df_tf.index <= ts])
+                                if conf is not None:
+                                    ml_predictions[key] = conf
+
+                                    # Accuracy tracking
+                                    fwd = tf_params["forward"]
+                                    th = tf_params["threshold"]
+                                    future_df = df_tf[df_tf.index > ts]
+                                    if len(future_df) >= fwd:
+                                        cur_close = float(df_tf[df_tf.index <= ts].iloc[-1]["close"])
+                                        fut_close = float(future_df.iloc[fwd - 1]["close"])
+                                        ret = (fut_close - cur_close) / cur_close
+                                        if abs(ret) >= th:
+                                            ml_total += 1
+                                            if (ret >= th and conf >= 0.5) or (ret <= -th and conf < 0.5):
+                                                ml_correct += 1
+                            except Exception:
+                                pass
 
             # --- CHECK REDUCE CONDITIONS (partial profit-taking) ---
             # Mirror live engine: reduce fires before full exit, max 4 reduces per position.
@@ -791,6 +838,55 @@ class BacktestEngine:
             return 0.5
         except Exception as e:
             logger.debug(f"ML predict failed: {e}")
+            return None
+
+    # ── TFT helpers ──────────────────────────────────────────────────
+
+    def _train_tft_model(self, tft_trainer, df: pd.DataFrame, symbol: str,
+                         interval: str):
+        """Train a TFT model on sliced DataFrame (walk-forward safe)."""
+        try:
+            from core.strategy.indicators import compute_all
+            from core.ml.features import compute_features as _cf, create_regression_label, REQUIRED_INDICATORS
+
+            df_ind = compute_all(df.copy(), REQUIRED_INDICATORS)
+            X = _cf(df_ind, None)
+            y = create_regression_label(df_ind, forward_periods=4)
+            X["label"] = y.values
+
+            feature_cols = [c for c in X.columns if c != "label"
+                          and X[c].dtype in ('float64', 'float32', 'int64')]
+            model, metrics = tft_trainer.train(
+                X, feature_cols=feature_cols, label_col="label",
+                epochs=30, batch_size=32, learning_rate=1e-3,
+                validation_split=0.2, patience=6)
+            return model
+        except Exception as e:
+            logger.debug(f"TFT train failed for {symbol}: {e}")
+            return None
+
+    def _predict_tft(self, tft_trainer, model, df: pd.DataFrame) -> float | None:
+        """Predict with TFT — returns confidence in [0, 1]."""
+        if len(df) < 100:
+            return None
+        try:
+            from core.strategy.indicators import compute_all
+            from core.ml.features import compute_features as _cf, REQUIRED_INDICATORS
+
+            df_ind = compute_all(df.copy(), REQUIRED_INDICATORS)
+            X = _cf(df_ind, None)
+            result = tft_trainer.predict(model, X)
+            if result is None:
+                return None
+
+            tft_conf = result["confidence"]
+            tft_dir = result["direction"]
+            if tft_dir > 0:
+                return tft_conf
+            else:
+                return 1.0 - tft_conf
+        except Exception as e:
+            logger.debug(f"TFT predict failed: {e}")
             return None
 
     def _detect_market_regime(self, df: pd.DataFrame) -> str:
