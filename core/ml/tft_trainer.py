@@ -102,13 +102,21 @@ class TFTTrainer:
         X = np.stack(X_list, axis=0)
         y = np.array(y_list)
 
-        # Standardize features per window (prevents look-ahead)
-        # We use the statistics of the input window itself
+        # Standardize with expanding-window stats (walk-forward safe).
+        # For each window at position i, use mean/std of all data [0 : i+seq_len].
+        # This preserves trend info — model can see if current value is high/low
+        # relative to history, not just relative to the last 100 bars.
         for feat in range(X.shape[2]):
-            feat_data = X[:, :, feat]
-            f_mean = feat_data.mean(axis=1, keepdims=True)
-            f_std = feat_data.std(axis=1, keepdims=True) + 1e-8
-            X[:, :, feat] = (feat_data - f_mean) / f_std
+            feat_data = data[:num_samples + self.seq_len, feat]
+            cumsum = np.cumsum(feat_data)
+            cumsum2 = np.cumsum(feat_data ** 2)
+            for i in range(num_samples):
+                end = i + self.seq_len  # last index in this window
+                n = end + 1
+                f_mean = cumsum[end] / n
+                f_var = cumsum2[end] / n - f_mean ** 2
+                f_std = np.sqrt(max(f_var, 1e-10)) + 1e-8
+                X[i, :, feat] = (X[i, :, feat] - f_mean) / f_std
 
         return torch.tensor(X), torch.tensor(y)
 
@@ -117,11 +125,11 @@ class TFTTrainer:
     def train(self, df: pd.DataFrame,
               feature_cols: list[str] | None = None,
               label_col: str = "label",
-              epochs: int = 50,
+              epochs: int = 80,
               batch_size: int = 64,
               learning_rate: float = 1e-3,
               validation_split: float = 0.2,
-              patience: int = 10) -> tuple[Optional[TFTModel], dict]:
+              patience: int = 20) -> tuple[Optional[TFTModel], dict]:
         """Train a TFT model on *df*.
 
         Returns (model, metrics_dict).

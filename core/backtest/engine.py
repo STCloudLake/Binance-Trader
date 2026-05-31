@@ -144,8 +144,8 @@ class BacktestEngine:
             from core.ml.tft_trainer import TFTTrainer as _TFTTrainer
             tft_trainer = _TFTTrainer(
                 data_dir=str(self.config.data_dir),
-                seq_len=100, d_model=64, num_heads=4,
-                lstm_layers=2, dropout=0.2)
+                seq_len=100, d_model=96, num_heads=4,
+                lstm_layers=3, dropout=0.2)
 
         # ── Skip training: preload cached models from disk ──
         if skip_ml_training:
@@ -885,8 +885,8 @@ class BacktestEngine:
                           and X[c].dtype in ('float64', 'float32', 'int64')]
             model, metrics = tft_trainer.train(
                 X, feature_cols=feature_cols, label_col="label",
-                epochs=30, batch_size=32, learning_rate=1e-3,
-                validation_split=0.2, patience=6)
+                epochs=60, batch_size=64, learning_rate=1e-3,
+                validation_split=0.2, patience=15)
             return model
         except Exception as e:
             logger.debug(f"TFT train failed for {symbol}: {e}")
