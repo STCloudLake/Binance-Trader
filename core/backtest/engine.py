@@ -676,60 +676,32 @@ class BacktestEngine:
 
     # ---- ML Helpers ----
 
-    # Indicator config used for ML feature computation
+    # Indicator config used for ML feature computation (imported from features.py)
+    # Kept as instance attribute for consistent access
     _ML_INDICATORS = {
-        "rsi": {"period": 14},
+        "rsi": {"period": 14, "source": "close"},
         "macd": {"fast": 12, "slow": 26, "signal": 9},
         "bollinger": {"period": 20, "stddev": 2},
         "adx": {"period": 14},
     }
-    _ML_FEATURE_NAMES = [
-        "rsi", "macd_histogram", "bollinger_width",
-        "volume_ratio", "price_momentum_24h", "adx",
-    ]
 
     def _compute_ml_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Compute indicators then extract ML feature columns.
+        """Compute the full 30-dim feature set for ML.
 
-        Builds a richer feature set including multi-period returns and volatility.
+        Uses the shared compute_features() from core.ml.features.
         """
         from core.strategy.indicators import compute_all
-        from core.ml.features import build_features
+        from core.ml.features import compute_features as _compute_features
 
         df_ind = compute_all(df.copy(), self._ML_INDICATORS)
-        feature_df = build_features(df_ind, self._ML_FEATURE_NAMES)
-        if len(df_ind) > 5:
-            close = df_ind["close"]
-            # Multi-period returns
-            feature_df["ret_1"] = close.pct_change(1)
-            feature_df["ret_5"] = close.pct_change(5)
-            feature_df["ret_20"] = close.pct_change(20)
-            # Volatility
-            rets = feature_df["ret_1"]
-            feature_df["vol_10"] = rets.rolling(10).std()
-            feature_df["vol_20"] = rets.rolling(20).std()
-            # Volume features
-            if "volume" in df_ind.columns:
-                vol = df_ind["volume"]
-                feature_df["vol_chg_5"] = vol.pct_change(5)
-                feature_df["vol_chg_20"] = vol.pct_change(20)
-            # Price position relative to recent range
-            feature_df["pos_20"] = (close - close.rolling(20).min()) / (
-                close.rolling(20).max() - close.rolling(20).min() + 1e-9)
-            # Trend strength: close vs multiple EMAs
-            ema20 = close.ewm(span=20, adjust=False).mean()
-            ema50 = close.ewm(span=50, adjust=False).mean()
-            feature_df["ema20_dist"] = (close - ema20) / (ema20 + 1e-9)
-            feature_df["ema50_dist"] = (close - ema50) / (ema50 + 1e-9)
-        feature_df = feature_df.replace([np.inf, -np.inf], np.nan)
-        feature_df = feature_df.ffill().fillna(0)
-        return feature_df
+        return _compute_features(df_ind, None)  # None = all default features
 
     def _train_ml_model(self, df: pd.DataFrame, tf_params: dict = None):
-        """Train an XGBoost classifier with timeframe-appropriate labels.
+        """Train a LightGBM classifier (XGBoost fallback) with timeframe-appropriate labels.
 
         Each strategy's primary timeframe gets its own model with matched
         forward_periods and threshold (e.g., 1m→20 periods, 1h→4 periods).
+        Tries LightGBM first; falls back to XGBoost if LightGBM is unavailable.
         """
         if tf_params is None:
             tf_params = {"forward": 4, "threshold": 0.005, "min_candles": 100}
@@ -739,7 +711,6 @@ class BacktestEngine:
             return None
         try:
             from core.ml.features import create_binary_label
-            import xgboost as xgb
 
             feature_df = self._compute_ml_features(df)
             labels = create_binary_label(
@@ -754,11 +725,29 @@ class BacktestEngine:
 
             n_up = int(y.sum())
             n_down = len(y) - n_up
+            scale_pos_weight = max(1.0, n_down / max(n_up, 1))
 
+            # Try LightGBM first (faster, often more accurate)
+            try:
+                import lightgbm as lgb
+                model = lgb.LGBMClassifier(
+                    n_estimators=150, max_depth=6, learning_rate=0.05,
+                    subsample=0.8, colsample_bytree=0.8,
+                    scale_pos_weight=scale_pos_weight,
+                    min_child_samples=20,
+                    reg_alpha=0.1, reg_lambda=0.1,
+                    verbosity=-1, random_state=42)
+                model.fit(X, y)
+                return model
+            except ImportError:
+                pass
+
+            # XGBoost fallback
+            import xgboost as xgb
             model = xgb.XGBClassifier(
                 n_estimators=100, max_depth=5, learning_rate=0.05,
                 subsample=0.8, colsample_bytree=0.8,
-                scale_pos_weight=max(1.0, n_down / max(n_up, 1)),
+                scale_pos_weight=scale_pos_weight,
                 eval_metric='logloss', verbosity=0, random_state=42)
             model.fit(X, y)
             return model
@@ -770,7 +759,9 @@ class BacktestEngine:
         """Predict probability(price up >= 0.5%) using the trained model.
 
         Returns confidence in [0,1] or None if data is insufficient.
-        If the model is too uncertain (0.4–0.6), returns 0.5 (neutral).
+        If the model is too uncertain (0.38–0.62), returns 0.5 (neutral).
+        The wider neutral band reflects the 30-dim feature set's higher
+        dimensionality.
         """
         if len(df) < 50:
             return None
@@ -783,7 +774,7 @@ class BacktestEngine:
             if proba.shape[1] >= 2:
                 conf = float(proba[0][1])
                 # Shrink toward 0.5 if model is uncertain
-                if 0.40 <= conf <= 0.60:
+                if 0.38 <= conf <= 0.62:
                     return 0.5  # neutral — model doesn't know
                 return conf
             return 0.5
