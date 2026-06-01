@@ -139,13 +139,16 @@ class BacktestEngine:
 
         # TFT state (only when ml_engine == 'tft')
         tft_trainer = None
-        tft_feature_cache: dict[str, pd.DataFrame] = {}  # sym -> feature df with label
         if ml_engine == "tft":
-            from core.ml.tft_trainer import TFTTrainer as _TFTTrainer
-            tft_trainer = _TFTTrainer(
-                data_dir=str(self.config.data_dir),
-                seq_len=100, d_model=96, num_heads=4,
-                lstm_layers=3, dropout=0.2)
+            try:
+                from core.ml.tft_trainer import TFTTrainer as _TFTTrainer
+                tft_trainer = _TFTTrainer(
+                    data_dir=str(self.config.data_dir),
+                    seq_len=100, d_model=96, num_heads=4,
+                    lstm_layers=3, dropout=0.2)
+            except Exception as e:
+                logger.warning(f"TFT unavailable, falling back to LightGBM: {e}")
+                ml_engine = "lightgbm"
 
         # ── Skip training: preload cached models from disk ──
         if skip_ml_training:
@@ -226,6 +229,12 @@ class BacktestEngine:
             "1h":  {"forward": 4,  "threshold": 0.005, "min_candles": 100},
             "2h":  {"forward": 4,  "threshold": 0.006, "min_candles": 80},
             "4h":  {"forward": 4,  "threshold": 0.008, "min_candles": 60},
+            "6h":  {"forward": 4,  "threshold": 0.010, "min_candles": 50},
+            "8h":  {"forward": 4,  "threshold": 0.012, "min_candles": 40},
+            "12h": {"forward": 4,  "threshold": 0.015, "min_candles": 30},
+            "1d":  {"forward": 4,  "threshold": 0.020, "min_candles": 25},
+            "3d":  {"forward": 4,  "threshold": 0.030, "min_candles": 20},
+            "1w":  {"forward": 4,  "threshold": 0.050, "min_candles": 15},
         }
 
         # Position sizing
@@ -339,7 +348,7 @@ class BacktestEngine:
 
                     # ── TFT path ──
                     if ml_engine == "tft" and tft_trainer is not None:
-                        if counter >= ml_retrain_interval or key not in ml_models:
+                        if not skip_ml_training and (counter >= ml_retrain_interval or key not in ml_models):
                             sliced = df_tf[df_tf.index <= ts]
                             if len(sliced) >= 150:
                                 model = self._train_tft_model(
@@ -372,7 +381,7 @@ class BacktestEngine:
 
                     # ── LightGBM path ──
                     else:
-                        if counter >= ml_retrain_interval or key not in ml_models:
+                        if not skip_ml_training and (counter >= ml_retrain_interval or key not in ml_models):
                             sliced = df_tf[df_tf.index <= ts]
                             model = self._train_ml_model(sliced, tf_params)
                             if model is not None:

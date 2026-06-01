@@ -158,6 +158,7 @@ class TFTTrainer:
             optimizer, mode='min', factor=0.5, patience=5)
 
         best_val_loss = float('inf')
+        best_val_acc = 0.0
         best_state = None
         patience_counter = 0
 
@@ -165,7 +166,7 @@ class TFTTrainer:
         val_dataset = torch.utils.data.TensorDataset(X_val, y_val)
 
         train_loader = torch.utils.data.DataLoader(
-            train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+            train_dataset, batch_size=batch_size, shuffle=False, drop_last=True)
         val_loader = torch.utils.data.DataLoader(
             val_dataset, batch_size=batch_size * 2, shuffle=False)
 
@@ -214,6 +215,7 @@ class TFTTrainer:
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                best_val_acc = val_acc
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 patience_counter = 0
             else:
@@ -233,7 +235,7 @@ class TFTTrainer:
 
         metrics = {
             "val_loss": best_val_loss,
-            "val_accuracy": val_acc,
+            "val_accuracy": best_val_acc,
             "epochs_trained": epoch + 1,
             "num_sequences": len(X),
             "num_features": num_features,
@@ -273,10 +275,12 @@ class TFTTrainer:
 
         data = recent[feature_cols].values.astype(np.float32)
 
-        # Standardize using this window's statistics
+        # Standardize using expanding-window statistics from ALL available history
+        # (consistent with training normalization in prepare_sequences)
+        full_data = df[feature_cols].values.astype(np.float32)
         for feat in range(data.shape[1]):
-            f_mean = data[:, feat].mean()
-            f_std = data[:, feat].std() + 1e-8
+            f_mean = full_data[:, feat].mean()
+            f_std = full_data[:, feat].std() + 1e-8
             data[:, feat] = (data[:, feat] - f_mean) / f_std
 
         X = torch.tensor(data).unsqueeze(0).to(self.device)  # (1, seq, features)

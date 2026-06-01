@@ -192,6 +192,9 @@ class TFTModel(nn.Module):
         self.num_features = num_features
         self.seq_len = seq_len
         self.d_model = d_model
+        self.num_heads = num_heads
+        self.lstm_layers = lstm_layers
+        self.dropout = dropout
         self.quantiles = quantiles or [0.1, 0.5, 0.9]
         self.num_quantiles = len(self.quantiles)
 

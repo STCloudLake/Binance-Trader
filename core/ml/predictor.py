@@ -71,7 +71,7 @@ class MLPredictor:
         from loguru import logger
         await asyncio.sleep(300)
         while self._running:
-            for symbol in self.market_data._watched_symbols:
+            for symbol in self.market_data.watched_symbols:
                 try:
                     if self._model_type == 'tft':
                         await self.train_tft_model(symbol, "periodic", "1h")
@@ -187,7 +187,7 @@ class MLPredictor:
 
         # TFT uses regression labels (forward return %)
         y = create_regression_label(df, forward_periods=4)
-        X["label"] = y.values
+        X["label"] = y  # use pandas index alignment (safer than .values)
 
         tft = self._get_tft_trainer()
         model, metrics = tft.train(

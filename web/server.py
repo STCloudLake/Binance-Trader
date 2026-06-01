@@ -1714,6 +1714,13 @@ Return ONLY valid JSON in this exact format:
             except Exception:
                 pass
 
+        # Cleanup old completed runs (> 1 hour ago) to prevent memory leak
+        _now = time.time()
+        for rid in list(_bt_runs.keys()):
+            r = _bt_runs[rid]
+            if r.get("done") and _now - r.get("started", 0) > 3600:
+                _bt_runs.pop(rid, None)
+
         run_id = _uuid.uuid4().hex[:12]
         _bt_runs[run_id] = {
             "progress": 0, "total": 0, "done": False,
@@ -1769,13 +1776,24 @@ Return ONLY valid JSON in this exact format:
 
     @app.get("/partials/backtest-active")
     async def backtest_active(request: Request):
-        """Check cookie for active backtest and return progress bar if running."""
+        """Check for active backtest and return progress bar if running.
+
+        First checks the bt_active_run cookie, then falls back to any
+        non-done run (recovers from browser sleep / page refresh).
+        """
         run_id = request.cookies.get("bt_active_run", "")
-        if not run_id or run_id not in _bt_runs:
-            return HTMLResponse("")  # no active run, return empty
+        if not run_id or run_id not in _bt_runs or _bt_runs[run_id].get("done"):
+            # Cookie lost or run done — find any active run
+            active = [(rid, r) for rid, r in _bt_runs.items() if not r.get("done")]
+            if active:
+                run_id = active[0][0]
+            else:
+                return HTMLResponse("")
+
         run = _bt_runs[run_id]
         if run.get("done"):
-            return HTMLResponse("")  # already finished
+            return HTMLResponse("")
+
         total = run.get("total", 100)
         current = run.get("progress", 0)
         pct = round(current / max(total, 1) * 100, 1)
@@ -1783,8 +1801,35 @@ Return ONLY valid JSON in this exact format:
             "request": None, "run_id": run_id,
             "date_start": run.get("date_start", ""),
             "date_end": run.get("date_end", ""),
+            "strategies": run.get("strategies", ""),
+            "symbols": run.get("symbols", ""),
+            "ml_engine": run.get("ml_engine", ""),
+            "device": run.get("device", ""),
+            "skip_training": run.get("skip_training", False),
             "initial_pct": pct,
         })
+
+    @app.get("/api/backtest/running")
+    async def backtest_running():
+        """Return list of active backtest runs (for recovery after sleep)."""
+        active = []
+        for rid, run in _bt_runs.items():
+            if not run.get("done"):
+                total = run.get("total", 0)
+                current = run.get("progress", 0)
+                active.append({
+                    "run_id": rid,
+                    "date_start": run.get("date_start", ""),
+                    "date_end": run.get("date_end", ""),
+                    "strategies": run.get("strategies", ""),
+                    "symbols": run.get("symbols", ""),
+                    "ml_engine": run.get("ml_engine", ""),
+                    "device": run.get("device", ""),
+                    "progress": current,
+                    "total": total,
+                    "pct": round(current / max(total, 1) * 100, 1),
+                })
+        return active
 
     @app.get("/api/backtest/progress/{run_id}")
     async def backtest_progress(run_id: str):
