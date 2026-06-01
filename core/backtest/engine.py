@@ -188,17 +188,32 @@ class BacktestEngine:
                         _indicator_cache[cache_key] = compute_all(df_full.copy(), strategy.indicators)
 
         def _get_cached_df(sym: str, interval: str, indicators: dict, ts) -> pd.DataFrame | None:
-            """Return indicator DataFrame sliced to ≤ ts, from cache if possible."""
+            """Return indicator DataFrame sliced to ≤ ts, from cache if possible.
+
+            Uses iloc for O(log n) lookup instead of boolean indexing (O(n)).
+            """
             config_hash = _json.dumps(indicators, sort_keys=True, ensure_ascii=True)
             cached = _indicator_cache.get((config_hash, sym, interval))
             if cached is not None:
-                return cached[cached.index <= ts]
+                try:
+                    pos = cached.index.get_loc(ts)
+                    if isinstance(pos, slice):
+                        pos = pos.stop - 1
+                    return cached.iloc[:pos + 1]
+                except KeyError:
+                    # ts not exactly in index — fall through to boolean
+                    return cached[cached.index <= ts]
             # Fallback: compute on the fly
             df = feeder.get_all_data_for_symbol(sym, interval)
             if len(df) < 20:
                 return None
-            df = df[df.index <= ts].copy()
-            return compute_all(df, indicators)
+            try:
+                pos = df.index.get_loc(ts)
+                if isinstance(pos, slice):
+                    pos = pos.stop - 1
+                return compute_all(df.iloc[:pos + 1], indicators)
+            except KeyError:
+                return compute_all(df[df.index <= ts], indicators)
 
         # Per-timeframe ML parameters: forward_periods and threshold
         # Shorter TFs need more lookahead periods to capture a meaningful move
@@ -870,11 +885,20 @@ class BacktestEngine:
     # ── TFT helpers ──────────────────────────────────────────────────
 
     def _train_tft_model(self, tft_trainer, df: pd.DataFrame, symbol: str,
-                         interval: str):
-        """Train a TFT model on sliced DataFrame (walk-forward safe)."""
+                         interval: str, max_train_rows: int = 5000):
+        """Train a TFT model on sliced DataFrame (walk-forward safe).
+
+        Caps training data to *max_train_rows* most recent candles so that
+        retrain time stays constant regardless of how far the backtest has
+        progressed.
+        """
         try:
             from core.strategy.indicators import compute_all
             from core.ml.features import compute_features as _cf, create_regression_label, REQUIRED_INDICATORS
+
+            # Cap to recent data to keep training time constant
+            if len(df) > max_train_rows:
+                df = df.iloc[-max_train_rows:]
 
             df_ind = compute_all(df.copy(), REQUIRED_INDICATORS)
             X = _cf(df_ind, None)
