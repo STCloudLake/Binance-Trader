@@ -365,6 +365,13 @@ function loadGAPanel() {
     if (title) title.textContent = '— GA {{ _("策略进化") }}';
     fetch('/partials/ga-panel').then(function(r) { return r.text(); }).then(function(html) {
         document.getElementById('editor-form').innerHTML = html;
+        // Execute scripts — innerHTML doesn't run <script> tags
+        var scripts = document.getElementById('editor-form').querySelectorAll('script');
+        scripts.forEach(function(s) {
+            var newScript = document.createElement('script');
+            newScript.textContent = s.textContent;
+            document.body.appendChild(newScript);
+        });
     });
 }
 </script>
