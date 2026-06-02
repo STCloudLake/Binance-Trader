@@ -2,16 +2,16 @@
     <h3 class="text-lg mb-3">{{ _("Genetic Algorithm Strategy Evolution") }}</h3>
 
     <!-- Config -->
-    <div class="mb-4 space-y-2">
+    <div class="mb-4 space-y-2" id="ga-config-section">
         <div class="grid grid-cols-4 gap-3">
             <div>
                 <label class="text-sm text-slate-400">Population</label>
-                <input type="number" id="ga-pop-size" value="60" min="20" max="120"
+                <input type="number" id="ga-pop-size" value="30" min="10" max="100"
                        class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-white text-sm">
             </div>
             <div>
                 <label class="text-sm text-slate-400">Generations</label>
-                <input type="number" id="ga-generations" value="20" min="5" max="50"
+                <input type="number" id="ga-generations" value="15" min="3" max="50"
                        class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-white text-sm">
             </div>
             <div>
@@ -26,120 +26,200 @@
             </div>
         </div>
 
-        <div class="flex gap-2">
+        <div class="flex gap-2 mt-2">
             <button onclick="startGA()" id="ga-start-btn"
                     class="bg-emerald-600 hover:bg-emerald-500 text-white px-6 py-2 rounded text-sm font-bold">
-                Start Evolution
+                {{ _("Start Evolution") }}
             </button>
             <button onclick="stopGA()" id="ga-stop-btn"
                     class="bg-red-600 hover:bg-red-500 text-white px-6 py-2 rounded text-sm font-bold hidden">
-                Stop
+                {{ _("Stop") }}
             </button>
             <span id="ga-status-text" class="text-sm text-slate-400 self-center"></span>
         </div>
     </div>
 
-    <!-- Progress -->
+    <!-- Error -->
+    <div id="ga-error" class="hidden bg-red-900/30 border border-red-600 rounded p-3 text-red-400 text-sm mb-3"></div>
+
+    <!-- Progress (hidden until started) -->
     <div id="ga-progress" class="hidden mb-4">
         <div class="flex justify-between text-xs text-slate-400 mb-1">
-            <span id="ga-gen-text">Generation 0/0</span>
-            <span id="ga-fit-text">Best Fitness: -</span>
+            <span id="ga-phase-text">{{ _("Initializing population...") }}</span>
+            <span id="ga-step-text">0 / 0</span>
         </div>
-        <div class="w-full bg-slate-700 rounded-full h-3 mb-2">
-            <div id="ga-progress-fill" class="bg-emerald-500 h-3 rounded-full transition-all" style="width:0%"></div>
+        <div class="w-full bg-slate-700 rounded-full h-4 mb-2 overflow-hidden">
+            <div id="ga-progress-fill" class="bg-emerald-500 h-4 rounded-full transition-all duration-500" style="width:0%"></div>
         </div>
-        <div class="grid grid-cols-3 gap-2 text-xs text-slate-400">
+        <div class="grid grid-cols-4 gap-2 text-xs text-slate-400">
+            <span>{{ _("Generation") }}: <strong id="ga-gen" class="text-slate-300">-</strong></span>
+            <span>{{ _("Best Fitness") }}: <strong id="ga-fitness" class="text-emerald-400">-</strong></span>
             <span>Sharpe: <strong id="ga-sharpe" class="text-slate-300">-</strong></span>
             <span>Win Rate: <strong id="ga-winrate" class="text-slate-300">-</strong></span>
+        </div>
+        <div class="grid grid-cols-4 gap-2 text-xs text-slate-400 mt-1">
             <span>Trades: <strong id="ga-trades" class="text-slate-300">-</strong></span>
+            <span>{{ _("Avg Fitness") }}: <strong id="ga-avg-fit" class="text-slate-300">-</strong></span>
+            <span>{{ _("Diversity") }}: <strong id="ga-diversity" class="text-slate-300">-</strong></span>
+            <span>{{ _("Elapsed") }}: <strong id="ga-elapsed" class="text-slate-300">-</strong></span>
         </div>
     </div>
 
     <!-- Champion -->
     <div id="ga-champion" class="hidden bg-emerald-900/30 border border-emerald-600 rounded p-4">
-        <h4 class="text-emerald-400 font-bold mb-2">Champion Strategy</h4>
+        <h4 class="text-emerald-400 font-bold mb-2">{{ _("Champion Strategy") }}</h4>
         <div id="ga-champion-info" class="text-sm text-slate-300"></div>
+        <button onclick="loadStrategyFromGA()" class="mt-2 bg-sky-600 hover:bg-sky-500 text-white px-3 py-1 rounded text-xs">
+            {{ _("Load in Editor") }}
+        </button>
     </div>
-
-    <!-- Error -->
-    <div id="ga-error" class="hidden bg-red-900/30 border border-red-600 rounded p-3 text-red-400 text-sm mt-2"></div>
 </div>
 
 <script>
 var _gaPollTimer = null;
+var _gaStartTime = 0;
 
 function startGA() {
     var btn = document.getElementById('ga-start-btn');
+    var errorDiv = document.getElementById('ga-error');
     btn.disabled = true;
-    btn.textContent = 'Starting...';
+    btn.textContent = '{{ _("Starting...") }}';
+    errorDiv.classList.add('hidden');
+
+    _gaStartTime = Date.now();
 
     fetch('/api/ga/evolve', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
+        credentials: 'same-origin',
         body: JSON.stringify({
             symbols: ['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT'],
             date_start: document.getElementById('ga-date-start').value,
             date_end: document.getElementById('ga-date-end').value,
-            population_size: parseInt(document.getElementById('ga-pop-size').value),
-            generations: parseInt(document.getElementById('ga-generations').value),
+            population_size: parseInt(document.getElementById('ga-pop-size').value) || 30,
+            generations: parseInt(document.getElementById('ga-generations').value) || 15,
+            seed_strategies: ['mean_reversion_rsi_bollinger_bands'],
         })
-    }).then(function(r) { return r.json(); }).then(function(data) {
+    }).then(function(r) {
+        if (!r.ok) {
+            return r.json().then(function(d) { throw new Error(d.error || 'HTTP ' + r.status); });
+        }
+        return r.json();
+    }).then(function(data) {
         if (data.ok) {
             document.getElementById('ga-start-btn').classList.add('hidden');
             document.getElementById('ga-stop-btn').classList.remove('hidden');
             document.getElementById('ga-progress').classList.remove('hidden');
-            document.getElementById('ga-error').classList.add('hidden');
-            _gaPollTimer = setInterval(pollGAStatus, 3000);
+            document.getElementById('ga-champion').classList.add('hidden');
+            document.getElementById('ga-phase-text').textContent = '{{ _("Evaluating generation 1...") }}';
+            _gaPollTimer = setInterval(pollGAStatus, 2000);
             pollGAStatus();
         } else {
-            document.getElementById('ga-error').classList.remove('hidden');
-            document.getElementById('ga-error').textContent = 'Error: ' + (data.error || 'unknown');
+            showError(data.error || '{{ _("Unknown error") }}');
             btn.disabled = false;
-            btn.textContent = 'Start Evolution';
+            btn.textContent = '{{ _("Start Evolution") }}';
         }
+    }).catch(function(err) {
+        showError(err.message || '{{ _("Connection failed") }}');
+        btn.disabled = false;
+        btn.textContent = '{{ _("Start Evolution") }}';
     });
+}
+
+function showError(msg) {
+    var errorDiv = document.getElementById('ga-error');
+    errorDiv.classList.remove('hidden');
+    errorDiv.textContent = '{{ _("Error") }}: ' + msg;
 }
 
 function stopGA() {
-    fetch('/api/ga/stop', {method: 'POST'}).then(function() {
-        clearInterval(_gaPollTimer);
-        document.getElementById('ga-start-btn').classList.remove('hidden');
-        document.getElementById('ga-start-btn').disabled = false;
-        document.getElementById('ga-start-btn').textContent = 'Start Evolution';
-        document.getElementById('ga-stop-btn').classList.add('hidden');
-        document.getElementById('ga-status-text').textContent = 'Stopped';
-    });
+    fetch('/api/ga/stop', {method: 'POST', credentials: 'same-origin'}).then(function() {
+        resetUI();
+        document.getElementById('ga-status-text').textContent = '{{ _("Stopped") }}';
+    }).catch(function() { resetUI(); });
+}
+
+function resetUI() {
+    clearInterval(_gaPollTimer);
+    document.getElementById('ga-start-btn').classList.remove('hidden');
+    document.getElementById('ga-start-btn').disabled = false;
+    document.getElementById('ga-start-btn').textContent = '{{ _("Start Evolution") }}';
+    document.getElementById('ga-stop-btn').classList.add('hidden');
 }
 
 function pollGAStatus() {
-    fetch('/api/ga/status').then(function(r) { return r.json(); }).then(function(s) {
-        if (!s.running && s.generation > 0) {
-            clearInterval(_gaPollTimer);
-            document.getElementById('ga-start-btn').classList.remove('hidden');
-            document.getElementById('ga-start-btn').disabled = false;
-            document.getElementById('ga-start-btn').textContent = 'Start Evolution';
-            document.getElementById('ga-stop-btn').classList.add('hidden');
-            document.getElementById('ga-status-text').textContent = 'Complete';
+    fetch('/api/ga/status', {credentials: 'same-origin'}).then(function(r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+    }).then(function(s) {
+        if (!s || s.error) {
+            showError(s && s.error ? s.error : '{{ _("No data") }}');
+            resetUI();
+            return;
         }
 
-        var pct = s.total_generations > 0 ? Math.round(s.generation / s.total_generations * 100) : 0;
+        var running = s.running;
+        var gen = s.generation || 0;
+        var total = s.total_generations || 1;
+        var pct = total > 0 ? Math.round(gen / total * 100) : 0;
+
+        // Update progress bar
         document.getElementById('ga-progress-fill').style.width = pct + '%';
-        document.getElementById('ga-gen-text').textContent = 'Generation ' + s.generation + '/' + s.total_generations;
-        document.getElementById('ga-fit-text').textContent = 'Best Fitness: ' + (s.best_fitness || 0).toFixed(2);
+        document.getElementById('ga-gen').textContent = gen + ' / ' + total;
+
+        if (running) {
+            document.getElementById('ga-phase-text').textContent =
+                '{{ _("Evolving...") }} ' + '{{ _("Generation") }} ' + gen + '/' + total;
+        } else if (gen > 0) {
+            document.getElementById('ga-phase-text').textContent = '{{ _("Complete") }}';
+            document.getElementById('ga-status-text').textContent = '{{ _("Evolution finished") }}';
+            clearInterval(_gaPollTimer);
+            resetUI();
+        } else {
+            document.getElementById('ga-phase-text').textContent = '{{ _("Initializing population...") }}';
+        }
+
+        document.getElementById('ga-step-text').textContent =
+            '{{ _("Gen") }} ' + gen + ' / ' + total + ' (' + pct + '%)';
+        document.getElementById('ga-fitness').textContent = (s.best_fitness || 0).toFixed(2);
         document.getElementById('ga-sharpe').textContent = (s.best_sharpe || 0).toFixed(2);
         document.getElementById('ga-winrate').textContent = (s.best_win_rate || 0).toFixed(1) + '%';
-        document.getElementById('ga-trades').textContent = s.best_trades || 0;
+        document.getElementById('ga-trades').textContent = s.best_trades || '-';
+        document.getElementById('ga-avg-fit').textContent =
+            s.history && s.history.length > 0 ? (s.history[s.history.length-1].avg_fitness || 0).toFixed(2) : '-';
+        document.getElementById('ga-diversity').textContent =
+            s.history && s.history.length > 0 ? (s.history[s.history.length-1].population_diversity || 0).toFixed(3) : '-';
+
+        var elapsed = Math.round((Date.now() - _gaStartTime) / 1000);
+        var mins = Math.floor(elapsed / 60);
+        var secs = elapsed % 60;
+        document.getElementById('ga-elapsed').textContent = mins + 'm ' + secs + 's';
 
         if (s.champion_name) {
             document.getElementById('ga-champion').classList.remove('hidden');
-            document.getElementById('ga-champion-info').textContent =
-                s.champion_name + ' | Fitness: ' + (s.best_fitness || 0).toFixed(2) +
-                ' | Sharpe: ' + (s.best_sharpe || 0).toFixed(2);
+            document.getElementById('ga-champion-info').innerHTML =
+                '<strong>' + s.champion_name + '</strong><br>' +
+                'Fitness: ' + (s.best_fitness || 0).toFixed(2) +
+                ' | Sharpe: ' + (s.best_sharpe || 0).toFixed(2) +
+                ' | Win Rate: ' + (s.best_win_rate || 0).toFixed(1) + '%' +
+                ' | Trades: ' + (s.best_trades || 0);
         }
 
         if (s.error) {
-            document.getElementById('ga-error').classList.remove('hidden');
-            document.getElementById('ga-error').textContent = s.error;
+            showError(s.error);
+            resetUI();
+        }
+    }).catch(function(err) {
+        // Polling failed silently - will retry on next interval
+        console.log('GA poll error:', err);
+    });
+}
+
+function loadStrategyFromGA() {
+    fetch('/api/ga/status', {credentials: 'same-origin'}).then(function(r) { return r.json(); }).then(function(s) {
+        if (s.champion_name) {
+            // Reload strategy list and open editor
+            location.reload();
         }
     });
 }
