@@ -50,6 +50,12 @@ class GAStrategyEvolver:
         self.engine = engine
         self.loader = loader
         self.config = config or GARunConfig()
+
+        # Isolated loader for GA temp strategies — never touches strategies/
+        _ga_dir = Path(loader.strategies_dir).parent / "data" / "ga_strategies"
+        _ga_dir.mkdir(parents=True, exist_ok=True)
+        self.ga_loader = StrategyLoader(str(_ga_dir))
+
         self._population: list[dict] = []
         self._generation = 0
         self._best_fitness = -999
@@ -57,7 +63,7 @@ class GAStrategyEvolver:
         self._stagnation_count = 0
         self._history: list[dict] = []
         self._running = False
-        self._stop_after_gen = False  # graceful stop flag
+        self._stop_after_gen = False
         self._progress_callback = None
         self._checkpoint_path = Path(loader.strategies_dir).parent / "data" / "ga_checkpoint.pkl"
 
@@ -140,6 +146,7 @@ class GAStrategyEvolver:
             self._population = evaluate_population_batch(
                 self._population, symbols, date_start, train_end,
                 self.engine, self.loader,
+                ga_loader=self.ga_loader,
                 batch_size=min(cfg.population_size, 15),
                 progress_callback=lambda c, t: self._report_progress(self._generation or 1, c, t))
 
@@ -212,6 +219,7 @@ class GAStrategyEvolver:
         if self._best_chromosome:
             champion_config = chromosome_to_strategy(self._best_chromosome)
             champion_config.name = f"ga_champion_{int(time.time())}"
+            # Save champion to MAIN strategies dir (not temp)
             self.loader.save(champion_config)
 
             train_result = self._best_chromosome.get("fitness_result", {})
@@ -225,7 +233,8 @@ class GAStrategyEvolver:
                 val_result = evaluate_chromosome(
                     self._best_chromosome, symbols,
                     validation_start, date_end,
-                    self.engine, self.loader)
+                    self.engine, self.loader,
+                    ga_loader=self.ga_loader)
                 validation = {
                     "sharpe": val_result.get("sharpe", 0),
                     "win_rate": val_result.get("win_rate", 0),

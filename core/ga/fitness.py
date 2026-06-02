@@ -16,12 +16,17 @@ def evaluate_chromosome(
     date_end: str,
     engine,
     loader: StrategyLoader,
+    ga_loader: StrategyLoader | None = None,
     initial_balance: float = 10000.0,
 ) -> dict:
     """Evaluate a single chromosome via backtest.
 
+    Uses *ga_loader* (isolated temp dir) to save/load strategy files
+    so GA never touches the main strategies/ directory.
+
     Returns a dict with fitness components.
     """
+    save_loader = ga_loader or loader
     try:
         config = chromosome_to_strategy(chromosome)
         # Disable ML during GA fitness eval — 3-5x faster, avoids
@@ -29,7 +34,7 @@ def evaluate_chromosome(
         if config.ml_config:
             config.ml_config.enabled = False
         # Save temporarily so the backtest engine can load it
-        loader.save(config)
+        save_loader.save(config)
 
         # GA evaluates pure indicator performance — ML adds noise and cost
         # Disable ML during evolution for 3-5x speedup.
@@ -83,7 +88,7 @@ def evaluate_chromosome(
 
         # Cleanup temp strategy file
         try:
-            loader.delete(config.name)
+            save_loader.delete(config.name)
         except Exception:
             pass
 
@@ -192,16 +197,17 @@ def evaluate_population_batch(
     date_end: str,
     engine,
     loader: StrategyLoader,
+    ga_loader: StrategyLoader | None = None,
     batch_size: int = 10,
     initial_balance: float = 10000.0,
     progress_callback=None,
 ) -> list[dict]:
     """Evaluate chromosomes in batched backtests — 4-5x faster than individual.
 
-    Groups chromosomes into batches and runs each batch as a single
-    backtest with per_strategy_isolation=True. All strategies in a batch
-    share one data pass, eliminating redundant I/O and indicator compute.
+    Uses *ga_loader* (isolated temp dir) for strategy files so GA never
+    touches the main strategies/ directory.
     """
+    save_loader = ga_loader or loader
     results = [None] * len(population)
     total = len(population)
     completed = 0
@@ -218,7 +224,7 @@ def evaluate_population_batch(
             if config.ml_config:
                 config.ml_config.enabled = False
             config.name = f"ga_batch_{batch_start + i}_{random.randint(1000,9999)}"
-            loader.save(config)
+            save_loader.save(config)
             batch_names.append(config.name)
 
         # Single backtest for entire batch
@@ -291,7 +297,7 @@ def evaluate_population_batch(
     # Cleanup batch strategy files
     for name in batch_names:
         try:
-            loader.delete(name)
+            save_loader.delete(name)
         except Exception:
             pass
 
