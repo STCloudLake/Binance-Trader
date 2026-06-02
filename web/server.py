@@ -883,6 +883,11 @@ def create_app(config: Config, event_bus: EventBus, auth_manager=None) -> FastAP
                 body["ml_config"] = MLConfig(**ml)
             config = StrategyConfig(**body)
             loader.save(config)
+            # Sync engine so new strategy is immediately available
+            engine = getattr(app.state, "strategy_engine", None)
+            if engine:
+                engine._strategies[config.name] = config
+                engine._purge_stale_cache()
             return JSONResponse({"ok": True, "name": config.name})
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=400)
@@ -903,8 +908,17 @@ def create_app(config: Config, event_bus: EventBus, auth_manager=None) -> FastAP
             config = StrategyConfig(**body)
             # Save new config first; only delete old file if normalized names differ
             loader.save(config)
-            if loader._normalize(new_name) != loader._normalize(name):
+            # Handle rename: delete old file if normalized name changed
+            old_normalized = loader._normalize(name)
+            if loader._normalize(new_name) != old_normalized:
                 loader.delete(name)
+            # Sync engine
+            engine = getattr(app.state, "strategy_engine", None)
+            if engine:
+                if old_normalized != loader._normalize(new_name):
+                    engine._strategies.pop(name, None)  # remove old name
+                engine._strategies[config.name] = config
+                engine._purge_stale_cache()
             return JSONResponse({"ok": True, "name": config.name})
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=400)
@@ -957,6 +971,11 @@ def create_app(config: Config, event_bus: EventBus, auth_manager=None) -> FastAP
             return JSONResponse({"error": "No loader"}, status_code=500)
         try:
             loader.delete(name)
+            # Remove from engine
+            engine = getattr(app.state, "strategy_engine", None)
+            if engine:
+                engine._strategies.pop(name, None)
+                engine._purge_stale_cache()
             return JSONResponse({"ok": True})
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
@@ -1683,7 +1702,9 @@ Return ONLY valid JSON in this exact format:
                            mode: str = Form("full"),
                            initial_balance: float = Form(10000.0),
                            strategy_symbols: str = Form("{}"),
-                           simulate_ai_weights: str = Form("1")):
+                           simulate_ai_weights: str = Form("1"),
+                           ml_engine: str = Form("lightgbm"),
+                           skip_ml_training: str = Form("0")):
         if err := _require_trader(request): return err
         engine = getattr(app.state, "backtest_engine", None)
         if not engine:
@@ -1701,10 +1722,33 @@ Return ONLY valid JSON in this exact format:
         except (json.JSONDecodeError, TypeError):
             pass
 
+        # Detect GPU for display
+        bt_device = "cpu"
+        if ml_engine in ("tft", "patchtst"):
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    _t = torch.zeros(1).cuda()
+                    bt_device = "cuda"
+            except Exception:
+                pass
+
+        # Cleanup old completed runs (> 1 hour ago) to prevent memory leak
+        _now = time.time()
+        for rid in list(_bt_runs.keys()):
+            r = _bt_runs[rid]
+            if r.get("done") and _now - r.get("started", 0) > 3600:
+                _bt_runs.pop(rid, None)
+
         run_id = _uuid.uuid4().hex[:12]
         _bt_runs[run_id] = {
             "progress": 0, "total": 0, "done": False,
             "date_start": date_start, "date_end": date_end,
+            "strategies": strategies,
+            "symbols": symbols,
+            "ml_engine": ml_engine,
+            "device": bt_device,
+            "skip_training": (skip_ml_training == "1"),
             "started": time.time(),
         }
 
@@ -1717,7 +1761,9 @@ Return ONLY valid JSON in this exact format:
                 strategy_list, symbol_list, date_start, date_end,
                 initial_balance, mode, progress_callback=on_progress,
                 strategy_symbols=bt_strategy_symbols,
-                simulate_ai_weights=(simulate_ai_weights == "1"))
+                simulate_ai_weights=(simulate_ai_weights == "1"),
+                ml_engine=ml_engine,
+                skip_ml_training=(skip_ml_training == "1"))
 
         async def _run_bt():
             loop = asyncio.get_event_loop()
@@ -1738,19 +1784,36 @@ Return ONLY valid JSON in this exact format:
         resp = _render("partials/backtest_progress.html", {
             "request": None, "run_id": run_id,
             "date_start": date_start, "date_end": date_end,
+            "strategies": strategies,
+            "symbols": symbols,
+            "ml_engine": ml_engine,
+            "device": bt_device,
+            "skip_training": (skip_ml_training == "1"),
+            "initial_pct": 0,
         })
         resp.set_cookie("bt_active_run", run_id, max_age=3600, httponly=False)
         return resp
 
     @app.get("/partials/backtest-active")
     async def backtest_active(request: Request):
-        """Check cookie for active backtest and return progress bar if running."""
+        """Check for active backtest and return progress bar if running.
+
+        First checks the bt_active_run cookie, then falls back to any
+        non-done run (recovers from browser sleep / page refresh).
+        """
         run_id = request.cookies.get("bt_active_run", "")
-        if not run_id or run_id not in _bt_runs:
-            return HTMLResponse("")  # no active run, return empty
+        if not run_id or run_id not in _bt_runs or _bt_runs[run_id].get("done"):
+            # Cookie lost or run done — find any active run
+            active = [(rid, r) for rid, r in _bt_runs.items() if not r.get("done")]
+            if active:
+                run_id = active[0][0]
+            else:
+                return HTMLResponse("")
+
         run = _bt_runs[run_id]
         if run.get("done"):
-            return HTMLResponse("")  # already finished
+            return HTMLResponse("")
+
         total = run.get("total", 100)
         current = run.get("progress", 0)
         pct = round(current / max(total, 1) * 100, 1)
@@ -1758,8 +1821,35 @@ Return ONLY valid JSON in this exact format:
             "request": None, "run_id": run_id,
             "date_start": run.get("date_start", ""),
             "date_end": run.get("date_end", ""),
+            "strategies": run.get("strategies", ""),
+            "symbols": run.get("symbols", ""),
+            "ml_engine": run.get("ml_engine", ""),
+            "device": run.get("device", ""),
+            "skip_training": run.get("skip_training", False),
             "initial_pct": pct,
         })
+
+    @app.get("/api/backtest/running")
+    async def backtest_running():
+        """Return list of active backtest runs (for recovery after sleep)."""
+        active = []
+        for rid, run in _bt_runs.items():
+            if not run.get("done"):
+                total = run.get("total", 0)
+                current = run.get("progress", 0)
+                active.append({
+                    "run_id": rid,
+                    "date_start": run.get("date_start", ""),
+                    "date_end": run.get("date_end", ""),
+                    "strategies": run.get("strategies", ""),
+                    "symbols": run.get("symbols", ""),
+                    "ml_engine": run.get("ml_engine", ""),
+                    "device": run.get("device", ""),
+                    "progress": current,
+                    "total": total,
+                    "pct": round(current / max(total, 1) * 100, 1),
+                })
+        return active
 
     @app.get("/api/backtest/progress/{run_id}")
     async def backtest_progress(run_id: str):

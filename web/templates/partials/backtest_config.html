@@ -106,6 +106,23 @@
             <label class="text-sm text-slate-400">{{ _("模拟AI动态调整信号权重") }}</label>
         </div>
 
+        <!-- ML engine selector -->
+        <div class="flex items-center gap-3 mb-2">
+            <label class="text-sm text-slate-400">{{ _("ML引擎") }}:</label>
+            <select name="ml_engine" class="bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
+                <option value="lightgbm">LightGBM (树模型, 快)</option>
+                <option value="patchtst">PatchTST Transformer (推荐)</option>
+                <option value="tft">TFT Transformer (序列模型)</option>
+            </select>
+        </div>
+
+        <!-- Skip ML training -->
+        <div class="flex items-center gap-2 mb-2">
+            <input type="checkbox" name="skip_ml_training" value="1" class="accent-emerald-500">
+            <label class="text-sm text-slate-400">{{ _("跳过ML训练，复用缓存模型") }}</label>
+            <span class="text-xs text-slate-500">({{ _("需先完成至少一次回测") }})</span>
+        </div>
+
         <button type="submit" class="bg-sky-600 hover:bg-sky-500 text-white px-6 py-2 rounded text-sm font-bold">
             {{ _("Run Backtest") }}
         </button>
@@ -170,16 +187,28 @@ async function runBacktest(e) {
     fd.append('mode', form.mode.value);
     fd.append('initial_balance', form.initial_balance.value);
     fd.append('simulate_ai_weights', form.simulate_ai_weights?.checked ? '1' : '0');
+    fd.append('ml_engine', form.ml_engine?.value || 'lightgbm');
+    fd.append('skip_ml_training', form.skip_ml_training?.checked ? '1' : '0');
     // Include the backtest-only matrix mapping
     fd.append('strategy_symbols', JSON.stringify(getMatrixMapping()));
 
-    // Show progress bar immediately
+    // Show progress bar immediately (static placeholder before real progress loads)
     document.getElementById('backtest-results').innerHTML = '<div class="card mb-4"><div class="text-slate-400 text-sm">{{ _("Starting backtest...") }}</div><div class="w-full bg-slate-700 rounded-full h-3 mt-2"><div class="bg-sky-500 h-3 rounded-full animate-pulse" style="width:10%"></div></div></div>';
     switchToResults();
 
     var resp = await fetch('/api/backtest/run', { method: 'POST', body: fd });
     var html = await resp.text();
     document.getElementById('backtest-results').innerHTML = html;
+
+    // Execute scripts in the response (innerHTML doesn't run <script> tags)
+    var container = document.getElementById('backtest-results');
+    var scripts = container.querySelectorAll('script');
+    scripts.forEach(function(s) {
+        var newScript = document.createElement('script');
+        newScript.textContent = s.textContent;
+        document.body.appendChild(newScript);
+    });
+
     status.textContent = '';
 }
 </script>

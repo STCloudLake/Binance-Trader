@@ -19,11 +19,7 @@ indicators:
 ml_config:
   confidence_threshold: 0.65
   enabled: true
-  features:
-  - rsi
-  - bollinger_width
-  - volume_ratio
-  - price_momentum_24h
+  features: []
   weight: 0.3
 mode: trend
 name: Mean Reversion RSI + Bollinger Bands

@@ -84,13 +84,17 @@ class BacktestEngine:
                                   initial_balance=10000.0, mode="full",
                                   progress_callback=None,
                                   strategy_symbols: dict[str, list[str]] = None,
-                                  simulate_ai_weights: bool = True):
+                                  simulate_ai_weights: bool = True,
+                                  ml_engine: str = "lightgbm",
+                                  skip_ml_training: bool = False):
         """Full backtest with ML predictions, signal fusion, and risk controls.
 
         Args:
             simulate_ai_weights: If True, adjust signal weights based on detected
                 market regime (mimicking what the live AI market assessment does).
-                Default True so backtest reflects realistic AI-driven weight dynamics.
+            ml_engine: 'lightgbm' (tree), 'tft' (transformer), 'patchtst' (patch-transformer).
+            skip_ml_training: If True, load pre-trained models from disk instead of
+                training. Useful for repeat backtests over the same period.
         """
         t0 = time.time()
 
@@ -129,8 +133,14 @@ class BacktestEngine:
         ml_predictions: dict[str, float] = {}  # "strategy_name|symbol" -> latest confidence
         ml_correct = 0
         ml_total = 0
-        ml_retrain_counter: dict[str, int] = {}
-        ml_retrain_interval = 50
+        # Training cost per retrain: LightGBM ~0.3s, PatchTST ~8s, TFT ~15s
+        # Use longer intervals for expensive models to keep backtest time reasonable.
+        if ml_engine == "tft":
+            ml_retrain_interval = 800
+        elif ml_engine == "patchtst":
+            ml_retrain_interval = 500  # PatchTST is ~2x faster than TFT
+        else:
+            ml_retrain_interval = 100
         market_regime: dict[str, str] = {}
 
         # Per-timeframe ML parameters: forward_periods and threshold
@@ -144,7 +154,135 @@ class BacktestEngine:
             "1h":  {"forward": 4,  "threshold": 0.005, "min_candles": 100},
             "2h":  {"forward": 4,  "threshold": 0.006, "min_candles": 80},
             "4h":  {"forward": 4,  "threshold": 0.008, "min_candles": 60},
+            "6h":  {"forward": 4,  "threshold": 0.010, "min_candles": 50},
+            "8h":  {"forward": 4,  "threshold": 0.012, "min_candles": 40},
+            "12h": {"forward": 4,  "threshold": 0.015, "min_candles": 30},
+            "1d":  {"forward": 4,  "threshold": 0.020, "min_candles": 25},
+            "3d":  {"forward": 4,  "threshold": 0.030, "min_candles": 20},
+            "1w":  {"forward": 4,  "threshold": 0.050, "min_candles": 15},
         }
+
+        # Build round-robin model keys (staggered retraining — 1 model/step)
+        _ml_keys: list[tuple[str, str, str, dict, list[str]]] = []  # (key, sym, tf, params, features)
+        _ml_key_idx: dict[str, int] = {}  # key → index in _ml_keys
+        for strategy in strategy_configs:
+            if not (strategy.ml_config and strategy.ml_config.enabled):
+                continue
+            primary_tf = min(strategy.timeframes, key=_tf_minutes) if strategy.timeframes else "1h"
+            tf_params = _ML_TF_PARAMS.get(primary_tf, _ML_TF_PARAMS["1h"])
+            # Respect per-strategy feature selection: empty = all features
+            ml_features = (strategy.ml_config.features
+                          if (strategy.ml_config and strategy.ml_config.features)
+                          else None)
+            for sym in symbols:
+                key = f"{strategy.name}|{sym}"
+                _ml_key_idx[key] = len(_ml_keys)
+                _ml_keys.append((key, sym, primary_tf, tf_params, ml_features))
+        # Scale interval up if more models than steps in the interval
+        _effective_interval = max(ml_retrain_interval, len(_ml_keys))
+        _ml_retrain_stagger = max(1, _effective_interval // max(len(_ml_keys), 1))
+        if _ml_keys:
+            logger.info(f"ML round-robin: {len(_ml_keys)} models, "
+                       f"retrain 1 every {_ml_retrain_stagger} steps "
+                       f"(= each model every ~{_ml_retrain_stagger * len(_ml_keys)} steps)")
+
+        # TFT state (only when ml_engine == 'tft')
+        tft_trainer = None
+        if ml_engine == "tft":
+            try:
+                from core.ml.tft_trainer import TFTTrainer as _TFTTrainer
+                tft_trainer = _TFTTrainer(
+                    data_dir=str(self.config.data_dir),
+                    seq_len=100, d_model=96, num_heads=4,
+                    lstm_layers=3, dropout=0.2)
+            except Exception as e:
+                logger.warning(f"TFT unavailable, falling back to LightGBM: {e}")
+                ml_engine = "lightgbm"
+
+        # PatchTST state (only when ml_engine == 'patchtst')
+        patchtst_trainer = None
+        if ml_engine == "patchtst":
+            try:
+                from core.ml.patchtst_trainer import PatchTSTTrainer as _PTTrainer
+                patchtst_trainer = _PTTrainer(
+                    data_dir=str(self.config.data_dir),
+                    seq_len=100, patch_len=16, stride=8,
+                    d_model=128, num_heads=8, num_layers=3, dropout=0.15)
+            except Exception as e:
+                logger.warning(f"PatchTST unavailable: {e}")
+                ml_engine = "lightgbm"
+
+        # ── Skip training: preload cached models from disk ──
+        if skip_ml_training:
+            from core.ml.trainer import MLTrainer as _MLTrainer
+            _disk_trainer = _MLTrainer(str(self.config.data_dir))
+            models_dir = Path(self.config.data_dir) / "models"
+            for strategy in strategy_configs:
+                if not (strategy.ml_config and strategy.ml_config.enabled):
+                    continue
+                for sym in symbols:
+                    key = f"{strategy.name}|{sym}"
+                    if ml_engine == "tft" and tft_trainer is not None:
+                        model = tft_trainer.load(sym, strategy.name)
+                        if model is not None:
+                            ml_models[key] = model
+                    elif ml_engine == "patchtst" and patchtst_trainer is not None:
+                        model = patchtst_trainer.load(sym, strategy.name)
+                        if model is not None:
+                            ml_models[key] = model
+                    else:
+                        pkl_path = models_dir / f"{sym}_{strategy.name}_binary.pkl"
+                        if pkl_path.exists():
+                            model = _disk_trainer.load_model(str(pkl_path))
+                            if model is not None:
+                                ml_models[key] = model
+            preloaded = len(ml_models)
+            if preloaded > 0:
+                logger.info(f"Preloaded {preloaded} cached ML models from disk")
+
+        # ── Indicator cache: precompute each unique indicator config once ──
+        # Key: (json_hash_of_indicators, symbol, interval) → full DataFrame
+        # Eliminates ~1.25M compute_all calls (hottest path in the engine).
+        _indicator_cache: dict[tuple[str, str, str], pd.DataFrame] = {}
+        import json as _json
+        for strategy in strategy_configs:
+            config_hash = _json.dumps(strategy.indicators, sort_keys=True, ensure_ascii=True)
+            for sym in symbols:
+                for tf in strategy.timeframes:
+                    cache_key = (config_hash, sym, tf)
+                    if cache_key in _indicator_cache:
+                        continue
+                    df_full = feeder.get_all_data_for_symbol(sym, tf)
+                    if len(df_full) >= 20:
+                        _indicator_cache[cache_key] = compute_all(df_full.copy(), strategy.indicators)
+
+        def _get_cached_df(sym: str, interval: str, indicators: dict, ts) -> pd.DataFrame | None:
+            """Return indicator DataFrame sliced to ≤ ts, from cache if possible.
+
+            Uses iloc for O(log n) lookup instead of boolean indexing (O(n)).
+            """
+            config_hash = _json.dumps(indicators, sort_keys=True, ensure_ascii=True)
+            cached = _indicator_cache.get((config_hash, sym, interval))
+            if cached is not None:
+                try:
+                    pos = cached.index.get_loc(ts)
+                    if isinstance(pos, slice):
+                        pos = pos.stop - 1
+                    return cached.iloc[:pos + 1]
+                except KeyError:
+                    # ts not exactly in index — fall through to boolean
+                    return cached[cached.index <= ts]
+            # Fallback: compute on the fly
+            df = feeder.get_all_data_for_symbol(sym, interval)
+            if len(df) < 20:
+                return None
+            try:
+                pos = df.index.get_loc(ts)
+                if isinstance(pos, slice):
+                    pos = pos.stop - 1
+                return compute_all(df.iloc[:pos + 1], indicators)
+            except KeyError:
+                return compute_all(df[df.index <= ts], indicators)
 
         # Position sizing
         from core.risk.position_sizer import PositionSizer
@@ -247,41 +385,125 @@ class BacktestEngine:
                         continue
 
                     key = f"{strategy.name}|{sym}"
-                    counter = ml_retrain_counter.get(key, 0) + 1
-                    ml_retrain_counter[key] = counter
-                    if counter >= ml_retrain_interval or key not in ml_models:
-                        sliced = df_tf[df_tf.index <= ts]
-                        model = self._train_ml_model(sliced, tf_params)
-                        if model is not None:
-                            ml_models[key] = model
-                        ml_retrain_counter[key] = 0
-                        # Regime detection on 1h for this symbol
-                        if sym not in market_regime:
-                            df_1h = feeder.get_all_data_for_symbol(sym, "1h")
+                    retrain_idx = _ml_key_idx.get(key, 0)
+                    should_retrain = (
+                        not skip_ml_training and
+                        key not in ml_models and
+                        step % _ml_retrain_stagger == retrain_idx % _ml_retrain_stagger and
+                        step > 0
+                    )
+
+                    # Regime detection on 1h for this symbol (once)
+                    if sym not in market_regime:
+                        df_1h = feeder.get_all_data_for_symbol(sym, "1h")
+                        try:
+                            pos_1h = df_1h.index.get_loc(ts)
+                            if isinstance(pos_1h, slice): pos_1h = pos_1h.stop - 1
+                            market_regime[sym] = self._detect_market_regime(df_1h.iloc[:pos_1h + 1])
+                        except KeyError:
                             market_regime[sym] = self._detect_market_regime(df_1h[df_1h.index <= ts])
 
-                    # Predict
-                    model = ml_models.get(key)
-                    if model is not None:
-                        try:
-                            conf = self._predict_ml(model, df_tf[df_tf.index <= ts])
-                            if conf is not None:
-                                ml_predictions[key] = conf
+                    # Fast slice: get_loc is O(log n) vs boolean indexing O(n)
+                    try:
+                        pos_tf = df_tf.index.get_loc(ts)
+                        if isinstance(pos_tf, slice): pos_tf = pos_tf.stop - 1
+                        sliced = df_tf.iloc[:pos_tf + 1]
+                    except KeyError:
+                        sliced = df_tf[df_tf.index <= ts]
 
-                                # Accuracy tracking
-                                fwd = tf_params["forward"]
-                                th = tf_params["threshold"]
-                                future_df = df_tf[df_tf.index > ts]
-                                if len(future_df) >= fwd:
-                                    cur_close = float(df_tf[df_tf.index <= ts].iloc[-1]["close"])
-                                    fut_close = float(future_df.iloc[fwd - 1]["close"])
-                                    ret = (fut_close - cur_close) / cur_close
-                                    if abs(ret) >= th:
-                                        ml_total += 1
-                                        if (ret >= th and conf >= 0.5) or (ret <= -th and conf < 0.5):
-                                            ml_correct += 1
-                        except Exception:
-                            pass
+                    # ── PatchTST path ──
+                    if ml_engine == "patchtst" and patchtst_trainer is not None:
+                        if should_retrain:
+                            if len(sliced) >= 150:
+                                model = self._train_patchtst_model(
+                                    patchtst_trainer, sliced, sym, primary_tf,
+                                    feature_list=strategy.ml_config.features if strategy.ml_config else None)
+                                if model is not None:
+                                    ml_models[key] = model
+
+                        model = ml_models.get(key)
+                        if model is not None:
+                            try:
+                                conf = self._predict_patchtst(
+                                    patchtst_trainer, model, sliced)
+                                if conf is not None:
+                                    ml_predictions[key] = conf
+                                    fwd = tf_params["forward"]
+                                    th = tf_params["threshold"]
+                                    future_df = df_tf[df_tf.index > ts]
+                                    if len(future_df) >= fwd:
+                                        cur_close = float(sliced.iloc[-1]["close"])
+                                        fut_close = float(future_df.iloc[fwd - 1]["close"])
+                                        ret = (fut_close - cur_close) / cur_close
+                                        if abs(ret) >= th:
+                                            ml_total += 1
+                                            if (ret >= th and conf >= 0.5) or (ret <= -th and conf < 0.5):
+                                                ml_correct += 1
+                            except Exception:
+                                pass
+
+                    # ── TFT path ──
+                    elif ml_engine == "tft" and tft_trainer is not None:
+                        if should_retrain:
+                            if len(sliced) >= 150:
+                                model = self._train_tft_model(
+                                    tft_trainer, sliced, sym, primary_tf,
+                                    feature_list=strategy.ml_config.features if strategy.ml_config else None)
+                                if model is not None:
+                                    ml_models[key] = model
+                            # model updated (round-robin)
+
+                        model = ml_models.get(key)
+                        if model is not None:
+                            try:
+                                conf = self._predict_tft(
+                                    tft_trainer, model, sliced)
+                                if conf is not None:
+                                    ml_predictions[key] = conf
+                                    # Accuracy tracking
+                                    fwd = tf_params["forward"]
+                                    th = tf_params["threshold"]
+                                    future_df = df_tf[df_tf.index > ts]
+                                    if len(future_df) >= fwd:
+                                        cur_close = float(sliced.iloc[-1]["close"])
+                                        fut_close = float(future_df.iloc[fwd - 1]["close"])
+                                        ret = (fut_close - cur_close) / cur_close
+                                        if abs(ret) >= th:
+                                            ml_total += 1
+                                            if (ret >= th and conf >= 0.5) or (ret <= -th and conf < 0.5):
+                                                ml_correct += 1
+                            except Exception:
+                                pass
+
+                    # ── LightGBM path ──
+                    else:
+                        if should_retrain:
+                            model = self._train_ml_model(sliced, tf_params)
+                            if model is not None:
+                                ml_models[key] = model
+                            # model updated (round-robin)
+
+                        model = ml_models.get(key)
+                        if model is not None:
+                            try:
+                                conf = self._predict_ml(model, sliced)
+                                if conf is not None:
+                                    ml_predictions[key] = conf
+
+                                    # Accuracy tracking
+                                    fwd = tf_params["forward"]
+                                    th = tf_params["threshold"]
+                                    future_df = df_tf[df_tf.index > ts]
+                                    if len(future_df) >= fwd:
+                                        cur_close = float(sliced.iloc[-1]["close"])
+                                        fut_close = float(future_df.iloc[fwd - 1]["close"])
+                                        ret = (fut_close - cur_close) / cur_close
+                                        if abs(ret) >= th:
+                                            ml_total += 1
+                                            if (ret >= th and conf >= 0.5) or (ret <= -th and conf < 0.5):
+                                                ml_correct += 1
+                            except Exception:
+                                pass
 
             # --- CHECK REDUCE CONDITIONS (partial profit-taking) ---
             # Mirror live engine: reduce fires before full exit, max 4 reduces per position.
@@ -303,17 +525,11 @@ class BacktestEngine:
                         continue
 
                     for interval in strategy.timeframes:
-                        df = feeder.get_all_data_for_symbol(sym, interval)
-                        if len(df) < 50:
-                            continue
-                        df = df[df.index <= ts].copy()
-                        if len(df) < 20:
-                            continue
                         try:
-                            df = compute_all(df, strategy.indicators)
+                            df = _get_cached_df(sym, interval, strategy.indicators, ts)
                         except Exception:
                             continue
-                        if len(df) == 0:
+                        if df is None or len(df) < 20:
                             continue
 
                         for rc in conditions:
@@ -419,17 +635,11 @@ class BacktestEngine:
                     if strategy.name != pos.get("strategy_name"):
                         continue
                     for interval in strategy.timeframes:
-                        df = feeder.get_all_data_for_symbol(sym, interval)
-                        if len(df) < 50:
-                            continue
-                        df = df[df.index <= ts].copy()
-                        if len(df) < 20:
-                            continue
                         try:
-                            df = compute_all(df, strategy.indicators)
+                            df = _get_cached_df(sym, interval, strategy.indicators, ts)
                         except Exception:
                             continue
-                        if len(df) == 0:
+                        if df is None or len(df) < 20:
                             continue
 
                         exit_conds = strategy.exit_conditions.get(pos["side"], [])
@@ -477,17 +687,11 @@ class BacktestEngine:
                     higher_tfs = sorted_tfs[1:]
 
                     # --- Evaluate primary (shortest) timeframe for entry signal ---
-                    df_primary = feeder.get_all_data_for_symbol(sym, primary_tf)
-                    if len(df_primary) < 50:
-                        continue
-                    df_primary = df_primary[df_primary.index <= ts].copy()
-                    if len(df_primary) < 20:
-                        continue
                     try:
-                        df_primary = compute_all(df_primary, strategy.indicators)
+                        df_primary = _get_cached_df(sym, primary_tf, strategy.indicators, ts)
                     except Exception:
                         continue
-                    if len(df_primary) == 0:
+                    if df_primary is None or len(df_primary) < 20:
                         continue
 
                     # Evaluate entry conditions on primary timeframe
@@ -676,60 +880,37 @@ class BacktestEngine:
 
     # ---- ML Helpers ----
 
-    # Indicator config used for ML feature computation
+    # Indicator config used for ML feature computation (imported from features.py)
+    # Kept as instance attribute for consistent access
     _ML_INDICATORS = {
-        "rsi": {"period": 14},
+        "rsi": {"period": 14, "source": "close"},
         "macd": {"fast": 12, "slow": 26, "signal": 9},
         "bollinger": {"period": 20, "stddev": 2},
         "adx": {"period": 14},
     }
-    _ML_FEATURE_NAMES = [
-        "rsi", "macd_histogram", "bollinger_width",
-        "volume_ratio", "price_momentum_24h", "adx",
-    ]
 
-    def _compute_ml_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Compute indicators then extract ML feature columns.
+    def _compute_ml_features(self, df: pd.DataFrame,
+                             feature_list: list[str] | None = None) -> pd.DataFrame:
+        """Compute the full feature set for ML, optionally filtered.
 
-        Builds a richer feature set including multi-period returns and volatility.
+        Uses the shared compute_features() from core.ml.features.
+        feature_list=None → all features; non-empty list → filter.
         """
         from core.strategy.indicators import compute_all
-        from core.ml.features import build_features
+        from core.ml.features import compute_features as _compute_features
 
         df_ind = compute_all(df.copy(), self._ML_INDICATORS)
-        feature_df = build_features(df_ind, self._ML_FEATURE_NAMES)
-        if len(df_ind) > 5:
-            close = df_ind["close"]
-            # Multi-period returns
-            feature_df["ret_1"] = close.pct_change(1)
-            feature_df["ret_5"] = close.pct_change(5)
-            feature_df["ret_20"] = close.pct_change(20)
-            # Volatility
-            rets = feature_df["ret_1"]
-            feature_df["vol_10"] = rets.rolling(10).std()
-            feature_df["vol_20"] = rets.rolling(20).std()
-            # Volume features
-            if "volume" in df_ind.columns:
-                vol = df_ind["volume"]
-                feature_df["vol_chg_5"] = vol.pct_change(5)
-                feature_df["vol_chg_20"] = vol.pct_change(20)
-            # Price position relative to recent range
-            feature_df["pos_20"] = (close - close.rolling(20).min()) / (
-                close.rolling(20).max() - close.rolling(20).min() + 1e-9)
-            # Trend strength: close vs multiple EMAs
-            ema20 = close.ewm(span=20, adjust=False).mean()
-            ema50 = close.ewm(span=50, adjust=False).mean()
-            feature_df["ema20_dist"] = (close - ema20) / (ema20 + 1e-9)
-            feature_df["ema50_dist"] = (close - ema50) / (ema50 + 1e-9)
-        feature_df = feature_df.replace([np.inf, -np.inf], np.nan)
-        feature_df = feature_df.ffill().fillna(0)
-        return feature_df
+        # None = all features; [] or non-empty list = filter
+        fl = feature_list if feature_list else None
+        return _compute_features(df_ind, fl)
 
-    def _train_ml_model(self, df: pd.DataFrame, tf_params: dict = None):
-        """Train an XGBoost classifier with timeframe-appropriate labels.
+    def _train_ml_model(self, df: pd.DataFrame, tf_params: dict = None,
+                         feature_list: list[str] | None = None):
+        """Train a LightGBM classifier (XGBoost fallback) with timeframe-appropriate labels.
 
         Each strategy's primary timeframe gets its own model with matched
         forward_periods and threshold (e.g., 1m→20 periods, 1h→4 periods).
+        Tries LightGBM first; falls back to XGBoost if LightGBM is unavailable.
         """
         if tf_params is None:
             tf_params = {"forward": 4, "threshold": 0.005, "min_candles": 100}
@@ -739,9 +920,8 @@ class BacktestEngine:
             return None
         try:
             from core.ml.features import create_binary_label
-            import xgboost as xgb
 
-            feature_df = self._compute_ml_features(df)
+            feature_df = self._compute_ml_features(df, feature_list)
             labels = create_binary_label(
                 df, forward_periods=tf_params["forward"],
                 threshold=tf_params["threshold"])
@@ -754,11 +934,29 @@ class BacktestEngine:
 
             n_up = int(y.sum())
             n_down = len(y) - n_up
+            scale_pos_weight = max(1.0, n_down / max(n_up, 1))
 
+            # Try LightGBM first (faster, often more accurate)
+            try:
+                import lightgbm as lgb
+                model = lgb.LGBMClassifier(
+                    n_estimators=150, max_depth=6, learning_rate=0.05,
+                    subsample=0.8, colsample_bytree=0.8,
+                    scale_pos_weight=scale_pos_weight,
+                    min_child_samples=20,
+                    reg_alpha=0.1, reg_lambda=0.1,
+                    verbosity=-1, random_state=42)
+                model.fit(X, y)
+                return model
+            except ImportError:
+                pass
+
+            # XGBoost fallback
+            import xgboost as xgb
             model = xgb.XGBClassifier(
                 n_estimators=100, max_depth=5, learning_rate=0.05,
                 subsample=0.8, colsample_bytree=0.8,
-                scale_pos_weight=max(1.0, n_down / max(n_up, 1)),
+                scale_pos_weight=scale_pos_weight,
                 eval_metric='logloss', verbosity=0, random_state=42)
             model.fit(X, y)
             return model
@@ -770,7 +968,9 @@ class BacktestEngine:
         """Predict probability(price up >= 0.5%) using the trained model.
 
         Returns confidence in [0,1] or None if data is insufficient.
-        If the model is too uncertain (0.4–0.6), returns 0.5 (neutral).
+        If the model is too uncertain (0.38–0.62), returns 0.5 (neutral).
+        The wider neutral band reflects the 30-dim feature set's higher
+        dimensionality.
         """
         if len(df) < 50:
             return None
@@ -783,12 +983,152 @@ class BacktestEngine:
             if proba.shape[1] >= 2:
                 conf = float(proba[0][1])
                 # Shrink toward 0.5 if model is uncertain
-                if 0.40 <= conf <= 0.60:
+                if 0.38 <= conf <= 0.62:
                     return 0.5  # neutral — model doesn't know
                 return conf
             return 0.5
         except Exception as e:
             logger.debug(f"ML predict failed: {e}")
+            return None
+
+    # ── TFT helpers ──────────────────────────────────────────────────
+
+    def _train_tft_model(self, tft_trainer, df: pd.DataFrame, symbol: str,
+                         interval: str, max_train_rows: int = 5000):
+        """Train a TFT model on sliced DataFrame (walk-forward safe).
+
+        Caps training data to *max_train_rows* most recent candles so that
+        retrain time stays constant regardless of how far the backtest has
+        progressed.
+        """
+        try:
+            from core.strategy.indicators import compute_all
+            from core.ml.features import compute_features as _cf, create_regression_label, REQUIRED_INDICATORS
+
+            # Cap to recent data to keep training time constant
+            if len(df) > max_train_rows:
+                df = df.iloc[-max_train_rows:]
+
+            df_ind = compute_all(df.copy(), REQUIRED_INDICATORS)
+            X = _cf(df_ind, None)
+            y = create_regression_label(df_ind, forward_periods=4)
+            X["label"] = y.values
+
+            feature_cols = [c for c in X.columns if c != "label"
+                          and X[c].dtype in ('float64', 'float32', 'int64')]
+
+            t0 = time.time()
+            model, metrics = tft_trainer.train(
+                X, feature_cols=feature_cols, label_col="label",
+                epochs=60, batch_size=64, learning_rate=1e-3,
+                validation_split=0.2, patience=15)
+            elapsed = time.time() - t0
+
+            if model is not None:
+                dev = next(model.parameters()).device
+                logger.info(
+                    f"TFT trained {symbol} {interval} | "
+                    f"device={dev} rows={len(X)} "
+                    f"acc={metrics.get('val_accuracy', 0):.1%} "
+                    f"epochs={metrics.get('epochs_trained', 0)} "
+                    f"time={elapsed:.1f}s")
+            return model
+        except Exception as e:
+            logger.debug(f"TFT train failed for {symbol}: {e}")
+            return None
+
+    def _predict_tft(self, tft_trainer, model, df: pd.DataFrame) -> float | None:
+        """Predict with TFT — returns confidence in [0, 1]."""
+        if len(df) < 100:
+            return None
+        try:
+            from core.strategy.indicators import compute_all
+            from core.ml.features import compute_features as _cf, REQUIRED_INDICATORS
+
+            df_ind = compute_all(df.copy(), REQUIRED_INDICATORS)
+            X = _cf(df_ind, None)
+            result = tft_trainer.predict(model, X)
+            if result is None:
+                return None
+
+            tft_conf = result["confidence"]
+            tft_dir = result["direction"]
+            if tft_dir > 0:
+                return tft_conf
+            else:
+                return 1.0 - tft_conf
+        except Exception as e:
+            logger.debug(f"TFT predict failed: {e}")
+            return None
+
+    # ── PatchTST helpers ─────────────────────────────────────────────
+
+    def _train_patchtst_model(self, trainer, df: pd.DataFrame, symbol: str,
+                              interval: str, max_train_rows: int = 5000,
+                              feature_list: list[str] | None = None):
+        """Train a PatchTST model with triple-barrier labels."""
+        try:
+            from core.strategy.indicators import compute_all
+            from core.ml.features import (compute_features as _cf,
+                  create_triple_barrier_label, REQUIRED_INDICATORS)
+
+            if len(df) > max_train_rows:
+                df = df.iloc[-max_train_rows:]
+
+            df_ind = compute_all(df.copy(), REQUIRED_INDICATORS)
+            # feature_list=None or [] → use all features; non-empty → filter
+            fl = feature_list if feature_list else None
+            X = _cf(df_ind, fl)
+            # Triple barrier: 2% up/down, 24 periods lookahead
+            y = create_triple_barrier_label(
+                df_ind, forward_periods=24, upper_pct=0.02, lower_pct=0.02,
+                timeout_label=2.0)  # timeout = class 2
+            X["label"] = y.values
+
+            t0 = time.time()
+            model, metrics = trainer.train(
+                X, feature_cols=None, label_col="label",
+                epochs=50, batch_size=64, learning_rate=1e-3,
+                validation_split=0.2, patience=12)
+            elapsed = time.time() - t0
+
+            if model is not None:
+                dev = next(model.parameters()).device
+                logger.info(
+                    f"PatchTST trained {symbol} {interval} | "
+                    f"device={dev} rows={len(X)} "
+                    f"acc={metrics.get('val_accuracy', 0):.1%} "
+                    f"epochs={metrics.get('epochs_trained', 0)} "
+                    f"time={elapsed:.1f}s")
+            return model
+        except Exception as e:
+            logger.debug(f"PatchTST train failed for {symbol}: {e}")
+            return None
+
+    def _predict_patchtst(self, trainer, model, df: pd.DataFrame) -> float | None:
+        """Predict with PatchTST — returns confidence in [0, 1]."""
+        if len(df) < 100:
+            return None
+        try:
+            from core.strategy.indicators import compute_all
+            from core.ml.features import compute_features as _cf, REQUIRED_INDICATORS
+
+            df_ind = compute_all(df.copy(), REQUIRED_INDICATORS)
+            X = _cf(df_ind, None)
+            result = trainer.predict(model, X)
+            if result is None:
+                return None
+
+            direction = result["direction"]
+            confidence = result["confidence"]
+            if direction > 0:
+                return confidence
+            elif direction < 0:
+                return 1.0 - confidence
+            else:
+                return 0.5  # timeout/neutral
+        except Exception as e:
+            logger.debug(f"PatchTST predict failed: {e}")
             return None
 
     def _detect_market_regime(self, df: pd.DataFrame) -> str:

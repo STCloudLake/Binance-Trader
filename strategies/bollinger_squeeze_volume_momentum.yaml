@@ -20,10 +20,7 @@ indicators:
 ml_config:
   confidence_threshold: 0.65
   enabled: true
-  features:
-  - bollinger_width
-  - volume_ratio
-  - adx
+  features: []
   weight: 0.35
 mode: trend
 name: Bollinger Squeeze + Volume Momentum

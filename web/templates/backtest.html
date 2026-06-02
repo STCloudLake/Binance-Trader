@@ -18,8 +18,26 @@
 
 <!-- Tab: Results -->
 <div id="bt-tab-results" class="bt-tab-content hidden">
-    <!-- Auto-reconnect: cookie bt_active_run is set when a backtest runs.
-         This HTMX div checks for it and auto-loads progress if found. -->
+    <!-- Manual reconnect for sleep recovery -->
+    <div id="bt-manual-reconnect" class="bg-amber-900/30 border border-amber-600 rounded p-4 mb-4 text-sm">
+        <p class="text-amber-400 font-bold mb-2">{{ _("Recover running backtest") }}</p>
+        <p class="text-slate-400 mb-2">{{ _("If a backtest is running but the progress bar is gone (e.g. after sleep), enter the run ID to reconnect.") }}</p>
+        <div class="flex gap-2">
+            <input type="text" id="bt-runid-input" placeholder="Run ID (12 hex chars, e.g. a1b2c3d4e5f6)"
+                   class="flex-1 bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-white text-sm font-mono">
+            <button onclick="reconnectById()"
+                    class="bg-amber-600 hover:bg-amber-500 text-white px-4 py-1.5 rounded text-sm font-bold">
+                {{ _("Reconnect") }}
+            </button>
+        </div>
+        <p class="text-xs text-slate-500 mt-2">
+            {{ _("Tip: check server console for the run ID, or look at") }}
+            <code class="text-slate-400">data/backtest/</code>
+            {{ _("file timestamps to find the current run.") }}
+        </p>
+    </div>
+
+    <!-- Active backtest progress bar (cookie-based, original endpoint) -->
     <div id="backtest-results"
          hx-get="/partials/backtest-active"
          hx-trigger="load"
@@ -39,6 +57,45 @@
 .bt-tab-content.hidden { display: none; }
 </style>
 <script>
+function reconnectById() {
+    var runId = document.getElementById('bt-runid-input').value.trim();
+    if (!runId || runId.length < 8) return;
+    switchBtTab('results');
+    var results = document.getElementById('backtest-results');
+    results.innerHTML = '<div class="text-slate-400 text-sm">Connecting to run ' + runId + '...</div>';
+
+    // Poll progress directly
+    var timer = setInterval(function() {
+        fetch('/api/backtest/progress/' + runId).then(function(r) { return r.json(); }).then(function(data) {
+            if (data.error) {
+                results.innerHTML = '<div class="text-red-400 text-sm">Run not found: ' + runId + '</div>';
+                clearInterval(timer);
+                return;
+            }
+            var pct = data.pct || 0;
+            results.innerHTML =
+                '<div class="card mb-4">' +
+                '<h3 class="text-lg mb-3">Running Backtest...</h3>' +
+                '<div class="w-full bg-slate-700 rounded-full h-4 mb-2">' +
+                '<div class="bg-sky-500 h-4 rounded-full" style="width:' + pct + '%"></div>' +
+                '</div>' +
+                '<div class="flex justify-between text-xs text-slate-400">' +
+                '<span>' + pct.toFixed(1) + '%</span>' +
+                '<span>' + (data.progress || 0) + ' / ' + (data.total || 0) + '</span>' +
+                '</div></div>';
+            if (data.done) {
+                clearInterval(timer);
+                fetch('/api/backtest/result/' + runId).then(function(r) { return r.text(); }).then(function(html) {
+                    results.innerHTML = html;
+                });
+            }
+        }).catch(function() {
+            results.innerHTML = '<div class="text-red-400 text-sm">Cannot reach server</div>';
+            clearInterval(timer);
+        });
+    }, 2000);
+}
+
 function switchBtTab(tab) {
     document.querySelectorAll('.bt-tab').forEach(function(b) {
         if (b.dataset.tab === tab) {

@@ -23,6 +23,10 @@ class MarketDataProvider:
         self._price_cache: dict[str, float] = {}
         self._price_history: dict[str, list[tuple[float, float]]] = {}
 
+    @property
+    def watched_symbols(self) -> list[str]:
+        return list(self._watched_symbols)
+
     async def start(self, symbols: list[str], intervals: list[str]):
         self._watched_symbols = symbols
         self._intervals = intervals

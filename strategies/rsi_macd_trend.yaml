@@ -24,12 +24,7 @@ indicators:
 ml_config:
   confidence_threshold: 0.6
   enabled: true
-  features:
-  - rsi
-  - macd_histogram
-  - bollinger_width
-  - volume_ratio
-  - price_momentum_24h
+  features: []
   weight: 0.4
 mode: trend
 name: RSI+MACD Trend
