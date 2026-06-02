@@ -28,6 +28,7 @@
         </div>
         <button class="w-full bg-green-700 hover:bg-green-600 text-white px-3 py-2 rounded text-sm mb-2" onclick="newStrategy()">+ {{ _('新建策略') }}</button>
         <button class="w-full bg-purple-700 hover:bg-purple-600 text-white px-3 py-2 rounded text-sm" id="ai-recommend-btn" onclick="aiRecommend()">🤖 AI {{ _('推荐策略') }}</button>
+        <button class="w-full bg-emerald-700 hover:bg-emerald-600 text-white px-3 py-2 rounded text-sm mt-2" onclick="loadGAPanel()">🧬 GA {{ _('策略进化') }}</button>
         <div id="ai-recommend-msg" class="text-xs mt-1"></div>
     </div>
 
@@ -355,6 +356,15 @@ function saveStrategy() {
         } else {
             r.text().then(function(t) { msg.innerHTML = '<span class="text-red-400">{{ _("保存失败") }}: ' + t + '</span>'; });
         }
+    });
+}
+
+function loadGAPanel() {
+    var editor = document.getElementById('strategy-editor');
+    var title = document.getElementById('editor-title');
+    if (title) title.textContent = '— GA {{ _("策略进化") }}';
+    fetch('/partials/ga-panel').then(function(r) { return r.text(); }).then(function(html) {
+        document.getElementById('editor-form').innerHTML = html;
     });
 }
 </script>
