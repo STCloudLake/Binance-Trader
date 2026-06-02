@@ -1,0 +1,39 @@
+enabled: true
+entry_conditions:
+  long:
+  - volume_ratio > 1.5
+  - rsi < 35
+  short:
+  - rsi > 70
+  - close < bollinger_upper
+  - volume_ratio > 2.0
+exit_conditions:
+  long:
+  - close < bollinger_middle
+  short:
+  - rsi < 35
+indicators:
+  adx:
+    period: 19
+  bollinger:
+    period: 17
+    stddev: 2.35
+  macd:
+    fast: 11
+    signal: 10
+    slow: 23
+  rsi:
+    period: 18
+    source: close
+ml_config:
+  confidence_threshold: 0.7
+  enabled: true
+  features: []
+  weight: 0.2
+mode: momentum
+name: ga_gen_1_1332
+reduce_conditions: {}
+symbols: []
+timeframes:
+- 1m
+- 1h

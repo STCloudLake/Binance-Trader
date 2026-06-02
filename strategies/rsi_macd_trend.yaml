@@ -28,15 +28,7 @@ ml_config:
   weight: 0.4
 mode: trend
 name: RSI+MACD Trend
-reduce_conditions:
-  long:
-  - condition: rsi > 55 and close > bollinger_upper
-    reduce_pct: 50
-  - condition: rsi > 70 and volume_ratio > 1.8
-    reduce_pct: 30
-  short:
-  - condition: rsi < 40 and close < bollinger_lower
-    reduce_pct: 50
+reduce_conditions: {}
 symbols: []
 timeframes:
 - 1h

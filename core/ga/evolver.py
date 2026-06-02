@@ -333,26 +333,15 @@ class GAStrategyEvolver:
         return sum(valid) / max(len(valid), 1)
 
     def _compute_diversity(self) -> float:
-        """Measure population diversity as avg pairwise gene distance."""
+        """Measure population diversity as pairwise fitness spread."""
         if len(self._population) < 2:
             return 0.0
-        # Simplified: diversity of continuous gene values
-        all_vals = []
-        for chrom in self._population[:20]:  # sample
-            vals = [g.value for g in chrom.get("continuous", [])]
-            if vals:
-                all_vals.append(vals)
-        if len(all_vals) < 2:
+        fits = [c.get("fitness_result", {}).get("fitness", -999)
+                for c in self._population if c.get("fitness_result", {}).get("fitness", -999) > -900]
+        if len(fits) < 2:
             return 0.0
         import numpy as np
-        arr = np.array(all_vals)
-        if arr.shape[1] == 0:
-            return 0.0
-        # Coefficient of variation across population
-        means = arr.mean(axis=0)
-        stds = arr.std(axis=0)
-        cvs = stds / (np.abs(means) + 1e-9)
-        return float(np.mean(cvs))
+        return float(np.std(fits) / (abs(np.mean(fits)) + 1e-9))
 
     def _report_progress(self, phase: str, completed: int, total: int):
         if self._progress_callback:

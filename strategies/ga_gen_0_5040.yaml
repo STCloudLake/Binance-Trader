@@ -22,7 +22,7 @@ ml_config:
   features: []
   weight: 0.3
 mode: trend
-name: Mean Reversion RSI + Bollinger Bands
+name: ga_gen_0_5040
 reduce_conditions: {}
 symbols: []
 timeframes:

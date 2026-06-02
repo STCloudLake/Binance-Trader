@@ -1,0 +1,38 @@
+enabled: true
+entry_conditions:
+  long:
+  - close > bollinger_lower
+  - volume_ratio > 2.0
+  - macd_histogram > 0
+  short:
+  - adx > 20
+  - macd_histogram < 0
+exit_conditions:
+  long:
+  - close < bollinger_middle
+  short:
+  - rsi < 45
+  - rsi < 35
+indicators:
+  bollinger:
+    period: 29
+    stddev: 2.65
+  macd:
+    fast: 15
+    signal: 6
+    slow: 24
+  rsi:
+    period: 20
+    source: close
+ml_config:
+  confidence_threshold: 0.57
+  enabled: true
+  features: []
+  weight: 0.2
+mode: trend
+name: ga_gen_4_7526
+reduce_conditions: {}
+symbols: []
+timeframes:
+- 5m
+- 1h

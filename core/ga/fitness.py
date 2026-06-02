@@ -27,7 +27,7 @@ def evaluate_chromosome(
         # Save temporarily so the backtest engine can load it
         loader.save(config)
 
-        result = engine.run(
+        result = engine.run_with_exit_evaluation(
             strategies=[config.name],
             symbols=symbols,
             date_start=date_start,

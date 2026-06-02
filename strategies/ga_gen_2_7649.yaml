@@ -1,0 +1,40 @@
+enabled: true
+entry_conditions:
+  long:
+  - adx > 20
+  - close > bollinger_lower
+  - rsi < 35
+  short:
+  - adx > 25
+exit_conditions:
+  long:
+  - close < bollinger_middle
+  - rsi > 55
+  - rsi > 65
+  short:
+  - close > ema_slow
+  - rsi < 45
+  - close > bollinger_middle
+indicators:
+  bollinger:
+    period: 25
+    stddev: 2.5
+  macd:
+    fast: 15
+    signal: 12
+    slow: 22
+  rsi:
+    period: 12
+    source: close
+ml_config:
+  confidence_threshold: 0.74
+  enabled: true
+  features: []
+  weight: 0.3
+mode: range
+name: ga_gen_2_7649
+reduce_conditions: {}
+symbols: []
+timeframes:
+- 5m
+- 15m

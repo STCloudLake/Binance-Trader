@@ -1,0 +1,40 @@
+enabled: true
+entry_conditions:
+  long:
+  - adx > 20
+  - macd_histogram > 0
+  - close > bollinger_lower
+  short:
+  - volume_ratio > 1.5
+  - close < bollinger_upper
+exit_conditions:
+  long:
+  - close < bollinger_lower
+  short:
+  - close > ema_slow
+  - close > bollinger_upper
+  - close > bollinger_middle
+indicators:
+  adx:
+    period: 20
+  bollinger:
+    period: 19
+    stddev: 1.88
+  macd:
+    fast: 12
+    signal: 6
+    slow: 28
+  rsi:
+    period: 11
+    source: close
+ml_config:
+  confidence_threshold: 0.67
+  enabled: true
+  features: []
+  weight: 0.1
+mode: range
+name: ga_gen_3_9345
+reduce_conditions: {}
+symbols: []
+timeframes:
+- 15m

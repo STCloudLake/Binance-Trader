@@ -1,0 +1,37 @@
+enabled: true
+entry_conditions:
+  long:
+  - volume_ratio > 2.0
+  - macd_histogram > 0
+  short:
+  - macd_histogram < 0
+  - ema_fast < ema_slow
+exit_conditions:
+  long:
+  - rsi > 65
+  - close < ema_slow
+  - rsi > 55
+  short:
+  - rsi < 45
+  - rsi < 35
+  - close > ema_slow
+indicators:
+  macd:
+    fast: 9
+    signal: 8
+    slow: 34
+  rsi:
+    period: 21
+    source: close
+ml_config:
+  confidence_threshold: 0.61
+  enabled: true
+  features: []
+  weight: 0.1
+mode: momentum
+name: ga_gen_2_7367
+reduce_conditions: {}
+symbols: []
+timeframes:
+- 1m
+- 15m
