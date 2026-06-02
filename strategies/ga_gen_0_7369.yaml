@@ -22,7 +22,7 @@ ml_config:
   features: []
   weight: 0.3
 mode: trend
-name: ga_gen_0_7529
+name: ga_gen_0_7369
 reduce_conditions: {}
 symbols: []
 timeframes:

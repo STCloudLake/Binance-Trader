@@ -24,9 +24,16 @@ def evaluate_chromosome(
     """
     try:
         config = chromosome_to_strategy(chromosome)
+        # Disable ML during GA fitness eval — 3-5x faster, avoids
+        # 50%-accurate ML adding noise to honest indicator performance
+        if config.ml_config:
+            config.ml_config.enabled = False
         # Save temporarily so the backtest engine can load it
         loader.save(config)
 
+        # GA evaluates pure indicator performance — ML adds noise and cost
+        # Disable ML during evolution for 3-5x speedup.
+        # ML can be re-enabled on the final champion for production use.
         result = engine.run_with_exit_evaluation(
             strategies=[config.name],
             symbols=symbols,

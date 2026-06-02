@@ -1,39 +1,43 @@
 enabled: true
 entry_conditions:
   long:
-  - ema_fast > ema_slow
-  - rsi < 35
+  - adx > 25
   short:
+  - close < bollinger_upper
   - volume_ratio > 1.5
+  - rsi > 70
 exit_conditions:
   long:
-  - close < ema_slow
-  - rsi > 65
-  - close < bollinger_middle
+  - close < bollinger_lower
   short:
   - rsi < 45
+  - close > bollinger_upper
+  - rsi < 35
 indicators:
   adx:
-    period: 21
+    period: 12
   bollinger:
-    period: 26
-    stddev: 1.76
+    period: 16
+    stddev: 1.57
+  ema:
+    period: 15
+    source: close
   macd:
-    fast: 16
-    signal: 10
+    fast: 9
+    signal: 6
     slow: 23
   rsi:
-    period: 12
+    period: 11
     source: close
 ml_config:
   confidence_threshold: 0.72
   enabled: true
   features: []
-  weight: 0.3
-mode: trend
-name: ga_gen_3_8033
+  weight: 0.1
+mode: scalp
+name: ga_gen_3_9227
 reduce_conditions: {}
 symbols: []
 timeframes:
 - 1m
-- 1h
+- 5m
