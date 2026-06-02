@@ -1,4 +1,4 @@
-enabled: false
+enabled: true
 entry_conditions:
   long:
   - rsi < 25 and close <= bollinger_lower and volume > volume_sma * 1.2
