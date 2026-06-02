@@ -125,5 +125,5 @@ def evaluate_condition(df: pd.DataFrame, condition: str) -> pd.Series:
         return result
     except Exception as e:
         from loguru import logger
-        logger.warning(f"Condition evaluation failed: '{condition}' — {e}")
+        logger.debug(f"Condition evaluation failed: '{condition}' — {e}")
         return pd.Series([False] * len(df), index=df.index)
