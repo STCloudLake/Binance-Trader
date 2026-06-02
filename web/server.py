@@ -2084,4 +2084,97 @@ Return ONLY valid JSON in this exact format:
         return _render("partials/strategy_lifecycle.html",
                        {"request": request, "events": events})
 
+    # ── GA Evolution ──────────────────────────────────────────────────
+
+    _ga_state = {
+        "running": False,
+        "generation": 0, "total_generations": 0,
+        "best_fitness": 0, "best_sharpe": 0, "best_win_rate": 0,
+        "best_trades": 0, "champion_name": "", "champion_config": None,
+        "population_size": 0, "started": 0, "history": [],
+        "error": None,
+    }
+
+    @app.post("/api/ga/evolve")
+    async def ga_evolve(request: Request):
+        if err := _require_trader(request): return err
+        body = await request.json() if request.headers.get("content-type") == "application/json" else {}
+        engine = getattr(app.state, "backtest_engine", None)
+        loader = getattr(app.state, "strategy_loader", None)
+        if not engine or not loader:
+            return JSONResponse({"error": "Engine or loader not initialized"}, status_code=500)
+
+        symbols = body.get("symbols", ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"])
+        date_start = body.get("date_start", "2026-05-01")
+        date_end = body.get("date_end", "2026-05-15")
+        pop_size = min(body.get("population_size", 60), 120)
+        generations = min(body.get("generations", 20), 50)
+        seed_strategies = body.get("seed_strategies", [])
+
+        from core.ga.evolver import GAStrategyEvolver, GARunConfig
+        config = GARunConfig(
+            population_size=pop_size, generations=generations,
+            elite_count=max(4, pop_size // 10),
+            immigrant_count=max(4, pop_size // 10),
+            max_workers=3,
+        )
+
+        evolver = GAStrategyEvolver(engine, loader, config)
+        app.state._ga_evolver = evolver
+
+        _ga_state.update({
+            "running": True, "generation": 0, "total_generations": generations,
+            "best_fitness": 0, "best_sharpe": 0, "best_win_rate": 0,
+            "best_trades": 0, "champion_name": "", "champion_config": None,
+            "population_size": pop_size, "started": time.time(),
+            "history": [], "error": None,
+        })
+
+        def on_gen(gen, total, info):
+            _ga_state.update({
+                "generation": gen, "total_generations": total,
+                "best_fitness": info.get("best_fitness", 0),
+                "best_sharpe": info.get("best_sharpe", 0),
+                "best_win_rate": info.get("best_win_rate", 0),
+                "best_trades": info.get("best_trades", 0),
+                "history": evolver.history[-20:],
+            })
+
+        evolver.set_progress_callback(on_gen)
+
+        async def _run_ga():
+            try:
+                result = evolver.evolve(symbols, date_start, date_end, seed_strategies)
+                _ga_state["running"] = False
+                _ga_state["champion_name"] = result.get("champion_name", "")
+                _ga_state["champion_config"] = result.get("champion_config")
+                _ga_state["best_fitness"] = result.get("fitness", 0)
+                _ga_state["best_sharpe"] = result.get("sharpe", 0)
+                _ga_state["error"] = result.get("error")
+            except Exception as e:
+                _ga_state["running"] = False
+                _ga_state["error"] = str(e)
+            finally:
+                app.state._ga_evolver = None
+
+        asyncio.create_task(_run_ga())
+        return JSONResponse({"ok": True})
+
+    @app.get("/api/ga/status")
+    async def ga_status():
+        return _ga_state
+
+    @app.post("/api/ga/stop")
+    async def ga_stop(request: Request):
+        if err := _require_trader(request): return err
+        evolver = getattr(app.state, "_ga_evolver", None)
+        if evolver:
+            evolver.stop()
+        _ga_state["running"] = False
+        return JSONResponse({"ok": True})
+
+    @app.get("/partials/ga-panel")
+    async def partial_ga_panel(request: Request):
+        return _render("partials/ga_panel.html", {"request": request, "state": _ga_state})
+
     return app

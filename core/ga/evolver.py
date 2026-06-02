@@ -1,0 +1,359 @@
+"""Genetic Algorithm strategy evolver.
+
+Orchestrates the full evolution cycle:
+    1. Initialize random population
+    2. Evaluate fitness (parallel backtests)
+    3. Select parents via tournament
+    4. Crossover to produce offspring
+    5. Mutate offspring
+    6. Elite preservation + diversity injection
+    7. Repeat for N generations
+    8. Final champion → save as YAML strategy
+"""
+
+import copy
+import random
+import time
+import math
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from loguru import logger
+
+from core.ga.genome import (
+    strategy_to_chromosome, chromosome_to_strategy,
+    random_chromosome, ContinuousGene, CategoricalGene, StructuralGene,
+)
+from core.ga.fitness import evaluate_population, parameter_sensitivity_test
+from core.strategy.loader import StrategyLoader
+
+
+@dataclass
+class GARunConfig:
+    """Configuration for a GA evolution run."""
+    population_size: int = 80
+    generations: int = 30
+    elite_count: int = 8       # top N preserved unchanged
+    immigrant_count: int = 8   # new random individuals each generation
+    tournament_size: int = 3
+    mutation_rate: float = 0.25
+    crossover_rate: float = 0.7
+    overfit_penalty: float = 0.3  # weight of sensitivity penalty
+    max_workers: int = 4       # parallel backtest workers
+    early_stop_generations: int = 10  # stop if no improvement for N gens
+
+
+class GAStrategyEvolver:
+    """Genetic algorithm for evolving trading strategies."""
+
+    def __init__(self, engine, loader: StrategyLoader,
+                 config: GARunConfig | None = None):
+        self.engine = engine
+        self.loader = loader
+        self.config = config or GARunConfig()
+        self._population: list[dict] = []
+        self._generation = 0
+        self._best_fitness = -999
+        self._best_chromosome: dict | None = None
+        self._stagnation_count = 0
+        self._history: list[dict] = []
+        self._running = False
+        self._progress_callback = None
+
+    @property
+    def generation(self) -> int:
+        return self._generation
+
+    @property
+    def best_fitness(self) -> float:
+        return self._best_fitness
+
+    @property
+    def population(self) -> list[dict]:
+        return self._population
+
+    @property
+    def history(self) -> list[dict]:
+        return self._history
+
+    def set_progress_callback(self, callback):
+        self._progress_callback = callback
+
+    # ── Main evolution loop ───────────────────────────────────────
+
+    def evolve(self,
+               symbols: list[str],
+               date_start: str,
+               date_end: str,
+               seed_strategies: list[str] | None = None) -> dict:
+        """Run the full GA evolution.
+
+        Parameters
+        ----------
+        seed_strategies : list[str] | None
+            Names of existing strategies to include in the initial population.
+            These provide "good genes" to bootstrap evolution.
+        """
+        self._running = True
+        cfg = self.config
+        t_start = time.time()
+
+        logger.info(f"GA: population={cfg.population_size}, "
+                    f"generations={cfg.generations}, "
+                    f"elite={cfg.elite_count}, symbols={symbols}")
+
+        # ── Initialize population ──
+        self._population = self._init_population(seed_strategies)
+        self._generation = 0
+        self._best_fitness = -999
+        self._best_chromosome = None
+        self._stagnation_count = 0
+        self._history = []
+
+        # ── Evolution loop ──
+        for gen in range(cfg.generations):
+            if not self._running:
+                break
+
+            self._generation = gen + 1
+            gen_start = time.time()
+
+            # 1. Evaluate fitness
+            self._population = evaluate_population(
+                self._population, symbols, date_start, date_end,
+                self.engine, self.loader,
+                max_workers=cfg.max_workers,
+                progress_callback=lambda c, t: self._report_progress("eval", c, t))
+
+            # 2. Sort by fitness
+            self._population.sort(
+                key=lambda c: c.get("fitness_result", {}).get("fitness", -999),
+                reverse=True)
+
+            best = self._population[0]
+            best_fit = best.get("fitness_result", {}).get("fitness", -999)
+            avg_fit = self._compute_avg_fitness()
+
+            # 3. Record history
+            gen_info = {
+                "generation": self._generation,
+                "best_fitness": best_fit,
+                "avg_fitness": avg_fit,
+                "best_sharpe": best.get("fitness_result", {}).get("sharpe", 0),
+                "best_win_rate": best.get("fitness_result", {}).get("win_rate", 0),
+                "best_trades": best.get("fitness_result", {}).get("trade_count", 0),
+                "population_diversity": self._compute_diversity(),
+                "elapsed": time.time() - gen_start,
+            }
+            self._history.append(gen_info)
+
+            logger.info(
+                f"Gen {self._generation:3d}/{cfg.generations} | "
+                f"best={best_fit:.2f} avg={avg_fit:.2f} "
+                f"sharpe={gen_info['best_sharpe']:.2f} "
+                f"trades={gen_info['best_trades']} "
+                f"div={gen_info['population_diversity']:.3f} "
+                f"time={gen_info['elapsed']:.0f}s")
+
+            if self._progress_callback:
+                self._progress_callback(self._generation, cfg.generations, gen_info)
+
+            # 4. Check improvement
+            if best_fit > self._best_fitness + 0.01:
+                self._best_fitness = best_fit
+                self._best_chromosome = copy.deepcopy(best)
+                self._stagnation_count = 0
+            else:
+                self._stagnation_count += 1
+
+            # 5. Early stop
+            if self._stagnation_count >= cfg.early_stop_generations:
+                logger.info(f"GA early stop: no improvement for "
+                           f"{cfg.early_stop_generations} generations")
+                break
+
+            # 6. Create next generation
+            if gen < cfg.generations - 1:
+                self._population = self._next_generation()
+
+        # ── Final champion ──
+        self._running = False
+        elapsed = time.time() - t_start
+
+        if self._best_chromosome:
+            champion_config = chromosome_to_strategy(self._best_chromosome)
+            champion_config.name = f"ga_champion_{int(time.time())}"
+            self.loader.save(champion_config)
+
+            result = self._best_chromosome.get("fitness_result", {})
+            logger.info(
+                f"GA complete: {self._generation} gens in {elapsed:.0f}s | "
+                f"champion={champion_config.name} "
+                f"fitness={result.get('fitness',0):.2f} "
+                f"sharpe={result.get('sharpe',0):.2f} "
+                f"trades={result.get('trade_count',0)}")
+
+            return {
+                "champion_name": champion_config.name,
+                "champion_config": champion_config.model_dump(),
+                "fitness": result.get("fitness", 0),
+                "sharpe": result.get("sharpe", 0),
+                "win_rate": result.get("win_rate", 0),
+                "trade_count": result.get("trade_count", 0),
+                "generations": self._generation,
+                "elapsed_seconds": elapsed,
+                "history": self._history,
+            }
+        else:
+            return {"error": "No valid champion found"}
+
+    def stop(self):
+        self._running = False
+
+    # ── Internal methods ──────────────────────────────────────────
+
+    def _init_population(self, seed_strategies: list[str] | None) -> list[dict]:
+        """Create initial population mixing random + seeded."""
+        cfg = self.config
+        population = []
+
+        # Seeded individuals from existing strategies
+        if seed_strategies:
+            for name in seed_strategies[:cfg.elite_count]:
+                try:
+                    s_config = self.loader.load(name)
+                    chrom = strategy_to_chromosome(s_config)
+                    chrom["name"] = f"seed_{name}"
+                    population.append(chrom)
+                except Exception as e:
+                    logger.warning(f"Failed to seed '{name}': {e}")
+
+        # Fill remainder with random
+        needed = cfg.population_size - len(population)
+        for i in range(needed):
+            population.append(random_chromosome(f"ga_rand_{i}"))
+
+        return population
+
+    def _next_generation(self) -> list[dict]:
+        """Selection → Crossover → Mutation → next population."""
+        cfg = self.config
+        current = self._population
+        current_fitnesses = [
+            c.get("fitness_result", {}).get("fitness", -999) for c in current]
+
+        new_pop = []
+
+        # ── Elite preservation ──
+        for i in range(min(cfg.elite_count, len(current))):
+            new_pop.append(copy.deepcopy(current[i]))
+
+        # ── Crossover + Mutation ──
+        while len(new_pop) < cfg.population_size - cfg.immigrant_count:
+            if random.random() < cfg.crossover_rate:
+                p1 = self._tournament_select(current, current_fitnesses)
+                p2 = self._tournament_select(current, current_fitnesses)
+                child = self._crossover(p1, p2)
+            else:
+                parent = self._tournament_select(current, current_fitnesses)
+                child = copy.deepcopy(parent)
+
+            if random.random() < cfg.mutation_rate:
+                child = self._mutate(child)
+
+            child["fitness_result"] = {}  # clear stale result
+            new_pop.append(child)
+
+        # ── Diversity injection ──
+        for i in range(cfg.immigrant_count):
+            new_pop.append(random_chromosome(f"ga_immigrant_{i}"))
+
+        # Trim to exact population size
+        return new_pop[:cfg.population_size]
+
+    def _tournament_select(self, population, fitnesses) -> dict:
+        """Tournament selection: pick k random, return best."""
+        cfg = self.config
+        k = min(cfg.tournament_size, len(population))
+        candidates = random.sample(range(len(population)), k)
+        best_idx = max(candidates, key=lambda i: fitnesses[i])
+        return population[best_idx]
+
+    def _crossover(self, p1: dict, p2: dict) -> dict:
+        """Two-point crossover on continuous genes, random exchange on structural."""
+        child_cont = []
+        for g1, g2 in zip(p1["continuous"], p2["continuous"]):
+            if random.random() < 0.5:
+                child_cont.append(copy.deepcopy(g1))
+            else:
+                child_cont.append(copy.deepcopy(g2))
+
+        child_cat = []
+        for g1, g2 in zip(p1["categorical"], p2["categorical"]):
+            if random.random() < 0.5:
+                child_cat.append(copy.deepcopy(g1))
+            else:
+                child_cat.append(copy.deepcopy(g2))
+
+        child_struct = []
+        for g1, g2 in zip(p1["structural"], p2["structural"]):
+            # Random exchange of individual conditions
+            all_conds = list(set(g1.conditions + g2.conditions))
+            n = random.randint(1, len(all_conds))
+            child_struct.append(StructuralGene(
+                g1.name,
+                conditions=random.sample(all_conds, min(n, len(all_conds))),
+                template_pool=g1.template_pool,
+            ))
+
+        return {
+            "continuous": child_cont,
+            "categorical": child_cat,
+            "structural": child_struct,
+            "name": f"ga_child_{random.randint(1000,9999)}",
+        }
+
+    def _mutate(self, chrom: dict) -> dict:
+        """Apply mutation to all gene types."""
+        for gene in chrom["continuous"]:
+            if random.random() < 0.2:
+                gene.mutate()
+        for gene in chrom["categorical"]:
+            if random.random() < 0.1:
+                gene.mutate()
+        for gene in chrom["structural"]:
+            if random.random() < 0.15:
+                gene.mutate()
+        chrom["fitness_result"] = {}
+        return chrom
+
+    def _compute_avg_fitness(self) -> float:
+        fits = [c.get("fitness_result", {}).get("fitness", -999)
+                for c in self._population]
+        valid = [f for f in fits if f > -900]
+        return sum(valid) / max(len(valid), 1)
+
+    def _compute_diversity(self) -> float:
+        """Measure population diversity as avg pairwise gene distance."""
+        if len(self._population) < 2:
+            return 0.0
+        # Simplified: diversity of continuous gene values
+        all_vals = []
+        for chrom in self._population[:20]:  # sample
+            vals = [g.value for g in chrom.get("continuous", [])]
+            if vals:
+                all_vals.append(vals)
+        if len(all_vals) < 2:
+            return 0.0
+        import numpy as np
+        arr = np.array(all_vals)
+        if arr.shape[1] == 0:
+            return 0.0
+        # Coefficient of variation across population
+        means = arr.mean(axis=0)
+        stds = arr.std(axis=0)
+        cvs = stds / (np.abs(means) + 1e-9)
+        return float(np.mean(cvs))
+
+    def _report_progress(self, phase: str, completed: int, total: int):
+        if self._progress_callback:
+            self._progress_callback(completed, total)
