@@ -57,7 +57,9 @@ class GAStrategyEvolver:
         self._stagnation_count = 0
         self._history: list[dict] = []
         self._running = False
+        self._stop_after_gen = False  # graceful stop flag
         self._progress_callback = None
+        self._checkpoint_path = Path(loader.strategies_dir).parent / "data" / "ga_checkpoint.pkl"
 
     @property
     def generation(self) -> int:
@@ -85,7 +87,8 @@ class GAStrategyEvolver:
                date_start: str,
                date_end: str,
                seed_strategies: list[str] | None = None,
-               validation_start: str | None = None) -> dict:
+               validation_start: str | None = None,
+               resume: bool = False) -> dict:
         """Run the full GA evolution.
 
         Parameters
@@ -94,9 +97,9 @@ class GAStrategyEvolver:
             Names of existing strategies to include in the initial population.
         validation_start : str | None
             If set, the final champion is also tested on this→date_end
-            (out-of-sample). The GA only sees date_start→validation_start
-            during evolution. This is the single most important defense
-            against overfitting.
+            (out-of-sample).
+        resume : bool
+            If True, try to load a checkpoint and continue from there.
         """
         self._running = True
         cfg = self.config
@@ -111,13 +114,18 @@ class GAStrategyEvolver:
                     f"train={date_start}~{train_end}"
                     + (f", validate={validation_start}~{date_end}" if has_validation else ""))
 
-        # ── Initialize population ──
-        self._population = self._init_population(seed_strategies)
-        self._generation = 0
-        self._best_fitness = -999
-        self._best_chromosome = None
-        self._stagnation_count = 0
-        self._history = []
+        # ── Initialize or resume ──
+        if resume and self.load_checkpoint():
+            # Resume from checkpoint — skip initialization
+            self._stagnation_count = 0
+            logger.info(f"GA resuming from generation {self._generation}")
+        else:
+            self._population = self._init_population(seed_strategies)
+            self._generation = 0
+            self._best_fitness = -999
+            self._best_chromosome = None
+            self._stagnation_count = 0
+            self._history = []
 
         # ── Evolution loop ──
         for gen in range(cfg.generations):
@@ -167,7 +175,10 @@ class GAStrategyEvolver:
             if self._progress_callback:
                 self._progress_callback((self._generation, cfg.generations, gen_info))
 
-            # 4. Check improvement
+            # 4. Save checkpoint (for resume after stop/crash)
+            self._save_checkpoint()
+
+            # 5. Check improvement
             if best_fit > self._best_fitness + 0.01:
                 self._best_fitness = best_fit
                 self._best_chromosome = copy.deepcopy(best)
@@ -181,13 +192,21 @@ class GAStrategyEvolver:
                            f"{cfg.early_stop_generations} generations")
                 break
 
-            # 6. Create next generation
+            # 6. Graceful stop check
+            if self._stop_after_gen:
+                logger.info(f"GA stopped gracefully after generation {self._generation}")
+                break
+
+            # 7. Create next generation
             if gen < cfg.generations - 1:
                 self._population = self._next_generation()
 
         # ── Final champion ──
         self._running = False
         elapsed = time.time() - t_start
+
+        if self._best_chromosome and not self._stop_after_gen:
+            self.clear_checkpoint()  # clean completion — no resume needed
 
         if self._best_chromosome:
             champion_config = chromosome_to_strategy(self._best_chromosome)
@@ -245,7 +264,8 @@ class GAStrategyEvolver:
             return {"error": "No valid champion found"}
 
     def stop(self):
-        self._running = False
+        """Graceful stop — finish current generation, save checkpoint."""
+        self._stop_after_gen = True
 
     # ── Internal methods ──────────────────────────────────────────
 
@@ -380,6 +400,54 @@ class GAStrategyEvolver:
             return 0.0
         import numpy as np
         return float(np.std(fits) / (abs(np.mean(fits)) + 1e-9))
+
+    # ── Checkpoint / Resume ────────────────────────────────────────
+
+    def _save_checkpoint(self):
+        """Save current GA state to disk for resume."""
+        try:
+            import pickle
+            state = {
+                "population": self._population,
+                "generation": self._generation,
+                "best_fitness": self._best_fitness,
+                "best_chromosome": self._best_chromosome,
+                "history": self._history,
+                "config": self.config,
+            }
+            self._checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._checkpoint_path, "wb") as f:
+                pickle.dump(state, f)
+        except Exception as e:
+            logger.warning(f"GA checkpoint save failed: {e}")
+
+    def load_checkpoint(self) -> bool:
+        """Load saved GA state. Returns True if checkpoint was loaded."""
+        try:
+            import pickle
+            if not self._checkpoint_path.exists():
+                return False
+            with open(self._checkpoint_path, "rb") as f:
+                state = pickle.load(f)
+            self._population = state["population"]
+            self._generation = state["generation"]
+            self._best_fitness = state["best_fitness"]
+            self._best_chromosome = state["best_chromosome"]
+            self._history = state["history"]
+            logger.info(f"GA checkpoint loaded: gen={self._generation}, "
+                       f"best_fitness={self._best_fitness:.2f}")
+            return True
+        except Exception as e:
+            logger.warning(f"GA checkpoint load failed: {e}")
+            return False
+
+    def clear_checkpoint(self):
+        """Remove checkpoint file after successful completion."""
+        try:
+            if self._checkpoint_path.exists():
+                self._checkpoint_path.unlink()
+        except Exception:
+            pass
 
     def _report_progress(self, gen: int, completed: int, total: int):
         if self._progress_callback:

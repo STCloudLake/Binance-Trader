@@ -2111,6 +2111,7 @@ Return ONLY valid JSON in this exact format:
         pop_size = min(body.get("population_size", 60), 120)
         generations = min(body.get("generations", 20), 50)
         seed_strategies = body.get("seed_strategies", [])
+        resume = body.get("resume", False)
 
         from core.ga.evolver import GAStrategyEvolver, GARunConfig
         config = GARunConfig(
@@ -2130,7 +2131,8 @@ Return ONLY valid JSON in this exact format:
             "best_trades": 0, "champion_name": "", "champion_config": None,
             "population_size": pop_size, "started": ga_start_time,
             "eval_completed": 0, "eval_total": 0, "phase": "init",
-            "history": [], "error": None,
+            "history": [], "error": None, "stopped": False, "resumable": False,
+            "checkpoint_gen": 0,
         })
 
         def on_gen(progress_info):
@@ -2165,7 +2167,7 @@ Return ONLY valid JSON in this exact format:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                     result = await loop.run_in_executor(
                         pool, evolver.evolve, symbols, date_start, date_end,
-                        seed_strategies, validation_start)
+                        seed_strategies, validation_start, resume)
                 _ga_state["running"] = False
                 _ga_state["elapsed_seconds"] = time.time() - _ga_state["started"]
                 _ga_state["champion_name"] = result.get("champion_name", "")
@@ -2176,6 +2178,10 @@ Return ONLY valid JSON in this exact format:
             except Exception as e:
                 _ga_state["running"] = False
                 _ga_state["error"] = str(e)
+                # Check if checkpoint exists for resume
+                import os
+                ckpt = os.path.join(str(Path(config.data_dir) if hasattr(config, 'data_dir') else 'data'), 'ga_checkpoint.pkl')
+                _ga_state["resumable"] = os.path.exists(ckpt)
             finally:
                 app.state._ga_evolver = None
 
@@ -2192,7 +2198,8 @@ Return ONLY valid JSON in this exact format:
         evolver = getattr(app.state, "_ga_evolver", None)
         if evolver:
             evolver.stop()
-        _ga_state["running"] = False
+            _ga_state["stopped"] = True
+            _ga_state["phase"] = "stopping"
         return JSONResponse({"ok": True})
 
     @app.get("/partials/ga-panel")

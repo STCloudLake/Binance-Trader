@@ -47,6 +47,10 @@
                     class="bg-red-600 hover:bg-red-500 text-white px-6 py-2 rounded text-sm font-bold hidden">
                 {{ _("Stop") }}
             </button>
+            <button onclick="resumeGA()" id="ga-resume-btn"
+                    class="bg-amber-600 hover:bg-amber-500 text-white px-6 py-2 rounded text-sm font-bold hidden">
+                {{ _("Resume") }}
+            </button>
             <span id="ga-status-text" class="text-sm text-slate-400 self-center"></span>
         </div>
     </div>
@@ -186,10 +190,51 @@ function showError(msg) {
 }
 
 function stopGA() {
+    document.getElementById('ga-stop-btn').disabled = true;
+    document.getElementById('ga-stop-btn').textContent = '{{ _("Stopping...") }}';
+    document.getElementById('ga-phase-text').textContent = '{{ _("Stopping after current generation...") }}';
     fetch('/api/ga/stop', {method: 'POST', credentials: 'same-origin'}).then(function() {
-        resetUI();
-        document.getElementById('ga-status-text').textContent = '{{ _("Stopped") }}';
+        // Will complete after current generation finishes
     }).catch(function() { resetUI(); });
+}
+
+function resumeGA() {
+    var btn = document.getElementById('ga-resume-btn');
+    btn.disabled = true;
+    btn.textContent = '{{ _("Resuming...") }}';
+    fetch('/api/ga/evolve', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        credentials: 'same-origin',
+        body: JSON.stringify({
+            symbols: ['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT'],
+            date_start: document.getElementById('ga-date-start').value,
+            date_end: document.getElementById('ga-date-end').value,
+            validation_start: document.getElementById('ga-val-start').value || null,
+            population_size: parseInt(document.getElementById('ga-pop-size').value) || 30,
+            generations: parseInt(document.getElementById('ga-generations').value) || 15,
+            seed_strategies: ['mean_reversion_rsi_bollinger_bands'],
+            resume: true,
+        })
+    }).then(function(r) { return r.json(); }).then(function(data) {
+        if (data.ok) {
+            document.getElementById('ga-start-btn').classList.add('hidden');
+            document.getElementById('ga-resume-btn').classList.add('hidden');
+            document.getElementById('ga-stop-btn').classList.remove('hidden');
+            document.getElementById('ga-stop-btn').disabled = false;
+            document.getElementById('ga-stop-btn').textContent = '{{ _("Stop") }}';
+            document.getElementById('ga-progress').classList.remove('hidden');
+            document.getElementById('ga-champion').classList.add('hidden');
+            _gaStartTime = Date.now();
+            startTickTimer();
+            _gaPollTimer = setInterval(pollGAStatus, 2000);
+            pollGAStatus();
+        }
+    }).catch(function(err) {
+        btn.disabled = false;
+        btn.textContent = '{{ _("Resume") }}';
+        showError(err.message);
+    });
 }
 
 function resetUI() {
@@ -243,10 +288,18 @@ function pollGAStatus() {
                     '{{ _("Gen") }} ' + gen + '/' + total + ' ' + '{{ _("evaluating") }} ' + evalDone + '/' + evalTotal;
             }
         } else if (gen > 0) {
-            document.getElementById('ga-phase-text').textContent = '{{ _("Complete") }}';
-            document.getElementById('ga-status-text').textContent = '{{ _("Evolution finished") }}';
+            if (s.stopped) {
+                document.getElementById('ga-phase-text').textContent = '{{ _("Stopped") }} — Gen ' + gen + '/' + total;
+                document.getElementById('ga-status-text').textContent = '{{ _("Checkpoint saved, can resume") }}';
+            } else {
+                document.getElementById('ga-phase-text').textContent = '{{ _("Complete") }}';
+                document.getElementById('ga-status-text').textContent = '{{ _("Evolution finished") }}';
+            }
             clearInterval(_gaPollTimer);
             resetUI();
+            if (s.resumable) {
+                document.getElementById('ga-resume-btn').classList.remove('hidden');
+            }
         } else {
             document.getElementById('ga-phase-text').textContent = '{{ _("Initializing population...") }}';
         }
@@ -331,6 +384,8 @@ function loadStrategyFromGA() {
             document.getElementById('ga-phase-text').textContent = '{{ _("Reconnected to running evolution...") }}';
             // Use server's start time for accurate elapsed/ETA
             _gaStartTime = (s.started || (Date.now()/1000 - (s.elapsed_seconds || 0))) * 1000;
+            _gaOverallPct = 0;
+            startTickTimer();
             _gaPollTimer = setInterval(pollGAStatus, 2000);
             pollGAStatus();
         }
