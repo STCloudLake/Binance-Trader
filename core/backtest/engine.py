@@ -133,9 +133,30 @@ class BacktestEngine:
         ml_predictions: dict[str, float] = {}  # "strategy_name|symbol" -> latest confidence
         ml_correct = 0
         ml_total = 0
-        ml_retrain_counter: dict[str, int] = {}
-        ml_retrain_interval = 200 if ml_engine == "tft" else 100
+        # TFT training is ~50x slower than LightGBM per retrain (15s vs 0.3s).
+        # Use much longer intervals for TFT to keep total backtest time reasonable.
+        # LightGBM: retrain each model every ~100 steps (~30s of CPU work per cycle)
+        # TFT:      retrain each model every ~800 steps (~2 min of GPU work per cycle)
+        ml_retrain_interval = 800 if ml_engine == "tft" else 100
         market_regime: dict[str, str] = {}
+
+        # Build round-robin model keys (staggered retraining — 1 model/step)
+        _ml_keys: list[tuple[str, str, str, dict]] = []  # (key, sym, primary_tf, tf_params)
+        _ml_key_idx: dict[str, int] = {}  # key → index in _ml_keys
+        for strategy in strategy_configs:
+            if not (strategy.ml_config and strategy.ml_config.enabled):
+                continue
+            primary_tf = min(strategy.timeframes, key=_tf_minutes) if strategy.timeframes else "1h"
+            tf_params = _ML_TF_PARAMS.get(primary_tf, _ML_TF_PARAMS["1h"])
+            for sym in symbols:
+                key = f"{strategy.name}|{sym}"
+                _ml_key_idx[key] = len(_ml_keys)
+                _ml_keys.append((key, sym, primary_tf, tf_params))
+        _ml_retrain_stagger = max(1, ml_retrain_interval // max(len(_ml_keys), 1))
+        if _ml_keys:
+            logger.info(f"ML round-robin: {len(_ml_keys)} models, "
+                       f"retrain 1 every {_ml_retrain_stagger} steps "
+                       f"(= each model every ~{_ml_retrain_stagger * len(_ml_keys)} steps)")
 
         # TFT state (only when ml_engine == 'tft')
         tft_trainer = None
@@ -338,8 +359,12 @@ class BacktestEngine:
                         continue
 
                     key = f"{strategy.name}|{sym}"
-                    counter = ml_retrain_counter.get(key, 0) + 1
-                    ml_retrain_counter[key] = counter
+                    retrain_idx = _ml_key_idx.get(key, 0)
+                    should_retrain = (
+                        not skip_ml_training and
+                        step % _ml_retrain_stagger == retrain_idx % _ml_retrain_stagger and
+                        step > 0
+                    ) or key not in ml_models
 
                     # Regime detection on 1h for this symbol (once)
                     if sym not in market_regime:
@@ -348,14 +373,14 @@ class BacktestEngine:
 
                     # ── TFT path ──
                     if ml_engine == "tft" and tft_trainer is not None:
-                        if not skip_ml_training and (counter >= ml_retrain_interval or key not in ml_models):
+                        if should_retrain:
                             sliced = df_tf[df_tf.index <= ts]
                             if len(sliced) >= 150:
                                 model = self._train_tft_model(
                                     tft_trainer, sliced, sym, primary_tf)
                                 if model is not None:
                                     ml_models[key] = model
-                            ml_retrain_counter[key] = 0
+                            # model updated (round-robin)
 
                         model = ml_models.get(key)
                         if model is not None:
@@ -381,12 +406,12 @@ class BacktestEngine:
 
                     # ── LightGBM path ──
                     else:
-                        if not skip_ml_training and (counter >= ml_retrain_interval or key not in ml_models):
+                        if should_retrain:
                             sliced = df_tf[df_tf.index <= ts]
                             model = self._train_ml_model(sliced, tf_params)
                             if model is not None:
                                 ml_models[key] = model
-                            ml_retrain_counter[key] = 0
+                            # model updated (round-robin)
 
                         model = ml_models.get(key)
                         if model is not None:
