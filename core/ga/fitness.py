@@ -70,6 +70,10 @@ def evaluate_chromosome(
         if total_return < -5:
             fitness -= abs(total_return) * 0.5
 
+        # ── Complexity penalty ──
+        # Penalize overparameterized strategies to reduce overfitting risk
+        fitness -= complexity_penalty(chromosome)
+
         return {
             "fitness": round(fitness, 4),
             "sharpe": round(sharpe, 4),
@@ -84,6 +88,88 @@ def evaluate_chromosome(
     except Exception as e:
         logger.debug(f"Fitness eval failed: {e}")
         return {"fitness": -999, "error": str(e)}
+
+
+def complexity_penalty(chromosome: dict) -> float:
+    """Penalize overparameterized strategies.
+
+    More conditions + more indicators + more params = higher risk of overfitting.
+    Returns a penalty value to subtract from fitness.
+    """
+    structural = chromosome.get("structural", [])
+    continuous = chromosome.get("continuous", [])
+    indicators_used = set()
+
+    # Count conditions
+    n_conditions = sum(len(g.conditions) for g in structural)
+
+    # Count unique indicator types from continuous genes
+    for g in continuous:
+        name = g.name.split("_")[0]  # "rsi_period" -> "rsi"
+        indicators_used.add(name)
+
+    penalty = 0.0
+    penalty += n_conditions * 0.8       # each condition adds overfit risk
+    penalty += len(indicators_used) * 1.2  # each indicator type
+    penalty += len(continuous) * 0.3     # each tunable parameter
+    return penalty
+
+
+def deflated_sharpe_ratio(
+    observed_sharpe: float,
+    n_trials: int,
+    observation_periods: int = 365,
+    variance_sharpe: float = 1.0,
+) -> dict:
+    """Compute Deflated Sharpe Ratio (DSR) — statistical significance test.
+
+    Accounts for multiple testing: out of *n_trials* random strategies,
+    what's the probability of seeing a Sharpe >= *observed_sharpe* purely
+    by chance?
+
+    Based on: Bailey & López de Prado (2014), "The Deflated Sharpe Ratio"
+
+    Parameters
+    ----------
+    observed_sharpe : float
+        The Sharpe ratio of the champion strategy.
+    n_trials : int
+        Number of strategies evaluated (population × generations).
+    observation_periods : int
+        Number of return observations (trading days).
+    variance_sharpe : float
+        Variance of the Sharpe ratio under null (≈1 for daily returns).
+
+    Returns
+    -------
+    dict with dsr (deflated SR), p_value, significant (bool at 95%).
+    """
+    import math
+    from scipy import stats as _stats
+
+    if observed_sharpe <= 0 or n_trials <= 1:
+        return {"dsr": 0.0, "p_value": 1.0, "significant": False}
+
+    # Expected maximum Sharpe from n_trials random trials
+    # E[max(SR)] ≈ sqrt(2 * log(n_trials))
+    expected_max = math.sqrt(variance_sharpe / observation_periods) * math.sqrt(2 * math.log(n_trials))
+
+    # Deflated Sharpe = observed - expected_max
+    dsr = observed_sharpe - expected_max
+
+    # P-value: is DSR significantly > 0?
+    # Test: H0: true Sharpe = expected_max (just lucky data mining)
+    se = math.sqrt(variance_sharpe / observation_periods)
+    z_score = max(dsr, 0) / max(se, 1e-9)
+    p_value = 1.0 - _stats.norm.cdf(z_score)
+
+    return {
+        "dsr": round(dsr, 4),
+        "expected_max_random": round(expected_max, 4),
+        "p_value": round(max(p_value, 0.0), 4),
+        "significant": dsr > 0 and p_value < 0.05,
+        "n_trials": n_trials,
+    }
 
 
 def evaluate_population(

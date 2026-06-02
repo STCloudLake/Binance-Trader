@@ -21,8 +21,20 @@
             </div>
             <div>
                 <label class="text-sm text-slate-400">End Date</label>
-                <input type="date" id="ga-date-end" value="2026-05-15"
+                <input type="date" id="ga-date-end" value="2026-05-31"
                        class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-white text-sm">
+            </div>
+        </div>
+        <div class="grid grid-cols-4 gap-3 mt-2">
+            <div>
+                <label class="text-sm text-slate-400">Validation Start (optional)</label>
+                <input type="date" id="ga-val-start" value="2026-05-20"
+                       class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-white text-sm">
+            </div>
+            <div class="col-span-3 flex items-end">
+                <span class="text-xs text-slate-500">
+                    {{ _("GA trains on Start→Validation, tests champion on Validation→End") }}
+                </span>
             </div>
         </div>
 
@@ -96,6 +108,7 @@ function startGA() {
             symbols: ['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT'],
             date_start: document.getElementById('ga-date-start').value,
             date_end: document.getElementById('ga-date-end').value,
+            validation_start: document.getElementById('ga-val-start').value || null,
             population_size: parseInt(document.getElementById('ga-pop-size').value) || 30,
             generations: parseInt(document.getElementById('ga-generations').value) || 15,
             seed_strategies: ['mean_reversion_rsi_bollinger_bands'],
@@ -197,12 +210,31 @@ function pollGAStatus() {
 
         if (s.champion_name) {
             document.getElementById('ga-champion').classList.remove('hidden');
-            document.getElementById('ga-champion-info').innerHTML =
-                '<strong>' + s.champion_name + '</strong><br>' +
-                'Fitness: ' + (s.best_fitness || 0).toFixed(2) +
-                ' | Sharpe: ' + (s.best_sharpe || 0).toFixed(2) +
-                ' | Win Rate: ' + (s.best_win_rate || 0).toFixed(1) + '%' +
-                ' | Trades: ' + (s.best_trades || 0);
+            var info = '<strong>' + s.champion_name + '</strong><br>';
+            info += '<div class=\'grid grid-cols-2 gap-2 mt-1\'>';
+            info += '<div><span class=\'text-slate-400\'>Train Sharpe:</span> ' + (s.best_sharpe || 0).toFixed(2) + '</div>';
+            info += '<div><span class=\'text-slate-400\'>Train Win Rate:</span> ' + (s.best_win_rate || 0).toFixed(1) + '%</div>';
+
+            if (s.validation) {
+                var v = s.validation;
+                var valSharpe = v.sharpe || 0;
+                var trainSharpe = s.best_sharpe || 0;
+                var drop = trainSharpe > 0 ? Math.round((1 - valSharpe / trainSharpe) * 100) : 0;
+                var color = drop < 20 ? 'text-emerald-400' : (drop < 50 ? 'text-yellow-400' : 'text-red-400');
+                info += '<div><span class=\'text-slate-400\'>Val Sharpe:</span> <span class=\'' + color + '\'>' + valSharpe.toFixed(2) + '</span></div>';
+                info += '<div><span class=\'text-slate-400\'>Val Win Rate:</span> ' + (v.win_rate || 0).toFixed(1) + '%</div>';
+
+                if (s.dsr) {
+                    var dsr = s.dsr;
+                    var sigColor = dsr.significant ? 'text-emerald-400' : 'text-red-400';
+                    info += '<div class=\'col-span-2 mt-1\'>';
+                    info += '<span class=\'text-slate-400\'>DSR:</span> <span class=\'' + sigColor + '\'>' + (dsr.dsr || 0).toFixed(3) + '</span>';
+                    info += ' <span class=\'text-xs text-slate-500\'>(' + (dsr.significant ? 'significant' : 'NOT significant') + ', p=' + (dsr.p_value || 1).toFixed(3) + ')</span>';
+                    info += '</div>';
+                }
+            }
+            info += '</div>';
+            document.getElementById('ga-champion-info').innerHTML = info;
         }
 
         if (s.error) {

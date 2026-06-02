@@ -2106,7 +2106,8 @@ Return ONLY valid JSON in this exact format:
 
         symbols = body.get("symbols", ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"])
         date_start = body.get("date_start", "2026-05-01")
-        date_end = body.get("date_end", "2026-05-15")
+        date_end = body.get("date_end", "2026-05-31")
+        validation_start = body.get("validation_start") or None
         pop_size = min(body.get("population_size", 60), 120)
         generations = min(body.get("generations", 20), 50)
         seed_strategies = body.get("seed_strategies", [])
@@ -2149,7 +2150,8 @@ Return ONLY valid JSON in this exact format:
             try:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                     result = await loop.run_in_executor(
-                        pool, evolver.evolve, symbols, date_start, date_end, seed_strategies)
+                        pool, evolver.evolve, symbols, date_start, date_end,
+                        seed_strategies, validation_start)
                 _ga_state["running"] = False
                 _ga_state["elapsed_seconds"] = time.time() - _ga_state["started"]
                 _ga_state["champion_name"] = result.get("champion_name", "")

@@ -84,22 +84,32 @@ class GAStrategyEvolver:
                symbols: list[str],
                date_start: str,
                date_end: str,
-               seed_strategies: list[str] | None = None) -> dict:
+               seed_strategies: list[str] | None = None,
+               validation_start: str | None = None) -> dict:
         """Run the full GA evolution.
 
         Parameters
         ----------
         seed_strategies : list[str] | None
             Names of existing strategies to include in the initial population.
-            These provide "good genes" to bootstrap evolution.
+        validation_start : str | None
+            If set, the final champion is also tested on this→date_end
+            (out-of-sample). The GA only sees date_start→validation_start
+            during evolution. This is the single most important defense
+            against overfitting.
         """
         self._running = True
         cfg = self.config
         t_start = time.time()
 
+        # Training period: if validation_start is set, stop training there
+        train_end = validation_start if validation_start else date_end
+        has_validation = validation_start is not None
+
         logger.info(f"GA: population={cfg.population_size}, "
                     f"generations={cfg.generations}, "
-                    f"elite={cfg.elite_count}, symbols={symbols}")
+                    f"train={date_start}~{train_end}"
+                    + (f", validate={validation_start}~{date_end}" if has_validation else ""))
 
         # ── Initialize population ──
         self._population = self._init_population(seed_strategies)
@@ -119,7 +129,7 @@ class GAStrategyEvolver:
 
             # 1. Evaluate fitness
             self._population = evaluate_population(
-                self._population, symbols, date_start, date_end,
+                self._population, symbols, date_start, train_end,
                 self.engine, self.loader,
                 max_workers=cfg.max_workers,
                 progress_callback=lambda c, t: self._report_progress("eval", c, t))
@@ -184,24 +194,52 @@ class GAStrategyEvolver:
             champion_config.name = f"ga_champion_{int(time.time())}"
             self.loader.save(champion_config)
 
-            result = self._best_chromosome.get("fitness_result", {})
+            train_result = self._best_chromosome.get("fitness_result", {})
+
+            # ── Out-of-sample validation ──
+            validation = None
+            dsr = None
+            if has_validation:
+                logger.info(f"GA: validating champion on {validation_start}~{date_end}")
+                from core.ga.fitness import evaluate_chromosome
+                val_result = evaluate_chromosome(
+                    self._best_chromosome, symbols,
+                    validation_start, date_end,
+                    self.engine, self.loader)
+                validation = {
+                    "sharpe": val_result.get("sharpe", 0),
+                    "win_rate": val_result.get("win_rate", 0),
+                    "trade_count": val_result.get("trade_count", 0),
+                    "total_return": val_result.get("total_return", 0),
+                }
+                # ── Statistical significance ──
+                n_trials = cfg.population_size * self._generation
+                from core.ga.fitness import deflated_sharpe_ratio
+                dsr = deflated_sharpe_ratio(
+                    val_result.get("sharpe", 0), n_trials)
+                logger.info(
+                    f"GA validation: sharpe={validation['sharpe']:.2f} "
+                    f"DSR={dsr['dsr']:.2f} sig={dsr['significant']} "
+                    f"(train sharpe={train_result.get('sharpe',0):.2f})")
+
             logger.info(
                 f"GA complete: {self._generation} gens in {elapsed:.0f}s | "
                 f"champion={champion_config.name} "
-                f"fitness={result.get('fitness',0):.2f} "
-                f"sharpe={result.get('sharpe',0):.2f} "
-                f"trades={result.get('trade_count',0)}")
+                f"fitness={train_result.get('fitness',0):.2f} "
+                f"sharpe={train_result.get('sharpe',0):.2f}")
 
             return {
                 "champion_name": champion_config.name,
                 "champion_config": champion_config.model_dump(),
-                "fitness": result.get("fitness", 0),
-                "sharpe": result.get("sharpe", 0),
-                "win_rate": result.get("win_rate", 0),
-                "trade_count": result.get("trade_count", 0),
+                "fitness": train_result.get("fitness", 0),
+                "sharpe": train_result.get("sharpe", 0),
+                "win_rate": train_result.get("win_rate", 0),
+                "trade_count": train_result.get("trade_count", 0),
                 "generations": self._generation,
                 "elapsed_seconds": elapsed,
                 "history": self._history,
+                "validation": validation,
+                "dsr": dsr,
             }
         else:
             return {"error": "No valid champion found"}
