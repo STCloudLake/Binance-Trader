@@ -1,0 +1,35 @@
+enabled: true
+entry_conditions:
+  long:
+  - volume_ratio > 2.0
+  - rsi < 35
+  short:
+  - adx > 20
+  - close < bollinger_upper
+  - rsi > 65
+exit_conditions:
+  long:
+  - close < bollinger_middle
+  - close < ema_slow
+  - rsi > 65
+  short:
+  - close > ema_slow
+indicators:
+  macd:
+    fast: 12
+    signal: 11
+    slow: 32
+  rsi:
+    period: 11
+    source: close
+ml_config:
+  confidence_threshold: 0.62
+  enabled: false
+  features: []
+  weight: 0.1
+mode: range
+name: ga_gen_7_7227
+reduce_conditions: {}
+symbols: []
+timeframes:
+- 4h

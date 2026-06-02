@@ -86,10 +86,15 @@ class BacktestEngine:
                                   strategy_symbols: dict[str, list[str]] = None,
                                   simulate_ai_weights: bool = True,
                                   ml_engine: str = "lightgbm",
-                                  skip_ml_training: bool = False):
+                                  skip_ml_training: bool = False,
+                                  per_strategy_isolation: bool = False):
         """Full backtest with ML predictions, signal fusion, and risk controls.
 
         Args:
+            per_strategy_isolation: If True, each strategy gets independent
+                positions (no blocking). Position key = 'strategy|symbol'.
+                Used for GA batch evaluation where multiple strategies
+                run in a single data pass.
             simulate_ai_weights: If True, adjust signal weights based on detected
                 market regime (mimicking what the live AI market assessment does).
             ml_engine: 'lightgbm' (tree), 'tft' (transformer), 'patchtst' (patch-transformer).
@@ -336,8 +341,14 @@ class BacktestEngine:
         # Entry threshold
         ENTRY_THRESHOLD = 0.5
 
-        # Max positions
+        # Max positions (per-strategy when isolated)
         max_positions = self.config.hard_limits.max_open_trades
+        if per_strategy_isolation:
+            max_positions = max(1, max_positions // max(len(strategy_configs), 1))
+
+        # Position key helper — includes strategy name when isolated
+        def _pkey(sym: str, s_name: str = "") -> str:
+            return f"{s_name}|{sym}" if per_strategy_isolation else sym
 
         # Per-strategy×symbol results matrix (use YAML config names as keys)
         per_matrix: dict[str, dict[str, dict]] = {}
@@ -506,11 +517,10 @@ class BacktestEngine:
                                 pass
 
             # --- CHECK REDUCE CONDITIONS (partial profit-taking) ---
-            # Mirror live engine: reduce fires before full exit, max 4 reduces per position.
-            for sym in list(positions.keys()):
-                pos = positions[sym]
-                reduce_key = f"reduce_{sym}_{pos.get('side','')}"
-                reduce_count = positions[sym].get("reduce_count", 0)
+            for pos_key in list(positions.keys()):
+                pos = positions[pos_key]
+                sym = pos["symbol"]
+                reduce_count = pos.get("reduce_count", 0)
                 if reduce_count >= 4:
                     continue
 
@@ -594,8 +604,9 @@ class BacktestEngine:
                         break  # one interval is enough
 
             # --- CHECK EXITS ---
-            for sym in list(positions.keys()):
-                pos = positions[sym]
+            for pos_key in list(positions.keys()):
+                pos = positions[pos_key]
+                sym = pos["symbol"]
 
                 # Get current close price from the feeder data (using primary TF)
                 price_now = 0.0
@@ -614,7 +625,7 @@ class BacktestEngine:
                         if (pos["side"] == "long" and price_now <= sl_price) or \
                            (pos["side"] == "short" and price_now >= sl_price):
                             balance = self._close_position(
-                                sym, pos, price_now, ts, "stop_loss",
+                                pos_key, pos, price_now, ts, "stop_loss",
                                 trades, events, balance, positions, per_matrix)
                             continue
 
@@ -624,7 +635,7 @@ class BacktestEngine:
                         if (pos["side"] == "long" and price_now >= tp_price) or \
                            (pos["side"] == "short" and price_now <= tp_price):
                             balance = self._close_position(
-                                sym, pos, price_now, ts, f"tp_{int(tp_pct*100)}pct",
+                                pos_key, pos, price_now, ts, f"tp_{int(tp_pct*100)}pct",
                                 trades, events, balance, positions, per_matrix)
                             break
 
@@ -648,7 +659,7 @@ class BacktestEngine:
                             if hasattr(mask, 'iloc') and mask.iloc[-1]:
                                 exit_price = float(df["close"].iloc[-1])
                                 balance = self._close_position(
-                                    sym, pos, exit_price, ts, "indicator",
+                                    pos_key, pos, exit_price, ts, "indicator",
                                     trades, events, balance, positions, per_matrix)
                                 break
                         if sym not in positions:
@@ -674,7 +685,7 @@ class BacktestEngine:
                 for sym in symbols:
                     if sym not in effective_symbols:
                         continue  # strategy not assigned to this symbol
-                    if sym in positions:
+                    if _pkey(sym, strategy.name) in positions:
                         continue
                     if len(positions) >= max_positions:
                         break
@@ -776,7 +787,8 @@ class BacktestEngine:
                     trade_group = f"bt_{pos_counter}_{int(ts.timestamp())}"
                     balance -= amount_usdt
 
-                    positions[sym] = {
+                    pos_key = _pkey(sym, strategy.name)
+                    positions[pos_key] = {
                         "symbol": sym, "side": side,
                         "quantity": qty, "entry_price": price,
                         "amount_usdt": amount_usdt,
@@ -827,9 +839,10 @@ class BacktestEngine:
             "per_matrix": per_matrix,
         }
 
-    def _close_position(self, sym, pos, exit_price, ts, reason, trades, events,
+    def _close_position(self, pos_key, pos, exit_price, ts, reason, trades, events,
                          balance, positions, per_matrix):
         """Close a position and record the trade. Used for SL/TP/indicator exits."""
+        sym = pos["symbol"]
         entry_price = pos["entry_price"]
         qty = pos["quantity"]
         amount = pos.get("amount_usdt", qty * entry_price)
@@ -875,7 +888,7 @@ class BacktestEngine:
             else:
                 cell["short_trades"] += 1
 
-        del positions[sym]
+        del positions[pos_key]
         return balance
 
     # ---- ML Helpers ----

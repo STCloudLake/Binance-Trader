@@ -1,0 +1,37 @@
+enabled: true
+entry_conditions:
+  long:
+  - volume_ratio > 1.5
+  short:
+  - rsi > 70
+exit_conditions:
+  long:
+  - close < bollinger_middle
+  - rsi > 65
+  - close < bollinger_lower
+  short:
+  - close > bollinger_upper
+indicators:
+  adx:
+    period: 12
+  ema:
+    period: 10
+    source: close
+  macd:
+    fast: 13
+    signal: 6
+    slow: 31
+  rsi:
+    period: 17
+    source: close
+ml_config:
+  confidence_threshold: 0.55
+  enabled: false
+  features: []
+  weight: 0.2
+mode: trend
+name: ga_gen_9_8144
+reduce_conditions: {}
+symbols: []
+timeframes:
+- 1m

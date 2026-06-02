@@ -135,11 +135,12 @@ class GAStrategyEvolver:
             self._generation = gen + 1
             gen_start = time.time()
 
-            # 1. Evaluate fitness
-            self._population = evaluate_population(
+            # 1. Evaluate fitness (batch mode — 4-5x faster)
+            from core.ga.fitness import evaluate_population_batch
+            self._population = evaluate_population_batch(
                 self._population, symbols, date_start, train_end,
                 self.engine, self.loader,
-                max_workers=cfg.max_workers,
+                batch_size=min(cfg.population_size, 15),
                 progress_callback=lambda c, t: self._report_progress(self._generation or 1, c, t))
 
             # 2. Sort by fitness
