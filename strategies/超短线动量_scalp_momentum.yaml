@@ -30,12 +30,7 @@ indicators:
 ml_config:
   confidence_threshold: 0.55
   enabled: true
-  features:
-  - rsi
-  - macd_histogram
-  - bollinger_width
-  - volume_ratio
-  - price_momentum_5m
+  features: []
   weight: 0.4
 mode: scalp
 name: 超短线动量 Scalp Momentum

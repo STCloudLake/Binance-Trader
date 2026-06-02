@@ -1,0 +1,35 @@
+enabled: false
+entry_conditions:
+  long:
+  - stoch_k < 20 and close > ema_50 and volume_ratio > 1.2
+  short:
+  - stoch_k > 80 and close < ema_50 and volume_ratio > 1.2
+exit_conditions:
+  long:
+  - stoch_k > 80
+  short:
+  - stoch_k < 20
+indicators:
+  ema:
+    period: 50
+    source: close
+  stoch:
+    period: ''
+ml_config:
+  confidence_threshold: 0.6
+  enabled: true
+  features: []
+  weight: 0.3
+mode: trend
+name: Stochastic Oscillator Trend Reversal with EMA Filter
+reduce_conditions:
+  long:
+  - condition: stoch_k > 60 and close > ema_50 and volume_ratio > 1.0
+    reduce_pct: 50
+  short:
+  - condition: stoch_k < 40 and close < ema_50 and volume_ratio > 1.0
+    reduce_pct: 50
+symbols: []
+timeframes:
+- 1h
+- 4h

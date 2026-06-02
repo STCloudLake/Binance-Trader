@@ -144,17 +144,21 @@ class BacktestEngine:
         market_regime: dict[str, str] = {}
 
         # Build round-robin model keys (staggered retraining — 1 model/step)
-        _ml_keys: list[tuple[str, str, str, dict]] = []  # (key, sym, primary_tf, tf_params)
+        _ml_keys: list[tuple[str, str, str, dict, list[str]]] = []  # (key, sym, tf, params, features)
         _ml_key_idx: dict[str, int] = {}  # key → index in _ml_keys
         for strategy in strategy_configs:
             if not (strategy.ml_config and strategy.ml_config.enabled):
                 continue
             primary_tf = min(strategy.timeframes, key=_tf_minutes) if strategy.timeframes else "1h"
             tf_params = _ML_TF_PARAMS.get(primary_tf, _ML_TF_PARAMS["1h"])
+            # Respect per-strategy feature selection: empty = all features
+            ml_features = (strategy.ml_config.features
+                          if (strategy.ml_config and strategy.ml_config.features)
+                          else None)
             for sym in symbols:
                 key = f"{strategy.name}|{sym}"
                 _ml_key_idx[key] = len(_ml_keys)
-                _ml_keys.append((key, sym, primary_tf, tf_params))
+                _ml_keys.append((key, sym, primary_tf, tf_params, ml_features))
         _ml_retrain_stagger = max(1, ml_retrain_interval // max(len(_ml_keys), 1))
         if _ml_keys:
             logger.info(f"ML round-robin: {len(_ml_keys)} models, "
@@ -397,7 +401,8 @@ class BacktestEngine:
                             sliced = df_tf[df_tf.index <= ts]
                             if len(sliced) >= 150:
                                 model = self._train_patchtst_model(
-                                    patchtst_trainer, sliced, sym, primary_tf)
+                                    patchtst_trainer, sliced, sym, primary_tf,
+                                    feature_list=strategy.ml_config.features if strategy.ml_config else None)
                                 if model is not None:
                                     ml_models[key] = model
 
@@ -428,7 +433,8 @@ class BacktestEngine:
                             sliced = df_tf[df_tf.index <= ts]
                             if len(sliced) >= 150:
                                 model = self._train_tft_model(
-                                    tft_trainer, sliced, sym, primary_tf)
+                                    tft_trainer, sliced, sym, primary_tf,
+                                    feature_list=strategy.ml_config.features if strategy.ml_config else None)
                                 if model is not None:
                                     ml_models[key] = model
                             # model updated (round-robin)
@@ -870,18 +876,23 @@ class BacktestEngine:
         "adx": {"period": 14},
     }
 
-    def _compute_ml_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Compute the full 30-dim feature set for ML.
+    def _compute_ml_features(self, df: pd.DataFrame,
+                             feature_list: list[str] | None = None) -> pd.DataFrame:
+        """Compute the full feature set for ML, optionally filtered.
 
         Uses the shared compute_features() from core.ml.features.
+        feature_list=None → all features; non-empty list → filter.
         """
         from core.strategy.indicators import compute_all
         from core.ml.features import compute_features as _compute_features
 
         df_ind = compute_all(df.copy(), self._ML_INDICATORS)
-        return _compute_features(df_ind, None)  # None = all default features
+        # None = all features; [] or non-empty list = filter
+        fl = feature_list if feature_list else None
+        return _compute_features(df_ind, fl)
 
-    def _train_ml_model(self, df: pd.DataFrame, tf_params: dict = None):
+    def _train_ml_model(self, df: pd.DataFrame, tf_params: dict = None,
+                         feature_list: list[str] | None = None):
         """Train a LightGBM classifier (XGBoost fallback) with timeframe-appropriate labels.
 
         Each strategy's primary timeframe gets its own model with matched
@@ -897,7 +908,7 @@ class BacktestEngine:
         try:
             from core.ml.features import create_binary_label
 
-            feature_df = self._compute_ml_features(df)
+            feature_df = self._compute_ml_features(df, feature_list)
             labels = create_binary_label(
                 df, forward_periods=tf_params["forward"],
                 threshold=tf_params["threshold"])
@@ -1040,7 +1051,8 @@ class BacktestEngine:
     # ── PatchTST helpers ─────────────────────────────────────────────
 
     def _train_patchtst_model(self, trainer, df: pd.DataFrame, symbol: str,
-                              interval: str, max_train_rows: int = 5000):
+                              interval: str, max_train_rows: int = 5000,
+                              feature_list: list[str] | None = None):
         """Train a PatchTST model with triple-barrier labels."""
         try:
             from core.strategy.indicators import compute_all
@@ -1051,7 +1063,9 @@ class BacktestEngine:
                 df = df.iloc[-max_train_rows:]
 
             df_ind = compute_all(df.copy(), REQUIRED_INDICATORS)
-            X = _cf(df_ind, None)
+            # feature_list=None or [] → use all features; non-empty → filter
+            fl = feature_list if feature_list else None
+            X = _cf(df_ind, fl)
             # Triple barrier: 2% up/down, 24 periods lookahead
             y = create_triple_barrier_label(
                 df_ind, forward_periods=24, upper_pct=0.02, lower_pct=0.02,
