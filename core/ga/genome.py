@@ -206,22 +206,22 @@ def chromosome_to_strategy(chromosome: dict) -> StrategyConfig:
 
     indicators = {}
     if "rsi_period" in cont:
-        indicators["rsi"] = {"period": int(cont["rsi_period"]), "source": "close"}
+        indicators["rsi"] = {"period": int(cont.get("rsi_period", 14)), "source": "close"}
     if "macd_fast" in cont:
         indicators["macd"] = {
-            "fast": int(cont["macd_fast"]),
-            "slow": int(cont["macd_slow"]),
-            "signal": int(cont["macd_signal"]),
+            "fast": int(cont.get("macd_fast", 12)),
+            "slow": int(cont.get("macd_slow", 26)),
+            "signal": int(cont.get("macd_signal", 9)),
         }
     if "bb_period" in cont:
         indicators["bollinger"] = {
-            "period": int(cont["bb_period"]),
-            "stddev": round(cont["bb_stddev"], 2),
+            "period": int(cont.get("bb_period", 20)),
+            "stddev": round(cont.get("bb_stddev", 2.0), 2),
         }
     if "adx_period" in cont:
-        indicators["adx"] = {"period": int(cont["adx_period"])}
+        indicators["adx"] = {"period": int(cont.get("adx_period", 14))}
     if "ema_period" in cont:
-        indicators["ema"] = {"period": int(cont["ema_period"]), "source": "close"}
+        indicators["ema"] = {"period": int(cont.get("ema_period", 9)), "source": "close"}
 
     ml_config = MLConfig(
         enabled=cont.get("ml_weight", 0) > 0,
