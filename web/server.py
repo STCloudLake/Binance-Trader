@@ -1724,7 +1724,7 @@ Return ONLY valid JSON in this exact format:
 
         # Detect GPU for display
         bt_device = "cpu"
-        if ml_engine == "tft":
+        if ml_engine in ("tft", "patchtst"):
             try:
                 import torch
                 if torch.cuda.is_available():
@@ -1789,6 +1789,7 @@ Return ONLY valid JSON in this exact format:
             "ml_engine": ml_engine,
             "device": bt_device,
             "skip_training": (skip_ml_training == "1"),
+            "initial_pct": 0,
         })
         resp.set_cookie("bt_active_run", run_id, max_age=3600, httponly=False)
         return resp

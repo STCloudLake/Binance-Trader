@@ -196,9 +196,9 @@ class PatchTSTModel(nn.Module):
         raw = self.output_head(h)  # (B, num_outputs)
 
         if self.output_mode == "triple_barrier":
-            probs = F.softmax(raw, dim=-1)  # [P(up), P(down), P(timeout)]
-            p_up = probs[:, 0]
-            p_down = probs[:, 1]
+            probs = F.softmax(raw, dim=-1)  # [P(down), P(up), P(timeout)] — class order
+            p_down = probs[:, 0]  # class 0 = lower barrier hit first (bearish)
+            p_up = probs[:, 1]    # class 1 = upper barrier hit first (bullish)
 
             direction = torch.where(
                 p_up > p_down,
@@ -214,9 +214,9 @@ class PatchTSTModel(nn.Module):
             return {
                 "logits": raw,
                 "probs": probs,
-                "p_up": p_up,
-                "p_down": p_down,
-                "p_timeout": probs[:, 2],
+                "p_up": p_up,        # class 1 = upper barrier hit
+                "p_down": p_down,    # class 0 = lower barrier hit
+                "p_timeout": probs[:, 2],  # class 2 = timeout
                 "direction": direction,
                 "confidence": confidence,
             }

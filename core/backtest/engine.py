@@ -178,7 +178,9 @@ class BacktestEngine:
                 key = f"{strategy.name}|{sym}"
                 _ml_key_idx[key] = len(_ml_keys)
                 _ml_keys.append((key, sym, primary_tf, tf_params, ml_features))
-        _ml_retrain_stagger = max(1, ml_retrain_interval // max(len(_ml_keys), 1))
+        # Scale interval up if more models than steps in the interval
+        _effective_interval = max(ml_retrain_interval, len(_ml_keys))
+        _ml_retrain_stagger = max(1, _effective_interval // max(len(_ml_keys), 1))
         if _ml_keys:
             logger.info(f"ML round-robin: {len(_ml_keys)} models, "
                        f"retrain 1 every {_ml_retrain_stagger} steps "
@@ -386,19 +388,32 @@ class BacktestEngine:
                     retrain_idx = _ml_key_idx.get(key, 0)
                     should_retrain = (
                         not skip_ml_training and
+                        key not in ml_models and
                         step % _ml_retrain_stagger == retrain_idx % _ml_retrain_stagger and
                         step > 0
-                    ) or key not in ml_models
+                    )
 
                     # Regime detection on 1h for this symbol (once)
                     if sym not in market_regime:
                         df_1h = feeder.get_all_data_for_symbol(sym, "1h")
-                        market_regime[sym] = self._detect_market_regime(df_1h[df_1h.index <= ts])
+                        try:
+                            pos_1h = df_1h.index.get_loc(ts)
+                            if isinstance(pos_1h, slice): pos_1h = pos_1h.stop - 1
+                            market_regime[sym] = self._detect_market_regime(df_1h.iloc[:pos_1h + 1])
+                        except KeyError:
+                            market_regime[sym] = self._detect_market_regime(df_1h[df_1h.index <= ts])
+
+                    # Fast slice: get_loc is O(log n) vs boolean indexing O(n)
+                    try:
+                        pos_tf = df_tf.index.get_loc(ts)
+                        if isinstance(pos_tf, slice): pos_tf = pos_tf.stop - 1
+                        sliced = df_tf.iloc[:pos_tf + 1]
+                    except KeyError:
+                        sliced = df_tf[df_tf.index <= ts]
 
                     # ── PatchTST path ──
                     if ml_engine == "patchtst" and patchtst_trainer is not None:
                         if should_retrain:
-                            sliced = df_tf[df_tf.index <= ts]
                             if len(sliced) >= 150:
                                 model = self._train_patchtst_model(
                                     patchtst_trainer, sliced, sym, primary_tf,
@@ -410,14 +425,14 @@ class BacktestEngine:
                         if model is not None:
                             try:
                                 conf = self._predict_patchtst(
-                                    patchtst_trainer, model, df_tf[df_tf.index <= ts])
+                                    patchtst_trainer, model, sliced)
                                 if conf is not None:
                                     ml_predictions[key] = conf
                                     fwd = tf_params["forward"]
                                     th = tf_params["threshold"]
                                     future_df = df_tf[df_tf.index > ts]
                                     if len(future_df) >= fwd:
-                                        cur_close = float(df_tf[df_tf.index <= ts].iloc[-1]["close"])
+                                        cur_close = float(sliced.iloc[-1]["close"])
                                         fut_close = float(future_df.iloc[fwd - 1]["close"])
                                         ret = (fut_close - cur_close) / cur_close
                                         if abs(ret) >= th:
@@ -430,7 +445,6 @@ class BacktestEngine:
                     # ── TFT path ──
                     elif ml_engine == "tft" and tft_trainer is not None:
                         if should_retrain:
-                            sliced = df_tf[df_tf.index <= ts]
                             if len(sliced) >= 150:
                                 model = self._train_tft_model(
                                     tft_trainer, sliced, sym, primary_tf,
@@ -443,7 +457,7 @@ class BacktestEngine:
                         if model is not None:
                             try:
                                 conf = self._predict_tft(
-                                    tft_trainer, model, df_tf[df_tf.index <= ts])
+                                    tft_trainer, model, sliced)
                                 if conf is not None:
                                     ml_predictions[key] = conf
                                     # Accuracy tracking
@@ -451,7 +465,7 @@ class BacktestEngine:
                                     th = tf_params["threshold"]
                                     future_df = df_tf[df_tf.index > ts]
                                     if len(future_df) >= fwd:
-                                        cur_close = float(df_tf[df_tf.index <= ts].iloc[-1]["close"])
+                                        cur_close = float(sliced.iloc[-1]["close"])
                                         fut_close = float(future_df.iloc[fwd - 1]["close"])
                                         ret = (fut_close - cur_close) / cur_close
                                         if abs(ret) >= th:
@@ -464,7 +478,6 @@ class BacktestEngine:
                     # ── LightGBM path ──
                     else:
                         if should_retrain:
-                            sliced = df_tf[df_tf.index <= ts]
                             model = self._train_ml_model(sliced, tf_params)
                             if model is not None:
                                 ml_models[key] = model
@@ -473,7 +486,7 @@ class BacktestEngine:
                         model = ml_models.get(key)
                         if model is not None:
                             try:
-                                conf = self._predict_ml(model, df_tf[df_tf.index <= ts])
+                                conf = self._predict_ml(model, sliced)
                                 if conf is not None:
                                     ml_predictions[key] = conf
 
@@ -482,7 +495,7 @@ class BacktestEngine:
                                     th = tf_params["threshold"]
                                     future_df = df_tf[df_tf.index > ts]
                                     if len(future_df) >= fwd:
-                                        cur_close = float(df_tf[df_tf.index <= ts].iloc[-1]["close"])
+                                        cur_close = float(sliced.iloc[-1]["close"])
                                         fut_close = float(future_df.iloc[fwd - 1]["close"])
                                         ret = (fut_close - cur_close) / cur_close
                                         if abs(ret) >= th:
