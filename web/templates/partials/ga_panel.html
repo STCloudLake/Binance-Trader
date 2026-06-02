@@ -60,6 +60,14 @@
             <span id="ga-phase-text">{{ _("Initializing population...") }}</span>
             <span id="ga-step-text">0 / 0</span>
         </div>
+        <!-- Double progress bar: intra-gen (thin) + generation (thick) -->
+        <div class="w-full bg-slate-700 rounded-full h-2 mb-1 overflow-hidden">
+            <div id="ga-eval-fill" class="bg-sky-400 h-2 rounded-full transition-all duration-300" style="width:0%"></div>
+        </div>
+        <div class="flex justify-between text-xs text-slate-500 mb-1">
+            <span id="ga-eval-text">{{ _("Evaluating...") }}</span>
+            <span id="ga-eta-text">ETA: --</span>
+        </div>
         <div class="w-full bg-slate-700 rounded-full h-4 mb-2 overflow-hidden">
             <div id="ga-progress-fill" class="bg-emerald-500 h-4 rounded-full transition-all duration-500" style="width:0%"></div>
         </div>
@@ -174,15 +182,33 @@ function pollGAStatus() {
         var running = s.running;
         var gen = s.generation || 0;
         var total = s.total_generations || 1;
-        var pct = total > 0 ? Math.round(gen / total * 100) : 0;
 
-        // Update progress bar
-        document.getElementById('ga-progress-fill').style.width = pct + '%';
+        // ── Compute detailed progress ──
+        // Generation progress (0-100%) + intra-generation evaluation progress
+        var genPct = total > 0 ? (gen / total * 100) : 0;
+
+        // Intra-gen: how many chromosomes evaluated in current gen?
+        var evalDone = s.eval_completed || 0;
+        var evalTotal = s.eval_total || s.population_size || 30;
+        var evalPct = evalTotal > 0 ? Math.round(evalDone / evalTotal * 100) : 0;
+
+        // Overall progress: blend gen-level and intra-gen
+        var overallPct = genPct + (evalPct / total);
+        overallPct = Math.min(overallPct, 100);
+        if (!running && gen > 0) overallPct = 100;
+
+        document.getElementById('ga-progress-fill').style.width = overallPct + '%';
+        document.getElementById('ga-eval-fill').style.width = evalPct + '%';
         document.getElementById('ga-gen').textContent = gen + ' / ' + total;
 
         if (running) {
-            document.getElementById('ga-phase-text').textContent =
-                '{{ _("Evolving...") }} ' + '{{ _("Generation") }} ' + gen + '/' + total;
+            var phase = s.phase || 'evolving';
+            if (phase === 'init') {
+                document.getElementById('ga-phase-text').textContent = '{{ _("Initializing population...") }}';
+            } else {
+                document.getElementById('ga-phase-text').textContent =
+                    '{{ _("Gen") }} ' + gen + '/' + total + ' ' + '{{ _("evaluating") }} ' + evalDone + '/' + evalTotal;
+            }
         } else if (gen > 0) {
             document.getElementById('ga-phase-text').textContent = '{{ _("Complete") }}';
             document.getElementById('ga-status-text').textContent = '{{ _("Evolution finished") }}';
@@ -192,21 +218,29 @@ function pollGAStatus() {
             document.getElementById('ga-phase-text').textContent = '{{ _("Initializing population...") }}';
         }
 
-        document.getElementById('ga-step-text').textContent =
-            '{{ _("Gen") }} ' + gen + ' / ' + total + ' (' + pct + '%)';
-        document.getElementById('ga-fitness').textContent = (s.best_fitness || 0).toFixed(2);
-        document.getElementById('ga-sharpe').textContent = (s.best_sharpe || 0).toFixed(2);
-        document.getElementById('ga-winrate').textContent = (s.best_win_rate || 0).toFixed(1) + '%';
-        document.getElementById('ga-trades').textContent = s.best_trades || '-';
-        document.getElementById('ga-avg-fit').textContent =
-            s.history && s.history.length > 0 ? (s.history[s.history.length-1].avg_fitness || 0).toFixed(2) : '-';
-        document.getElementById('ga-diversity').textContent =
-            s.history && s.history.length > 0 ? (s.history[s.history.length-1].population_diversity || 0).toFixed(3) : '-';
+        document.getElementById('ga-eval-text').textContent =
+            '{{ _("Evaluating chromosomes") }}: ' + evalDone + ' / ' + evalTotal;
+        document.getElementById('ga-step-text').textContent = overallPct.toFixed(1) + '%';
 
-        var elapsed = Math.round((Date.now() - _gaStartTime) / 1000);
+        // ── ETA Calculation ──
+        var elapsed = s.elapsed_seconds || Math.round((Date.now() - _gaStartTime) / 1000);
         var mins = Math.floor(elapsed / 60);
-        var secs = elapsed % 60;
+        var secs = Math.round(elapsed % 60);
         document.getElementById('ga-elapsed').textContent = mins + 'm ' + secs + 's';
+
+        if (overallPct > 0 && overallPct < 100 && running) {
+            var totalEstimated = elapsed / (overallPct / 100);
+            var remaining = totalEstimated - elapsed;
+            var remMins = Math.floor(remaining / 60);
+            var remSecs = Math.round(remaining % 60);
+            if (remMins > 0) {
+                document.getElementById('ga-eta-text').textContent = 'ETA: ' + remMins + 'm ' + remSecs + 's';
+            } else {
+                document.getElementById('ga-eta-text').textContent = 'ETA: ' + remSecs + 's';
+            }
+        } else if (overallPct >= 100) {
+            document.getElementById('ga-eta-text').textContent = '';
+        }
 
         if (s.champion_name) {
             document.getElementById('ga-champion').classList.remove('hidden');
@@ -277,7 +311,8 @@ function loadStrategyFromGA() {
             document.getElementById('ga-progress').classList.remove('hidden');
             document.getElementById('ga-champion').classList.add('hidden');
             document.getElementById('ga-phase-text').textContent = '{{ _("Reconnected to running evolution...") }}';
-            _gaStartTime = Date.now() - (s.elapsed_seconds || 0) * 1000;
+            // Use server's start time for accurate elapsed/ETA
+            _gaStartTime = (s.started || (Date.now()/1000 - (s.elapsed_seconds || 0))) * 1000;
             _gaPollTimer = setInterval(pollGAStatus, 2000);
             pollGAStatus();
         }

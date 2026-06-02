@@ -2123,24 +2123,38 @@ Return ONLY valid JSON in this exact format:
         evolver = GAStrategyEvolver(engine, loader, config)
         app.state._ga_evolver = evolver
 
+        ga_start_time = time.time()
         _ga_state.update({
             "running": True, "generation": 0, "total_generations": generations,
             "best_fitness": 0, "best_sharpe": 0, "best_win_rate": 0,
             "best_trades": 0, "champion_name": "", "champion_config": None,
-            "population_size": pop_size, "started": time.time(),
+            "population_size": pop_size, "started": ga_start_time,
+            "eval_completed": 0, "eval_total": 0, "phase": "init",
             "history": [], "error": None,
         })
 
-        def on_gen(gen, total, info):
-            _ga_state.update({
-                "generation": gen, "total_generations": total,
-                "best_fitness": info.get("best_fitness", 0),
-                "best_sharpe": info.get("best_sharpe", 0),
-                "best_win_rate": info.get("best_win_rate", 0),
-                "best_trades": info.get("best_trades", 0),
-                "elapsed_seconds": time.time() - _ga_state["started"],
-                "history": evolver.history[-20:],
-            })
+        def on_gen(progress_info):
+            # progress_info can be dict with generation+intra-gen progress,
+            # or legacy (gen, total, info) tuple from gen completion
+            if isinstance(progress_info, dict):
+                _ga_state.update({
+                    "phase": progress_info.get("phase", "evolving"),
+                    "eval_completed": progress_info.get("eval_completed", 0),
+                    "eval_total": progress_info.get("eval_total", 0),
+                    "elapsed_seconds": time.time() - ga_start_time,
+                })
+            else:
+                gen, total, info = progress_info
+                _ga_state.update({
+                    "generation": gen, "total_generations": total,
+                    "phase": "gen_complete",
+                    "best_fitness": info.get("best_fitness", 0),
+                    "best_sharpe": info.get("best_sharpe", 0),
+                    "best_win_rate": info.get("best_win_rate", 0),
+                    "best_trades": info.get("best_trades", 0),
+                    "elapsed_seconds": time.time() - ga_start_time,
+                    "history": evolver.history[-20:],
+                })
 
         evolver.set_progress_callback(on_gen)
 

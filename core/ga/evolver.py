@@ -132,7 +132,7 @@ class GAStrategyEvolver:
                 self._population, symbols, date_start, train_end,
                 self.engine, self.loader,
                 max_workers=cfg.max_workers,
-                progress_callback=lambda c, t: self._report_progress("eval", c, t))
+                progress_callback=lambda c, t: self._report_progress(self._generation or 1, c, t))
 
             # 2. Sort by fitness
             self._population.sort(
@@ -165,7 +165,7 @@ class GAStrategyEvolver:
                 f"time={gen_info['elapsed']:.0f}s")
 
             if self._progress_callback:
-                self._progress_callback(self._generation, cfg.generations, gen_info)
+                self._progress_callback((self._generation, cfg.generations, gen_info))
 
             # 4. Check improvement
             if best_fit > self._best_fitness + 0.01:
@@ -381,6 +381,11 @@ class GAStrategyEvolver:
         import numpy as np
         return float(np.std(fits) / (abs(np.mean(fits)) + 1e-9))
 
-    def _report_progress(self, phase: str, completed: int, total: int):
+    def _report_progress(self, gen: int, completed: int, total: int):
         if self._progress_callback:
-            self._progress_callback(completed, total)
+            self._progress_callback({
+                "generation": gen,
+                "eval_completed": completed,
+                "eval_total": total,
+                "phase": "evolving",
+            })
