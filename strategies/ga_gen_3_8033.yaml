@@ -1,0 +1,39 @@
+enabled: true
+entry_conditions:
+  long:
+  - ema_fast > ema_slow
+  - rsi < 35
+  short:
+  - volume_ratio > 1.5
+exit_conditions:
+  long:
+  - close < ema_slow
+  - rsi > 65
+  - close < bollinger_middle
+  short:
+  - rsi < 45
+indicators:
+  adx:
+    period: 21
+  bollinger:
+    period: 26
+    stddev: 1.76
+  macd:
+    fast: 16
+    signal: 10
+    slow: 23
+  rsi:
+    period: 12
+    source: close
+ml_config:
+  confidence_threshold: 0.72
+  enabled: true
+  features: []
+  weight: 0.3
+mode: trend
+name: ga_gen_3_8033
+reduce_conditions: {}
+symbols: []
+timeframes:
+- 1m
+- 1h

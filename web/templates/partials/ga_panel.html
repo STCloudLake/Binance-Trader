@@ -97,7 +97,37 @@
 
 <script>
 var _gaPollTimer = null;
+var _gaTickTimer = null;
 var _gaStartTime = 0;
+var _gaOverallPct = 0;
+var _gaElapsed = 0;
+
+// ── Client-side clock — always ticks even if poll is slow ──
+function startTickTimer() {
+    if (_gaTickTimer) clearInterval(_gaTickTimer);
+    _gaTickTimer = setInterval(function() {
+        if (_gaStartTime > 0) {
+            _gaElapsed = Math.round((Date.now() - _gaStartTime) / 1000);
+            var mins = Math.floor(_gaElapsed / 60);
+            var secs = Math.round(_gaElapsed % 60);
+            var el = document.getElementById('ga-elapsed');
+            if (el) el.textContent = mins + 'm ' + secs + 's';
+            // Update ETA
+            var eta = document.getElementById('ga-eta-text');
+            if (eta && _gaOverallPct > 0 && _gaOverallPct < 100) {
+                var totalEst = _gaElapsed / (_gaOverallPct / 100);
+                var rem = totalEst - _gaElapsed;
+                var rm = Math.floor(rem / 60);
+                var rs = Math.round(rem % 60);
+                eta.textContent = 'ETA: ' + (rm > 0 ? rm + 'm ' : '') + rs + 's';
+            }
+        }
+    }, 1000);
+}
+
+function stopTickTimer() {
+    if (_gaTickTimer) { clearInterval(_gaTickTimer); _gaTickTimer = null; }
+}
 
 function startGA() {
     var btn = document.getElementById('ga-start-btn');
@@ -107,6 +137,8 @@ function startGA() {
     errorDiv.classList.add('hidden');
 
     _gaStartTime = Date.now();
+    _gaOverallPct = 0;
+    startTickTimer();
 
     fetch('/api/ga/evolve', {
         method: 'POST',
@@ -162,6 +194,7 @@ function stopGA() {
 
 function resetUI() {
     clearInterval(_gaPollTimer);
+    stopTickTimer();
     document.getElementById('ga-start-btn').classList.remove('hidden');
     document.getElementById('ga-start-btn').disabled = false;
     document.getElementById('ga-start-btn').textContent = '{{ _("Start Evolution") }}';
@@ -193,11 +226,11 @@ function pollGAStatus() {
         var evalPct = evalTotal > 0 ? Math.round(evalDone / evalTotal * 100) : 0;
 
         // Overall progress: blend gen-level and intra-gen
-        var overallPct = genPct + (evalPct / total);
-        overallPct = Math.min(overallPct, 100);
-        if (!running && gen > 0) overallPct = 100;
+        _gaOverallPct = genPct + (evalPct / total);
+        _gaOverallPct = Math.min(_gaOverallPct, 100);
+        if (!running && gen > 0) _gaOverallPct = 100;
 
-        document.getElementById('ga-progress-fill').style.width = overallPct + '%';
+        document.getElementById('ga-progress-fill').style.width = _gaOverallPct + '%';
         document.getElementById('ga-eval-fill').style.width = evalPct + '%';
         document.getElementById('ga-gen').textContent = gen + ' / ' + total;
 
@@ -222,23 +255,8 @@ function pollGAStatus() {
             '{{ _("Evaluating chromosomes") }}: ' + evalDone + ' / ' + evalTotal;
         document.getElementById('ga-step-text').textContent = overallPct.toFixed(1) + '%';
 
-        // ── ETA Calculation ──
-        var elapsed = s.elapsed_seconds || Math.round((Date.now() - _gaStartTime) / 1000);
-        var mins = Math.floor(elapsed / 60);
-        var secs = Math.round(elapsed % 60);
-        document.getElementById('ga-elapsed').textContent = mins + 'm ' + secs + 's';
-
-        if (overallPct > 0 && overallPct < 100 && running) {
-            var totalEstimated = elapsed / (overallPct / 100);
-            var remaining = totalEstimated - elapsed;
-            var remMins = Math.floor(remaining / 60);
-            var remSecs = Math.round(remaining % 60);
-            if (remMins > 0) {
-                document.getElementById('ga-eta-text').textContent = 'ETA: ' + remMins + 'm ' + remSecs + 's';
-            } else {
-                document.getElementById('ga-eta-text').textContent = 'ETA: ' + remSecs + 's';
-            }
-        } else if (overallPct >= 100) {
+        // ── ETA is handled by tick timer (always ticking) ──
+        if (_gaOverallPct >= 100) {
             document.getElementById('ga-eta-text').textContent = '';
         }
 

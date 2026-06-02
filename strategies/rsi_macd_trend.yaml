@@ -1,4 +1,4 @@
-enabled: true
+enabled: false
 entry_conditions:
   long:
   - rsi < 35 and macd_histogram > 0

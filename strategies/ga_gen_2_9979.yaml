@@ -1,0 +1,43 @@
+enabled: true
+entry_conditions:
+  long:
+  - rsi < 35
+  - close > ema_fast
+  - adx > 25
+  short:
+  - close < bollinger_upper
+  - volume_ratio > 2.0
+  - rsi > 65
+exit_conditions:
+  long:
+  - rsi > 55
+  - rsi > 65
+  - close < bollinger_middle
+  short:
+  - rsi < 35
+  - close > bollinger_middle
+indicators:
+  adx:
+    period: 14
+  ema:
+    period: 28
+    source: close
+  macd:
+    fast: 15
+    signal: 7
+    slow: 34
+  rsi:
+    period: 12
+    source: close
+ml_config:
+  confidence_threshold: 0.59
+  enabled: true
+  features: []
+  weight: 0.3
+mode: momentum
+name: ga_gen_2_9979
+reduce_conditions: {}
+symbols: []
+timeframes:
+- 15m
+- 4h

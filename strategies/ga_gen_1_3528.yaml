@@ -1,0 +1,43 @@
+enabled: true
+entry_conditions:
+  long:
+  - rsi < 30
+  - volume_ratio > 1.5
+  - close > bollinger_lower
+  short:
+  - close < ema_fast
+  - adx > 20
+  - adx > 25
+exit_conditions:
+  long:
+  - rsi > 65
+  - close < ema_slow
+  short:
+  - rsi < 45
+  - close > ema_slow
+  - close > bollinger_upper
+indicators:
+  bollinger:
+    period: 21
+    stddev: 1.89
+  ema:
+    period: 19
+    source: close
+  macd:
+    fast: 14
+    signal: 11
+    slow: 26
+  rsi:
+    period: 18
+    source: close
+ml_config:
+  confidence_threshold: 0.59
+  enabled: true
+  features: []
+  weight: 0.1
+mode: trend
+name: ga_gen_1_3528
+reduce_conditions: {}
+symbols: []
+timeframes:
+- 1h
