@@ -81,6 +81,12 @@ def evaluate_chromosome(
         # Penalize overparameterized strategies to reduce overfitting risk
         fitness -= complexity_penalty(chromosome)
 
+        # Cleanup temp strategy file
+        try:
+            loader.delete(config.name)
+        except Exception:
+            pass
+
         return {
             "fitness": round(fitness, 4),
             "sharpe": round(sharpe, 4),
@@ -281,6 +287,13 @@ def evaluate_population_batch(
             completed += 1
             if progress_callback:
                 progress_callback(completed, total)
+
+    # Cleanup batch strategy files
+    for name in batch_names:
+        try:
+            loader.delete(name)
+        except Exception:
+            pass
 
     # Apply results to population
     for i, r in enumerate(results):
