@@ -110,7 +110,8 @@
         <div class="flex items-center gap-3 mb-2">
             <label class="text-sm text-slate-400">{{ _("ML引擎") }}:</label>
             <select name="ml_engine" class="bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
-                <option value="lightgbm">LightGBM (树模型)</option>
+                <option value="lightgbm">LightGBM (树模型, 快)</option>
+                <option value="patchtst">PatchTST Transformer (推荐)</option>
                 <option value="tft">TFT Transformer (序列模型)</option>
             </select>
         </div>

@@ -92,7 +92,7 @@ class BacktestEngine:
         Args:
             simulate_ai_weights: If True, adjust signal weights based on detected
                 market regime (mimicking what the live AI market assessment does).
-            ml_engine: 'lightgbm' (default tree model) or 'tft' (sequence transformer).
+            ml_engine: 'lightgbm' (tree), 'tft' (transformer), 'patchtst' (patch-transformer).
             skip_ml_training: If True, load pre-trained models from disk instead of
                 training. Useful for repeat backtests over the same period.
         """
@@ -133,11 +133,14 @@ class BacktestEngine:
         ml_predictions: dict[str, float] = {}  # "strategy_name|symbol" -> latest confidence
         ml_correct = 0
         ml_total = 0
-        # TFT training is ~50x slower than LightGBM per retrain (15s vs 0.3s).
-        # Use much longer intervals for TFT to keep total backtest time reasonable.
-        # LightGBM: retrain each model every ~100 steps (~30s of CPU work per cycle)
-        # TFT:      retrain each model every ~800 steps (~2 min of GPU work per cycle)
-        ml_retrain_interval = 800 if ml_engine == "tft" else 100
+        # Training cost per retrain: LightGBM ~0.3s, PatchTST ~8s, TFT ~15s
+        # Use longer intervals for expensive models to keep backtest time reasonable.
+        if ml_engine == "tft":
+            ml_retrain_interval = 800
+        elif ml_engine == "patchtst":
+            ml_retrain_interval = 500  # PatchTST is ~2x faster than TFT
+        else:
+            ml_retrain_interval = 100
         market_regime: dict[str, str] = {}
 
         # Build round-robin model keys (staggered retraining — 1 model/step)
@@ -171,6 +174,19 @@ class BacktestEngine:
                 logger.warning(f"TFT unavailable, falling back to LightGBM: {e}")
                 ml_engine = "lightgbm"
 
+        # PatchTST state (only when ml_engine == 'patchtst')
+        patchtst_trainer = None
+        if ml_engine == "patchtst":
+            try:
+                from core.ml.patchtst_trainer import PatchTSTTrainer as _PTTrainer
+                patchtst_trainer = _PTTrainer(
+                    data_dir=str(self.config.data_dir),
+                    seq_len=100, patch_len=16, stride=8,
+                    d_model=128, num_heads=8, num_layers=3, dropout=0.15)
+            except Exception as e:
+                logger.warning(f"PatchTST unavailable: {e}")
+                ml_engine = "lightgbm"
+
         # ── Skip training: preload cached models from disk ──
         if skip_ml_training:
             from core.ml.trainer import MLTrainer as _MLTrainer
@@ -183,6 +199,10 @@ class BacktestEngine:
                     key = f"{strategy.name}|{sym}"
                     if ml_engine == "tft" and tft_trainer is not None:
                         model = tft_trainer.load(sym, strategy.name)
+                        if model is not None:
+                            ml_models[key] = model
+                    elif ml_engine == "patchtst" and patchtst_trainer is not None:
+                        model = patchtst_trainer.load(sym, strategy.name)
                         if model is not None:
                             ml_models[key] = model
                     else:
@@ -371,8 +391,39 @@ class BacktestEngine:
                         df_1h = feeder.get_all_data_for_symbol(sym, "1h")
                         market_regime[sym] = self._detect_market_regime(df_1h[df_1h.index <= ts])
 
+                    # ── PatchTST path ──
+                    if ml_engine == "patchtst" and patchtst_trainer is not None:
+                        if should_retrain:
+                            sliced = df_tf[df_tf.index <= ts]
+                            if len(sliced) >= 150:
+                                model = self._train_patchtst_model(
+                                    patchtst_trainer, sliced, sym, primary_tf)
+                                if model is not None:
+                                    ml_models[key] = model
+
+                        model = ml_models.get(key)
+                        if model is not None:
+                            try:
+                                conf = self._predict_patchtst(
+                                    patchtst_trainer, model, df_tf[df_tf.index <= ts])
+                                if conf is not None:
+                                    ml_predictions[key] = conf
+                                    fwd = tf_params["forward"]
+                                    th = tf_params["threshold"]
+                                    future_df = df_tf[df_tf.index > ts]
+                                    if len(future_df) >= fwd:
+                                        cur_close = float(df_tf[df_tf.index <= ts].iloc[-1]["close"])
+                                        fut_close = float(future_df.iloc[fwd - 1]["close"])
+                                        ret = (fut_close - cur_close) / cur_close
+                                        if abs(ret) >= th:
+                                            ml_total += 1
+                                            if (ret >= th and conf >= 0.5) or (ret <= -th and conf < 0.5):
+                                                ml_correct += 1
+                            except Exception:
+                                pass
+
                     # ── TFT path ──
-                    if ml_engine == "tft" and tft_trainer is not None:
+                    elif ml_engine == "tft" and tft_trainer is not None:
                         if should_retrain:
                             sliced = df_tf[df_tf.index <= ts]
                             if len(sliced) >= 150:
@@ -984,6 +1035,73 @@ class BacktestEngine:
                 return 1.0 - tft_conf
         except Exception as e:
             logger.debug(f"TFT predict failed: {e}")
+            return None
+
+    # ── PatchTST helpers ─────────────────────────────────────────────
+
+    def _train_patchtst_model(self, trainer, df: pd.DataFrame, symbol: str,
+                              interval: str, max_train_rows: int = 5000):
+        """Train a PatchTST model with triple-barrier labels."""
+        try:
+            from core.strategy.indicators import compute_all
+            from core.ml.features import (compute_features as _cf,
+                  create_triple_barrier_label, REQUIRED_INDICATORS)
+
+            if len(df) > max_train_rows:
+                df = df.iloc[-max_train_rows:]
+
+            df_ind = compute_all(df.copy(), REQUIRED_INDICATORS)
+            X = _cf(df_ind, None)
+            # Triple barrier: 2% up/down, 24 periods lookahead
+            y = create_triple_barrier_label(
+                df_ind, forward_periods=24, upper_pct=0.02, lower_pct=0.02,
+                timeout_label=2.0)  # timeout = class 2
+            X["label"] = y.values
+
+            t0 = time.time()
+            model, metrics = trainer.train(
+                X, feature_cols=None, label_col="label",
+                epochs=50, batch_size=64, learning_rate=1e-3,
+                validation_split=0.2, patience=12)
+            elapsed = time.time() - t0
+
+            if model is not None:
+                dev = next(model.parameters()).device
+                logger.info(
+                    f"PatchTST trained {symbol} {interval} | "
+                    f"device={dev} rows={len(X)} "
+                    f"acc={metrics.get('val_accuracy', 0):.1%} "
+                    f"epochs={metrics.get('epochs_trained', 0)} "
+                    f"time={elapsed:.1f}s")
+            return model
+        except Exception as e:
+            logger.debug(f"PatchTST train failed for {symbol}: {e}")
+            return None
+
+    def _predict_patchtst(self, trainer, model, df: pd.DataFrame) -> float | None:
+        """Predict with PatchTST — returns confidence in [0, 1]."""
+        if len(df) < 100:
+            return None
+        try:
+            from core.strategy.indicators import compute_all
+            from core.ml.features import compute_features as _cf, REQUIRED_INDICATORS
+
+            df_ind = compute_all(df.copy(), REQUIRED_INDICATORS)
+            X = _cf(df_ind, None)
+            result = trainer.predict(model, X)
+            if result is None:
+                return None
+
+            direction = result["direction"]
+            confidence = result["confidence"]
+            if direction > 0:
+                return confidence
+            elif direction < 0:
+                return 1.0 - confidence
+            else:
+                return 0.5  # timeout/neutral
+        except Exception as e:
+            logger.debug(f"PatchTST predict failed: {e}")
             return None
 
     def _detect_market_regime(self, df: pd.DataFrame) -> str:
