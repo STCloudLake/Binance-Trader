@@ -103,14 +103,19 @@ class BacktestEngine:
         """
         t0 = time.time()
 
-        # Load strategy configs
+        # Load strategy configs — support direct config objects for GA
         strategy_configs = []
-        for name in strategies:
-            try:
-                s = self.strategy_engine.loader.load(name)
-                strategy_configs.append(s)
-            except Exception as e:
-                return {"error": f"Strategy '{name}' not found: {e}"}
+        if isinstance(strategies, list) and strategies and not isinstance(strategies[0], str):
+            # strategies is already a list of StrategyConfig objects
+            strategy_configs = strategies
+            strategies = [s.name for s in strategy_configs]
+        else:
+            for name in strategies:
+                try:
+                    s = self.strategy_engine.loader.load(name)
+                    strategy_configs.append(s)
+                except Exception as e:
+                    return {"error": f"Strategy '{name}' not found: {e}"}
 
         # Determine required intervals
         intervals = list(set(tf for s in strategy_configs

@@ -29,18 +29,12 @@ def evaluate_chromosome(
     save_loader = ga_loader or loader
     try:
         config = chromosome_to_strategy(chromosome)
-        # Disable ML during GA fitness eval — 3-5x faster, avoids
-        # 50%-accurate ML adding noise to honest indicator performance
         if config.ml_config:
             config.ml_config.enabled = False
-        # Save temporarily so the backtest engine can load it
-        save_loader.save(config)
 
-        # GA evaluates pure indicator performance — ML adds noise and cost
-        # Disable ML during evolution for 3-5x speedup.
-        # ML can be re-enabled on the final champion for production use.
+        # Pass StrategyConfig directly — no file I/O needed
         result = engine.run_with_exit_evaluation(
-            strategies=[config.name],
+            strategies=[config],  # StrategyConfig object, not file name
             symbols=symbols,
             date_start=date_start,
             date_end=date_end,
@@ -85,12 +79,6 @@ def evaluate_chromosome(
         # ── Complexity penalty ──
         # Penalize overparameterized strategies to reduce overfitting risk
         fitness -= complexity_penalty(chromosome)
-
-        # Cleanup temp strategy file
-        try:
-            save_loader.delete(config.name)
-        except Exception:
-            pass
 
         return {
             "fitness": round(fitness, 4),
@@ -216,20 +204,18 @@ def evaluate_population_batch(
         batch_end = min(batch_start + batch_size, total)
         batch = population[batch_start:batch_end]
 
-        # Save batch strategies and collect names
-        batch_names = []
+        # Build StrategyConfig objects directly — no file I/O needed
+        batch_configs = []
         for i, chrom in enumerate(batch):
             config = chromosome_to_strategy(chrom)
-            # Disable ML for speed
             if config.ml_config:
                 config.ml_config.enabled = False
             config.name = f"ga_batch_{batch_start + i}_{random.randint(1000,9999)}"
-            save_loader.save(config)
-            batch_names.append(config.name)
+            batch_configs.append(config)
 
-        # Single backtest for entire batch
+        # Single backtest for entire batch — pass configs directly
         result = engine.run_with_exit_evaluation(
-            strategies=batch_names,
+            strategies=batch_configs,  # list of StrategyConfig, not names
             symbols=symbols,
             date_start=date_start,
             date_end=date_end,
@@ -242,10 +228,10 @@ def evaluate_population_batch(
 
         # Extract per-strategy metrics from per_matrix
         per_matrix = result.get("per_matrix", {})
-        for i, name in enumerate(batch_names):
+        for i, config in enumerate(batch_configs):
             idx = batch_start + i
             chrom = population[idx]
-            cell_data = per_matrix.get(name, {})
+            cell_data = per_matrix.get(config.name, {})
 
             trades = sum(c.get("trades", 0) for c in cell_data.values())
             pnl = sum(c.get("pnl", 0) for c in cell_data.values())
@@ -293,13 +279,6 @@ def evaluate_population_batch(
             completed += 1
             if progress_callback:
                 progress_callback(completed, total)
-
-    # Cleanup batch strategy files
-    for name in batch_names:
-        try:
-            save_loader.delete(name)
-        except Exception:
-            pass
 
     # Apply results to population
     for i, r in enumerate(results):
