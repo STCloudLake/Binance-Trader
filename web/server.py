@@ -2143,8 +2143,12 @@ Return ONLY valid JSON in this exact format:
         evolver.set_progress_callback(on_gen)
 
         async def _run_ga():
+            import concurrent.futures
+            loop = asyncio.get_event_loop()
             try:
-                result = evolver.evolve(symbols, date_start, date_end, seed_strategies)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    result = await loop.run_in_executor(
+                        pool, evolver.evolve, symbols, date_start, date_end, seed_strategies)
                 _ga_state["running"] = False
                 _ga_state["champion_name"] = result.get("champion_name", "")
                 _ga_state["champion_config"] = result.get("champion_config")
