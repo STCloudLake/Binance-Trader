@@ -883,6 +883,11 @@ def create_app(config: Config, event_bus: EventBus, auth_manager=None) -> FastAP
                 body["ml_config"] = MLConfig(**ml)
             config = StrategyConfig(**body)
             loader.save(config)
+            # Sync engine so new strategy is immediately available
+            engine = getattr(app.state, "strategy_engine", None)
+            if engine:
+                engine._strategies[config.name] = config
+                engine._purge_stale_cache()
             return JSONResponse({"ok": True, "name": config.name})
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=400)
@@ -903,8 +908,17 @@ def create_app(config: Config, event_bus: EventBus, auth_manager=None) -> FastAP
             config = StrategyConfig(**body)
             # Save new config first; only delete old file if normalized names differ
             loader.save(config)
-            if loader._normalize(new_name) != loader._normalize(name):
+            # Handle rename: delete old file if normalized name changed
+            old_normalized = loader._normalize(name)
+            if loader._normalize(new_name) != old_normalized:
                 loader.delete(name)
+            # Sync engine
+            engine = getattr(app.state, "strategy_engine", None)
+            if engine:
+                if old_normalized != loader._normalize(new_name):
+                    engine._strategies.pop(name, None)  # remove old name
+                engine._strategies[config.name] = config
+                engine._purge_stale_cache()
             return JSONResponse({"ok": True, "name": config.name})
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=400)
@@ -957,6 +971,11 @@ def create_app(config: Config, event_bus: EventBus, auth_manager=None) -> FastAP
             return JSONResponse({"error": "No loader"}, status_code=500)
         try:
             loader.delete(name)
+            # Remove from engine
+            engine = getattr(app.state, "strategy_engine", None)
+            if engine:
+                engine._strategies.pop(name, None)
+                engine._purge_stale_cache()
             return JSONResponse({"ok": True})
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)

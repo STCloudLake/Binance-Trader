@@ -1,0 +1,39 @@
+enabled: false
+entry_conditions:
+  long:
+  - plus_di > minus_di and adx > 25 and rsi > 50
+  short:
+  - minus_di > plus_di and adx > 25 and rsi < 45
+exit_conditions:
+  long:
+  - plus_di < minus_di or rsi < 40
+  short:
+  - minus_di < plus_di or rsi > 55
+indicators:
+  adx:
+    period: 14
+  rsi:
+    period: 14
+    source: ''
+ml_config:
+  confidence_threshold: 0.6
+  enabled: true
+  features:
+  - rsi
+  - volume_ratio
+  - price_momentum_24h
+  - adx
+  weight: 0.3
+mode: trend
+name: ADX-DMI Trend Momentum with RSI Filter
+reduce_conditions:
+  long:
+  - condition: rsi > 70 and adx > 30
+    reduce_pct: 50
+  short:
+  - condition: rsi < 30 and adx > 30
+    reduce_pct: 50
+symbols: []
+timeframes:
+- 1h
+- 4h
