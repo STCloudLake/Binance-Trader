@@ -218,9 +218,37 @@ function pollGAStatus() {
 function loadStrategyFromGA() {
     fetch('/api/ga/status', {credentials: 'same-origin'}).then(function(r) { return r.json(); }).then(function(s) {
         if (s.champion_name) {
-            // Reload strategy list and open editor
             location.reload();
         }
     });
 }
+
+// ── Auto-reconnect on page load ──
+(function() {
+    fetch('/api/ga/status', {credentials: 'same-origin'}).then(function(r) { return r.json(); }).then(function(s) {
+        if (!s) return;
+
+        // Show previous champion
+        if (s.champion_name) {
+            document.getElementById('ga-champion').classList.remove('hidden');
+            document.getElementById('ga-champion-info').innerHTML =
+                '<strong>' + s.champion_name + '</strong><br>' +
+                'Fitness: ' + (s.best_fitness || 0).toFixed(2) +
+                ' | Sharpe: ' + (s.best_sharpe || 0).toFixed(2) +
+                ' | Win Rate: ' + (s.best_win_rate || 0).toFixed(1) + '%';
+        }
+
+        // Reconnect to running evolution
+        if (s.running) {
+            document.getElementById('ga-start-btn').classList.add('hidden');
+            document.getElementById('ga-stop-btn').classList.remove('hidden');
+            document.getElementById('ga-progress').classList.remove('hidden');
+            document.getElementById('ga-champion').classList.add('hidden');
+            document.getElementById('ga-phase-text').textContent = '{{ _("Reconnected to running evolution...") }}';
+            _gaStartTime = Date.now() - (s.elapsed_seconds || 0) * 1000;
+            _gaPollTimer = setInterval(pollGAStatus, 2000);
+            pollGAStatus();
+        }
+    }).catch(function() { /* server not ready yet */ });
+})();
 </script>

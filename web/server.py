@@ -2137,6 +2137,7 @@ Return ONLY valid JSON in this exact format:
                 "best_sharpe": info.get("best_sharpe", 0),
                 "best_win_rate": info.get("best_win_rate", 0),
                 "best_trades": info.get("best_trades", 0),
+                "elapsed_seconds": time.time() - _ga_state["started"],
                 "history": evolver.history[-20:],
             })
 
@@ -2150,6 +2151,7 @@ Return ONLY valid JSON in this exact format:
                     result = await loop.run_in_executor(
                         pool, evolver.evolve, symbols, date_start, date_end, seed_strategies)
                 _ga_state["running"] = False
+                _ga_state["elapsed_seconds"] = time.time() - _ga_state["started"]
                 _ga_state["champion_name"] = result.get("champion_name", "")
                 _ga_state["champion_config"] = result.get("champion_config")
                 _ga_state["best_fitness"] = result.get("fitness", 0)
