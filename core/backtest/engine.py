@@ -143,6 +143,25 @@ class BacktestEngine:
             ml_retrain_interval = 100
         market_regime: dict[str, str] = {}
 
+        # Per-timeframe ML parameters: forward_periods and threshold
+        # Shorter TFs need more lookahead periods to capture a meaningful move
+        _ML_TF_PARAMS = {
+            "1m":  {"forward": 20, "threshold": 0.003, "min_candles": 300},
+            "3m":  {"forward": 15, "threshold": 0.004, "min_candles": 200},
+            "5m":  {"forward": 12, "threshold": 0.005, "min_candles": 200},
+            "15m": {"forward": 8,  "threshold": 0.005, "min_candles": 150},
+            "30m": {"forward": 6,  "threshold": 0.005, "min_candles": 120},
+            "1h":  {"forward": 4,  "threshold": 0.005, "min_candles": 100},
+            "2h":  {"forward": 4,  "threshold": 0.006, "min_candles": 80},
+            "4h":  {"forward": 4,  "threshold": 0.008, "min_candles": 60},
+            "6h":  {"forward": 4,  "threshold": 0.010, "min_candles": 50},
+            "8h":  {"forward": 4,  "threshold": 0.012, "min_candles": 40},
+            "12h": {"forward": 4,  "threshold": 0.015, "min_candles": 30},
+            "1d":  {"forward": 4,  "threshold": 0.020, "min_candles": 25},
+            "3d":  {"forward": 4,  "threshold": 0.030, "min_candles": 20},
+            "1w":  {"forward": 4,  "threshold": 0.050, "min_candles": 15},
+        }
+
         # Build round-robin model keys (staggered retraining — 1 model/step)
         _ml_keys: list[tuple[str, str, str, dict, list[str]]] = []  # (key, sym, tf, params, features)
         _ml_key_idx: dict[str, int] = {}  # key → index in _ml_keys
@@ -262,25 +281,6 @@ class BacktestEngine:
                 return compute_all(df.iloc[:pos + 1], indicators)
             except KeyError:
                 return compute_all(df[df.index <= ts], indicators)
-
-        # Per-timeframe ML parameters: forward_periods and threshold
-        # Shorter TFs need more lookahead periods to capture a meaningful move
-        _ML_TF_PARAMS = {
-            "1m":  {"forward": 20, "threshold": 0.003, "min_candles": 300},
-            "3m":  {"forward": 15, "threshold": 0.004, "min_candles": 200},
-            "5m":  {"forward": 12, "threshold": 0.005, "min_candles": 200},
-            "15m": {"forward": 8,  "threshold": 0.005, "min_candles": 150},
-            "30m": {"forward": 6,  "threshold": 0.005, "min_candles": 120},
-            "1h":  {"forward": 4,  "threshold": 0.005, "min_candles": 100},
-            "2h":  {"forward": 4,  "threshold": 0.006, "min_candles": 80},
-            "4h":  {"forward": 4,  "threshold": 0.008, "min_candles": 60},
-            "6h":  {"forward": 4,  "threshold": 0.010, "min_candles": 50},
-            "8h":  {"forward": 4,  "threshold": 0.012, "min_candles": 40},
-            "12h": {"forward": 4,  "threshold": 0.015, "min_candles": 30},
-            "1d":  {"forward": 4,  "threshold": 0.020, "min_candles": 25},
-            "3d":  {"forward": 4,  "threshold": 0.030, "min_candles": 20},
-            "1w":  {"forward": 4,  "threshold": 0.050, "min_candles": 15},
-        }
 
         # Position sizing
         from core.risk.position_sizer import PositionSizer
