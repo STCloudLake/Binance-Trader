@@ -123,6 +123,50 @@
             <span class="text-xs text-slate-500">({{ _("需先完成至少一次回测") }})</span>
         </div>
 
+        <!-- Trading Cost Model -->
+        <details class="mb-3">
+            <summary class="text-sm text-slate-400 cursor-pointer hover:text-slate-300">
+                {{ _("Trading Costs") }} ⚙️
+            </summary>
+            <div class="grid grid-cols-3 gap-2 mt-2 p-3 bg-slate-800/50 rounded">
+                <div class="flex items-center gap-2">
+                    <input type="checkbox" name="cost_enabled" value="1" checked class="accent-amber-500">
+                    <label class="text-xs text-slate-400">Enable Cost Model</label>
+                </div>
+                <div>
+                    <label class="text-xs text-slate-500">Taker Fee %</label>
+                    <input type="number" name="taker_fee_pct" value="0.04" min="0" max="1" step="0.005"
+                           class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1 text-white text-xs">
+                </div>
+                <div></div>
+                <div>
+                    <label class="text-xs text-slate-500">BTC Spread %</label>
+                    <input type="number" name="spread_btc" value="0.01" min="0" max="1" step="0.005"
+                           class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1 text-white text-xs">
+                </div>
+                <div>
+                    <label class="text-xs text-slate-500">ETH Spread %</label>
+                    <input type="number" name="spread_eth" value="0.02" min="0" max="1" step="0.005"
+                           class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1 text-white text-xs">
+                </div>
+                <div>
+                    <label class="text-xs text-slate-500">BNB Spread %</label>
+                    <input type="number" name="spread_bnb" value="0.03" min="0" max="1" step="0.005"
+                           class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1 text-white text-xs">
+                </div>
+                <div>
+                    <label class="text-xs text-slate-500">SOL Spread %</label>
+                    <input type="number" name="spread_sol" value="0.03" min="0" max="1" step="0.005"
+                           class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1 text-white text-xs">
+                </div>
+                <div>
+                    <label class="text-xs text-slate-500">XRP Spread %</label>
+                    <input type="number" name="spread_xrp" value="0.04" min="0" max="1" step="0.005"
+                           class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1 text-white text-xs">
+                </div>
+            </div>
+        </details>
+
         <button type="submit" class="bg-sky-600 hover:bg-sky-500 text-white px-6 py-2 rounded text-sm font-bold">
             {{ _("Run Backtest") }}
         </button>
@@ -189,6 +233,14 @@ async function runBacktest(e) {
     fd.append('simulate_ai_weights', form.simulate_ai_weights?.checked ? '1' : '0');
     fd.append('ml_engine', form.ml_engine?.value || 'lightgbm');
     fd.append('skip_ml_training', form.skip_ml_training?.checked ? '1' : '0');
+    // Cost model params
+    fd.append('cost_enabled', form.cost_enabled?.checked ? '1' : '0');
+    fd.append('taker_fee_pct', form.taker_fee_pct?.value || '0.04');
+    fd.append('spread_btc', form.spread_btc?.value || '0.01');
+    fd.append('spread_eth', form.spread_eth?.value || '0.02');
+    fd.append('spread_bnb', form.spread_bnb?.value || '0.03');
+    fd.append('spread_sol', form.spread_sol?.value || '0.03');
+    fd.append('spread_xrp', form.spread_xrp?.value || '0.04');
     // Include the backtest-only matrix mapping
     fd.append('strategy_symbols', JSON.stringify(getMatrixMapping()));
 

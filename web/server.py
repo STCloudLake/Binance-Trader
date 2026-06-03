@@ -1704,7 +1704,14 @@ Return ONLY valid JSON in this exact format:
                            strategy_symbols: str = Form("{}"),
                            simulate_ai_weights: str = Form("1"),
                            ml_engine: str = Form("lightgbm"),
-                           skip_ml_training: str = Form("0")):
+                           skip_ml_training: str = Form("0"),
+                           cost_enabled: str = Form("1"),
+                           taker_fee_pct: float = Form(0.04),
+                           spread_btc: float = Form(0.01),
+                           spread_eth: float = Form(0.02),
+                           spread_bnb: float = Form(0.03),
+                           spread_sol: float = Form(0.03),
+                           spread_xrp: float = Form(0.04)):
         if err := _require_trader(request): return err
         engine = getattr(app.state, "backtest_engine", None)
         if not engine:
@@ -1721,6 +1728,17 @@ Return ONLY valid JSON in this exact format:
             bt_strategy_symbols = json.loads(strategy_symbols) if strategy_symbols else {}
         except (json.JSONDecodeError, TypeError):
             pass
+
+        # ── Runtime cost model params ──
+        bt_config = getattr(app.state, "config", None)
+        if bt_config:
+            bt_config.backtest_cost_enabled = (cost_enabled == "1")
+            bt_config.backtest_taker_fee_pct = taker_fee_pct
+            bt_config.backtest_spread_pct = {
+                "BTCUSDT": spread_btc, "ETHUSDT": spread_eth,
+                "BNBUSDT": spread_bnb, "SOLUSDT": spread_sol,
+                "XRPUSDT": spread_xrp,
+            }
 
         # Detect GPU for display
         bt_device = "cpu"
@@ -2112,6 +2130,22 @@ Return ONLY valid JSON in this exact format:
         generations = min(body.get("generations", 20), 50)
         seed_strategies = body.get("seed_strategies", [])
         resume = body.get("resume", False)
+
+        # ── Runtime cost model params (override config.yaml) ──
+        cost_enabled = body.get("cost_enabled", True)
+        taker_fee_pct = body.get("taker_fee_pct", 0.04)
+        spread_pct = body.get("spread_pct", {
+            "BTCUSDT": 0.01, "ETHUSDT": 0.02, "BNBUSDT": 0.03,
+            "SOLUSDT": 0.03, "XRPUSDT": 0.04,
+        })
+        # Apply overrides to the active config
+        bt_config = getattr(app.state, "config", None)
+        if bt_config:
+            bt_config.backtest_cost_enabled = cost_enabled
+            bt_config.backtest_taker_fee_pct = taker_fee_pct
+            bt_config.backtest_spread_pct = spread_pct
+        _ga_state["cost_config"] = {
+            "enabled": cost_enabled, "fee_pct": taker_fee_pct, "spreads": spread_pct}
 
         from core.ga.evolver import GAStrategyEvolver, GARunConfig
         config = GARunConfig(
