@@ -11,6 +11,9 @@ ai:
 auth:
   jwt_secret: ''
   session_hours: 24
+backtest:
+  engine_mode: "auto"       # "auto" | "hybrid" | "legacy"
+  ml_enabled: false          # enable ML training/prediction during backtest
 binance:
   testnet: true
 core_position:

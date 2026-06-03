@@ -97,6 +97,14 @@ class Config:
 
         self.language = self._get("language", "zh")
 
+        bt = self._get("backtest", {})
+        self.backtest_engine_mode = bt.get("engine_mode", "auto") if isinstance(bt, dict) else "auto"
+        if self.backtest_engine_mode not in ("auto", "hybrid", "legacy"):
+            from loguru import logger
+            logger.warning(f"Invalid backtest.engine_mode '{self.backtest_engine_mode}', falling back to 'auto'")
+            self.backtest_engine_mode = "auto"
+        self.backtest_ml_enabled = bt.get("ml_enabled", False) if isinstance(bt, dict) else False
+
         ai = self._get("ai", {})
         self.ai_mode = ai.get("mode", "semi_auto") if isinstance(ai, dict) else "semi_auto"
         self.ai_model = ai.get("model", "deepseek-chat") if isinstance(ai, dict) else "deepseek-chat"

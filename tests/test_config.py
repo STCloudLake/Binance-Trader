@@ -28,6 +28,14 @@ def test_config_env_override():
     del os.environ["DEEPSEEK_API_KEY"]
 
 
+def test_backtest_config_defaults():
+    from app.config import Config
+    Config._instance = None
+    config = Config.load("sim")
+    assert config.backtest_engine_mode == "auto"
+    assert config.backtest_ml_enabled is False
+
+
 def test_config_singleton():
     from app.config import Config
     Config._instance = None
