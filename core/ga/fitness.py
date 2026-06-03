@@ -189,36 +189,52 @@ def evaluate_population_batch(
     batch_size: int = 10,
     initial_balance: float = 10000.0,
     progress_callback=None,
+    max_workers: int = 4,
 ) -> list[dict]:
-    """Evaluate chromosomes in batched backtests — 4-5x faster than individual.
+    """Evaluate chromosomes in parallel batched backtests.
 
-    Uses *ga_loader* (isolated temp dir) for strategy files so GA never
-    touches the main strategies/ directory.
+    Strategies are split into *max_workers* groups and processed in parallel
+    threads. Since each strategy is isolated (per_strategy_isolation=True),
+    there is zero cross-contamination between parallel workers.
+
+    Args:
+        max_workers: Number of parallel threads for batch evaluation.
     """
-    save_loader = ga_loader or loader
-    results = [None] * len(population)
     total = len(population)
-    completed = 0
+    results: list = [None] * total
 
-    for batch_start in range(0, total, batch_size):
-        batch_end = min(batch_start + batch_size, total)
-        batch = population[batch_start:batch_end]
+    # ── Split population into worker groups ──
+    workers = min(max_workers, total)
+    chunk_size = max(1, total // workers)
+    chunks = []
+    for w in range(workers):
+        start = w * chunk_size
+        end = start + chunk_size if w < workers - 1 else total
+        if start < total:
+            chunks.append((start, end))
 
-        logger.info(f"GA batch backtest: evaluating strategies {batch_start+1}-{batch_end}/{total} "
-                    f"on {date_start}~{date_end} with {len(symbols)} symbols")
+    logger.info(f"GA batch eval: {total} strategies in {len(chunks)} parallel groups "
+                f"on {date_start}~{date_end} with {len(symbols)} symbols")
 
-        # Build StrategyConfig objects directly — no file I/O needed
-        batch_configs = []
-        for i, chrom in enumerate(batch):
+    completed_lock = __import__('threading').Lock()
+    completed = [0]
+
+    def _eval_chunk(chunk_start: int, chunk_end: int):
+        """Evaluate one chunk of strategies (called in a thread)."""
+        chunk_pop = population[chunk_start:chunk_end]
+
+        # Build StrategyConfig objects
+        chunk_configs = []
+        for i, chrom in enumerate(chunk_pop):
             config = chromosome_to_strategy(chrom)
             if config.ml_config:
                 config.ml_config.enabled = False
-            config.name = f"ga_batch_{batch_start + i}_{random.randint(1000,9999)}"
-            batch_configs.append(config)
+            config.name = f"ga_chunk_{chunk_start}_{chunk_start + i}_{random.randint(1000,9999)}"
+            chunk_configs.append(config)
 
-        # Single backtest for entire batch — pass configs directly
+        # Single backtest for this chunk
         result = engine.run_with_exit_evaluation(
-            strategies=batch_configs,  # list of StrategyConfig, not names
+            strategies=chunk_configs,
             symbols=symbols,
             date_start=date_start,
             date_end=date_end,
@@ -229,10 +245,10 @@ def evaluate_population_batch(
             per_strategy_isolation=True,
         )
 
-        # Extract per-strategy metrics from per_matrix
+        # Extract per-strategy metrics
         per_matrix = result.get("per_matrix", {})
-        for i, config in enumerate(batch_configs):
-            idx = batch_start + i
+        for i, config in enumerate(chunk_configs):
+            idx = chunk_start + i
             chrom = population[idx]
             cell_data = per_matrix.get(config.name, {})
 
@@ -241,21 +257,23 @@ def evaluate_population_batch(
             wins = sum(c.get("winning", 0) for c in cell_data.values())
             losses = sum(c.get("losing", 0) for c in cell_data.values())
 
-            # Compute fitness from per-strategy data
             win_rate = (wins / max(trades, 1)) * 100
-            # Approximate Sharpe from PnL sequence (simplified)
-            # Use profit_factor as proxy for risk/reward
             avg_win = sum(c.get("pnl", 0) for c in cell_data.values() if c.get("pnl", 0) > 0) / max(wins, 1)
             avg_loss = abs(sum(c.get("pnl", 0) for c in cell_data.values() if c.get("pnl", 0) < 0)) / max(losses, 1)
-            profit_factor = (wins * avg_win) / max(losses * avg_loss, 1e-9)
+            # ── Fix: cap profit_factor to prevent division-by-zero inflation ──
+            if losses > 0 and avg_loss > 0:
+                profit_factor = min((wins * avg_win) / (losses * avg_loss), 100.0)
+            elif wins > 0:
+                profit_factor = 100.0  # all wins = excellent, but cap at 100
+            else:
+                profit_factor = 0.1
 
             fitness = (
                 win_rate * 0.15
                 + max(profit_factor, 0.1) * 5
-                - abs(pnl / max(initial_balance, 1)) * 50  # drawdown proxy
+                - abs(pnl / max(initial_balance, 1)) * 50
             )
 
-            # Trade count penalty
             if trades < 5:
                 fitness -= 20
             elif trades < 15:
@@ -270,7 +288,7 @@ def evaluate_population_batch(
 
             results[idx] = {
                 "fitness": round(fitness, 4),
-                "sharpe": 0,  # not directly available in batch mode
+                "sharpe": 0,
                 "win_rate": round(win_rate, 2),
                 "profit_factor": round(profit_factor, 4),
                 "max_dd": 0,
@@ -279,9 +297,19 @@ def evaluate_population_batch(
                 "strategy_name": config.name,
             }
 
-            completed += 1
-            if progress_callback:
-                progress_callback(completed, total)
+            with completed_lock:
+                completed[0] += 1
+                if progress_callback:
+                    progress_callback(completed[0], total)
+
+    # ── Run chunks in parallel threads ──
+    if len(chunks) > 1:
+        with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
+            futures = [executor.submit(_eval_chunk, s, e) for s, e in chunks]
+            for f in futures:
+                f.result(timeout=3600)  # 1h timeout per chunk
+    else:
+        _eval_chunk(chunks[0][0], chunks[0][1])
 
     # Apply results to population
     for i, r in enumerate(results):

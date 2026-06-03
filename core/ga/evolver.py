@@ -149,6 +149,7 @@ class GAStrategyEvolver:
                 self.engine, self.loader,
                 ga_loader=self.ga_loader,
                 batch_size=cfg.population_size,  # full population in one hybrid pass
+                max_workers=getattr(cfg, 'max_workers', 4),
                 progress_callback=lambda c, t: self._report_progress(self._generation or 1, c, t))
 
             # 2. Sort by fitness
