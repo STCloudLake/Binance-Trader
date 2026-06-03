@@ -30,11 +30,13 @@ class EventDrivenExecutor:
 
     def __init__(self, sizer: PositionSizer, hard_limits,
                  per_strategy_isolation: bool = False,
-                 max_positions: int = 15):
+                 max_positions: int = 15,
+                 cost_config=None):
         self.sizer = sizer
         self.hard_limits = hard_limits
         self.per_strategy_isolation = per_strategy_isolation
         self.max_positions = max_positions
+        self.cost_config = cost_config  # optional: (enabled, fee_pct, spread_dict)
 
     def _pkey(self, sym: str, s_name: str = "") -> str:
         return f"{s_name}|{sym}" if self.per_strategy_isolation else sym
@@ -55,6 +57,19 @@ class EventDrivenExecutor:
         else:
             pnl = (entry_price - exit_price) * qty
 
+        # ── Trading costs (fees + spread) ──
+        costs = 0.0
+        if self.cost_config:
+            enabled, fee_pct, spread_dict = self.cost_config
+            if enabled:
+                spread_pct = spread_dict.get(sym, 0.03) / 100.0
+                fee = fee_pct / 100.0
+                entry_notional = qty * entry_price
+                exit_notional = qty * exit_price
+                costs = (entry_notional + exit_notional) * fee
+                costs += (entry_notional + exit_notional) * (spread_pct / 2.0)
+        pnl -= costs
+
         trades.append({
             "symbol": sym, "side": side,
             "entry_price": round(entry_price, 4),
@@ -67,6 +82,7 @@ class EventDrivenExecutor:
             "closed_at": str(ts),
             "amount_usdt": round(amount, 2),
             "exit_reason": reason,
+            "cost": round(costs, 4),
         })
         balance += amount + pnl
 

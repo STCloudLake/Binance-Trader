@@ -7,6 +7,7 @@ from loguru import logger
 from core.backtest.data_feeder import DataFeeder
 from core.backtest.metrics import calculate_metrics
 from core.backtest.engine_hybrid import run_hybrid
+from core.backtest.cost_model import apply_trading_costs
 from core.strategy.indicators import compute_all, evaluate_condition
 
 # Timeframe → minutes mapping for sorting and trend-filter logic
@@ -944,6 +945,10 @@ class BacktestEngine:
         else:
             pnl = (entry_price - exit_price) * qty
 
+        # ── Trading costs (fees + spread) ──
+        costs = apply_trading_costs(entry_price, exit_price, qty, sym, self.config)
+        pnl -= costs
+
         trades.append({
             "symbol": sym, "side": side,
             "entry_price": round(entry_price, 4),
@@ -956,6 +961,7 @@ class BacktestEngine:
             "closed_at": str(ts),
             "amount_usdt": round(amount, 2),
             "exit_reason": reason,
+            "cost": round(costs, 4),
         })
         balance += amount + pnl
         events.append({

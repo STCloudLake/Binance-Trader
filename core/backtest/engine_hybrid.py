@@ -77,10 +77,16 @@ def run_hybrid(strategies, symbols, date_start, date_end,
     if per_strategy_isolation:
         max_positions = max(1, max_positions // max(len(strategy_configs), 1))
 
+    # Cost model config tuple: (enabled, fee_pct, spread_dict)
+    cost_cfg = (getattr(config, 'backtest_cost_enabled', True),
+                getattr(config, 'backtest_taker_fee_pct', 0.04),
+                getattr(config, 'backtest_spread_pct', {}))
+
     executor = EventDrivenExecutor(
         sizer, config.hard_limits,
         per_strategy_isolation=per_strategy_isolation,
         max_positions=max_positions,
+        cost_config=cost_cfg,
     )
 
     logger.info(f"Hybrid engine: executing trades ({matrix.metadata['timestamp_count']} ticks)")
