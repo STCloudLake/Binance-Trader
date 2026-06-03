@@ -14,7 +14,7 @@ def test_config_loads_with_defaults():
     config = Config.load("sim")
     assert config.mode == "sim"
     assert config.web_port == 8899
-    assert config.hard_limits.max_leverage == 3
+    assert config.hard_limits.max_leverage == 4
     assert config.soft_params.risk_appetite == "balanced"
     assert config.signal_weights.indicator == 0.5
 

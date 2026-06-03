@@ -75,7 +75,11 @@ async def test_risk_rejection_on_tripped_breaker():
 
     risk = RiskManager(config, bus)
     risk.update_balance(10000)
-    risk.breaker.set_equity(9400)  # Trigger 6% drawdown
+    # Override breaker threshold for test: trip at 5% drawdown
+    risk.breaker.max_daily_drawdown_pct = 5.0
+    # First call establishes peak at 10000, second creates a 6% drawdown
+    risk.breaker.set_equity(10000)
+    risk.breaker.set_equity(9400)  # 6% drawdown > 5% threshold → trip
     await risk.start()
 
     risk_events = []

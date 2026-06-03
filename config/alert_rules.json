@@ -2,7 +2,9 @@
   {
     "name": "熔断触发",
     "event_type": "risk.breach",
-    "condition": {"event_type": "circuit_breaker_trip"},
+    "condition": {
+      "event_type": "circuit_breaker_trip"
+    },
     "level": "critical",
     "cooldown_seconds": 300,
     "enabled": true,
@@ -11,7 +13,9 @@
   {
     "name": "紧急止损",
     "event_type": "alert.trigger",
-    "condition": {"type": "emergency_stop"},
+    "condition": {
+      "type": "emergency_stop"
+    },
     "level": "critical",
     "cooldown_seconds": 60,
     "enabled": true,
@@ -20,7 +24,9 @@
   {
     "name": "AI 建议待审",
     "event_type": "ai.suggestion",
-    "condition": {"status": "pending"},
+    "condition": {
+      "status": "pending"
+    },
     "level": "info",
     "cooldown_seconds": 300,
     "enabled": true,
@@ -38,7 +44,9 @@
   {
     "name": "信号拒绝",
     "event_type": "alert.trigger",
-    "condition": {"type": "signal_rejected"},
+    "condition": {
+      "type": "signal_rejected"
+    },
     "level": "warning",
     "cooldown_seconds": 300,
     "enabled": true,

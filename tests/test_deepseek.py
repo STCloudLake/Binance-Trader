@@ -33,8 +33,8 @@ def test_market_assessment_no_api_key():
 
 def test_prompts_format():
     from core.ai import prompts
-    assert "{market_summary}" in prompts.COIN_SELECTION_PROMPT
-    assert "{recent_trades}" in prompts.STRATEGY_OPTIMIZATION_PROMPT
-    assert "{balance}" in prompts.RISK_ADJUSTMENT_PROMPT
-    assert "{price_data}" in prompts.MARKET_ASSESSMENT_PROMPT
+    assert "{context}" in prompts.COIN_SELECTION_PROMPT
+    assert "{context}" in prompts.STRATEGY_OPTIMIZATION_PROMPT
+    assert "{context}" in prompts.RISK_ADJUSTMENT_PROMPT
+    assert "{context}" in prompts.MARKET_ASSESSMENT_PROMPT
     assert "{title}" in prompts.NEWS_ANALYSIS_PROMPT

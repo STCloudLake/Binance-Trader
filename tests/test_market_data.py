@@ -20,6 +20,8 @@ def test_ohlcv_cache_append_and_get():
     assert len(df) == 1
     assert float(df.iloc[0]["close"]) == 50500.0
 
+    # Save to disk and verify file exists
+    cache.save("BTCUSDT", "1h")
     path = Path(data_dir) / "market" / "BTCUSDT" / "1h.parquet"
     assert path.exists()
 
@@ -33,6 +35,7 @@ def test_ohlcv_cache_persistence():
         "open": 3000.0, "high": 3100.0, "low": 2900.0,
         "close": 3050.0, "volume": 50.0,
     })
+    cache1.save("ETHUSDT", "4h")  # persist to disk
 
     cache2 = OHLVCache(data_dir)
     df = cache2.get("ETHUSDT", "4h")
