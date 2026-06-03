@@ -273,6 +273,6 @@ class EventDrivenExecutor:
             trades=trades,
             equity_curve=equity_curve,
             per_matrix=per_matrix,
-            final_balance=round(balance, 2),
+            final_balance=round(equity_curve[-1]["equity"] if equity_curve else balance, 2),
             runtime_seconds=round(time.time() - t0, 2),
         )

@@ -905,7 +905,8 @@ class BacktestEngine:
                 "balance": round(balance, 2), "invested": round(invested, 2),
             })
 
-        final_balance = balance
+        # Use last equity value (includes open position value), not just cash balance
+        final_balance = equity_curve[-1]["equity"] if equity_curve else balance
         metrics = calculate_metrics(trades, equity_curve, initial_balance, final_balance)
         metrics["ml_accuracy_pct"] = round(
             ml_correct / ml_total * 100 if ml_total > 0 else 0, 1)
