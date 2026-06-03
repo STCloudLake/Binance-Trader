@@ -30,15 +30,25 @@ class MarketDataProvider:
     async def start(self, symbols: list[str], intervals: list[str]):
         self._watched_symbols = symbols
         self._intervals = intervals
-        self.client = await AsyncClient.create(
-            api_key=self.config.binance_api_key or None,
-            api_secret=self.config.binance_api_secret or None,
-            testnet=self.config.binance_testnet,
-        )
+        try:
+            self.client = await AsyncClient.create(
+                api_key=self.config.binance_api_key or None,
+                api_secret=self.config.binance_api_secret or None,
+                testnet=self.config.binance_testnet,
+            )
+        except Exception as e:
+            from loguru import logger
+            logger.warning(f"Binance API unreachable (server will run offline): {e}")
+            self.client = None
         self._running = True
         # Pre-fetch historical klines so strategies can evaluate immediately
-        await self._prefetch_history(symbols, intervals)
-        self._tasks.append(asyncio.create_task(self._run_websocket()))
+        try:
+            await self._prefetch_history(symbols, intervals)
+        except Exception as e:
+            from loguru import logger
+            logger.warning(f"History prefetch failed: {e}")
+        if self.client is not None:
+            self._tasks.append(asyncio.create_task(self._run_websocket()))
         self._tasks.append(asyncio.create_task(self._run_price_tracker()))
         self._tasks.append(asyncio.create_task(self._run_cache_flush()))
 
