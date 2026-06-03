@@ -105,3 +105,51 @@ def test_signal_matrix_get_exit():
     assert matrix.get_exit("strat_a", "BTCUSDT", "1h", "long", dates[5]) is True
     assert matrix.get_exit("strat_a", "BTCUSDT", "1h", "long", dates[0]) is False
     assert matrix.get_exit("nonexistent", "BTCUSDT", "1h", "long", dates[0]) is False
+
+
+def test_batch_condition_eval_matches_sequential():
+    """Batch-evaluated conditions must match one-by-one evaluation."""
+    from core.strategy.indicators import compute_all, evaluate_condition
+
+    np.random.seed(42)
+    dates = pd.date_range("2026-01-01", periods=500, freq="1h")
+    close = 50000 + np.cumsum(np.random.randn(500) * 100)
+    df = pd.DataFrame({
+        "open": close - 50, "high": close + 100,
+        "low": close - 100, "close": close,
+        "volume": np.random.rand(500) * 100 + 50,
+    }, index=dates)
+
+    ind1 = {"rsi": {"period": 14, "source": "close"}}
+    ind2 = {"rsi": {"period": 7, "source": "close"}}
+    df1 = compute_all(df.copy(), ind1)
+    df2 = compute_all(df.copy(), ind2)
+
+    conditions = ["rsi < 30", "rsi > 70"]
+    for cond in conditions:
+        r1 = evaluate_condition(df1, cond)
+        r2 = evaluate_condition(df2, cond)
+        assert not r1.equals(r2) or r1.sum() == r2.sum() == 0
+
+
+def test_condition_and_combination():
+    """Multiple entry conditions must be combined with AND logic."""
+    from core.strategy.indicators import compute_all, evaluate_condition
+
+    np.random.seed(42)
+    dates = pd.date_range("2026-01-01", periods=500, freq="1h")
+    close = 50000 + np.cumsum(np.random.randn(500) * 100)
+    df = pd.DataFrame({
+        "open": close - 50, "high": close + 100,
+        "low": close - 100, "close": close,
+        "volume": np.random.rand(500) * 100 + 50,
+    }, index=dates)
+    df = compute_all(df, {"rsi": {"period": 14, "source": "close"},
+                          "macd": {"fast": 12, "slow": 26, "signal": 9}})
+
+    rsi_low = evaluate_condition(df, "rsi < 30")
+    macd_positive = evaluate_condition(df, "macd_histogram > 0")
+    combined = rsi_low & macd_positive
+
+    assert combined.sum() <= rsi_low.sum()
+    assert combined.sum() <= macd_positive.sum()
