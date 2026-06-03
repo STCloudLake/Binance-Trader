@@ -14,6 +14,15 @@ auth:
 backtest:
   engine_mode: "auto"       # "auto" | "hybrid" | "legacy"
   ml_enabled: false          # enable ML training/prediction during backtest
+  cost_model:                # trading cost simulation
+    enabled: true             # apply fees + spread to backtest PnL
+    taker_fee_pct: 0.04       # Binance spot taker fee (%)
+    spread_pct:               # per-symbol estimated spread (%)
+      BTCUSDT: 0.01
+      ETHUSDT: 0.02
+      BNBUSDT: 0.03
+      SOLUSDT: 0.03
+      XRPUSDT: 0.04
 binance:
   testnet: true
 core_position:

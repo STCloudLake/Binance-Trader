@@ -105,6 +105,12 @@ class Config:
             self.backtest_engine_mode = "auto"
         self.backtest_ml_enabled = bt.get("ml_enabled", False) if isinstance(bt, dict) else False
 
+        # Cost model: trading fees + spread
+        cost_cfg = bt.get("cost_model", {}) if isinstance(bt, dict) else {}
+        self.backtest_cost_enabled = cost_cfg.get("enabled", True) if isinstance(cost_cfg, dict) else True
+        self.backtest_taker_fee_pct = cost_cfg.get("taker_fee_pct", 0.04) if isinstance(cost_cfg, dict) else 0.04
+        self.backtest_spread_pct = cost_cfg.get("spread_pct", {}) if isinstance(cost_cfg, dict) else {}
+
         ai = self._get("ai", {})
         self.ai_mode = ai.get("mode", "semi_auto") if isinstance(ai, dict) else "semi_auto"
         self.ai_model = ai.get("model", "deepseek-chat") if isinstance(ai, dict) else "deepseek-chat"

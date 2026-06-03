@@ -36,6 +36,18 @@ def test_backtest_config_defaults():
     assert config.backtest_ml_enabled is False
 
 
+def test_backtest_cost_model_config():
+    from app.config import Config
+    Config._instance = None
+    config = Config.load("sim")
+    assert config.backtest_cost_enabled is True
+    assert config.backtest_taker_fee_pct == 0.04
+    spreads = config.backtest_spread_pct
+    assert isinstance(spreads, dict)
+    assert "BTCUSDT" in spreads
+    assert spreads["BTCUSDT"] == 0.01
+
+
 def test_config_singleton():
     from app.config import Config
     Config._instance = None
