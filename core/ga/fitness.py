@@ -205,13 +205,16 @@ def evaluate_population_batch(
 
     # ── Split population into worker groups ──
     workers = min(max_workers, total)
-    chunk_size = max(1, total // workers)
+    # Distribute remainder evenly: 7 strategies ÷ 4 workers → [2,2,2,1]
+    base = total // workers
+    rem = total % workers
     chunks = []
+    cursor = 0
     for w in range(workers):
-        start = w * chunk_size
-        end = start + chunk_size if w < workers - 1 else total
-        if start < total:
-            chunks.append((start, end))
+        size = base + (1 if w < rem else 0)
+        if size > 0:
+            chunks.append((cursor, cursor + size))
+            cursor += size
 
     logger.info(f"GA batch eval: {total} strategies in {len(chunks)} parallel groups "
                 f"on {date_start}~{date_end} with {len(symbols)} symbols")
