@@ -204,6 +204,9 @@ def evaluate_population_batch(
         batch_end = min(batch_start + batch_size, total)
         batch = population[batch_start:batch_end]
 
+        logger.info(f"GA batch backtest: evaluating strategies {batch_start+1}-{batch_end}/{total} "
+                    f"on {date_start}~{date_end} with {len(symbols)} symbols")
+
         # Build StrategyConfig objects directly — no file I/O needed
         batch_configs = []
         for i, chrom in enumerate(batch):
@@ -273,7 +276,7 @@ def evaluate_population_batch(
                 "max_dd": 0,
                 "total_return": round(pnl / initial_balance * 100, 2),
                 "trade_count": trades,
-                "strategy_name": name,
+                "strategy_name": config.name,
             }
 
             completed += 1

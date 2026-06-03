@@ -57,4 +57,9 @@ AGENTS.md
 # Logs
 *.log
 logs/
+
+# GA evolved strategies (prevent champion files from entering repo)
+strategies/ga_champion_*.yaml
+strategies/ga_*.yaml
 data/ga_strategies/
+data/deepseek_models.json

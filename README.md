@@ -1,5 +1,7 @@
 # Binance Trader
 
+![Binance Trader](social-preview.png)
+
 基于 Python 的自动化加密货币交易系统，集成多策略引擎、遗传算法优化、ML 预测、AI 决策、三层风控和实时 Web 管理面板。
 
 ## 架构
@@ -51,7 +53,7 @@ binance_trader/
 │   ├── server.py                 # FastAPI 应用 (80+ 路由, WebSocket, HTMX)
 │   ├── i18n.py                   # 中英文翻译 (200+ 条目)
 │   └── templates/                # Jinja2 模板
-├── strategies/                   # YAML 策略定义 (7 个)
+├── strategies/                   # YAML 策略定义
 ├── config/                       # 系统配置、风控参数、告警规则
 ├── data/                         # 运行时数据 (DB, 模型, 缓存)
 ├── scripts/                      # 工具脚本 (数据下载等)
@@ -61,11 +63,11 @@ binance_trader/
 ## 核心能力
 
 ### 策略引擎
-- **7 个内置策略** — ADX-DMI趋势、布林带挤压、均值回归+RSI、MACD-RSI动量、RSI+MACD趋势、随机指标反转、超短线动量
-- **YAML 声明式定义** — 策略完全通过 YAML 文件定义，可在 Web UI 中创建/编辑/启用
-- **信号融合** — `(indicator×w_ind + ML×w_ml + news×w_news) / total_weight`
-- **多时间框架** — 支持 1m/5m/15m/1h/4h 组合，高频框架确认 + 长期框架过滤
-- **策略×交易对矩阵** — 回测中自由配置每个策略作用于哪些币种
+- **声明式策略定义** — 通过 YAML 文件完整描述策略：指标参数、入场/出场条件、减仓规则、时间框架
+- **信号融合引擎** — `(indicator×w_ind + ML×w_ml + news×w_news) / total_weight`，支持动态权重调整
+- **多时间框架** — 1m/5m/15m/1h/4h 自由组合，短线确认 + 长线过滤
+- **策略×交易对矩阵** — 每个策略独立配置交易币种，回测中精确衡量策略-交易对适配度
+- **Web UI 全生命周期管理** — 创建、编辑、启用/禁用、删除策略，即时生效无需重启
 
 ### 遗传算法策略优化 (GA)
 - **自动进化策略** — 初始化种群 → 并行回测评估 → 选择/交叉/变异 → 迭代进化
@@ -143,20 +145,3 @@ python app/main.py
 ```
 
 访问 `http://127.0.0.1:8899`，默认账户 `admin` / `admin`。
-
-## 关键发现
-
-基于 2026 年 5 月 4 轮全矩阵回测（共 25,000+ 笔交易）：
-
-- **均值回归策略最可靠** — RSI+Bollinger 均线回归 95% 胜率，$300+ 月利润
-- **趋势跟踪在 V 型市场失效** — EMA 突破策略持续亏损 $500-900/月
-- **ML 方向预测 ≈50%** — 与学术界 918 实验结论一致：OHLCV 数据无法可靠预测短期方向
-- **遗传算法是更优路径** — 直接优化策略参数和结构，绕开方向预测的理论天花板
-
-## 分支
-
-| 分支 | 内容 |
-|------|------|
-| `master` | 生产就绪：策略引擎、回测系统、AI 决策、风控 |
-| `feature/three-layer-ml` | ML 增强：PatchTST、TFT、Triple Barrier、37维特征 |
-| `feature/genetic-algorithm` | GA 策略进化引擎 |

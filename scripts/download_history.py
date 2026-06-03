@@ -15,7 +15,7 @@ import time
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]
 DATA_DIR = Path("data/market")
 LIMIT = 1000  # Binance max per request
-DAYS = 30
+DAYS = 365
 
 # OHLCV column names from Binance API
 COLUMNS = ["open_time", "open", "high", "low", "close", "volume",

@@ -1,6 +1,8 @@
 # Binance Trader
 
-An automated cryptocurrency trading system built in Python, integrating multi-strategy engine, ML prediction, AI decision-making, three-tier risk control, and a real-time web management panel.
+![Binance Trader](social-preview.png)
+
+An automated cryptocurrency trading system built in Python, integrating multi-strategy engine, genetic algorithm optimization, ML prediction, AI decision-making, three-tier risk control, and a real-time web management panel.
 
 ## Architecture
 
@@ -15,6 +17,10 @@ binance_trader/
 │   │   ├── engine.py             # Strategy evaluation, signal fusion (indicator + ML + news)
 │   │   ├── loader.py             # YAML strategy CRUD (Pydantic models)
 │   │   └── indicators.py         # TA-Lib technical indicators (RSI, MACD, BB, EMA, ADX, etc.)
+│   ├── ga/                       # Genetic algorithm optimization
+│   │   ├── evolver.py            # GA evolution engine: selection/crossover/mutation/elite
+│   │   ├── genome.py             # Strategy↔chromosome encoding
+│   │   └── fitness.py            # Fitness evaluation: Sharpe × win rate × stability
 │   ├── market_data/              # Market data
 │   │   ├── provider.py           # Binance WebSocket multi-stream + REST polling hybrid
 │   │   └── ohlcv_cache.py        # Parquet + in-memory dual-layer OHLCV cache
@@ -48,14 +54,14 @@ binance_trader/
 │   └── rules.py                  # AlertRule dataclass, 5 default rules, JSON persistence
 ├── db/
 │   └── database.py               # SQLite schema (13 tables), atomic balance operations
-├── strategies/                   # Strategy YAML definitions (5 built-in)
+├── strategies/                   # Strategy YAML definitions
 ├── config/
 │   ├── config.yaml               # Master config (AI mode, signal weights, news, allocation)
 │   ├── risk_params.yaml          # Risk parameters (drawdown, position, stop limits)
 │   ├── alert_rules.json          # Alert rule definitions (JSON format)
 │   └── secrets.yaml              # Sensitive credentials (gitignored)
 ├── data/                         # Runtime data (DB, models, cache — all gitignored)
-└── tests/                        # 13 test files
+└── tests/                        # Test files
 ```
 
 ## Core Capabilities
@@ -79,32 +85,30 @@ binance_trader/
 4. Exit signal → `POSITION_EXIT`/`POSITION_REDUCE` → close/reduce position
 5. Circuit breaker trip → `RISK_BREACH` → AI decision / preset action
 
-### 5 Built-in Strategies
+### Strategy Engine
 
-| Strategy | Indicators | Timeframes | Description |
-|----------|------------|------------|-------------|
-| EMA+Volume Breakout | EMA9/21/50, VOL SMA20, OBV | 15m, 1h | Trend breakout + volume confirmation |
-| RSI+MACD Trend | RSI14, MACD, ADX14 | 1h, 4h | Trend following + momentum confirmation |
-| Mean Reversion RSI+BB | RSI14, BB20, ATR14 | 5m, 15m | Oversold/overbought reversion |
-| Bollinger Squeeze+Volume | BB20, KDJ, VOL SMA20 | 15m, 1h | Bollinger squeeze breakout |
-| Scalp Momentum | EMA5/13, RSI7, MACD, Stochastic | 1m, 5m | Ultra-short-term momentum |
+- **Declarative YAML definitions** — strategies are fully described in YAML: indicator parameters, entry/exit conditions, partial-reduction rules, and timeframes
+- **Signal fusion engine** — `(indicator×w_ind + ML×w_ml + news×w_news) / total_weight` with dynamic weight adjustment
+- **Multi-timeframe** — any combination of 1m/5m/15m/1h/4h; short-term confirmation + long-term trend filtering
+- **Strategy×Symbol matrix** — each strategy independently selects trading symbols; backtests measure per-cell performance
+- **Web UI lifecycle management** — create, edit, toggle, and delete strategies from the browser without restarting
 
-Strategies are defined declaratively via YAML files. Create/edit/delete/toggle in the Web UI.
+### Genetic Algorithm Strategy Optimization
 
-### Signal Fusion
+- **Automated evolution** — initialize population → parallel backtest evaluation → selection/crossover/mutation → iterative improvement
+- **Genome encoding** — continuous genes (indicator parameters) + categorical genes (mode/timeframes) + structural genes (entry/exit conditions)
+- **Fitness function** — Sharpe ratio ×2 + win rate + profit factor − drawdown penalty − overfitting penalty
+- **Anti-overfitting** — out-of-sample validation + complexity penalty + Deflated Sharpe Ratio
+- **Checkpoint/resume** — evolution state persists to disk after each generation, survives restarts
 
-```
-final_score = (indicator_signal × W_ind + ml_confidence × W_ml + news_sentiment × W_news) / total_weight
-```
+### Machine Learning (3 engines)
 
-Weights are adjustable in real-time via Web UI. In `full_auto` mode, AI optimizes weights automatically.
-
-### ML Prediction
-
-- **Model**: XGBoost binary classifier (predicts `up`/`down` direction)
-- **Features**: RSI, MACD_histogram, BB_width, volume_ratio, price_momentum_24h
-- **Training**: Per-symbol models on 4h kline data, incremental training
-- **Prediction**: Publishes `ML_PREDICTION` events on each entry signal evaluation
+- **LightGBM** — gradient-boosted trees, fast and stable (~3h full-matrix backtest)
+- **TFT (Temporal Fusion Transformer)** — variable selection networks + LSTM + multi-head attention
+- **PatchTST** — #1 ranked in 2026 benchmarks: patch embedding + Transformer encoder
+- **Triple Barrier labels** — path-aware upper/lower/timeout classification, better than binary direction labels
+- **37-dimensional features** — momentum, volatility, volume quality, price position, trend strength, micro-structure, time cycles
+- **Round-robin retraining** — staggered: 1 model per step, avoids GPU burst overload
 
 ### AI Decision-Making (DeepSeek)
 
@@ -274,7 +278,7 @@ Configure in `config/risk_params.yaml` or Web UI settings:
 | Market Data | python-binance (WebSocket multi-stream + REST) |
 | Web Framework | FastAPI + Jinja2 + HTMX + ECharts |
 | Database | SQLite (aiosqlite) + Parquet (pyarrow) |
-| ML | scikit-learn + XGBoost |
+| ML | LightGBM + PyTorch (TFT, PatchTST) |
 | AI | OpenAI SDK → DeepSeek API |
 | Technical Indicators | TA-Lib |
 | Auth | bcrypt + PyJWT (HS256) |

@@ -2176,6 +2176,8 @@ Return ONLY valid JSON in this exact format:
                 _ga_state["best_sharpe"] = result.get("sharpe", 0)
                 _ga_state["error"] = result.get("error")
             except Exception as e:
+                import traceback
+                logger.error(f"GA evolution crashed: {e}\n{traceback.format_exc()}")
                 _ga_state["running"] = False
                 _ga_state["error"] = str(e)
                 # Check if checkpoint exists for resume
