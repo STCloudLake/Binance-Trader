@@ -142,7 +142,7 @@ class SignalMatrixBuilder:
                     for cond in s.exit_conditions.get(side, []):
                         all_conditions.setdefault(cond, []).append((s.name, primary_tf, f"exit_{side}"))
 
-            condition_results: dict[str, dict[str, pd.Series]] = {}
+            condition_results: dict[str, dict[tuple[str, str], pd.Series]] = {}
             for cond_str in all_conditions:
                 condition_results[cond_str] = {}
                 for group in groups:
@@ -153,7 +153,7 @@ class SignalMatrixBuilder:
                         if df is None:
                             continue
                         result = evaluate_condition(df, cond_str)
-                        condition_results[cond_str][tf] = result
+                        condition_results[cond_str][(config_hash, tf)] = result
 
             # ── Build signal rows for this symbol ──
             entry_rows = []
@@ -161,13 +161,14 @@ class SignalMatrixBuilder:
 
             for s in strategies:
                 primary_tf = s.timeframes[0] if s.timeframes else "1h"
+                config_hash = self.grouper._config_hash(s)
 
                 # Long entry: AND all long entry conditions
                 long_conds = s.entry_conditions.get("long", [])
                 if long_conds:
                     long_signals = None
                     for cond_str in long_conds:
-                        result = condition_results.get(cond_str, {}).get(primary_tf)
+                        result = condition_results.get(cond_str, {}).get((config_hash, primary_tf))
                         if result is not None:
                             aligned = result.reindex(timestamps, fill_value=False)
                             if long_signals is None:
@@ -184,14 +185,14 @@ class SignalMatrixBuilder:
                 if short_conds:
                     short_signals = None
                     for cond_str in short_conds:
-                        result = condition_results.get(cond_str, {}).get(primary_tf)
+                        result = condition_results.get(cond_str, {}).get((config_hash, primary_tf))
                         if result is not None:
                             aligned = result.reindex(timestamps, fill_value=False)
                             if short_signals is None:
                                 short_signals = aligned.astype(bool)
                             else:
                                 short_signals = short_signals & aligned.astype(bool)
-                    if short_signals is not None:
+                    if short_signals is not None and short_signals.any():
                         short_series = short_signals.astype(int) * -1
                         # Check if there's already a long row for this (strategy, sym, tf)
                         combined = short_series.copy()
@@ -213,7 +214,7 @@ class SignalMatrixBuilder:
                     if exit_conds:
                         exit_sig = None
                         for cond_str in exit_conds:
-                            result = condition_results.get(cond_str, {}).get(primary_tf)
+                            result = condition_results.get(cond_str, {}).get((config_hash, primary_tf))
                             if result is not None:
                                 aligned = result.reindex(timestamps, fill_value=False)
                                 if exit_sig is None:

@@ -784,17 +784,27 @@ class BacktestEngine:
                     if df_primary is None or len(df_primary) < 20:
                         continue
 
-                    # Evaluate entry conditions on primary timeframe
-                    long_active = False
-                    short_active = False
-                    for side in ["long", "short"]:
-                        for cond in strategy.entry_conditions.get(side, []):
-                            mask = evaluate_condition(df_primary, cond)
-                            met = bool(hasattr(mask, 'iloc') and mask.iloc[-1])
-                            if met and side == "long":
-                                long_active = True
-                            elif met and side == "short":
-                                short_active = True
+                    # Evaluate entry conditions on primary timeframe (AND logic)
+                    long_active = True
+                    short_active = True
+                    long_conds = strategy.entry_conditions.get("long", [])
+                    short_conds = strategy.entry_conditions.get("short", [])
+                    if not long_conds:
+                        long_active = False
+                    if not short_conds:
+                        short_active = False
+                    for cond in long_conds:
+                        mask = evaluate_condition(df_primary, cond)
+                        met = bool(hasattr(mask, 'iloc') and mask.iloc[-1])
+                        if not met:
+                            long_active = False
+                            break
+                    for cond in short_conds:
+                        mask = evaluate_condition(df_primary, cond)
+                        met = bool(hasattr(mask, 'iloc') and mask.iloc[-1])
+                        if not met:
+                            short_active = False
+                            break
 
                     if long_active and short_active:
                         continue
