@@ -185,6 +185,20 @@ class EventDrivenExecutor:
                 if pos_key not in positions:
                     continue
 
+                # Trailing stop update
+                trailing_pct = pos.get("trailing_stop_pct", 0) / 100.0
+                if trailing_pct > 0:
+                    best = pos.get("best_price", pos["entry_price"])
+                    if side == "long" and current_price > best:
+                        pos["best_price"] = current_price
+                    elif side == "short" and current_price < best:
+                        pos["best_price"] = current_price
+                    best_price = pos["best_price"]
+                    if side == "long":
+                        pos["stop_loss"] = best_price * (1 - trailing_pct)
+                    else:
+                        pos["stop_loss"] = best_price * (1 + trailing_pct)
+
                 # Indicator exit check
                 exit_hit = matrix.get_exit(s_name, sym, tf, side, ts)
                 if exit_hit:
@@ -220,10 +234,16 @@ class EventDrivenExecutor:
                 except (KeyError, IndexError):
                     continue
 
-                # Position sizing
+                # Position sizing (with risk-based sizing if cost model is active)
                 qty, risk_amount = self.sizer.calculate_position_size(
                     account_balance=balance, current_price=price,
                     position_type="satellite")
+                # ── Risk-based adjustment: tighter stop → larger position ──
+                if self.cost_config:
+                    risk_capital = balance * 0.01  # risk 1% of capital
+                    sl_dist = 0.02  # default 2% stop loss
+                    qty_risk = risk_capital / (price * sl_dist)
+                    qty = min(qty, qty_risk) if qty_risk > 0 else qty
                 if qty <= 0:
                     continue
 
@@ -236,6 +256,7 @@ class EventDrivenExecutor:
 
                 sl = self.sizer.calculate_stop_loss(entry_price=price, side=side)
                 tps = self.sizer.calculate_take_profits(entry_price=price, side=side)
+                trailing_pct = 1.5  # default trailing stop distance (%)
 
                 positions[pos_key] = {
                     "symbol": sym, "side": side,
@@ -244,6 +265,8 @@ class EventDrivenExecutor:
                     "strategy_name": s_name,
                     "opened_at": str(ts), "trade_group": f"bt_{pos_counter}_{int(ts.timestamp())}",
                     "stop_loss": sl, "take_profits": tps,
+                    "trailing_stop_pct": trailing_pct,
+                    "best_price": price,
                     "timeframe": tf, "reduce_count": 0,
                 }
 

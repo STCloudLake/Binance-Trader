@@ -11,6 +11,20 @@ class MLConfig(BaseModel):
     weight: float = 0.3
 
 
+class RiskExitConfig(BaseModel):
+    """Standardized risk-based exit rules applied to every position.
+
+    These exits are always active (stop-loss, trailing-stop, max-hold).
+    Indicator-based exits in exit_conditions are OPTIONAL and can be
+    disabled via use_indicator_exits=False — this lets GA focus purely
+    on entry alpha while exits follow fixed risk rules.
+    """
+    stop_loss_pct: float = 2.0         # fixed stop loss distance from entry (%)
+    trailing_stop_pct: float = 1.5     # trailing stop distance from best price (%)
+    max_hold_hours: float = 48.0       # force close after N hours (0 = no limit)
+    use_indicator_exits: bool = True   # if False, only risk exits are used
+
+
 class StrategyConfig(BaseModel):
     name: str
     enabled: bool = True
@@ -22,6 +36,7 @@ class StrategyConfig(BaseModel):
     exit_conditions: dict[str, list[str]] = {}
     reduce_conditions: dict[str, list[dict]] = {}
     ml_config: MLConfig | None = None
+    risk_exit: RiskExitConfig | None = None  # standardized risk exits
 
 
 class StrategyLoader:

@@ -722,30 +722,67 @@ class BacktestEngine:
                 if sym not in positions:
                     continue
 
-                for strategy in strategy_configs:
-                    if strategy.name != pos.get("strategy_name"):
-                        continue
-                    for interval in strategy.timeframes:
-                        try:
-                            df = _get_cached_df(sym, interval, strategy.indicators, ts)
-                        except Exception:
-                            continue
-                        if df is None or len(df) < 20:
-                            continue
+                # ---- TRAILING STOP UPDATE ----
+                # Update best price seen and check trailing stop
+                trailing_pct = pos.get("trailing_stop_pct", 0) / 100.0
+                if trailing_pct > 0 and price_now > 0:
+                    side = pos["side"]
+                    best = pos.get("best_price", pos["entry_price"])
+                    if side == "long" and price_now > best:
+                        pos["best_price"] = price_now
+                    elif side == "short" and price_now < best:
+                        pos["best_price"] = price_now
+                    # Update trailing stop level
+                    best_price = pos["best_price"]
+                    if side == "long":
+                        pos["stop_loss"] = best_price * (1 - trailing_pct)
+                    else:
+                        pos["stop_loss"] = best_price * (1 + trailing_pct)
 
-                        exit_conds = strategy.exit_conditions.get(pos["side"], [])
-                        for cond in exit_conds:
-                            mask = evaluate_condition(df, cond)
-                            if hasattr(mask, 'iloc') and mask.iloc[-1]:
-                                exit_price = float(df["close"].iloc[-1])
-                                balance = self._close_position(
-                                    pos_key, pos, exit_price, ts, "indicator",
-                                    trades, events, balance, positions, per_matrix)
+                # ---- MAX HOLD TIME CHECK ----
+                max_hours = pos.get("max_hold_hours", 0)
+                if max_hours > 0 and price_now > 0:
+                    try:
+                        opened = pd.Timestamp(pos["opened_at"])
+                        held_hours = (ts - opened).total_seconds() / 3600
+                        if held_hours >= max_hours:
+                            balance = self._close_position(
+                                pos_key, pos, price_now, ts, "max_hold",
+                                trades, events, balance, positions, per_matrix)
+                            continue
+                    except Exception:
+                        pass
+
+                if sym not in positions:
+                    continue
+
+                # ---- INDICATOR EXITS (skip if strategy uses risk-only exits) ----
+                use_indicator = pos.get("use_indicator_exits", True)
+                if use_indicator:
+                    for strategy in strategy_configs:
+                        if strategy.name != pos.get("strategy_name"):
+                            continue
+                        for interval in strategy.timeframes:
+                            try:
+                                df = _get_cached_df(sym, interval, strategy.indicators, ts)
+                            except Exception:
+                                continue
+                            if df is None or len(df) < 20:
+                                continue
+
+                            exit_conds = strategy.exit_conditions.get(pos["side"], [])
+                            for cond in exit_conds:
+                                mask = evaluate_condition(df, cond)
+                                if hasattr(mask, 'iloc') and mask.iloc[-1]:
+                                    exit_price = float(df["close"].iloc[-1])
+                                    balance = self._close_position(
+                                        pos_key, pos, exit_price, ts, "indicator",
+                                        trades, events, balance, positions, per_matrix)
+                                    break
+                            if sym not in positions:
                                 break
                         if sym not in positions:
                             break
-                    if sym not in positions:
-                        break
 
             # --- UPDATE SIGNAL WEIGHTS (simulate AI market assessment) ---
             # Use BTC regime as the broad market indicator
@@ -863,6 +900,16 @@ class BacktestEngine:
                     if qty <= 0:
                         continue
 
+                    # ── Risk-based position sizing (Kelly-lite) ──
+                    # Tighter stop → larger position for same risk budget
+                    re = strategy.risk_exit
+                    if re is not None:
+                        risk_capital = balance * 0.01  # risk 1% of capital per trade
+                        sl_dist = re.stop_loss_pct / 100.0
+                        qty_risk = risk_capital / (price * sl_dist)
+                        # Blend: use risk-based if it's more conservative, else keep base
+                        qty = min(qty, qty_risk) if qty_risk > 0 else qty
+
                     # Check max position size
                     max_amount = balance * (self.config.hard_limits.max_position_size_pct / 100)
                     if risk_amount > max_amount:
@@ -877,6 +924,16 @@ class BacktestEngine:
                     trade_group = f"bt_{pos_counter}_{int(ts.timestamp())}"
                     balance -= amount_usdt
 
+                    # Use strategy-specific risk exits if configured, else PositionSizer defaults
+                    re = strategy.risk_exit
+                    if re is not None:
+                        sl_pct = re.stop_loss_pct / 100.0
+                        sl = price * (1 - sl_pct) if side == "long" else price * (1 + sl_pct)
+                        tp_dist = re.trailing_stop_pct / 100.0
+                    else:
+                        sl = sizer.calculate_stop_loss(price, side)
+                        tp_dist = 1.5 / 100.0  # default trailing stop distance
+
                     pos_key = _pkey(sym, strategy.name)
                     positions[pos_key] = {
                         "symbol": sym, "side": side,
@@ -884,7 +941,11 @@ class BacktestEngine:
                         "amount_usdt": amount_usdt,
                         "strategy_name": strategy.name,
                         "opened_at": str(ts), "trade_group": trade_group,
-                        "stop_loss": sizer.calculate_stop_loss(price, side),
+                        "stop_loss": sl,
+                        "trailing_stop_pct": round(tp_dist * 100, 1),
+                        "best_price": price,  # for trailing stop tracking
+                        "max_hold_hours": re.max_hold_hours if re else 0,
+                        "use_indicator_exits": re.use_indicator_exits if re else True,
                         "take_profits": sizer.calculate_take_profits(price, side),
                         "reduce_count": 0,
                     }
