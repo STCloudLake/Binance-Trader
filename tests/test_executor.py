@@ -6,12 +6,20 @@ from app.config import Config
 
 @pytest.mark.asyncio
 async def test_sim_order_execution():
+    import tempfile, os
     from core.executor.executor import OrderExecutor
-    bus = EventBus()
-    await bus.start()
 
     Config._instance = None
     config = Config.load("sim")
+    # Isolate from production database
+    tmp_dir = tempfile.mkdtemp()
+    config.db_path = os.path.join(tmp_dir, "test.db")
+    from db.database import init_database
+    await init_database(config.db_path)
+
+    bus = EventBus()
+    await bus.start()
+
     executor = OrderExecutor(config, bus)
     await executor.start()
 
@@ -40,3 +48,5 @@ async def test_sim_order_execution():
 
     await executor.stop()
     await bus.shutdown()
+    import shutil
+    shutil.rmtree(tmp_dir, ignore_errors=True)
