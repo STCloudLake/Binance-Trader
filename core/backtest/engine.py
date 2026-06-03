@@ -6,6 +6,7 @@ from pathlib import Path
 from loguru import logger
 from core.backtest.data_feeder import DataFeeder
 from core.backtest.metrics import calculate_metrics
+from core.backtest.engine_hybrid import run_hybrid
 from core.strategy.indicators import compute_all, evaluate_condition
 
 # Timeframe → minutes mapping for sorting and trend-filter logic
@@ -66,6 +67,41 @@ class BacktestEngine:
         self.risk_manager = risk_manager
         self.order_executor = order_executor
 
+    def _select_engine(self, strategies, engine_mode: str) -> str:
+        """Determine which engine to use: 'hybrid' or 'legacy'."""
+        if engine_mode == "legacy":
+            return "legacy"
+
+        # Check if any strategy has ML enabled
+        strategy_configs = []
+        if isinstance(strategies, list) and strategies and not isinstance(strategies[0], str):
+            strategy_configs = strategies
+        else:
+            for name in strategies:
+                try:
+                    s = self.strategy_engine.loader.load(name)
+                    strategy_configs.append(s)
+                except Exception:
+                    pass
+
+        has_ml = any(
+            s.ml_config and s.ml_config.enabled
+            for s in strategy_configs
+        )
+
+        if engine_mode == "hybrid":
+            if has_ml:
+                raise ValueError(
+                    "Hybrid engine does not support ML training/prediction. "
+                    "Set config backtest.ml_enabled=false or use engine_mode='legacy'.")
+            return "hybrid"
+
+        # engine_mode == "auto"
+        n = len(strategies) if isinstance(strategies, list) else 1
+        if n >= 3 and not has_ml:
+            return "hybrid"
+        return "legacy"
+
     def run(self, strategies: list[str], symbols: list[str],
             date_start: str, date_end: str,
             initial_balance: float = 10000.0, mode: str = "full",
@@ -102,6 +138,44 @@ class BacktestEngine:
                 training. Useful for repeat backtests over the same period.
         """
         t0 = time.time()
+
+        # ── Engine mode selection ──
+        _engine_mode = getattr(self.config, 'backtest_engine_mode', 'auto')
+        _ml_enabled = getattr(self.config, 'backtest_ml_enabled', False)
+
+        # Override ML based on config
+        if not _ml_enabled and isinstance(strategies, list) and strategies:
+            if not isinstance(strategies[0], str):
+                for s in strategies:
+                    if s.ml_config:
+                        s.ml_config.enabled = False
+            else:
+                for name in strategies:
+                    try:
+                        s = self.strategy_engine.loader.load(name)
+                        if s.ml_config:
+                            s.ml_config.enabled = False
+                    except Exception:
+                        pass
+
+        # Route to hybrid engine if applicable
+        try:
+            use_hybrid = self._select_engine(strategies, _engine_mode) == "hybrid"
+        except ValueError:
+            use_hybrid = False
+
+        if use_hybrid:
+            try:
+                return run_hybrid(
+                    strategies, symbols, date_start, date_end,
+                    self.config, self.strategy_engine.loader,
+                    initial_balance=initial_balance,
+                    per_strategy_isolation=per_strategy_isolation,
+                    progress_callback=progress_callback,
+                )
+            except Exception as e:
+                logger.warning(f"Hybrid engine failed ({e}), falling back to legacy")
+                # Fall through to legacy engine below
 
         # Load strategy configs — support direct config objects for GA
         strategy_configs = []
