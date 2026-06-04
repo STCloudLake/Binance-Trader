@@ -4,6 +4,7 @@ import pytest
 import tempfile
 import os
 import random
+import pandas as pd
 from pathlib import Path
 
 
@@ -345,3 +346,90 @@ def test_genome_fitness_integration():
     assert loaded.name == config.name
     assert loaded.mode == config.mode
     assert loaded.indicators == config.indicators
+
+
+# ── Walk-Forward tests ──────────────────────────────────────────
+
+def test_wf_window_computation():
+    """Walk-forward should produce rolling, non-overlapping windows."""
+    from core.ga.walkforward import WalkForwardRunner, WFConfig
+    runner = WalkForwardRunner(None, None, "/tmp")
+    cfg = WFConfig(train_months=6, val_months=1, step_months=1)
+    windows = runner.compute_windows("2025-01-01", "2026-01-01", cfg)
+    assert len(windows) >= 5
+    # Each window: train_end == val_start (adjacent, no gap)
+    for tr_s, tr_e, val_s, val_e in windows:
+        assert tr_e == val_s, f"Gap between train end {tr_e} and val start {val_s}"
+    # Windows advance by 1 month
+    first_start = pd.Timestamp(windows[0][0])
+    second_start = pd.Timestamp(windows[1][0])
+    assert (second_start - first_start).days >= 28
+
+
+def test_wf_window_computation_short_range():
+    """Date range too short for any valid window should return empty."""
+    from core.ga.walkforward import WalkForwardRunner, WFConfig
+    runner = WalkForwardRunner(None, None, "/tmp")
+    cfg = WFConfig(train_months=6, val_months=1, step_months=1)
+    windows = runner.compute_windows("2025-01-01", "2025-03-01", cfg)
+    assert len(windows) == 0
+
+
+def test_wf_report_metrics():
+    """WFReport should compute correct aggregate statistics."""
+    from core.ga.walkforward import WFReport, WindowResult
+    results = [
+        WindowResult(1, 3, "2025-01-01", "2025-07-01", "2025-07-01", "2025-08-01",
+                     1.2, 0.8),
+        WindowResult(2, 3, "2025-02-01", "2025-08-01", "2025-08-01", "2025-09-01",
+                     1.5, -0.3),
+        WindowResult(3, 3, "2025-03-01", "2025-09-01", "2025-09-01", "2025-10-01",
+                     0.9, 1.1),
+    ]
+    report = WFReport.from_results(results, 100.0)
+    assert report.mean_val_sharpe > 0
+    assert report.std_val_sharpe > 0
+    assert report.wf_efficiency > 0
+    # 2 out of 3 windows have positive val_sharpe → ~66.7%
+    assert 60 < report.positive_window_pct < 70
+    assert report.best_val_sharpe == 1.1
+    assert report.best_window == 3
+
+
+def test_wf_report_single_window():
+    """Single window should not crash (std=0, corr=0)."""
+    from core.ga.walkforward import WFReport, WindowResult
+    results = [WindowResult(1, 1, "2025-01-01", "2025-07-01", "2025-07-01", "2025-08-01",
+                            1.0, 0.5)]
+    report = WFReport.from_results(results, 50.0)
+    assert report.mean_val_sharpe == 0.5
+    assert report.std_val_sharpe == 0.0
+    assert report.wf_efficiency == 0.0
+    assert report.train_val_correlation == 0.0
+
+
+def test_wf_report_empty():
+    """Empty results → safe defaults."""
+    from core.ga.walkforward import WFReport, WindowResult
+    report = WFReport.from_results([], 10.0)
+    assert report.mean_val_sharpe == 0.0
+    assert report.wf_efficiency == 0.0
+    assert report.windows == []
+
+
+def test_wf_state_save_load():
+    """Walk-Forward state should serialize and deserialize correctly."""
+    import tempfile, os
+    from core.ga.walkforward import WalkForwardRunner, WindowResult
+    tmp = tempfile.mkdtemp()
+    runner = WalkForwardRunner(None, None, tmp)
+    runner._state_path = Path(tmp) / "ga_wf_state.json"
+    runner._save_state(2, [
+        WindowResult(1, 3, "2025-01-01", "2025-07-01", "2025-07-01", "2025-08-01",
+                     1.0, 0.5, champion_name="champ_1"),
+    ])
+    loaded = runner._load_state()
+    assert loaded is not None
+    assert loaded["current_window"] == 2
+    assert len(loaded["completed"]) == 1
+    assert loaded["completed"][0]["champion_name"] == "champ_1"
