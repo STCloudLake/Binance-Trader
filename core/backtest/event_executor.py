@@ -92,8 +92,10 @@ class EventDrivenExecutor:
             cell["pnl"] += pnl
             if pnl > 0:
                 cell["winning"] += 1
+                cell["gross_win_pnl"] += pnl
             else:
                 cell["losing"] += 1
+                cell["gross_loss_pnl"] += abs(pnl)
             if side == "long":
                 cell["long_trades"] += 1
             else:
@@ -132,6 +134,7 @@ class EventDrivenExecutor:
                 per_matrix[s_name][sym] = {
                     "trades": 0, "pnl": 0.0, "winning": 0, "losing": 0,
                     "long_trades": 0, "short_trades": 0,
+                    "gross_win_pnl": 0.0, "gross_loss_pnl": 0.0,
                 }
 
         total_steps = len(timestamps)

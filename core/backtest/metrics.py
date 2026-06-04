@@ -49,7 +49,7 @@ def calculate_metrics(trades: list[dict], equity_curve: list[dict],
     win_rate = len(winning) / n_trades * 100 if n_trades > 0 else 0
     total_gains = sum(t.get("pnl", 0) for t in winning)
     total_losses = abs(sum(t.get("pnl", 0) for t in losing))
-    profit_factor = total_gains / total_losses if total_losses > 0 else float("inf")
+    profit_factor = total_gains / total_losses if total_losses > 0 else (999.0 if total_gains > 0 else 0.0)
 
     # Sharpe ratio (annualized)
     # Resample to daily equity first to get correct annualization regardless

@@ -57,10 +57,12 @@ def evaluate_chromosome(
 
         # ── Fitness score ──
         # Higher is better. Penalize extreme values and instability.
+        # Cap profit_factor to prevent extreme values from dominating fitness.
+        capped_pf = min(profit_factor, 100.0) if profit_factor != float('inf') else 100.0
         fitness = (
             max(sharpe, -5) * 2.0          # risk-adjusted return (capped floor)
             + win_rate * 0.15               # consistency
-            + max(profit_factor, 0.1) * 5   # reward good risk/reward
+            + max(capped_pf, 0.1) * 5       # reward good risk/reward (capped at 100)
             - max_dd * 0.3                  # penalize drawdowns
         )
 
@@ -259,33 +261,47 @@ def evaluate_population_batch(
             pnl = sum(c.get("pnl", 0) for c in cell_data.values())
             wins = sum(c.get("winning", 0) for c in cell_data.values())
             losses = sum(c.get("losing", 0) for c in cell_data.values())
+            long_trades = sum(c.get("long_trades", 0) for c in cell_data.values())
+            short_trades = sum(c.get("short_trades", 0) for c in cell_data.values())
 
             win_rate = (wins / max(trades, 1)) * 100
-            avg_win = sum(c.get("pnl", 0) for c in cell_data.values() if c.get("pnl", 0) > 0) / max(wins, 1)
-            avg_loss = abs(sum(c.get("pnl", 0) for c in cell_data.values() if c.get("pnl", 0) < 0)) / max(losses, 1)
-            # ── Fix: cap profit_factor to prevent division-by-zero inflation ──
-            if losses > 0 and avg_loss > 0:
-                profit_factor = min((wins * avg_win) / (losses * avg_loss), 100.0)
-            elif wins > 0:
-                profit_factor = 100.0  # all wins = excellent, but cap at 100
+
+            # ── Profit factor: use gross win/loss PnL (per-trade aggregate) ──
+            gross_win = sum(c.get("gross_win_pnl", 0.0) for c in cell_data.values())
+            gross_loss = sum(c.get("gross_loss_pnl", 0.0) for c in cell_data.values())
+            if gross_loss > 0:
+                profit_factor = min(gross_win / gross_loss, 100.0)
+            elif gross_win > 0:
+                profit_factor = 100.0  # no losing trades = excellent, cap at 100
             else:
                 profit_factor = 0.1
 
+            # ── Return on capital: positive → reward, negative → penalize ──
+            roc = pnl / max(initial_balance, 1)
+
+            # ── Long/short balance: penalize strategies that only trade one side ──
+            if trades > 0:
+                long_pct = long_trades / trades
+                imbalance = abs(long_pct - 0.5) * 2  # 0=balanced, 1=all one side
+            else:
+                imbalance = 1.0
+
             fitness = (
-                win_rate * 0.15
-                + max(profit_factor, 0.1) * 5
-                - abs(pnl / max(initial_balance, 1)) * 50
+                win_rate * 0.15                      # consistency
+                + max(profit_factor, 0.1) * 5        # risk/reward quality
+                + roc * 50                           # reward profit, penalize loss
+                - imbalance * 10                     # penalize all-long or all-short
             )
 
             if trades < 5:
-                fitness -= 20
+                fitness -= 20  # not enough data
             elif trades < 15:
-                fitness -= 5
+                fitness -= 5   # barely enough
             elif trades > 500:
-                fitness -= (trades - 500) * 0.02
+                fitness -= (trades - 500) * 0.02  # overtrading penalty
 
             if pnl < -50:
-                fitness -= abs(pnl) * 0.3
+                fitness -= abs(pnl) * 0.3  # heavy additional penalty for large losses
 
             fitness -= complexity_penalty(chrom)
 
@@ -297,6 +313,8 @@ def evaluate_population_batch(
                 "max_dd": 0,
                 "total_return": round(pnl / initial_balance * 100, 2),
                 "trade_count": trades,
+                "long_trades": long_trades,
+                "short_trades": short_trades,
                 "strategy_name": config.name,
             }
 
