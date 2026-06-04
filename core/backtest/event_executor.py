@@ -140,6 +140,10 @@ class EventDrivenExecutor:
         total_steps = len(timestamps)
         for step, ts in enumerate(timestamps):
 
+            # Yield GIL every 200 ticks so the asyncio event loop can serve HTTP
+            if step % 200 == 0:
+                time.sleep(0)
+
             if progress_callback and (step % 50 == 0 or step == total_steps - 1):
                 progress_callback(step + 1, total_steps, ts)
 

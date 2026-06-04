@@ -458,6 +458,9 @@ class BacktestEngine:
         # ---- Main Loop ----
         for slice_data in feeder:
             step += 1
+            # Yield GIL periodically so asyncio event loop stays responsive
+            if step % 200 == 0:
+                time.sleep(0)
             ts = slice_data["timestamp"]
             # Report progress every 10 steps or at start/end
             if progress_callback and (step % 10 == 0 or step == 1 or step == total_steps):
