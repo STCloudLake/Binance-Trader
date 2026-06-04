@@ -51,14 +51,6 @@
             </span>
         </div>
 
-        <script>
-        function toggleWFConfig() {
-            var wf = document.getElementById('ga-wf-enabled').checked;
-            document.getElementById('ga-wf-config').style.display = wf ? '' : 'none';
-            document.getElementById('ga-val-start').parentElement.parentElement.style.display = wf ? 'none' : '';
-        }
-        </script>
-
         <!-- Cost Model -->
         <details class="mt-3">
             <summary class="text-sm text-slate-400 cursor-pointer hover:text-slate-300">
@@ -259,6 +251,14 @@ function startGA() {
         btn.disabled = false;
         btn.textContent = '{{ _("Start Evolution") }}';
     });
+}
+
+function toggleWFConfig() {
+    var wf = document.getElementById('ga-wf-enabled');
+    if (!wf) return;
+    var checked = wf.checked;
+    document.getElementById('ga-wf-config').style.display = checked ? '' : 'none';
+    document.getElementById('ga-val-start').parentElement.parentElement.style.display = checked ? 'none' : '';
 }
 
 function showError(msg) {
