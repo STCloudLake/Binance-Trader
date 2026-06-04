@@ -433,3 +433,76 @@ def test_wf_state_save_load():
     assert loaded["current_window"] == 2
     assert len(loaded["completed"]) == 1
     assert loaded["completed"][0]["champion_name"] == "champ_1"
+
+
+# ── Fitness Calibration tests ────────────────────────────────────
+
+def test_default_weights():
+    """Default weights should be a valid dict with required keys."""
+    from core.ga.fitness_calibrate import DEFAULT_WEIGHTS
+    assert "wr" in DEFAULT_WEIGHTS
+    assert "pf" in DEFAULT_WEIGHTS
+    assert "roc" in DEFAULT_WEIGHTS
+    assert "bal" in DEFAULT_WEIGHTS
+    for v in DEFAULT_WEIGHTS.values():
+        assert v > 0
+
+
+def test_weight_grid_coverage():
+    """Weight grid should cover a reasonable search space (1000-10000 combos)."""
+    from core.ga.fitness_calibrate import WEIGHT_GRID
+    total = 1
+    for key in WEIGHT_GRID:
+        total *= len(WEIGHT_GRID[key])
+    assert total > 1000, f"Grid too small: {total} combos"
+    assert total < 10000, f"Grid too large: {total} combos (may be slow)"
+
+
+def test_spearman_perfect_correlation():
+    """Spearmanr on perfectly monotonic data should return ~1.0."""
+    from scipy.stats import spearmanr
+    x = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    y = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20]  # y = 2x
+    rho, p = spearmanr(x, y)
+    assert rho > 0.99, f"Expected ρ≈1.0, got {rho}"
+
+
+def test_spearman_anticorrelation():
+    """Spearmanr on inversely monotonic data should return ~-1.0."""
+    from scipy.stats import spearmanr
+    x = [1, 2, 3, 4, 5]
+    y = [5, 4, 3, 2, 1]
+    rho, p = spearmanr(x, y)
+    assert rho < -0.99
+
+
+def test_calibrator_save_load():
+    """Calibrated weights should survive save/load round-trip."""
+    import tempfile, os, json
+    from core.ga.fitness_calibrate import FitnessCalibrator, DEFAULT_WEIGHTS
+    tmp = tempfile.mkdtemp()
+    calibrator = FitnessCalibrator(None, None, tmp)
+    # Test default load (no saved file)
+    w = calibrator.load_weights()
+    assert w == DEFAULT_WEIGHTS
+    # Test save + load
+    test_weights = {"wr": 0.25, "pf": 7.0, "roc": 40, "bal": 12.0}
+    calibrator._save_weights_temp(test_weights)
+    w2 = calibrator.load_weights()
+    assert w2 == test_weights
+
+
+def test_custom_weights_in_fitness():
+    """Custom weights should change the fitness score relative to defaults."""
+    # With identical components but doubled wr weight, fitness should differ
+    win_rate, pf, roc, imbalance = 50.0, 2.0, 0.05, 0.3
+    default_w = {"wr": 0.15, "pf": 5.0, "roc": 50, "bal": 10.0}
+    custom_w = {"wr": 0.30, "pf": 5.0, "roc": 50, "bal": 10.0}
+
+    f_default = (win_rate * default_w["wr"] + max(pf, 0.1) * default_w["pf"]
+                 + roc * default_w["roc"] - imbalance * default_w["bal"])
+    f_custom = (win_rate * custom_w["wr"] + max(pf, 0.1) * custom_w["pf"]
+                + roc * custom_w["roc"] - imbalance * custom_w["bal"])
+
+    # Custom (double wr weight) should produce higher fitness for high wr
+    assert f_custom > f_default

@@ -144,12 +144,16 @@ class GAStrategyEvolver:
 
             # 1. Evaluate fitness (batch mode — 4-5x faster)
             from core.ga.fitness import evaluate_population_batch
+            from core.ga.fitness_calibrate import FitnessCalibrator
+            _data_dir = str(Path(self.loader.strategies_dir).parent) if hasattr(self.loader, 'strategies_dir') else "data"
+            _calibrated_weights = FitnessCalibrator.load_weights_static(_data_dir)
             self._population = evaluate_population_batch(
                 self._population, symbols, date_start, train_end,
                 self.engine, self.loader,
                 ga_loader=self.ga_loader,
                 batch_size=cfg.population_size,  # full population in one hybrid pass
                 max_workers=getattr(cfg, 'max_workers', 4),
+                weights=_calibrated_weights,
                 progress_callback=lambda c, t: self._report_progress(self._generation or 1, c, t))
 
             # 2. Sort by fitness

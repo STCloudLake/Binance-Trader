@@ -199,8 +199,14 @@ def evaluate_population_batch(
     initial_balance: float = 10000.0,
     progress_callback=None,
     max_workers: int = 4,
+    weights: dict | None = None,
 ) -> list[dict]:
     """Evaluate chromosomes in parallel batched backtests.
+
+    Args:
+        weights: Optional dict with keys 'wr', 'pf', 'roc', 'bal' to override
+                 the default fitness formula weights. Loaded from calibration
+                 data when available.
 
     Strategies are split into *max_workers* groups and processed in parallel
     threads. Since each strategy is isolated (per_strategy_isolation=True),
@@ -293,11 +299,14 @@ def evaluate_population_batch(
             else:
                 imbalance = 1.0
 
+            # ── Configurable weights (calibrated or default) ──
+            w = weights or {"wr": 0.15, "pf": 5.0, "roc": 50, "bal": 10.0}
+
             fitness = (
-                win_rate * 0.15                      # consistency
-                + max(profit_factor, 0.1) * 5        # risk/reward quality
-                + roc * 50                           # reward profit, penalize loss
-                - imbalance * 10                     # penalize all-long or all-short
+                win_rate * w["wr"]                  # consistency
+                + max(profit_factor, 0.1) * w["pf"]  # risk/reward quality
+                + roc * w["roc"]                     # reward profit, penalize loss
+                - imbalance * w["bal"]               # penalize all-long or all-short
             )
 
             if trades < 5:
