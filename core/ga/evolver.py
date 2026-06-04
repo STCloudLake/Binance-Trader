@@ -364,6 +364,19 @@ class GAStrategyEvolver:
             else:
                 child_cat.append(copy.deepcopy(g2))
 
+        # Indicator boolean genes: random inheritance from either parent
+        child_ind = []
+        p1_ind = {g.name: g for g in p1.get("indicator_genes", [])}
+        p2_ind = {g.name: g for g in p2.get("indicator_genes", [])}
+        for name in (p1_ind.keys() | p2_ind.keys()):
+            if name in p1_ind and name in p2_ind:
+                chosen = p1_ind[name] if random.random() < 0.5 else p2_ind[name]
+            elif name in p1_ind:
+                chosen = p1_ind[name]
+            else:
+                chosen = p2_ind[name]
+            child_ind.append(copy.deepcopy(chosen))
+
         child_struct = []
         for g1, g2 in zip(p1["structural"], p2["structural"]):
             # Random exchange of individual conditions
@@ -379,6 +392,7 @@ class GAStrategyEvolver:
             "continuous": child_cont,
             "categorical": child_cat,
             "structural": child_struct,
+            "indicator_genes": child_ind,
             "name": f"ga_child_{random.randint(1000,9999)}",
         }
 
@@ -393,6 +407,8 @@ class GAStrategyEvolver:
         for gene in chrom["structural"]:
             if random.random() < 0.15:
                 gene.mutate()
+        for gene in chrom.get("indicator_genes", []):
+            gene.mutate()
         chrom["fitness_result"] = {}
         return chrom
 

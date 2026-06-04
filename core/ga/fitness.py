@@ -106,19 +106,26 @@ def complexity_penalty(chromosome: dict) -> float:
     """
     structural = chromosome.get("structural", [])
     continuous = chromosome.get("continuous", [])
-    indicators_used = set()
 
     # Count conditions
     n_conditions = sum(len(g.conditions) for g in structural)
 
-    # Count unique indicator types from continuous genes
-    for g in continuous:
-        name = g.name.split("_")[0]  # "rsi_period" -> "rsi"
-        indicators_used.add(name)
+    # Count enabled indicators — prefer BooleanGene, fallback to parsing continuous genes
+    indicator_genes = chromosome.get("indicator_genes", [])
+    if indicator_genes:
+        n_indicators = sum(1 for g in indicator_genes if g.value)
+    else:
+        # Backward compat: parse from continuous gene names
+        indicators_used = set()
+        for g in continuous:
+            name = g.name.split("_")[0]  # "rsi_period" -> "rsi"
+            if name not in ("ml",):
+                indicators_used.add(name)
+        n_indicators = len(indicators_used)
 
     penalty = 0.0
-    penalty += n_conditions * 0.8       # each condition adds overfit risk
-    penalty += len(indicators_used) * 1.2  # each indicator type
+    penalty += n_conditions * 0.8        # each condition adds overfit risk
+    penalty += n_indicators * 1.2        # each indicator type
     penalty += len(continuous) * 0.3     # each tunable parameter
     return penalty
 

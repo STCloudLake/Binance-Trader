@@ -88,6 +88,7 @@ def compute_all(df: pd.DataFrame, indicator_configs: dict) -> pd.DataFrame:
             result["stoch_d"] = slowd
         elif name == "obv":
             result["obv"] = talib.OBV(result["close"].values, result["volume"].values)
+            result["obv_sma"] = result["obv"].rolling(20).mean()
         elif name == "cci":
             result["cci"] = talib.CCI(
                 result["high"].values, result["low"].values, result["close"].values,
@@ -111,6 +112,9 @@ def compute_all(df: pd.DataFrame, indicator_configs: dict) -> pd.DataFrame:
             result["ema_slow"] = talib.EMA(result["close"].values, timeperiod=21)
         if "price_momentum_24h" not in result.columns:
             result["price_momentum_24h"] = result["close"].pct_change(periods=24)
+        # Normalized ATR (volatility relative to price)
+        if "atr" in result.columns and "atr_ratio" not in result.columns:
+            result["atr_ratio"] = result["atr"] / result["close"]
 
     return result
 
