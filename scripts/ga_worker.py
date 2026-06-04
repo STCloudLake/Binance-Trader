@@ -168,7 +168,32 @@ def run_walkforward(job: dict, job_file: str):
         "current_window": 0,
     })
 
-    report = runner.run(symbols, date_start, date_end, wf_cfg, ga_cfg)
+    # ── Background progress reporter: updates current_window from runner state ──
+    import threading as _threading
+    _progress_stop = False
+
+    def _report_loop():
+        while not _progress_stop:
+            time.sleep(3)
+            try:
+                state = runner.get_state()
+                if state:
+                    update_progress(job_file, {
+                        "phase": "running",
+                        "total_windows": state.get("total_windows", len(windows)),
+                        "current_window": state.get("current_window", 0),
+                    })
+            except Exception:
+                pass
+
+    _progress_thread = _threading.Thread(target=_report_loop, daemon=True)
+    _progress_thread.start()
+
+    try:
+        report = runner.run(symbols, date_start, date_end, wf_cfg, ga_cfg)
+    finally:
+        _progress_stop = True
+        _progress_thread.join(timeout=5)
 
     write_result(job_file, {
         "type": "walkforward",
