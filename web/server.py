@@ -16,7 +16,7 @@ from app.event_bus import EventBus, Event, EventType
 from app.config import Config
 from core.auth.auth import AuthManager, User
 from db.database import get_db, save_sim_balance, atomic_adjust_balance
-import csv, io, os, shutil
+import csv, io, os, shutil, sys
 
 logger = logging.getLogger(__name__)
 
