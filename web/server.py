@@ -2238,6 +2238,111 @@ Return ONLY valid JSON in this exact format:
             _ga_state["phase"] = "stopping"
         return JSONResponse({"ok": True})
 
+    # ── Walk-Forward endpoints ───────────────────────────────────
+
+    _wf_state = {
+        "running": False, "current_window": 0, "total_windows": 0,
+        "completed": [], "report": None, "error": None, "started": 0,
+        "elapsed_seconds": 0, "phase": "idle",
+    }
+
+    @app.post("/api/ga/walkforward")
+    async def ga_walkforward(request: Request):
+        if err := _require_trader(request): return err
+        body = await request.json() if request.headers.get("content-type") == "application/json" else {}
+        engine = getattr(app.state, "backtest_engine", None)
+        loader = getattr(app.state, "strategy_loader", None)
+        if not engine or not loader:
+            return JSONResponse({"error": "Engine or loader not initialized"}, status_code=500)
+
+        symbols = body.get("symbols", ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"])
+        date_start = body.get("date_start", "2025-06-01")
+        date_end = body.get("date_end", "2026-06-01")
+        train_months = body.get("train_months", 6)
+        val_months = body.get("val_months", 1)
+        step_months = body.get("step_months", 1)
+        pop_size = min(body.get("population_size", 80), 120)
+        generations = min(body.get("generations", 20), 50)
+        resume = body.get("resume", False)
+
+        # Apply cost model overrides
+        cost_enabled = body.get("cost_enabled", True)
+        taker_fee_pct = body.get("taker_fee_pct", 0.04)
+        spread_pct = body.get("spread_pct", {})
+        bt_config = getattr(app.state, "config", None)
+        if bt_config:
+            bt_config.backtest_cost_enabled = cost_enabled
+            bt_config.backtest_taker_fee_pct = taker_fee_pct
+            bt_config.backtest_spread_pct = spread_pct
+
+        from core.ga.evolver import GARunConfig
+        from core.ga.walkforward import WalkForwardRunner, WFConfig
+
+        ga_config = GARunConfig(
+            population_size=pop_size, generations=generations,
+            elite_count=max(4, pop_size // 10),
+            immigrant_count=max(4, pop_size // 10),
+            max_workers=3,
+        )
+        wf_config = WFConfig(
+            enabled=True,
+            train_months=train_months,
+            val_months=val_months,
+            step_months=step_months,
+        )
+
+        data_dir = str(Path(loader.strategies_dir).parent) if hasattr(loader, 'strategies_dir') else "data"
+        runner = WalkForwardRunner(engine, loader, data_dir)
+        app.state._wf_runner = runner
+
+        t0 = time.time()
+        _wf_state.update({
+            "running": True, "current_window": 0, "total_windows": 0,
+            "completed": [], "report": None, "error": None,
+            "started": t0, "elapsed_seconds": 0, "phase": "init",
+        })
+
+        async def _run_wf():
+            try:
+                report = runner.run(symbols, date_start, date_end, wf_config, ga_config,
+                                    resume=resume)
+                _wf_state["running"] = False
+                _wf_state["report"] = report.to_dict()
+                _wf_state["elapsed_seconds"] = report.elapsed_seconds
+                _wf_state["phase"] = "complete"
+            except Exception as e:
+                import traceback
+                logger.error(f"WF crashed: {e}\n{traceback.format_exc()}")
+                _wf_state["running"] = False
+                _wf_state["error"] = str(e)
+                _wf_state["phase"] = "error"
+            finally:
+                app.state._wf_runner = None
+
+        asyncio.create_task(_run_wf())
+        return JSONResponse({"ok": True})
+
+    @app.get("/api/ga/wf_status")
+    async def ga_wf_status(request: Request):
+        runner = getattr(app.state, "_wf_runner", None)
+        if runner and _wf_state["running"]:
+            state = runner.get_state()
+            if state:
+                _wf_state["current_window"] = state.get("current_window", 0)
+                _wf_state["total_windows"] = state.get("total_windows", 0)
+                _wf_state["completed"] = state.get("completed", [])
+            _wf_state["elapsed_seconds"] = time.time() - _wf_state.get("started", time.time())
+        return _wf_state
+
+    @app.post("/api/ga/wf_stop")
+    async def ga_wf_stop(request: Request):
+        if err := _require_trader(request): return err
+        runner = getattr(app.state, "_wf_runner", None)
+        if runner:
+            runner.stop()
+            _wf_state["phase"] = "stopping"
+        return JSONResponse({"ok": True})
+
     @app.get("/partials/ga-panel")
     async def partial_ga_panel(request: Request):
         return _render("partials/ga_panel.html", {"request": request, "state": _ga_state})

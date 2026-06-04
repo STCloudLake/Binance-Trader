@@ -38,6 +38,27 @@
             </div>
         </div>
 
+        <!-- Walk-Forward Mode -->
+        <div class="flex items-center gap-3 mt-2">
+            <label class="flex items-center gap-2 text-sm text-amber-400 cursor-pointer">
+                <input type="checkbox" id="ga-wf-enabled" class="accent-amber-500" onchange="toggleWFConfig()">
+                {{ _("Walk-Forward Validation") }}
+            </label>
+            <span id="ga-wf-config" style="display:none" class="flex gap-2 items-center">
+                <label class="text-xs text-slate-500">Train Mo: <input type="number" id="ga-wf-train-mo" value="6" min="2" max="12" class="w-14 bg-slate-700 border border-slate-600 rounded px-1 py-0.5 text-white text-xs"></label>
+                <label class="text-xs text-slate-500">Val Mo: <input type="number" id="ga-wf-val-mo" value="1" min="1" max="3" class="w-12 bg-slate-700 border border-slate-600 rounded px-1 py-0.5 text-white text-xs"></label>
+                <label class="text-xs text-slate-500">Step Mo: <input type="number" id="ga-wf-step-mo" value="1" min="1" max="3" class="w-12 bg-slate-700 border border-slate-600 rounded px-1 py-0.5 text-white text-xs"></label>
+            </span>
+        </div>
+
+        <script>
+        function toggleWFConfig() {
+            var wf = document.getElementById('ga-wf-enabled').checked;
+            document.getElementById('ga-wf-config').style.display = wf ? '' : 'none';
+            document.getElementById('ga-val-start').parentElement.parentElement.style.display = wf ? 'none' : '';
+        }
+        </script>
+
         <!-- Cost Model -->
         <details class="mt-3">
             <summary class="text-sm text-slate-400 cursor-pointer hover:text-slate-300">
@@ -183,28 +204,37 @@ function startGA() {
     _gaOverallPct = 0;
     startTickTimer();
 
-    fetch('/api/ga/evolve', {
+    var isWF = document.getElementById('ga-wf-enabled').checked;
+    var endpoint = isWF ? '/api/ga/walkforward' : '/api/ga/evolve';
+    var pollFn = isWF ? pollWFStatus : pollGAStatus;
+    var body = {
+        symbols: ['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT'],
+        date_start: document.getElementById('ga-date-start').value,
+        date_end: document.getElementById('ga-date-end').value,
+        validation_start: isWF ? null : (document.getElementById('ga-val-start').value || null),
+        population_size: parseInt(document.getElementById('ga-pop-size').value) || 30,
+        generations: parseInt(document.getElementById('ga-generations').value) || 15,
+        seed_strategies: ['mean_reversion_rsi_bollinger_bands'],
+        cost_enabled: true,
+        taker_fee_pct: parseFloat(document.getElementById('ga-cost-fee').value) || 0.04,
+        spread_pct: {
+            BTCUSDT: parseFloat(document.getElementById('ga-spread-btc').value) || 0.01,
+            ETHUSDT: parseFloat(document.getElementById('ga-spread-eth').value) || 0.02,
+            BNBUSDT: parseFloat(document.getElementById('ga-spread-bnb').value) || 0.03,
+            SOLUSDT: parseFloat(document.getElementById('ga-spread-sol').value) || 0.03,
+            XRPUSDT: parseFloat(document.getElementById('ga-spread-xrp').value) || 0.04,
+        },
+    };
+    if (isWF) {
+        body.train_months = parseInt(document.getElementById('ga-wf-train-mo').value) || 6;
+        body.val_months = parseInt(document.getElementById('ga-wf-val-mo').value) || 1;
+        body.step_months = parseInt(document.getElementById('ga-wf-step-mo').value) || 1;
+    }
+    fetch(endpoint, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         credentials: 'same-origin',
-        body: JSON.stringify({
-            symbols: ['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT'],
-            date_start: document.getElementById('ga-date-start').value,
-            date_end: document.getElementById('ga-date-end').value,
-            validation_start: document.getElementById('ga-val-start').value || null,
-            population_size: parseInt(document.getElementById('ga-pop-size').value) || 30,
-            generations: parseInt(document.getElementById('ga-generations').value) || 15,
-            seed_strategies: ['mean_reversion_rsi_bollinger_bands'],
-            cost_enabled: true,
-            taker_fee_pct: parseFloat(document.getElementById('ga-cost-fee').value) || 0.04,
-            spread_pct: {
-                BTCUSDT: parseFloat(document.getElementById('ga-spread-btc').value) || 0.01,
-                ETHUSDT: parseFloat(document.getElementById('ga-spread-eth').value) || 0.02,
-                BNBUSDT: parseFloat(document.getElementById('ga-spread-bnb').value) || 0.03,
-                SOLUSDT: parseFloat(document.getElementById('ga-spread-sol').value) || 0.03,
-                XRPUSDT: parseFloat(document.getElementById('ga-spread-xrp').value) || 0.04,
-            },
-        })
+        body: JSON.stringify(body)
     }).then(function(r) {
         if (!r.ok) {
             return r.json().then(function(d) { throw new Error(d.error || 'HTTP ' + r.status); });
@@ -216,9 +246,9 @@ function startGA() {
             document.getElementById('ga-stop-btn').classList.remove('hidden');
             document.getElementById('ga-progress').classList.remove('hidden');
             document.getElementById('ga-champion').classList.add('hidden');
-            document.getElementById('ga-phase-text').textContent = '{{ _("Evaluating generation 1...") }}';
-            _gaPollTimer = setInterval(pollGAStatus, 2000);
-            pollGAStatus();
+            document.getElementById('ga-phase-text').textContent = isWF ? '{{ _("Walk-Forward starting...") }}' : '{{ _("Evaluating generation 1...") }}';
+            _gaPollTimer = setInterval(pollFn, 2000);
+            pollFn();
         } else {
             showError(data.error || '{{ _("Unknown error") }}');
             btn.disabled = false;
@@ -447,5 +477,45 @@ function loadStrategyFromGA() {
             pollGAStatus();
         }
     }).catch(function() { /* server not ready yet */ });
+}
+
+function pollWFStatus() {
+    fetch('/api/ga/wf_status', {credentials: 'same-origin'}).then(function(r) {
+        return r.json();
+    }).then(function(s) {
+        if (!s.running) {
+            clearInterval(_gaPollTimer); _gaPollTimer = null;
+            stopTickTimer();
+            document.getElementById('ga-stop-btn').classList.add('hidden');
+            document.getElementById('ga-start-btn').classList.remove('hidden');
+            document.getElementById('ga-start-btn').disabled = false;
+            document.getElementById('ga-start-btn').textContent = '{{ _("Start Evolution") }}';
+            if (s.report) {
+                var rpt = s.report;
+                document.getElementById('ga-champion').classList.remove('hidden');
+                document.getElementById('ga-champion-info').innerHTML =
+                    '<strong>{{ _("Walk-Forward Complete") }}</strong><br>' +
+                    'WF Efficiency: ' + (rpt.wf_efficiency || 0).toFixed(2) +
+                    ' | Mean Val Sharpe: ' + (rpt.mean_val_sharpe || 0).toFixed(2) +
+                    ' | +Win%: ' + (rpt.positive_window_pct || 0).toFixed(0) + '%' +
+                    ' | Best: ' + (rpt.best_val_sharpe || 0).toFixed(2);
+            } else if (s.error) {
+                showError(s.error);
+            }
+            document.getElementById('ga-phase-text').textContent = s.error ? '{{ _("WF failed") }}' : '{{ _("WF complete") }}';
+            document.getElementById('ga-progress-bar').style.width = '100%';
+            return;
+        }
+        var cur = s.current_window || 0;
+        var tot = s.total_windows || 0;
+        var pct = tot > 0 ? (cur / tot * 100) : 0;
+        document.getElementById('ga-progress-bar').style.width = pct.toFixed(0) + '%';
+        document.getElementById('ga-phase-text').textContent =
+            'WF Window ' + cur + '/' + tot + ' (' + s.phase + ')';
+        document.getElementById('ga-overall-progress').textContent =
+            'Window ' + cur + '/' + tot;
+    }).catch(function() { /* server not ready yet */ });
+}
+
 })();
 </script>
