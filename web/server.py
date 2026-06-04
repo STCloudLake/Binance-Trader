@@ -16,7 +16,7 @@ from app.event_bus import EventBus, Event, EventType
 from app.config import Config
 from core.auth.auth import AuthManager, User
 from db.database import get_db, save_sim_balance, atomic_adjust_balance
-import csv, io, os, shutil, sys
+import csv, io, os, shutil, sys, subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -2176,6 +2176,22 @@ Return ONLY valid JSON in this exact format:
         with open(job_file, "w") as f:
             json.dump(job_data, f)
 
+        # ── Kill previous worker if running ──
+        old_proc = getattr(app.state, "_ga_process", None)
+        if old_proc and old_proc.poll() is None:
+            old_proc.terminate()
+            try:
+                old_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                old_proc.kill()
+        old_wf = getattr(app.state, "_wf_process", None)
+        if old_wf and old_wf.poll() is None:
+            old_wf.terminate()
+            try:
+                old_wf.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                old_wf.kill()
+
         # ── Spawn worker subprocess ──
         worker_script = str(Path(__file__).parent.parent / "scripts" / "ga_worker.py")
         ga_start_time = time.time()
@@ -2327,6 +2343,22 @@ Return ONLY valid JSON in this exact format:
         }
         with open(job_file, "w") as f:
             json.dump(job_data, f)
+
+        # ── Kill previous worker if running ──
+        old_proc = getattr(app.state, "_ga_process", None)
+        if old_proc and old_proc.poll() is None:
+            old_proc.terminate()
+            try:
+                old_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                old_proc.kill()
+        old_wf = getattr(app.state, "_wf_process", None)
+        if old_wf and old_wf.poll() is None:
+            old_wf.terminate()
+            try:
+                old_wf.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                old_wf.kill()
 
         # ── Spawn worker subprocess ──
         worker_script = str(Path(__file__).parent.parent / "scripts" / "ga_worker.py")
