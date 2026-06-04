@@ -334,6 +334,20 @@ def chromosome_to_strategy(chromosome: dict) -> StrategyConfig:
     if ind_genes.get("sma", False) and "sma_period" in cont:
         indicators["sma"] = {"period": int(cont.get("sma_period", 50))}
 
+    # ── Fallback: ensure at least one indicator is active when all genes disabled
+    # but continuous genes exist (i.e., chromosome has the data but genes say "no")
+    if not indicators:
+        if "rsi_period" in cont:
+            indicators["rsi"] = {"period": int(cont.get("rsi_period", 14)), "source": "close"}
+        elif "macd_fast" in cont:
+            indicators["macd"] = {
+                "fast": int(cont.get("macd_fast", 12)),
+                "slow": int(cont.get("macd_slow", 26)),
+                "signal": int(cont.get("macd_signal", 9)),
+            }
+        elif "ema_period" in cont:
+            indicators["ema"] = {"period": int(cont.get("ema_period", 9)), "source": "close"}
+
     ml_config = MLConfig(
         enabled=cont.get("ml_weight", 0) > 0,
         weight=round(cont.get("ml_weight", 0), 2),
