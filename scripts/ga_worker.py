@@ -52,6 +52,7 @@ def run_ga(job: dict, job_file: str):
     config.backtest_cost_enabled = job.get("cost_enabled", True)
     config.backtest_taker_fee_pct = job.get("taker_fee_pct", 0.04)
     config.backtest_spread_pct = job.get("spread_pct", {})
+    config.backtest_engine_mode = "legacy"  # subprocess doesn't have full engine stack
 
     event_bus = EventBus()
     risk_manager = RiskManager(config, event_bus)
@@ -124,6 +125,7 @@ def run_walkforward(job: dict, job_file: str):
     config.backtest_cost_enabled = job.get("cost_enabled", True)
     config.backtest_taker_fee_pct = job.get("taker_fee_pct", 0.04)
     config.backtest_spread_pct = job.get("spread_pct", {})
+    config.backtest_engine_mode = "legacy"  # subprocess doesn't have full engine stack
 
     event_bus = EventBus()
     risk_manager = RiskManager(config, event_bus)
