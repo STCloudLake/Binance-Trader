@@ -69,7 +69,7 @@ def run_ga(job: dict, job_file: str):
         generations=generations,
         elite_count=max(4, pop_size // 10),
         immigrant_count=max(4, pop_size // 10),
-        max_workers=3,
+        max_workers=job.get("max_workers", 1),  # >1 uses multi-process (safe for TA-Lib)
     )
 
     evolver = GAStrategyEvolver(engine, loader, ga_cfg)
@@ -142,7 +142,7 @@ def run_walkforward(job: dict, job_file: str):
         generations=generations,
         elite_count=max(4, pop_size // 10),
         immigrant_count=max(4, pop_size // 10),
-        max_workers=3,
+        max_workers=job.get("max_workers", 1),  # >1 uses multi-process (safe for TA-Lib)
     )
 
     wf_cfg = WFConfig(
@@ -178,10 +178,27 @@ def run_walkforward(job: dict, job_file: str):
             try:
                 state = runner.get_state()
                 if state:
-                    update_progress(job_file, {
+                    data = {
                         "phase": "running",
                         "total_windows": state.get("total_windows", len(windows)),
                         "current_window": state.get("current_window", 0),
+                    }
+                    # Include GA sub-progress if available
+                    ga_phase = state.get("ga_phase", "")
+                    ga_gen = state.get("ga_gen", 0)
+                    ga_total = state.get("ga_total_gen", 0)
+                    if ga_phase:
+                        data["ga_phase"] = ga_phase
+                    if ga_gen and ga_total:
+                        data["ga_gen"] = ga_gen
+                        data["ga_total_gen"] = ga_total
+                    update_progress(job_file, data)
+                else:
+                    # State file doesn't exist yet — report at least that we're alive
+                    update_progress(job_file, {
+                        "phase": "running",
+                        "total_windows": len(windows),
+                        "current_window": 0,
                     })
             except Exception:
                 pass

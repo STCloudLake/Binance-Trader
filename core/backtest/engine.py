@@ -328,7 +328,10 @@ class BacktestEngine:
         # ── Indicator cache: precompute each unique indicator config once ──
         # Key: (json_hash_of_indicators, symbol, interval) → full DataFrame
         # Eliminates ~1.25M compute_all calls (hottest path in the engine).
+        # Bounded to ~500 MB to prevent OOM during GA/WF with many unique configs.
         _indicator_cache: dict[tuple[str, str, str], pd.DataFrame] = {}
+        _MAX_CACHE_BYTES = 500 * 1024 * 1024  # 500 MB
+        _cache_total_bytes = 0
         import json as _json
         for strategy in strategy_configs:
             config_hash = _json.dumps(strategy.indicators, sort_keys=True, ensure_ascii=True)
@@ -339,7 +342,16 @@ class BacktestEngine:
                         continue
                     df_full = feeder.get_all_data_for_symbol(sym, tf)
                     if len(df_full) >= 20:
-                        _indicator_cache[cache_key] = compute_all(df_full.copy(), strategy.indicators)
+                        # compute_all internally does df.copy(), so no need for outer copy
+                        cached_df = compute_all(df_full, strategy.indicators)
+                        entry_bytes = len(cached_df) * len(cached_df.columns) * 8
+                        # Evict oldest entries until we fit under the cap
+                        while _indicator_cache and _cache_total_bytes + entry_bytes > _MAX_CACHE_BYTES:
+                            oldest_key = next(iter(_indicator_cache))
+                            oldest_df = _indicator_cache.pop(oldest_key)
+                            _cache_total_bytes -= len(oldest_df) * len(oldest_df.columns) * 8
+                        _indicator_cache[cache_key] = cached_df
+                        _cache_total_bytes += entry_bytes
 
         def _get_cached_df(sym: str, interval: str, indicators: dict, ts) -> pd.DataFrame | None:
             """Return indicator DataFrame sliced to ≤ ts, from cache if possible.

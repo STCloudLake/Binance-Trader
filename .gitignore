@@ -62,4 +62,10 @@ logs/
 strategies/ga_champion_*.yaml
 strategies/ga_*.yaml
 data/ga_strategies/
+data/ga_jobs/
+data/ga_wf_state.json
+data/ga_checkpoint.pkl
 data/deepseek_models.json
+
+# Claude / AI agent plans (local only)
+docs/superpowers/

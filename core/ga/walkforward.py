@@ -207,6 +207,9 @@ class WalkForwardRunner:
         t0 = time.time()
         self._running = True
 
+        # Save initial state so progress reporters can see we've started
+        self._save_state(start_window, results, total_windows=len(windows))
+
         for i in range(start_window, len(windows)):
             if not self._running:
                 break
@@ -217,7 +220,23 @@ class WalkForwardRunner:
                 f"train={tr_start}~{tr_end}, val={val_start}~{val_end}"
             )
 
+            # Save state before starting GA so reporter sees current window
+            self._save_state(i, results, total_windows=len(windows))
+
             evolver = GAStrategyEvolver(self.engine, self.loader, ga_config)
+
+            # Hook GA progress to update WF state during evolution
+            def _ga_progress(info):
+                if isinstance(info, dict):
+                    self._save_state(i, results, total_windows=len(windows),
+                                     ga_phase=info.get("phase", "evolving"))
+                else:
+                    gen, total_gen, gen_info = info
+                    self._save_state(i, results, total_windows=len(windows),
+                                     ga_gen=gen, ga_total_gen=total_gen)
+
+            evolver.set_progress_callback(_ga_progress)
+
             champion = evolver.evolve(
                 symbols, tr_start, tr_end,
                 seed_strategies=seed_strategies,
@@ -239,7 +258,7 @@ class WalkForwardRunner:
                 champion_name=champion.get("champion_name", ""),
             )
             results.append(result)
-            self._save_state(i + 1, results)
+            self._save_state(i + 1, results, total_windows=len(windows))
 
             logger.info(
                 f"WF window {i + 1} done: "
@@ -269,13 +288,19 @@ class WalkForwardRunner:
 
     # ── State persistence ──────────────────────────────────────────
 
-    def _save_state(self, current_window: int, results: list[WindowResult]):
+    def _save_state(self, current_window: int, results: list[WindowResult],
+                     total_windows: int = 0, ga_phase: str = "",
+                     ga_gen: int = 0, ga_total_gen: int = 0):
         """Persist WF progress for resume after stop/crash."""
         try:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            nw = total_windows or (len(results) + max(0, current_window - len(results)))
             state = {
                 "current_window": current_window,
-                "total_windows": len(results) + max(0, current_window - len(results)),
+                "total_windows": nw,
+                "ga_phase": ga_phase,
+                "ga_gen": ga_gen,
+                "ga_total_gen": ga_total_gen,
                 "completed": [
                     {
                         "window": r.window, "train_sharpe": r.train_sharpe,

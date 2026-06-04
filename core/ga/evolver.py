@@ -142,19 +142,36 @@ class GAStrategyEvolver:
             self._generation = gen + 1
             gen_start = time.time()
 
-            # 1. Evaluate fitness (batch mode — 4-5x faster)
-            from core.ga.fitness import evaluate_population_batch
+            # 1. Evaluate fitness — route to multi-process when max_workers > 1
             from core.ga.fitness_calibrate import FitnessCalibrator
             _data_dir = str(Path(self.loader.strategies_dir).parent) if hasattr(self.loader, 'strategies_dir') else "data"
             _calibrated_weights = FitnessCalibrator.load_weights_static(_data_dir)
-            self._population = evaluate_population_batch(
-                self._population, symbols, date_start, train_end,
-                self.engine, self.loader,
-                ga_loader=self.ga_loader,
-                batch_size=cfg.population_size,  # full population in one hybrid pass
-                max_workers=getattr(cfg, 'max_workers', 4),
-                weights=_calibrated_weights,
-                progress_callback=lambda c, t: self._report_progress(self._generation or 1, c, t))
+            _bt_cfg = getattr(self.engine, 'config', None)
+
+            if getattr(cfg, 'max_workers', 1) > 1:
+                # Multi-process: each worker creates its own engine (avoids TA-Lib thread crash)
+                from core.ga.fitness import evaluate_population_multiprocess
+                self._population = evaluate_population_multiprocess(
+                    self._population, symbols, date_start, train_end,
+                    initial_balance=10000.0,
+                    max_workers=cfg.max_workers,
+                    weights=_calibrated_weights,
+                    cost_enabled=getattr(_bt_cfg, 'backtest_cost_enabled', True) if _bt_cfg else True,
+                    taker_fee_pct=getattr(_bt_cfg, 'backtest_taker_fee_pct', 0.04) if _bt_cfg else 0.04,
+                    spread_pct=getattr(_bt_cfg, 'backtest_spread_pct', {}) if _bt_cfg else {},
+                    engine_mode=getattr(_bt_cfg, 'backtest_engine_mode', 'legacy') if _bt_cfg else 'legacy',
+                    progress_callback=lambda c, t: self._report_progress(self._generation or 1, c, t))
+            else:
+                # Single-process: use existing threaded batch evaluation
+                from core.ga.fitness import evaluate_population_batch
+                self._population = evaluate_population_batch(
+                    self._population, symbols, date_start, train_end,
+                    self.engine, self.loader,
+                    ga_loader=self.ga_loader,
+                    batch_size=cfg.population_size,
+                    max_workers=1,  # force serial: avoids TA-Lib thread-safety crashes
+                    weights=_calibrated_weights,
+                    progress_callback=lambda c, t: self._report_progress(self._generation or 1, c, t))
 
             # 2. Sort by fitness
             self._population.sort(

@@ -3,7 +3,8 @@
 import time
 import random
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from pathlib import Path
 from loguru import logger
 from core.ga.genome import chromosome_to_strategy
 from core.strategy.loader import StrategyLoader
@@ -449,3 +450,259 @@ def parameter_sensitivity_test(
     # Normalize: std > 50% of base fitness = overfit
     sensitivity = std / max(abs(base_fitness), 1.0)
     return min(sensitivity, 1.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Multi-Process Batch Evaluation — uses ProcessPoolExecutor to avoid TA-Lib
+# C-extension crashes under multi-threading.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _mp_worker(worker_args: dict) -> list:
+    """Module-level picklable worker for ProcessPoolExecutor.
+
+    Each worker process creates its OWN engine stack from scratch.
+    No shared state with the parent or sibling processes.
+    TA-Lib is imported fresh in each process — no thread-safety issues.
+
+    Args:
+        worker_args: dict with keys:
+            population_chunk, symbols, date_start, date_end,
+            initial_balance, cost_enabled, taker_fee_pct, spread_pct,
+            weights, chunk_start_idx, engine_mode
+
+    Returns:
+        list of (index, result_dict) tuples
+    """
+    import random as _random
+    from app.config import Config
+    from core.strategy.loader import StrategyLoader
+    from core.backtest.engine import BacktestEngine
+    from core.risk.manager import RiskManager
+    from core.executor.executor import OrderExecutor
+    from app.event_bus import EventBus
+    from core.ga.genome import chromosome_to_strategy as _c2s
+
+    # ── Per-process engine stack ──
+    config = Config.load("sim")
+    config.backtest_cost_enabled = worker_args["cost_enabled"]
+    config.backtest_taker_fee_pct = worker_args["taker_fee_pct"]
+    config.backtest_spread_pct = worker_args["spread_pct"]
+    config.backtest_engine_mode = worker_args.get("engine_mode", "legacy")
+
+    event_bus = EventBus()
+    risk_manager = RiskManager(config, event_bus)
+    order_executor = OrderExecutor(config, event_bus)
+
+    loader = StrategyLoader(str(Path(config.data_dir).parent / "strategies"))
+    engine = BacktestEngine(config, None, risk_manager, order_executor)
+
+    # ── Evaluate chunk ──
+    chunk_start = worker_args["chunk_start_idx"]
+    population_chunk = worker_args["population_chunk"]
+    symbols = worker_args["symbols"]
+    date_start = worker_args["date_start"]
+    date_end = worker_args["date_end"]
+    initial_balance = worker_args["initial_balance"]
+    weights = worker_args.get("weights")
+
+    chunk_configs = []
+    for i, chrom in enumerate(population_chunk):
+        config_obj = _c2s(chrom)
+        if config_obj.ml_config:
+            config_obj.ml_config.enabled = False
+        config_obj.name = f"ga_mp_{chunk_start}_{chunk_start + i}_{_random.randint(1000, 9999)}"
+        chunk_configs.append(config_obj)
+
+    result = engine.run_with_exit_evaluation(
+        strategies=chunk_configs,
+        symbols=symbols,
+        date_start=date_start,
+        date_end=date_end,
+        initial_balance=initial_balance,
+        mode="full",
+        simulate_ai_weights=False,
+        ml_engine="lightgbm",
+        per_strategy_isolation=True,
+    )
+
+    # ── Extract per-strategy metrics (same formula as _eval_chunk) ──
+    results = []
+    per_matrix = result.get("per_matrix", {})
+    for i, config_obj in enumerate(chunk_configs):
+        idx = chunk_start + i
+        chrom = population_chunk[i]
+        cell_data = per_matrix.get(config_obj.name, {})
+
+        trades = sum(c.get("trades", 0) for c in cell_data.values())
+        pnl = sum(c.get("pnl", 0) for c in cell_data.values())
+        wins = sum(c.get("winning", 0) for c in cell_data.values())
+        losses = sum(c.get("losing", 0) for c in cell_data.values())
+        long_trades = sum(c.get("long_trades", 0) for c in cell_data.values())
+        short_trades = sum(c.get("short_trades", 0) for c in cell_data.values())
+
+        win_rate = (wins / max(trades, 1)) * 100
+
+        gross_win = sum(c.get("gross_win_pnl", 0.0) for c in cell_data.values())
+        gross_loss = sum(c.get("gross_loss_pnl", 0.0) for c in cell_data.values())
+        if gross_loss > 0:
+            profit_factor = min(gross_win / gross_loss, 100.0)
+        elif gross_win > 0:
+            profit_factor = 100.0
+        else:
+            profit_factor = 0.1
+
+        roc = pnl / max(initial_balance, 1)
+
+        if trades > 0:
+            imbalance = abs(long_trades / trades - 0.5) * 2
+        else:
+            imbalance = 1.0
+
+        w = weights or {"wr": 0.15, "pf": 5.0, "roc": 50, "bal": 10.0}
+
+        fitness = (
+            win_rate * w["wr"]
+            + max(profit_factor, 0.1) * w["pf"]
+            + roc * w["roc"]
+            - imbalance * w["bal"]
+        )
+
+        if trades < 5:
+            fitness -= 20
+        elif trades < 15:
+            fitness -= 5
+        elif trades > 500:
+            fitness -= (trades - 500) * 0.02
+
+        if pnl < -50:
+            fitness -= abs(pnl) * 0.3
+
+        # ── Complexity penalty (inline, avoids self-import) ──
+        structural = chrom.get("structural", [])
+        continuous = chrom.get("continuous", [])
+        n_conditions = sum(len(g.conditions) for g in structural)
+        indicator_genes = chrom.get("indicator_genes", [])
+        if indicator_genes:
+            n_indicators = sum(1 for g in indicator_genes if g.value)
+        else:
+            indicators_used = set()
+            for g in continuous:
+                name = g.name.split("_")[0]
+                if name not in ("ml",):
+                    indicators_used.add(name)
+            n_indicators = len(indicators_used)
+        cpenalty = n_conditions * 0.8 + n_indicators * 1.2 + len(continuous) * 0.3
+        fitness -= cpenalty
+
+        results.append((idx, {
+            "fitness": round(fitness, 4),
+            "sharpe": 0,
+            "win_rate": round(win_rate, 2),
+            "profit_factor": round(profit_factor, 4),
+            "max_dd": 0,
+            "total_return": round(pnl / initial_balance * 100, 2),
+            "trade_count": trades,
+            "long_trades": long_trades,
+            "short_trades": short_trades,
+            "strategy_name": config_obj.name,
+        }))
+
+    return results
+
+
+def evaluate_population_multiprocess(
+    population: list[dict],
+    symbols: list[str],
+    date_start: str,
+    date_end: str,
+    initial_balance: float = 10000.0,
+    max_workers: int = 4,
+    progress_callback=None,
+    weights: dict | None = None,
+    cost_enabled: bool = True,
+    taker_fee_pct: float = 0.04,
+    spread_pct: dict | None = None,
+    engine_mode: str = "legacy",
+) -> list[dict]:
+    """Evaluate chromosomes in parallel PROCESSES (not threads).
+
+    Uses ProcessPoolExecutor to avoid TA-Lib C-extension thread-safety crashes.
+    Each process independently creates its own engine, loader, etc.
+
+    Args:
+        max_workers: Number of parallel processes. Each gets ~ceil(N/max_workers)
+                     strategies and runs one batched backtest.
+        progress_callback: Called as callback(completed_count, total_count).
+    """
+    total = len(population)
+    results: list = [None] * total
+
+    workers = min(max_workers, total)
+    base = total // workers
+    rem = total % workers
+    chunks = []
+    cursor = 0
+    for w in range(workers):
+        size = base + (1 if w < rem else 0)
+        if size > 0:
+            chunks.append((cursor, size))
+            cursor += size
+
+    spread = spread_pct or {}
+
+    logger.info(
+        f"GA multiprocess eval: {total} strategies in {len(chunks)} processes "
+        f"on {date_start}~{date_end} with {len(symbols)} symbols"
+    )
+
+    # Prepare worker args for each chunk
+    futures_args = []
+    for chunk_start, chunk_size in chunks:
+        args = {
+            "population_chunk": population[chunk_start:chunk_start + chunk_size],
+            "symbols": symbols,
+            "date_start": date_start,
+            "date_end": date_end,
+            "initial_balance": initial_balance,
+            "cost_enabled": cost_enabled,
+            "taker_fee_pct": taker_fee_pct,
+            "spread_pct": spread,
+            "weights": weights,
+            "chunk_start_idx": chunk_start,
+            "engine_mode": engine_mode,
+        }
+        futures_args.append(args)
+
+    completed_count = 0
+
+    with ProcessPoolExecutor(max_workers=len(chunks)) as executor:
+        futures = {executor.submit(_mp_worker, a): a["chunk_start_idx"]
+                   for a in futures_args}
+
+        for future in as_completed(futures):
+            try:
+                chunk_results = future.result(timeout=3600)
+                for idx, r in chunk_results:
+                    results[idx] = r
+                completed_count += len(chunk_results)
+            except Exception as e:
+                logger.error(f"Multiprocess chunk failed: {e}")
+                chunk_start = futures[future]
+                chunk_size = next(
+                    (s for cs, s in chunks if cs == chunk_start), total - chunk_start
+                )
+                for i in range(chunk_start, chunk_start + chunk_size):
+                    results[i] = {"fitness": -999, "error": str(e)}
+                completed_count += chunk_size
+
+            if progress_callback:
+                progress_callback(completed_count, total)
+
+    # Apply results to population
+    for i, r in enumerate(results):
+        if r is not None:
+            population[i]["fitness_result"] = r
+        else:
+            population[i]["fitness_result"] = {"fitness": -999, "error": "mp eval failed"}
+
+    return population

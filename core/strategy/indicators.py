@@ -68,7 +68,9 @@ def compute_all(df: pd.DataFrame, indicator_configs: dict) -> pd.DataFrame:
             else:
                 result[f"ema_{period}"] = talib.EMA(source, timeperiod=period)
         elif name == "sma":
-            result[f"sma_{period}"] = talib.SMA(source, timeperiod=period)
+            sma_values = talib.SMA(source, timeperiod=period)
+            result[f"sma_{period}"] = sma_values
+            result["sma"] = sma_values  # plain name for condition templates
         elif name == "atr":
             result["atr"] = talib.ATR(
                 result["high"].values, result["low"].values, result["close"].values,
@@ -119,6 +121,8 @@ def compute_all(df: pd.DataFrame, indicator_configs: dict) -> pd.DataFrame:
     return result
 
 
+_COND_FAIL_LOG: set[str] = set()  # dedup failed conditions to avoid log spam
+
 def evaluate_condition(df: pd.DataFrame, condition: str) -> pd.Series:
     env = {col: df[col] for col in df.columns}
     def _sma(series, period):
@@ -131,5 +135,9 @@ def evaluate_condition(df: pd.DataFrame, condition: str) -> pd.Series:
         return result
     except Exception as e:
         from loguru import logger
-        logger.debug(f"Condition evaluation failed: '{condition}' — {e}")
+        # Rate-limit: log each unique failed condition only once per process
+        key = f"{condition}:{e}"
+        if key not in _COND_FAIL_LOG:
+            _COND_FAIL_LOG.add(key)
+            logger.debug(f"Condition evaluation failed: '{condition}' — {e}")
         return pd.Series([False] * len(df), index=df.index)

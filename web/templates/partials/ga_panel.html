@@ -3,25 +3,35 @@
 
     <!-- Config -->
     <div class="mb-4 space-y-2" id="ga-config-section">
-        <div class="grid grid-cols-4 gap-3">
+        <div class="grid grid-cols-5 gap-3">
             <div>
                 <label class="text-sm text-slate-400">Population</label>
                 <input type="number" id="ga-pop-size" value="30" min="10" max="100"
+                       oninput="updateResourceEstimate()"
                        class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-white text-sm">
             </div>
             <div>
                 <label class="text-sm text-slate-400">Generations</label>
                 <input type="number" id="ga-generations" value="15" min="3" max="50"
+                       oninput="updateResourceEstimate()"
+                       class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-white text-sm">
+            </div>
+            <div>
+                <label class="text-sm text-slate-400">Workers</label>
+                <input type="number" id="ga-workers" value="4" min="1" max="16"
+                       oninput="updateResourceEstimate()"
                        class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-white text-sm">
             </div>
             <div>
                 <label class="text-sm text-slate-400">Start Date</label>
                 <input type="date" id="ga-date-start" value="2026-05-01"
+                       onchange="updateResourceEstimate()"
                        class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-white text-sm">
             </div>
             <div>
                 <label class="text-sm text-slate-400">End Date</label>
                 <input type="date" id="ga-date-end" value="2026-05-31"
+                       onchange="updateResourceEstimate()"
                        class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-white text-sm">
             </div>
         </div>
@@ -41,13 +51,13 @@
         <!-- Walk-Forward Mode -->
         <div class="flex items-center gap-3 mt-2">
             <label class="flex items-center gap-2 text-sm text-amber-400 cursor-pointer">
-                <input type="checkbox" id="ga-wf-enabled" class="accent-amber-500" onchange="toggleWFConfig()">
+                <input type="checkbox" id="ga-wf-enabled" class="accent-amber-500" onchange="toggleWFConfig();updateResourceEstimate()">
                 {{ _("Walk-Forward Validation") }}
             </label>
             <span id="ga-wf-config" style="display:none" class="flex gap-2 items-center">
-                <label class="text-xs text-slate-500">Train Mo: <input type="number" id="ga-wf-train-mo" value="6" min="2" max="12" class="w-14 bg-slate-700 border border-slate-600 rounded px-1 py-0.5 text-white text-xs"></label>
+                <label class="text-xs text-slate-500">Train Mo: <input type="number" id="ga-wf-train-mo" value="6" min="2" max="12" oninput="updateResourceEstimate()" class="w-14 bg-slate-700 border border-slate-600 rounded px-1 py-0.5 text-white text-xs"></label>
                 <label class="text-xs text-slate-500">Val Mo: <input type="number" id="ga-wf-val-mo" value="1" min="1" max="3" class="w-12 bg-slate-700 border border-slate-600 rounded px-1 py-0.5 text-white text-xs"></label>
-                <label class="text-xs text-slate-500">Step Mo: <input type="number" id="ga-wf-step-mo" value="1" min="1" max="3" class="w-12 bg-slate-700 border border-slate-600 rounded px-1 py-0.5 text-white text-xs"></label>
+                <label class="text-xs text-slate-500">Step Mo: <input type="number" id="ga-wf-step-mo" value="1" min="1" max="3" oninput="updateResourceEstimate()" class="w-12 bg-slate-700 border border-slate-600 rounded px-1 py-0.5 text-white text-xs"></label>
             </span>
         </div>
 
@@ -89,6 +99,30 @@
                 </div>
             </div>
         </details>
+
+        <!-- Resource Estimate -->
+        <div id="ga-resource-estimate" class="mt-3 p-3 bg-slate-800/50 rounded border border-slate-700/50">
+            <div class="text-xs text-slate-400 mb-2 font-bold">⚡ Resource Estimate</div>
+            <div class="grid grid-cols-4 gap-3 text-xs">
+                <div>
+                    <span class="text-slate-500">Per-Gen Time:</span>
+                    <strong id="ga-est-pergen" class="text-sky-400 ml-1">--</strong>
+                </div>
+                <div>
+                    <span class="text-slate-500">Total Time:</span>
+                    <strong id="ga-est-total" class="text-sky-400 ml-1">--</strong>
+                </div>
+                <div>
+                    <span class="text-slate-500">Est. Memory:</span>
+                    <strong id="ga-est-memory" class="text-sky-400 ml-1">--</strong>
+                </div>
+                <div>
+                    <span class="text-slate-500">WF Windows:</span>
+                    <strong id="ga-est-wf-windows" class="text-amber-400 ml-1">--</strong>
+                </div>
+            </div>
+            <div id="ga-est-warning" class="hidden mt-2 text-xs text-amber-400 bg-amber-900/20 rounded px-2 py-1"></div>
+        </div>
 
         <div class="flex gap-2 mt-2">
             <button onclick="startGA()" id="ga-start-btn"
@@ -185,6 +219,90 @@ function stopTickTimer() {
     if (_gaTickTimer) { clearInterval(_gaTickTimer); _gaTickTimer = null; }
 }
 
+// ── Resource Estimation ──
+var EST_BASE_OVERHEAD = 15;      // seconds: data load + engine init per process
+var EST_PER_STRATEGY = 6.8;      // seconds per strategy evaluation
+var EST_MEM_PER_PROCESS = 650;   // MB per process
+
+function formatDuration(totalSec) {
+    if (totalSec < 60) return Math.round(totalSec) + 's';
+    if (totalSec < 3600) {
+        var m = Math.floor(totalSec / 60);
+        var s = Math.round(totalSec % 60);
+        return m + 'm ' + s + 's';
+    }
+    var h = Math.floor(totalSec / 3600);
+    var m = Math.floor((totalSec % 3600) / 60);
+    return h + 'h ' + m + 'm';
+}
+
+function updateResourceEstimate() {
+    var popSize = parseInt(document.getElementById('ga-pop-size').value) || 30;
+    var generations = parseInt(document.getElementById('ga-generations').value) || 15;
+    var workers = parseInt(document.getElementById('ga-workers').value) || 4;
+
+    var startDate = new Date(document.getElementById('ga-date-start').value);
+    var endDate = new Date(document.getElementById('ga-date-end').value);
+    var monthsDiff = (endDate.getFullYear() - startDate.getFullYear()) * 12
+                   + (endDate.getMonth() - startDate.getMonth());
+    if (monthsDiff < 1) monthsDiff = 1;
+
+    // Clamp workers
+    workers = Math.max(1, Math.min(workers, 16));
+
+    // Per-generation time (scaled by date range months)
+    var strategiesPerWorker = Math.ceil(popSize / workers);
+    var timePerGen = (EST_BASE_OVERHEAD + EST_PER_STRATEGY * strategiesPerWorker) * monthsDiff;
+    var totalTime = timePerGen * generations;
+
+    // Memory
+    var totalMemMB = workers * EST_MEM_PER_PROCESS;
+    var totalMemGB = totalMemMB / 1024;
+
+    // WF windows
+    var trainMo = parseInt(document.getElementById('ga-wf-train-mo').value) || 6;
+    var stepMo = parseInt(document.getElementById('ga-wf-step-mo').value) || 1;
+    var wfWindows = Math.max(0, Math.floor((monthsDiff - trainMo) / stepMo));
+    var wfTotalTime = totalTime * Math.max(wfWindows, 1);
+
+    // Update display
+    var perGenEl = document.getElementById('ga-est-pergen');
+    var totalEl = document.getElementById('ga-est-total');
+    var memEl = document.getElementById('ga-est-memory');
+    var wfWinEl = document.getElementById('ga-est-wf-windows');
+    var warningEl = document.getElementById('ga-est-warning');
+
+    var isWF = document.getElementById('ga-wf-enabled').checked;
+
+    if (perGenEl) perGenEl.textContent = formatDuration(timePerGen);
+    if (totalEl) totalEl.textContent = formatDuration(isWF ? wfTotalTime : totalTime);
+    if (memEl) memEl.textContent = totalMemGB.toFixed(1) + ' GB';
+    if (wfWinEl) wfWinEl.textContent = isWF ? wfWindows : '--';
+
+    // Warnings
+    if (warningEl) {
+        var warnings = [];
+        if (totalMemMB > 16000) {
+            warnings.push('High memory! Reduce workers.');
+        }
+        if (workers > 8 && popSize < workers * 5) {
+            warnings.push('Many workers for small population — diminishing returns.');
+        }
+        if (isWF && wfTotalTime > 7200) {
+            warnings.push('Long WF run (' + formatDuration(wfTotalTime) + '). Consider narrowing date range.');
+        }
+        if (wfWindows <= 0 && isWF) {
+            warnings.push('Date range too short for WF — need at least ' + (trainMo + 1) + ' months.');
+        }
+        if (warnings.length > 0) {
+            warningEl.classList.remove('hidden');
+            warningEl.innerHTML = warnings.join('<br>');
+        } else {
+            warningEl.classList.add('hidden');
+        }
+    }
+}
+
 function startGA() {
     var btn = document.getElementById('ga-start-btn');
     var errorDiv = document.getElementById('ga-error');
@@ -209,6 +327,7 @@ function startGA() {
         validation_start: isWF ? null : (document.getElementById('ga-val-start').value || null),
         population_size: parseInt(document.getElementById('ga-pop-size').value) || 30,
         generations: parseInt(document.getElementById('ga-generations').value) || 15,
+        max_workers: parseInt(document.getElementById('ga-workers').value) || 4,
         seed_strategies: ['mean_reversion_rsi_bollinger_bands'],
         cost_enabled: true,
         taker_fee_pct: parseFloat(document.getElementById('ga-cost-fee').value) || 0.04,
@@ -265,7 +384,7 @@ function toggleWFConfig() {
 }
 
 // ── Lock/unlock all GA inputs when job is running ──
-var _gaInputIds = ['ga-pop-size', 'ga-generations', 'ga-date-start', 'ga-date-end',
+var _gaInputIds = ['ga-pop-size', 'ga-generations', 'ga-workers', 'ga-date-start', 'ga-date-end',
     'ga-val-start', 'ga-wf-enabled', 'ga-wf-train-mo', 'ga-wf-val-mo', 'ga-wf-step-mo',
     'ga-cost-fee', 'ga-spread-btc', 'ga-spread-eth', 'ga-spread-bnb', 'ga-spread-sol', 'ga-spread-xrp'];
 
@@ -282,6 +401,7 @@ function restoreParams(params) {
     if (params.date_end) document.getElementById('ga-date-end').value = params.date_end;
     if (params.population_size) document.getElementById('ga-pop-size').value = params.population_size;
     if (params.generations) document.getElementById('ga-generations').value = params.generations;
+    if (params.max_workers) document.getElementById('ga-workers').value = params.max_workers;
     if (params.mode === 'walkforward') {
         document.getElementById('ga-wf-enabled').checked = true;
         toggleWFConfig();
@@ -326,6 +446,7 @@ function resumeGA() {
             validation_start: document.getElementById('ga-val-start').value || null,
             population_size: parseInt(document.getElementById('ga-pop-size').value) || 30,
             generations: parseInt(document.getElementById('ga-generations').value) || 15,
+            max_workers: parseInt(document.getElementById('ga-workers').value) || 4,
             seed_strategies: ['mean_reversion_rsi_bollinger_bands'],
             resume: true,
             cost_enabled: true,
@@ -429,7 +550,7 @@ function pollGAStatus() {
 
         document.getElementById('ga-eval-text').textContent =
             '{{ _("Evaluating chromosomes") }}: ' + evalDone + ' / ' + evalTotal;
-        document.getElementById('ga-step-text').textContent = overallPct.toFixed(1) + '%';
+        document.getElementById('ga-step-text').textContent = _gaOverallPct.toFixed(1) + '%';
 
         // ── ETA is handled by tick timer (always ticking) ──
         if (_gaOverallPct >= 100) {
@@ -538,6 +659,8 @@ function loadStrategyFromGA() {
             }
         }
     }).catch(function() { /* server not ready yet */ });
+    // Initial resource estimate
+    updateResourceEstimate();
 })();
 
 function pollWFStatus() {
@@ -565,16 +688,16 @@ function pollWFStatus() {
                 showError(s.error);
             }
             document.getElementById('ga-phase-text').textContent = s.error ? '{{ _("WF failed") }}' : '{{ _("WF complete") }}';
-            document.getElementById('ga-progress-bar').style.width = '100%';
+            document.getElementById('ga-progress-fill').style.width = '100%';
             return;
         }
         var cur = s.current_window || 0;
         var tot = s.total_windows || 0;
         var pct = tot > 0 ? (cur / tot * 100) : 0;
-        document.getElementById('ga-progress-bar').style.width = pct.toFixed(0) + '%';
+        document.getElementById('ga-progress-fill').style.width = pct.toFixed(0) + '%';
         document.getElementById('ga-phase-text').textContent =
-            'WF Window ' + cur + '/' + tot + ' (' + s.phase + ')';
-        document.getElementById('ga-overall-progress').textContent =
+            'WF Window ' + cur + '/' + tot + ' (' + (s.phase || 'running') + ')';
+        document.getElementById('ga-step-text').textContent =
             'Window ' + cur + '/' + tot;
     }).catch(function() { /* server not ready yet */ });
 }

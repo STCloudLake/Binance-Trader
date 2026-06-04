@@ -2135,6 +2135,7 @@ Return ONLY valid JSON in this exact format:
         validation_start = body.get("validation_start") or None
         pop_size = min(body.get("population_size", 60), 120)
         generations = min(body.get("generations", 20), 50)
+        max_workers = min(max(body.get("max_workers", 1), 1), 16)  # clamp 1-16
         seed_strategies = body.get("seed_strategies", [])
         resume = body.get("resume", False)
 
@@ -2167,6 +2168,7 @@ Return ONLY valid JSON in this exact format:
             "population_size": pop_size, "generations": generations,
             "symbols": symbols, "date_start": date_start, "date_end": date_end,
             "validation_start": validation_start,
+            "max_workers": max_workers,
             "seed_strategies": seed_strategies,
             "cost_enabled": cost_enabled,
             "taker_fee_pct": taker_fee_pct,
@@ -2208,6 +2210,7 @@ Return ONLY valid JSON in this exact format:
                 "date_start": date_start, "date_end": date_end,
                 "validation_start": validation_start,
                 "population_size": pop_size, "generations": generations,
+                "max_workers": max_workers,
                 "mode": "ga",
             },
         })
@@ -2316,6 +2319,7 @@ Return ONLY valid JSON in this exact format:
         step_months = body.get("step_months", 1)
         pop_size = min(body.get("population_size", 80), 120)
         generations = min(body.get("generations", 20), 50)
+        max_workers = min(max(body.get("max_workers", 1), 1), 16)  # clamp 1-16
         resume = body.get("resume", False)
 
         # Apply cost model overrides
@@ -2342,6 +2346,7 @@ Return ONLY valid JSON in this exact format:
             "symbols": symbols, "date_start": date_start, "date_end": date_end,
             "train_months": train_months, "val_months": val_months,
             "step_months": step_months,
+            "max_workers": max_workers,
             "cost_enabled": cost_enabled,
             "taker_fee_pct": taker_fee_pct,
             "spread_pct": spread_pct,
@@ -2380,6 +2385,7 @@ Return ONLY valid JSON in this exact format:
                 "train_months": train_months, "val_months": val_months,
                 "step_months": step_months,
                 "population_size": pop_size, "generations": generations,
+                "max_workers": max_workers,
                 "mode": "walkforward",
             },
         })
