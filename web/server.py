@@ -2192,7 +2192,7 @@ Return ONLY valid JSON in this exact format:
 
         proc = subprocess.Popen(
             [sys.executable, worker_script, "--job-type", "ga", "--job-file", job_file],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=open(job_file + ".log", "w"),
         )
         app.state._ga_process = proc
 
@@ -2341,7 +2341,7 @@ Return ONLY valid JSON in this exact format:
 
         proc = subprocess.Popen(
             [sys.executable, worker_script, "--job-type", "walkforward", "--job-file", job_file],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=open(job_file + ".log", "w"),
         )
         app.state._wf_process = proc
 
