@@ -75,6 +75,13 @@ def _render(template_name: str, context: dict, lang: str = None) -> HTMLResponse
 
 def create_app(config: Config, event_bus: EventBus, auth_manager=None) -> FastAPI:
     app = FastAPI(title="Binance Trader", docs_url=None, redoc_url=None)
+
+    # Mount static files for favicon and other static assets
+    from starlette.staticfiles import StaticFiles
+    static_dir = Path(__file__).parent / "static"
+    static_dir.mkdir(exist_ok=True)
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
     if auth_manager:
         from starlette.middleware.base import BaseHTTPMiddleware
         app.add_middleware(auth_manager.create_middleware())
