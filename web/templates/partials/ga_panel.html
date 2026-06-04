@@ -192,6 +192,9 @@ function startGA() {
     btn.textContent = '{{ _("Starting...") }}';
     errorDiv.classList.add('hidden');
 
+    // Lock all inputs while running
+    setInputsLocked(true);
+
     _gaStartTime = Date.now();
     _gaOverallPct = 0;
     startTickTimer();
@@ -261,6 +264,38 @@ function toggleWFConfig() {
     document.getElementById('ga-val-start').parentElement.parentElement.style.display = checked ? 'none' : '';
 }
 
+// ── Lock/unlock all GA inputs when job is running ──
+var _gaInputIds = ['ga-pop-size', 'ga-generations', 'ga-date-start', 'ga-date-end',
+    'ga-val-start', 'ga-wf-enabled', 'ga-wf-train-mo', 'ga-wf-val-mo', 'ga-wf-step-mo',
+    'ga-cost-fee', 'ga-spread-btc', 'ga-spread-eth', 'ga-spread-bnb', 'ga-spread-sol', 'ga-spread-xrp'];
+
+function setInputsLocked(locked) {
+    _gaInputIds.forEach(function(id) {
+        var el = document.getElementById(id);
+        if (el) el.disabled = locked;
+    });
+}
+
+function restoreParams(params) {
+    if (!params) return;
+    if (params.date_start) document.getElementById('ga-date-start').value = params.date_start;
+    if (params.date_end) document.getElementById('ga-date-end').value = params.date_end;
+    if (params.population_size) document.getElementById('ga-pop-size').value = params.population_size;
+    if (params.generations) document.getElementById('ga-generations').value = params.generations;
+    if (params.mode === 'walkforward') {
+        document.getElementById('ga-wf-enabled').checked = true;
+        toggleWFConfig();
+        if (params.train_months) document.getElementById('ga-wf-train-mo').value = params.train_months;
+        if (params.val_months) document.getElementById('ga-wf-val-mo').value = params.val_months;
+        if (params.step_months) document.getElementById('ga-wf-step-mo').value = params.step_months;
+        document.getElementById('ga-val-start').parentElement.parentElement.style.display = 'none';
+    } else {
+        document.getElementById('ga-wf-enabled').checked = false;
+        toggleWFConfig();
+        if (params.validation_start) document.getElementById('ga-val-start').value = params.validation_start;
+    }
+}
+
 function showError(msg) {
     var errorDiv = document.getElementById('ga-error');
     errorDiv.classList.remove('hidden');
@@ -327,6 +362,7 @@ function resumeGA() {
 function resetUI() {
     clearInterval(_gaPollTimer);
     stopTickTimer();
+    setInputsLocked(false);
     document.getElementById('ga-start-btn').classList.remove('hidden');
     document.getElementById('ga-start-btn').disabled = false;
     document.getElementById('ga-start-btn').textContent = '{{ _("Start Evolution") }}';
@@ -459,6 +495,8 @@ function loadStrategyFromGA() {
 
         // ── WF reconnection ──
         if (wfState && wfState.running) {
+            restoreParams(wfState.params);
+            setInputsLocked(true);
             document.getElementById('ga-start-btn').classList.add('hidden');
             document.getElementById('ga-stop-btn').classList.remove('hidden');
             document.getElementById('ga-progress').classList.remove('hidden');
@@ -485,6 +523,8 @@ function loadStrategyFromGA() {
             }
 
             if (gaState.running) {
+                restoreParams(gaState.params);
+                setInputsLocked(true);
                 document.getElementById('ga-start-btn').classList.add('hidden');
                 document.getElementById('ga-stop-btn').classList.remove('hidden');
                 document.getElementById('ga-progress').classList.remove('hidden');
@@ -507,6 +547,7 @@ function pollWFStatus() {
         if (!s.running) {
             clearInterval(_gaPollTimer); _gaPollTimer = null;
             stopTickTimer();
+            setInputsLocked(false);
             document.getElementById('ga-stop-btn').classList.add('hidden');
             document.getElementById('ga-start-btn').classList.remove('hidden');
             document.getElementById('ga-start-btn').disabled = false;

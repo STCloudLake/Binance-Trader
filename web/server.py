@@ -2204,6 +2204,12 @@ Return ONLY valid JSON in this exact format:
             "eval_completed": 0, "eval_total": 0, "phase": "init",
             "history": [], "error": None, "stopped": False, "resumable": False,
             "checkpoint_gen": 0, "job_file": job_file,
+            "params": {
+                "date_start": date_start, "date_end": date_end,
+                "validation_start": validation_start,
+                "population_size": pop_size, "generations": generations,
+                "mode": "ga",
+            },
         })
 
         proc = subprocess.Popen(
@@ -2369,6 +2375,13 @@ Return ONLY valid JSON in this exact format:
             "completed": [], "report": None, "error": None,
             "started": t0, "elapsed_seconds": 0, "phase": "init",
             "job_file": job_file,
+            "params": {
+                "date_start": date_start, "date_end": date_end,
+                "train_months": train_months, "val_months": val_months,
+                "step_months": step_months,
+                "population_size": pop_size, "generations": generations,
+                "mode": "walkforward",
+            },
         })
 
         proc = subprocess.Popen(
