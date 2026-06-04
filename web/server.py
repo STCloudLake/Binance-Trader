@@ -2343,6 +2343,57 @@ Return ONLY valid JSON in this exact format:
             _wf_state["phase"] = "stopping"
         return JSONResponse({"ok": True})
 
+    # ── Calibration endpoint ─────────────────────────────────────
+
+    _calib_state = {"running": False, "phase": "idle", "result": None, "error": None}
+
+    @app.post("/api/ga/calibrate")
+    async def ga_calibrate(request: Request):
+        if err := _require_trader(request): return err
+        body = await request.json() if request.headers.get("content-type") == "application/json" else {}
+        engine = getattr(app.state, "backtest_engine", None)
+        loader = getattr(app.state, "strategy_loader", None)
+        if not engine or not loader:
+            return JSONResponse({"error": "Engine or loader not initialized"}, status_code=500)
+
+        symbols = body.get("symbols", ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"])
+        date_start = body.get("date_start", "2025-06-01")
+        date_end = body.get("date_end", "2026-06-01")
+
+        data_dir = str(Path(loader.strategies_dir).parent) if hasattr(loader, 'strategies_dir') else "data"
+
+        from core.ga.fitness_calibrate import FitnessCalibrator
+        calibrator = FitnessCalibrator(engine, loader, data_dir)
+
+        _calib_state.update({"running": True, "phase": "stage1", "result": None, "error": None})
+
+        async def _run_calib():
+            try:
+                result = calibrator.calibrate(
+                    symbols, date_start, date_end,
+                    progress_callback=lambda stage, cur, tot: _calib_state.update(
+                        {"phase": stage, "progress_current": cur, "progress_total": tot}))
+                _calib_state["running"] = False
+                _calib_state["result"] = {
+                    "weights": result.weights,
+                    "stage1_spearman": result.stage1_spearman,
+                    "stage2_wf_efficiency": result.stage2_wf_efficiency,
+                }
+                _calib_state["phase"] = "complete"
+            except Exception as e:
+                import traceback
+                logger.error(f"Calibration crashed: {e}\n{traceback.format_exc()}")
+                _calib_state["running"] = False
+                _calib_state["error"] = str(e)
+                _calib_state["phase"] = "error"
+
+        asyncio.create_task(_run_calib())
+        return JSONResponse({"ok": True})
+
+    @app.get("/api/ga/calibrate_status")
+    async def ga_calibrate_status(request: Request):
+        return _calib_state
+
     @app.get("/partials/ga-panel")
     async def partial_ga_panel(request: Request):
         return _render("partials/ga_panel.html", {"request": request, "state": _ga_state})
