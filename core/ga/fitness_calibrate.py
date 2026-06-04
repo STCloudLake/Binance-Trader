@@ -76,7 +76,7 @@ class FitnessCalibrator:
             val_start = validation_start
 
         # ── Stage 1: Spearman rank correlation ──
-        n_strategies = 200
+        n_strategies = 60  # enough for Spearman ρ significance (p<0.01 for ρ>0.35)
         if progress_callback:
             progress_callback("stage1", 0, n_strategies)
 
