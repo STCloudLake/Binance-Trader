@@ -123,7 +123,9 @@ def evaluate_condition(df: pd.DataFrame, condition: str) -> pd.Series:
     env = {col: df[col] for col in df.columns}
     def _sma(series, period):
         return series.rolling(period).mean()
-    env["sma"] = _sma
+    # Avoid overwriting "sma" column with the helper function
+    if "sma" not in env:
+        env["sma"] = _sma
     try:
         result = pd.eval(condition, engine="python", local_dict=env)
         return result
