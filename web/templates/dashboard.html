@@ -2,28 +2,28 @@
 {% block content %}
 <h2 class="text-xl mb-4">{{ _('仪表盘') }}</h2>
 
-<div class="grid grid-cols-4 gap-4 mb-4" hx-get="/partials/stats" hx-trigger="every 5s">
-    <div class="card"><div class="text-sm text-slate-400">{{ _('账户余额') }}</div><div class="text-2xl font-bold text-green-400">{{ "%.2f"|format(balance|float) }} USDT</div></div>
-    <div class="card"><div class="text-sm text-slate-400">{{ _('持仓数') }}</div><div class="text-2xl font-bold text-sky-400">{{ positions|length }} / {{ max_trades }}</div></div>
-    <div class="card"><div class="text-sm text-slate-400">{{ _('今日盈亏') }}</div><div class="text-2xl font-bold {{ 'text-green-400' if daily_pnl|float > 0 else 'text-red-400' }}">{{ "%.2f"|format(daily_pnl|float) }} USDT</div></div>
-    <div class="card"><div class="text-sm text-slate-400">AI {{ _('模式') }}</div><div class="text-2xl font-bold text-purple-400">{{ ai_mode }}</div></div>
+<div class="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4 mb-4" hx-get="/partials/stats" hx-trigger="every 5s">
+    <div class="card"><div class="text-xs md:text-sm text-slate-400">{{ _('账户余额') }}</div><div class="text-lg md:text-2xl font-bold text-green-400">{{ "%.2f"|format(balance|float) }} USDT</div></div>
+    <div class="card"><div class="text-xs md:text-sm text-slate-400">{{ _('持仓数') }}</div><div class="text-lg md:text-2xl font-bold text-sky-400">{{ positions|length }} / {{ max_trades }}</div></div>
+    <div class="card"><div class="text-xs md:text-sm text-slate-400">{{ _('今日盈亏') }}</div><div class="text-lg md:text-2xl font-bold {{ 'text-green-400' if daily_pnl|float > 0 else 'text-red-400' }}">{{ "%.2f"|format(daily_pnl|float) }} USDT</div></div>
+    <div class="card"><div class="text-xs md:text-sm text-slate-400">AI {{ _('模式') }}</div><div class="text-lg md:text-2xl font-bold text-purple-400">{{ ai_mode }}</div></div>
 </div>
 
 <div class="card mb-4">
     <div class="flex justify-between items-center mb-2 flex-wrap gap-2">
         <h3 class="text-lg">K{{ _('线图表') }}</h3>
-        <div class="flex gap-1 items-center flex-wrap">
-            <select id="chart-symbol" class="bg-slate-700 border border-slate-600 rounded px-2 py-1 text-sm text-white" onchange="loadChart()">
+        <div class="flex gap-1 items-center flex-wrap text-xs">
+            <select id="chart-symbol" class="bg-slate-700 border border-slate-600 rounded px-2 py-1 text-xs md:text-sm text-white" onchange="loadChart()">
                 {% for s in ['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT'] %}<option value="{{s}}">{{s.replace('USDT','/USDT')}}</option>{% endfor %}
             </select>
-            <span class="text-slate-500">|</span>
-            <button class="timeframe-btn px-2 py-1 rounded text-xs bg-slate-700 text-slate-300" data-tf="1m" onclick="switchTF('1m', this)">1{{ _('分') }}</button>
-            <button class="timeframe-btn px-2 py-1 rounded text-xs bg-sky-700 text-white" data-tf="5m" onclick="switchTF('5m', this)">5{{ _('分') }}</button>
-            <button class="timeframe-btn px-2 py-1 rounded text-xs bg-slate-700 text-slate-300" data-tf="15m" onclick="switchTF('15m', this)">15{{ _('分') }}</button>
-            <button class="timeframe-btn px-2 py-1 rounded text-xs bg-slate-700 text-slate-300" data-tf="1h" onclick="switchTF('1h', this)">1{{ _('时') }}</button>
-            <button class="timeframe-btn px-2 py-1 rounded text-xs bg-slate-700 text-slate-300" data-tf="4h" onclick="switchTF('4h', this)">4{{ _('时') }}</button>
-            <button class="timeframe-btn px-2 py-1 rounded text-xs bg-slate-700 text-slate-300" data-tf="1d" onclick="switchTF('1d', this)">{{ _('日线') }}</button>
-            <span class="text-slate-500">|</span>
+            <span class="text-slate-500 hidden sm:inline">|</span>
+            <button class="timeframe-btn px-1.5 md:px-2 py-1 rounded text-xs bg-slate-700 text-slate-300" data-tf="1m" onclick="switchTF('1m', this)">1{{ _('分') }}</button>
+            <button class="timeframe-btn px-1.5 md:px-2 py-1 rounded text-xs bg-sky-700 text-white" data-tf="5m" onclick="switchTF('5m', this)">5{{ _('分') }}</button>
+            <button class="timeframe-btn px-1.5 md:px-2 py-1 rounded text-xs bg-slate-700 text-slate-300" data-tf="15m" onclick="switchTF('15m', this)">15{{ _('分') }}</button>
+            <button class="timeframe-btn px-1.5 md:px-2 py-1 rounded text-xs bg-slate-700 text-slate-300" data-tf="1h" onclick="switchTF('1h', this)">1{{ _('时') }}</button>
+            <button class="timeframe-btn px-1.5 md:px-2 py-1 rounded text-xs bg-slate-700 text-slate-300" data-tf="4h" onclick="switchTF('4h', this)">4{{ _('时') }}</button>
+            <button class="timeframe-btn px-1.5 md:px-2 py-1 rounded text-xs bg-slate-700 text-slate-300" data-tf="1d" onclick="switchTF('1d', this)">{{ _('日线') }}</button>
+            <span class="text-slate-500 hidden sm:inline">|</span>
             <label class="text-xs text-slate-400"><input type="checkbox" class="ind-overlay" data-ind="ema" onchange="renderIndicators()" checked> EMA</label>
             <label class="text-xs text-slate-400"><input type="checkbox" class="ind-overlay" data-ind="bollinger" onchange="renderIndicators()"> BOLL</label>
             <label class="text-xs text-slate-400"><input type="checkbox" class="ind-overlay" data-ind="macd" onchange="renderIndicators()"> MACD</label>
@@ -32,10 +32,10 @@
             <label class="text-xs text-slate-400"><input type="checkbox" class="ind-overlay" data-ind="volume" onchange="renderIndicators()"> VOL</label>
         </div>
     </div>
-    <div id="chart-container" style="width:100%;height:550px;"></div>
+    <div id="chart-container" style="width:100%;min-height:300px;height:55vh;max-height:550px;"></div>
 </div>
 
-<div class="grid grid-cols-3 gap-4 mb-4">
+<div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
     <div class="card">
         <h3 class="text-lg mb-3 text-sky-400">{{ _('快速交易') }} ({{ _('模拟') }})</h3>
         <form hx-post="/api/trade" hx-target="#trade-msg" hx-swap="innerHTML">
@@ -56,16 +56,16 @@
     </div>
     <div class="card col-span-2">
         <h3 class="text-lg mb-3">{{ _('当前持仓') }}</h3>
-        <div id="positions-table" hx-get="/partials/positions" hx-trigger="every 5s"><div class="text-slate-500 text-sm">{{ _('暂无持仓') }}</div></div>
+        <div id="positions-table" class="overflow-x-auto" hx-get="/partials/positions" hx-trigger="every 5s"><div class="text-slate-500 text-sm">{{ _('暂无持仓') }}</div></div>
     </div>
 </div>
 
 <div class="card mb-4">
     <h3 class="text-lg mb-2">{{ _('历史交易记录') }}</h3>
-    <div class="max-h-96 overflow-y-auto" id="trade-history" hx-get="/partials/trades?page=1" hx-trigger="load, every 10s"><div class="text-slate-500 text-sm">{{ _('加载中') }}...</div></div>
+    <div class="max-h-96 overflow-auto" id="trade-history"hx-get="/partials/trades?page=1" hx-trigger="load, every 10s"><div class="text-slate-500 text-sm">{{ _('加载中') }}...</div></div>
 </div>
 
-<div class="grid grid-cols-2 gap-4">
+<div class="grid grid-cols-1 md:grid-cols-2 gap-4">
     <div class="card"><h3 class="text-lg mb-2">{{ _('最近告警') }}</h3><div id="recent-alerts" hx-get="/partials/alerts?limit=5" hx-trigger="every 10s"><div class="text-slate-500 text-sm">{{ _('加载中') }}...</div></div></div>
     <div class="card"><h3 class="text-lg mb-2">AI {{ _('建议') }}</h3><div id="ai-suggestions" hx-get="/partials/ai-suggestions?limit=5" hx-trigger="every 30s"><div class="text-slate-500 text-sm">{{ _('加载中') }}...</div></div></div>
 </div>

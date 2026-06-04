@@ -7,7 +7,7 @@
                 <button type="button" class="text-xs text-sky-400 hover:underline ml-2" onclick="toggleAll('bt-strategies', true)">{{ _("Select All") }}</button>
                 <button type="button" class="text-xs text-slate-500 hover:underline ml-1" onclick="toggleAll('bt-strategies', false)">{{ _("Clear") }}</button>
             </label>
-            <div id="bt-strategies" class="grid grid-cols-2 gap-1 max-h-32 overflow-y-auto bg-slate-800 rounded p-2 border border-slate-600">
+            <div id="bt-strategies" class="grid grid-cols-1 sm:grid-cols-2 gap-1 max-h-32 overflow-y-auto bg-slate-800 rounded p-2 border border-slate-600">
                 {% for s in available_strategies %}
                 <label class="flex items-center gap-2 text-sm text-slate-300 hover:bg-slate-700 rounded px-2 py-1 cursor-pointer">
                     <input type="checkbox" name="strategy" value="{{ s }}" checked class="accent-sky-500">
@@ -78,7 +78,7 @@
         {% endif %}
 
         <!-- Date Range + Mode + Balance -->
-        <div class="grid grid-cols-4 gap-3">
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
             <div>
                 <label class="text-sm text-slate-400">{{ _("Start Date") }}</label>
                 <input type="date" name="date_start" value="{{ default_start }}" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
@@ -128,7 +128,7 @@
             <summary class="text-sm text-slate-400 cursor-pointer hover:text-slate-300">
                 {{ _("Trading Costs") }} ⚙️
             </summary>
-            <div class="grid grid-cols-3 gap-2 mt-2 p-3 bg-slate-800/50 rounded">
+            <div class="grid grid-cols-2 md:grid-cols-3 gap-2 mt-2 p-3 bg-slate-800/50 rounded">
                 <div class="flex items-center gap-2">
                     <input type="checkbox" name="cost_enabled" value="1" checked class="accent-amber-500">
                     <label class="text-xs text-slate-400">Enable Cost Model</label>

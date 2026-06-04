@@ -18,40 +18,96 @@
     <style>
         body { background: #0f172a; color: #e2e8f0; font-family: 'Microsoft YaHei', 'PingFang SC', 'Consolas', 'Monaco', monospace; }
         .card { background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 1rem; }
-        .nav-link { padding: 0.5rem 1rem; border-radius: 6px; color: #94a3b8; text-decoration: none; }
+        .nav-link { padding: 0.5rem 1rem; border-radius: 6px; color: #94a3b8; text-decoration: none; display: block; }
         .nav-link.active { background: #1e293b; color: #38bdf8; }
         .badge { padding: 2px 8px; border-radius: 10px; font-size: 0.75rem; }
         .badge-green { background: #064e3b; color: #34d399; }
         .badge-red { background: #7f1d1d; color: #f87171; }
         .badge-yellow { background: #78350f; color: #fbbf24; }
         .badge-blue { background: #1e3a5f; color: #60a5fa; }
+        /* Mobile nav transition */
+        #mobile-nav { transition: max-height 0.3s ease; max-height: 0; overflow: hidden; }
+        #mobile-nav.open { max-height: 500px; }
     </style>
 </head>
 <body class="min-h-screen">
-    <nav class="border-b border-slate-700 px-6 py-3 flex items-center gap-6">
-        <h1 class="text-lg font-bold text-sky-400 flex items-center gap-2">
-            <img src="/static/favicon.ico" alt="Binance" class="w-5 h-5">Binance Trader</h1>
-        {% set pages = [('dashboard', _('仪表盘')), ('strategies', _('策略监控')), ('backtest', _('Backtest')), ('ai', _('AI 面板')), ('alerts', _('预警中心')), ('settings', _('设置'))] %}
-        {% for slug, label in pages %}
-        <a href="/{{ slug }}" class="nav-link {{ 'active' if current_page == slug else '' }}">{{ label }}</a>
-        {% endfor %}
-        {% if current_user and current_user.is_admin %}
-        <span class="text-slate-600 mx-1">|</span>
-        <a href="/users" class="nav-link text-xs {{ 'active' if current_page == 'users' else '' }}">{{ _("Users") }}</a>
-        <a href="/db-manager" class="nav-link text-xs {{ 'active' if current_page == 'db_manager' else '' }}">{{ _("Database Manager") }}</a>
-        {% endif %}
-        <span class="flex-1"></span>
-        {% if current_user %}
-        <span class="text-xs text-slate-500">{{ current_user.display_name or current_user.username }}
-            <span class="badge {{ 'badge-yellow' if current_user.role == 'admin' else 'badge-blue' if current_user.role == 'trader' else 'badge-green' }}">{{ current_user.role }}</span>
-        </span>
-        <button class="text-xs text-red-400 hover:underline" onclick="logout()">{{ _("Logout") }}</button>
-        {% endif %}
+    <nav class="border-b border-slate-700 px-4 md:px-6 py-3">
+        {# ── Top bar: always visible ── #}
+        <div class="flex items-center gap-4">
+            <h1 class="text-lg font-bold text-sky-400 flex items-center gap-2 shrink-0">
+                <img src="/static/favicon.ico" alt="Binance" class="w-5 h-5"><span class="hidden sm:inline">Binance Trader</span></h1>
+
+            {# ── Desktop nav links (hidden on mobile) ── #}
+            {% set pages = [('dashboard', _('仪表盘')), ('strategies', _('策略监控')), ('backtest', _('Backtest')), ('ai', _('AI 面板')), ('alerts', _('预警中心')), ('settings', _('设置'))] %}
+            <div class="hidden md:flex items-center gap-1 flex-1 overflow-x-auto">
+                {% for slug, label in pages %}
+                <a href="/{{ slug }}" class="nav-link text-sm whitespace-nowrap {{ 'active' if current_page == slug else '' }}">{{ label }}</a>
+                {% endfor %}
+                {% if current_user and current_user.is_admin %}
+                <span class="text-slate-600 mx-1">|</span>
+                <a href="/users" class="nav-link text-xs whitespace-nowrap {{ 'active' if current_page == 'users' else '' }}">{{ _("Users") }}</a>
+                <a href="/db-manager" class="nav-link text-xs whitespace-nowrap {{ 'active' if current_page == 'db_manager' else '' }}">{{ _("Database Manager") }}</a>
+                {% endif %}
+            </div>
+
+            {# ── Desktop user info ── #}
+            {% if current_user %}
+            <div class="hidden md:flex items-center gap-3 ml-auto shrink-0">
+                <span class="text-xs text-slate-500 whitespace-nowrap">{{ current_user.display_name or current_user.username }}
+                    <span class="badge {{ 'badge-yellow' if current_user.role == 'admin' else 'badge-blue' if current_user.role == 'trader' else 'badge-green' }}">{{ current_user.role }}</span>
+                </span>
+                <button class="text-xs text-red-400 hover:underline" onclick="logout()">{{ _("Logout") }}</button>
+            </div>
+            {% endif %}
+
+            {# ── Mobile: user + hamburger ── #}
+            <div class="flex items-center gap-2 ml-auto md:hidden">
+                {% if current_user %}
+                <span class="text-xs text-slate-500 truncate max-w-[80px]">{{ current_user.display_name or current_user.username }}</span>
+                {% endif %}
+                <button id="hamburger-btn" onclick="toggleMobileNav()" class="text-slate-400 hover:text-white p-1" aria-label="Menu">
+                    <svg id="hamburger-icon" xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg>
+                    <svg id="hamburger-close" xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 hidden" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+                </button>
+            </div>
+        </div>
+
+        {# ── Mobile nav dropdown ── #}
+        <div id="mobile-nav" class="md:hidden border-t border-slate-700 mt-3">
+            <div class="flex flex-col gap-0.5 pt-3">
+                {% for slug, label in pages %}
+                <a href="/{{ slug }}" class="nav-link text-sm {{ 'active' if current_page == slug else '' }}">{{ label }}</a>
+                {% endfor %}
+                {% if current_user and current_user.is_admin %}
+                <div class="border-t border-slate-700 my-2"></div>
+                <a href="/users" class="nav-link text-sm {{ 'active' if current_page == 'users' else '' }}">{{ _("Users") }}</a>
+                <a href="/db-manager" class="nav-link text-sm {{ 'active' if current_page == 'db_manager' else '' }}">{{ _("Database Manager") }}</a>
+                {% endif %}
+                {% if current_user %}
+                <div class="border-t border-slate-700 my-2"></div>
+                <button class="nav-link text-sm text-red-400 hover:underline text-left" onclick="logout()">{{ _("Logout") }}</button>
+                {% endif %}
+            </div>
+        </div>
     </nav>
-    <main class="p-6">
+    <main class="p-4 md:p-6">
         {% block content %}{% endblock %}
     </main>
     <script>
+    function toggleMobileNav() {
+        var nav = document.getElementById('mobile-nav');
+        var icon = document.getElementById('hamburger-icon');
+        var close = document.getElementById('hamburger-close');
+        if (nav.classList.contains('open')) {
+            nav.classList.remove('open');
+            icon.classList.remove('hidden');
+            close.classList.add('hidden');
+        } else {
+            nav.classList.add('open');
+            icon.classList.add('hidden');
+            close.classList.remove('hidden');
+        }
+    }
     async function logout() {
         await fetch('/api/auth/logout', {method:'POST'});
         window.location.href = '/login';

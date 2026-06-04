@@ -3,12 +3,12 @@
 <h2 class="text-xl mb-4">{{ _('预警中心') }}</h2>
 
 <!-- Count cards -->
-<div class="grid grid-cols-4 gap-4 mb-4" id="alert-counts" hx-get="/api/alerts/counts" hx-trigger="every 15s" hx-swap="innerHTML">
+<div class="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4 mb-4" id="alert-counts" hx-get="/api/alerts/counts" hx-trigger="every 15s" hx-swap="innerHTML">
     {% include "partials/alert_counts.html" %}
 </div>
 
 <!-- Category tabs + search -->
-<div class="flex gap-2 mb-4 items-center" id="alert-tabs">
+<div class="flex gap-1 md:gap-2 mb-4 items-center flex-wrap" id="alert-tabs">
     <button class="px-3 py-1 rounded text-sm bg-slate-700 text-white" onclick="filterAlerts('')">{{ _('全部') }}</button>
     <button class="px-3 py-1 rounded text-sm bg-slate-800 text-slate-400" onclick="filterAlerts('signal,risk')">{{ _('风控') }}</button>
     <button class="px-3 py-1 rounded text-sm bg-slate-800 text-slate-400" onclick="filterAlerts('ai_')">AI</button>

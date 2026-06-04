@@ -2,7 +2,7 @@
 {% block content %}
 <h2 class="text-xl mb-4">{{ _("系统设置") }}</h2>
 
-<div class="grid grid-cols-2 gap-6">
+<div class="grid grid-cols-1 md:grid-cols-2 gap-6">
     <div class="card">
         <h3 class="text-lg mb-3">Binance API</h3>
         <form hx-post="/api/settings/binance" hx-target="#binance-msg" hx-swap="innerHTML">
@@ -36,7 +36,7 @@
     </div>
 </div>
 
-<div class="grid grid-cols-2 gap-6 mt-6">
+<div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6">
     <div class="card">
         <h3 class="text-lg mb-3">{{ _("AI 与新闻设置") }}</h3>
         <form hx-post="/api/settings/ai-news" hx-target="#ai-news-msg" hx-swap="innerHTML">
@@ -57,7 +57,7 @@
                 <p class="text-xs text-slate-500 mt-1">{{ _("价格波动超过此百分比时触发紧急新闻抓取") }}</p></div>
             <hr class="border-slate-700 my-3">
             <p class="text-sm text-slate-400 mb-2 font-bold">{{ _("AI 后台任务间隔") }} <span class="text-xs text-slate-500 font-normal">({{ _("修改后需重启生效") }})</span></p>
-            <div class="grid grid-cols-2 gap-2">
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
                 <div class="mb-2"><label class="text-xs text-slate-400">{{ _("市场评估 (分钟)") }}</label>
                     <input type="number" name="task_market_assessment" value="{{ ai_task_intervals.get('market_assessment', 60) }}" min="10" class="w-full bg-slate-800 border border-slate-600 rounded px-2 py-1 text-white text-xs"></div>
                 <div class="mb-2"><label class="text-xs text-slate-400">{{ _("币种选择 (分钟)") }}</label>

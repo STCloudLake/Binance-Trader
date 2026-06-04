@@ -2,7 +2,7 @@
 {% block content %}
 <h2 class="text-xl mb-4">{{ _("User Management") }}</h2>
 
-<div class="grid grid-cols-2 gap-6">
+<div class="grid grid-cols-1 md:grid-cols-2 gap-6">
     <div class="card">
         <h3 class="text-lg mb-3">{{ _("Add User") }}</h3>
         <form hx-post="/api/users" hx-target="#user-list" hx-swap="innerHTML" class="space-y-3">
@@ -32,7 +32,7 @@
 
 <div class="card mt-6 border border-sky-700">
     <h3 class="text-lg mb-3">{{ _("Change Password") }}</h3>
-    <form onsubmit="changePassword(event)" class="grid grid-cols-3 gap-3">
+    <form onsubmit="changePassword(event)" class="grid grid-cols-1 sm:grid-cols-3 gap-3">
         <input type="password" id="cp-current" placeholder="{{ _('Current Password') }}" class="bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
         <input type="password" id="cp-new" placeholder="{{ _('New Password') }}" class="bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
         <button type="submit" class="bg-sky-600 hover:bg-sky-500 text-white px-4 py-2 rounded text-sm">{{ _("Update Password") }}</button>

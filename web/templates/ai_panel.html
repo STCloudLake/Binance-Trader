@@ -2,7 +2,7 @@
 {% block content %}
 <h2 class="text-xl mb-4">AI {{ _('控制面板') }}</h2>
 
-<div class="grid grid-cols-3 gap-4 mb-6">
+<div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
     <!-- Status card -->
     <div class="card">
         <h3 class="text-lg mb-2">AI {{ _('状态') }}</h3>
@@ -142,20 +142,20 @@
 <div class="card mb-6">
     <h3 class="text-lg mb-3 text-sky-400">AI {{ _('即时交易咨询') }}</h3>
     <p class="text-sm text-slate-400 mb-3">{{ _('由') }} DeepSeek {{ _('分析当前') }} K {{ _('线数据') }}，{{ _('给出具体的交易方向') }}、{{ _('支撑阻力位和风险提示') }}</p>
-    <div class="flex gap-2 mb-3 flex-wrap">
-        <select id="consult-symbol" class="bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
+    <div class="flex gap-2 mb-3 flex-wrap text-sm">
+        <select id="consult-symbol" class="bg-slate-800 border border-slate-600 rounded px-2 md:px-3 py-1.5 md:py-2 text-white text-xs md:text-sm" class="bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
             <option value="BTCUSDT">BTC/USDT</option><option value="ETHUSDT">ETH/USDT</option>
             <option value="BNBUSDT">BNB/USDT</option><option value="SOLUSDT">SOL/USDT</option>
             <option value="XRPUSDT">XRP/USDT</option>
         </select>
-        <select id="consult-tf" class="bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
+        <select id="consult-tf" class="bg-slate-800 border border-slate-600 rounded px-2 md:px-3 py-1.5 md:py-2 text-white text-xs md:text-sm">
             <option value="5m">5{{ _('分') }} {{ _('超短线') }}</option>
             <option value="15m">15{{ _('分') }} {{ _('日内') }}</option>
             <option value="1h" selected>1{{ _('时') }} {{ _('日内') }}</option>
             <option value="4h">4{{ _('时') }} {{ _('波段') }}</option>
             <option value="1d">{{ _('日线') }} {{ _('趋势') }}</option>
         </select>
-        <button id="consult-btn" class="bg-sky-600 hover:bg-sky-500 text-white px-6 py-2 rounded text-sm font-bold disabled:opacity-50" onclick="askConsultation()">
+        <button id="consult-btn" class="bg-sky-600 hover:bg-sky-500 text-white px-4 md:px-6 py-2 rounded text-xs md:text-sm font-bold disabled:opacity-50" onclick="askConsultation()">
             {{ _('咨询') }} AI：{{ _('现在适合交易吗') }}？
         </button>
     </div>
