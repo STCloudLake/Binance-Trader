@@ -2154,18 +2154,32 @@ Return ONLY valid JSON in this exact format:
         _ga_state["cost_config"] = {
             "enabled": cost_enabled, "fee_pct": taker_fee_pct, "spreads": spread_pct}
 
-        from core.ga.evolver import GAStrategyEvolver, GARunConfig
-        config = GARunConfig(
-            population_size=pop_size, generations=generations,
-            elite_count=max(4, pop_size // 10),
-            immigrant_count=max(4, pop_size // 10),
-            max_workers=3,
-        )
+        # ── Write job file for subprocess worker ──
+        import uuid
+        import subprocess
+        data_dir = str(Path(loader.strategies_dir).parent) if hasattr(loader, 'strategies_dir') else "data"
+        jobs_dir = Path(data_dir) / "data" / "ga_jobs"
+        jobs_dir.mkdir(parents=True, exist_ok=True)
+        job_id = str(uuid.uuid4())[:8]
+        job_file = str(jobs_dir / f"ga_{job_id}.json")
 
-        evolver = GAStrategyEvolver(engine, loader, config)
-        app.state._ga_evolver = evolver
+        job_data = {
+            "population_size": pop_size, "generations": generations,
+            "symbols": symbols, "date_start": date_start, "date_end": date_end,
+            "validation_start": validation_start,
+            "seed_strategies": seed_strategies,
+            "cost_enabled": cost_enabled,
+            "taker_fee_pct": taker_fee_pct,
+            "spread_pct": spread_pct,
+            "resume": resume,
+        }
+        with open(job_file, "w") as f:
+            json.dump(job_data, f)
 
+        # ── Spawn worker subprocess ──
+        worker_script = str(Path(__file__).parent.parent / "scripts" / "ga_worker.py")
         ga_start_time = time.time()
+
         _ga_state.update({
             "running": True, "generation": 0, "total_generations": generations,
             "best_fitness": 0, "best_sharpe": 0, "best_win_rate": 0,
@@ -2173,62 +2187,72 @@ Return ONLY valid JSON in this exact format:
             "population_size": pop_size, "started": ga_start_time,
             "eval_completed": 0, "eval_total": 0, "phase": "init",
             "history": [], "error": None, "stopped": False, "resumable": False,
-            "checkpoint_gen": 0,
+            "checkpoint_gen": 0, "job_file": job_file,
         })
 
-        def on_gen(progress_info):
-            # progress_info can be dict with generation+intra-gen progress,
-            # or legacy (gen, total, info) tuple from gen completion
-            if isinstance(progress_info, dict):
-                _ga_state.update({
-                    "phase": progress_info.get("phase", "evolving"),
-                    "eval_completed": progress_info.get("eval_completed", 0),
-                    "eval_total": progress_info.get("eval_total", 0),
-                    "elapsed_seconds": time.time() - ga_start_time,
-                })
-            else:
-                gen, total, info = progress_info
-                _ga_state.update({
-                    "generation": gen, "total_generations": total,
-                    "phase": "gen_complete",
-                    "best_fitness": info.get("best_fitness", 0),
-                    "best_sharpe": info.get("best_sharpe", 0),
-                    "best_win_rate": info.get("best_win_rate", 0),
-                    "best_trades": info.get("best_trades", 0),
-                    "elapsed_seconds": time.time() - ga_start_time,
-                    "history": evolver.history[-20:],
-                })
+        proc = subprocess.Popen(
+            [sys.executable, worker_script, "--job-type", "ga", "--job-file", job_file],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        app.state._ga_process = proc
 
-        evolver.set_progress_callback(on_gen)
+        # ── Background monitor: poll progress/result files ──
+        async def _monitor_ga():
+            progress_file = job_file + ".progress"
+            result_file = job_file + ".result"
+            while _ga_state["running"]:
+                await asyncio.sleep(1)
+                _ga_state["elapsed_seconds"] = time.time() - ga_start_time
 
-        async def _run_ga():
-            import concurrent.futures
-            loop = asyncio.get_event_loop()
+                # Check if process is still alive
+                poll_result = proc.poll()
+                if poll_result is not None:
+                    # Process exited — read result
+                    try:
+                        if Path(result_file).exists():
+                            with open(result_file) as f:
+                                result = json.load(f)
+                            _ga_state["running"] = False
+                            _ga_state["elapsed_seconds"] = time.time() - ga_start_time
+                            if "error" in result:
+                                _ga_state["error"] = result["error"]
+                            else:
+                                _ga_state["champion_name"] = result.get("champion_name", "")
+                                _ga_state["champion_config"] = result.get("champion_config")
+                                _ga_state["best_fitness"] = result.get("fitness", 0)
+                                _ga_state["best_sharpe"] = result.get("sharpe", 0)
+                        else:
+                            _ga_state["running"] = False
+                            _ga_state["error"] = f"Worker exited with code {poll_result}"
+                    except Exception as e:
+                        _ga_state["running"] = False
+                        _ga_state["error"] = str(e)
+                    break
+
+                # Read progress
+                try:
+                    if Path(progress_file).exists():
+                        with open(progress_file) as f:
+                            progress = json.load(f)
+                        _ga_state["phase"] = progress.get("phase", "evolving")
+                        _ga_state["eval_completed"] = progress.get("eval_completed", 0)
+                        _ga_state["eval_total"] = progress.get("eval_total", 0)
+                        if "generation" in progress:
+                            _ga_state["generation"] = progress["generation"]
+                            _ga_state["total_generations"] = progress["total_generations"]
+                            _ga_state["best_fitness"] = progress.get("best_fitness", 0)
+                            _ga_state["best_sharpe"] = progress.get("best_sharpe", 0)
+                except Exception:
+                    pass
+
+            # Cleanup
             try:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    result = await loop.run_in_executor(
-                        pool, evolver.evolve, symbols, date_start, date_end,
-                        seed_strategies, validation_start, resume)
-                _ga_state["running"] = False
-                _ga_state["elapsed_seconds"] = time.time() - _ga_state["started"]
-                _ga_state["champion_name"] = result.get("champion_name", "")
-                _ga_state["champion_config"] = result.get("champion_config")
-                _ga_state["best_fitness"] = result.get("fitness", 0)
-                _ga_state["best_sharpe"] = result.get("sharpe", 0)
-                _ga_state["error"] = result.get("error")
-            except Exception as e:
-                import traceback
-                logger.error(f"GA evolution crashed: {e}\n{traceback.format_exc()}")
-                _ga_state["running"] = False
-                _ga_state["error"] = str(e)
-                # Check if checkpoint exists for resume
-                import os
-                ckpt = os.path.join(str(Path(config.data_dir) if hasattr(config, 'data_dir') else 'data'), 'ga_checkpoint.pkl')
-                _ga_state["resumable"] = os.path.exists(ckpt)
-            finally:
-                app.state._ga_evolver = None
+                Path(progress_file).unlink(missing_ok=True)
+            except Exception:
+                pass
+            app.state._ga_process = None
 
-        asyncio.create_task(_run_ga())
+        asyncio.create_task(_monitor_ga())
         return JSONResponse({"ok": True})
 
     @app.get("/api/ga/status")
@@ -2238,9 +2262,9 @@ Return ONLY valid JSON in this exact format:
     @app.post("/api/ga/stop")
     async def ga_stop(request: Request):
         if err := _require_trader(request): return err
-        evolver = getattr(app.state, "_ga_evolver", None)
-        if evolver:
-            evolver.stop()
+        proc = getattr(app.state, "_ga_process", None)
+        if proc and proc.poll() is None:
+            proc.terminate()
             _ga_state["stopped"] = True
             _ga_state["phase"] = "stopping"
         return JSONResponse({"ok": True})
@@ -2282,71 +2306,106 @@ Return ONLY valid JSON in this exact format:
             bt_config.backtest_taker_fee_pct = taker_fee_pct
             bt_config.backtest_spread_pct = spread_pct
 
-        from core.ga.evolver import GARunConfig
-        from core.ga.walkforward import WalkForwardRunner, WFConfig
+        # ── Write job file for subprocess worker ──
+        import uuid
+        import subprocess
+        data_dir_path = str(Path(loader.strategies_dir).parent) if hasattr(loader, 'strategies_dir') else "data"
+        jobs_dir = Path(data_dir_path) / "data" / "ga_jobs"
+        jobs_dir.mkdir(parents=True, exist_ok=True)
+        job_id = str(uuid.uuid4())[:8]
+        job_file = str(jobs_dir / f"wf_{job_id}.json")
 
-        ga_config = GARunConfig(
-            population_size=pop_size, generations=generations,
-            elite_count=max(4, pop_size // 10),
-            immigrant_count=max(4, pop_size // 10),
-            max_workers=3,
-        )
-        wf_config = WFConfig(
-            enabled=True,
-            train_months=train_months,
-            val_months=val_months,
-            step_months=step_months,
-        )
+        job_data = {
+            "population_size": pop_size, "generations": generations,
+            "symbols": symbols, "date_start": date_start, "date_end": date_end,
+            "train_months": train_months, "val_months": val_months,
+            "step_months": step_months,
+            "cost_enabled": cost_enabled,
+            "taker_fee_pct": taker_fee_pct,
+            "spread_pct": spread_pct,
+            "resume": resume,
+        }
+        with open(job_file, "w") as f:
+            json.dump(job_data, f)
 
-        data_dir = str(Path(loader.strategies_dir).parent) if hasattr(loader, 'strategies_dir') else "data"
-        runner = WalkForwardRunner(engine, loader, data_dir)
-        app.state._wf_runner = runner
-
+        # ── Spawn worker subprocess ──
+        worker_script = str(Path(__file__).parent.parent / "scripts" / "ga_worker.py")
         t0 = time.time()
+
         _wf_state.update({
             "running": True, "current_window": 0, "total_windows": 0,
             "completed": [], "report": None, "error": None,
             "started": t0, "elapsed_seconds": 0, "phase": "init",
+            "job_file": job_file,
         })
 
-        async def _run_wf():
-            try:
-                report = runner.run(symbols, date_start, date_end, wf_config, ga_config,
-                                    resume=resume)
-                _wf_state["running"] = False
-                _wf_state["report"] = report.to_dict()
-                _wf_state["elapsed_seconds"] = report.elapsed_seconds
-                _wf_state["phase"] = "complete"
-            except Exception as e:
-                import traceback
-                logger.error(f"WF crashed: {e}\n{traceback.format_exc()}")
-                _wf_state["running"] = False
-                _wf_state["error"] = str(e)
-                _wf_state["phase"] = "error"
-            finally:
-                app.state._wf_runner = None
+        proc = subprocess.Popen(
+            [sys.executable, worker_script, "--job-type", "walkforward", "--job-file", job_file],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        app.state._wf_process = proc
 
-        asyncio.create_task(_run_wf())
+        # ── Background monitor ──
+        async def _monitor_wf():
+            progress_file = job_file + ".progress"
+            result_file = job_file + ".result"
+            while _wf_state["running"]:
+                await asyncio.sleep(1)
+                _wf_state["elapsed_seconds"] = time.time() - t0
+
+                poll_result = proc.poll()
+                if poll_result is not None:
+                    try:
+                        if Path(result_file).exists():
+                            with open(result_file) as f:
+                                result = json.load(f)
+                            _wf_state["running"] = False
+                            _wf_state["elapsed_seconds"] = time.time() - t0
+                            if "error" in result:
+                                _wf_state["error"] = result["error"]
+                                _wf_state["phase"] = "error"
+                            elif result.get("type") == "walkforward":
+                                _wf_state["report"] = result["report"]
+                                _wf_state["phase"] = "complete"
+                        else:
+                            _wf_state["running"] = False
+                            _wf_state["error"] = f"Worker exited with code {poll_result}"
+                            _wf_state["phase"] = "error"
+                    except Exception as e:
+                        _wf_state["running"] = False
+                        _wf_state["error"] = str(e)
+                    break
+
+                # Read progress
+                try:
+                    if Path(progress_file).exists():
+                        with open(progress_file) as f:
+                            progress = json.load(f)
+                        _wf_state["phase"] = progress.get("phase", "running")
+                        _wf_state["current_window"] = progress.get("current_window", 0)
+                        _wf_state["total_windows"] = progress.get("total_windows", 0)
+                except Exception:
+                    pass
+
+            try:
+                Path(progress_file).unlink(missing_ok=True)
+            except Exception:
+                pass
+            app.state._wf_process = None
+
+        asyncio.create_task(_monitor_wf())
         return JSONResponse({"ok": True})
 
     @app.get("/api/ga/wf_status")
     async def ga_wf_status(request: Request):
-        runner = getattr(app.state, "_wf_runner", None)
-        if runner and _wf_state["running"]:
-            state = runner.get_state()
-            if state:
-                _wf_state["current_window"] = state.get("current_window", 0)
-                _wf_state["total_windows"] = state.get("total_windows", 0)
-                _wf_state["completed"] = state.get("completed", [])
-            _wf_state["elapsed_seconds"] = time.time() - _wf_state.get("started", time.time())
         return _wf_state
 
     @app.post("/api/ga/wf_stop")
     async def ga_wf_stop(request: Request):
         if err := _require_trader(request): return err
-        runner = getattr(app.state, "_wf_runner", None)
-        if runner:
-            runner.stop()
+        proc = getattr(app.state, "_wf_process", None)
+        if proc and proc.poll() is None:
+            proc.terminate()
             _wf_state["phase"] = "stopping"
         return JSONResponse({"ok": True})
 
