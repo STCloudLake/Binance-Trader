@@ -449,32 +449,53 @@ function loadStrategyFromGA() {
 
 // ── Auto-reconnect on page load ──
 (function() {
-    fetch('/api/ga/status', {credentials: 'same-origin'}).then(function(r) { return r.json(); }).then(function(s) {
-        if (!s) return;
+    // Check both GA and WF status
+    Promise.all([
+        fetch('/api/ga/status', {credentials: 'same-origin'}).then(function(r) { return r.json(); }).catch(function() { return null; }),
+        fetch('/api/ga/wf_status', {credentials: 'same-origin'}).then(function(r) { return r.json(); }).catch(function() { return null; })
+    ]).then(function(results) {
+        var gaState = results[0];
+        var wfState = results[1];
 
-        // Show previous champion
-        if (s.champion_name) {
-            document.getElementById('ga-champion').classList.remove('hidden');
-            document.getElementById('ga-champion-info').innerHTML =
-                '<strong>' + s.champion_name + '</strong><br>' +
-                'Fitness: ' + (s.best_fitness || 0).toFixed(2) +
-                ' | Sharpe: ' + (s.best_sharpe || 0).toFixed(2) +
-                ' | Win Rate: ' + (s.best_win_rate || 0).toFixed(1) + '%';
-        }
-
-        // Reconnect to running evolution
-        if (s.running) {
+        // ── WF reconnection ──
+        if (wfState && wfState.running) {
             document.getElementById('ga-start-btn').classList.add('hidden');
             document.getElementById('ga-stop-btn').classList.remove('hidden');
             document.getElementById('ga-progress').classList.remove('hidden');
             document.getElementById('ga-champion').classList.add('hidden');
-            document.getElementById('ga-phase-text').textContent = '{{ _("Reconnected to running evolution...") }}';
-            // Use server's start time for accurate elapsed/ETA
-            _gaStartTime = (s.started || (Date.now()/1000 - (s.elapsed_seconds || 0))) * 1000;
+            document.getElementById('ga-phase-text').textContent = '{{ _("Reconnected to Walk-Forward...") }}';
+            _gaStartTime = (wfState.started || (Date.now()/1000 - (wfState.elapsed_seconds || 0))) * 1000;
             _gaOverallPct = 0;
             startTickTimer();
-            _gaPollTimer = setInterval(pollGAStatus, 2000);
-            pollGAStatus();
+            _gaPollTimer = setInterval(pollWFStatus, 2000);
+            pollWFStatus();
+            return;
+        }
+
+        // ── Regular GA reconnection ──
+        if (gaState) {
+            // Show previous champion
+            if (gaState.champion_name) {
+                document.getElementById('ga-champion').classList.remove('hidden');
+                document.getElementById('ga-champion-info').innerHTML =
+                    '<strong>' + gaState.champion_name + '</strong><br>' +
+                    'Fitness: ' + (gaState.best_fitness || 0).toFixed(2) +
+                    ' | Sharpe: ' + (gaState.best_sharpe || 0).toFixed(2) +
+                    ' | Win Rate: ' + (gaState.best_win_rate || 0).toFixed(1) + '%';
+            }
+
+            if (gaState.running) {
+                document.getElementById('ga-start-btn').classList.add('hidden');
+                document.getElementById('ga-stop-btn').classList.remove('hidden');
+                document.getElementById('ga-progress').classList.remove('hidden');
+                document.getElementById('ga-champion').classList.add('hidden');
+                document.getElementById('ga-phase-text').textContent = '{{ _("Reconnected to running evolution...") }}';
+                _gaStartTime = (gaState.started || (Date.now()/1000 - (gaState.elapsed_seconds || 0))) * 1000;
+                _gaOverallPct = 0;
+                startTickTimer();
+                _gaPollTimer = setInterval(pollGAStatus, 2000);
+                pollGAStatus();
+            }
         }
     }).catch(function() { /* server not ready yet */ });
 })();
