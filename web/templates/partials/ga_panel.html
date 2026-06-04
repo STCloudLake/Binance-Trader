@@ -477,7 +477,7 @@ function loadStrategyFromGA() {
             pollGAStatus();
         }
     }).catch(function() { /* server not ready yet */ });
-}
+})();
 
 function pollWFStatus() {
     fetch('/api/ga/wf_status', {credentials: 'same-origin'}).then(function(r) {
@@ -516,6 +516,4 @@ function pollWFStatus() {
             'Window ' + cur + '/' + tot;
     }).catch(function() { /* server not ready yet */ });
 }
-
-})();
 </script>
