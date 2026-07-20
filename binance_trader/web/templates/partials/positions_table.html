@@ -1,0 +1,35 @@
+{% if not positions %}
+<div class="text-slate-500 text-sm">{{ _('暂无持仓') }}</div>
+{% else %}
+<table class="w-full text-sm">
+<thead class="text-slate-400 border-b border-slate-700">
+<tr>
+    <th class="text-left p-2">{{ _('交易对') }}</th>
+    <th class="text-left p-2">{{ _('方向') }}</th>
+    <th class="text-right p-2">{{ _('数量') }}</th>
+    <th class="text-right p-2">{{ _('入场价') }}</th>
+    <th class="text-right p-2">{{ _('现价') }}</th>
+    <th class="text-right p-2">{{ _('盈亏') }}</th>
+    <th class="text-left p-2">{{ _('类型') }}</th>
+    <th></th>
+</tr>
+</thead>
+<tbody>
+{% for pos in positions %}
+<tr class="border-b border-slate-800">
+    <td class="p-2 font-bold">{{ pos.symbol }}</td>
+    <td class="p-2"><span class="badge {{ 'badge-green' if pos.side == 'long' else 'badge-red' }}">{{ _('做多') if pos.side == 'long' else _('做空') }}</span></td>
+    <td class="p-2 text-right">{{ "%.4f"|format(pos.quantity) }}</td>
+    <td class="p-2 text-right">{{ "%.2f"|format(pos.entry_price) }}</td>
+    <td class="p-2 text-right">{{ "%.2f"|format(pos.live_price) }}</td>
+    <td class="p-2 text-right {{ 'text-green-400' if pos.pnl >= 0 else 'text-red-400' }}">{{ "%+.2f"|format(pos.pnl) }}</td>
+    <td class="p-2"><span class="badge badge-blue text-xs">{{ _('核心仓位') if pos.position_type == 'core' else _('卫星仓位') }}</span></td>
+    <td class="p-2">
+        <button class="text-yellow-400 text-xs hover:underline" hx-post="/api/trade/close/{{ pos.symbol }}" hx-vals='{"reduce_pct": 50}' hx-target="#positions-table" hx-swap="innerHTML">{{ _('减仓') }}</button>
+        <button class="text-red-400 text-xs hover:underline ml-2" hx-post="/api/trade/close/{{ pos.symbol }}" hx-target="#positions-table" hx-swap="innerHTML">{{ _('平仓') }}</button>
+    </td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}

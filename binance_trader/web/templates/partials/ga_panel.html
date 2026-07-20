@@ -1,0 +1,704 @@
+<div class="card mb-4" id="ga-panel">
+    <h3 class="text-lg mb-3">{{ _("Genetic Algorithm Strategy Evolution") }}</h3>
+
+    <!-- Config -->
+    <div class="mb-4 space-y-2" id="ga-config-section">
+        <div class="grid grid-cols-2 md:grid-cols-5 gap-3">
+            <div>
+                <label class="text-sm text-slate-400">Population</label>
+                <input type="number" id="ga-pop-size" value="30" min="10" max="100"
+                       oninput="updateResourceEstimate()"
+                       class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-white text-sm">
+            </div>
+            <div>
+                <label class="text-sm text-slate-400">Generations</label>
+                <input type="number" id="ga-generations" value="15" min="3" max="50"
+                       oninput="updateResourceEstimate()"
+                       class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-white text-sm">
+            </div>
+            <div>
+                <label class="text-sm text-slate-400">Workers</label>
+                <input type="number" id="ga-workers" value="4" min="1" max="16"
+                       oninput="updateResourceEstimate()"
+                       class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-white text-sm">
+            </div>
+            <div>
+                <label class="text-sm text-slate-400">Start Date</label>
+                <input type="date" id="ga-date-start" value="2026-05-01"
+                       onchange="updateResourceEstimate()"
+                       class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-white text-sm">
+            </div>
+            <div>
+                <label class="text-sm text-slate-400">End Date</label>
+                <input type="date" id="ga-date-end" value="2026-05-31"
+                       onchange="updateResourceEstimate()"
+                       class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-white text-sm">
+            </div>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">
+            <div>
+                <label class="text-sm text-slate-400">Validation Start (optional)</label>
+                <input type="date" id="ga-val-start" value="2026-05-20"
+                       class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-white text-sm">
+            </div>
+            <div class="flex items-end">
+                <span class="text-xs text-slate-500">
+                    {{ _("GA trains on Start→Validation, tests champion on Validation→End") }}
+                </span>
+            </div>
+        </div>
+
+        <!-- Walk-Forward Mode -->
+        <div class="flex items-center gap-3 mt-2">
+            <label class="flex items-center gap-2 text-sm text-amber-400 cursor-pointer">
+                <input type="checkbox" id="ga-wf-enabled" class="accent-amber-500" onchange="toggleWFConfig();updateResourceEstimate()">
+                {{ _("Walk-Forward Validation") }}
+            </label>
+            <span id="ga-wf-config" style="display:none" class="flex gap-2 items-center">
+                <label class="text-xs text-slate-500">Train Mo: <input type="number" id="ga-wf-train-mo" value="6" min="2" max="12" oninput="updateResourceEstimate()" class="w-14 bg-slate-700 border border-slate-600 rounded px-1 py-0.5 text-white text-xs"></label>
+                <label class="text-xs text-slate-500">Val Mo: <input type="number" id="ga-wf-val-mo" value="1" min="1" max="3" class="w-12 bg-slate-700 border border-slate-600 rounded px-1 py-0.5 text-white text-xs"></label>
+                <label class="text-xs text-slate-500">Step Mo: <input type="number" id="ga-wf-step-mo" value="1" min="1" max="3" oninput="updateResourceEstimate()" class="w-12 bg-slate-700 border border-slate-600 rounded px-1 py-0.5 text-white text-xs"></label>
+            </span>
+        </div>
+
+        <!-- Cost Model -->
+        <details class="mt-3">
+            <summary class="text-sm text-slate-400 cursor-pointer hover:text-slate-300">
+                {{ _("Trading Costs") }} ⚙️
+            </summary>
+            <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-2 mt-2 p-3 bg-slate-800/50 rounded">
+                <div>
+                    <label class="text-xs text-slate-500">Taker Fee %</label>
+                    <input type="number" id="ga-cost-fee" value="0.04" min="0" max="1" step="0.005"
+                           class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1 text-white text-xs">
+                </div>
+                <div>
+                    <label class="text-xs text-slate-500">BTC Spread %</label>
+                    <input type="number" id="ga-spread-btc" value="0.01" min="0" max="1" step="0.005"
+                           class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1 text-white text-xs">
+                </div>
+                <div>
+                    <label class="text-xs text-slate-500">ETH Spread %</label>
+                    <input type="number" id="ga-spread-eth" value="0.02" min="0" max="1" step="0.005"
+                           class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1 text-white text-xs">
+                </div>
+                <div>
+                    <label class="text-xs text-slate-500">BNB Spread %</label>
+                    <input type="number" id="ga-spread-bnb" value="0.03" min="0" max="1" step="0.005"
+                           class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1 text-white text-xs">
+                </div>
+                <div>
+                    <label class="text-xs text-slate-500">SOL Spread %</label>
+                    <input type="number" id="ga-spread-sol" value="0.03" min="0" max="1" step="0.005"
+                           class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1 text-white text-xs">
+                </div>
+                <div>
+                    <label class="text-xs text-slate-500">XRP Spread %</label>
+                    <input type="number" id="ga-spread-xrp" value="0.04" min="0" max="1" step="0.005"
+                           class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1 text-white text-xs">
+                </div>
+            </div>
+        </details>
+
+        <!-- Resource Estimate -->
+        <div id="ga-resource-estimate" class="mt-3 p-3 bg-slate-800/50 rounded border border-slate-700/50">
+            <div class="text-xs text-slate-400 mb-2 font-bold">⚡ Resource Estimate</div>
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+                <div>
+                    <span class="text-slate-500">Per-Gen Time:</span>
+                    <strong id="ga-est-pergen" class="text-sky-400 ml-1">--</strong>
+                </div>
+                <div>
+                    <span class="text-slate-500">Total Time:</span>
+                    <strong id="ga-est-total" class="text-sky-400 ml-1">--</strong>
+                </div>
+                <div>
+                    <span class="text-slate-500">Est. Memory:</span>
+                    <strong id="ga-est-memory" class="text-sky-400 ml-1">--</strong>
+                </div>
+                <div>
+                    <span class="text-slate-500">WF Windows:</span>
+                    <strong id="ga-est-wf-windows" class="text-amber-400 ml-1">--</strong>
+                </div>
+            </div>
+            <div id="ga-est-warning" class="hidden mt-2 text-xs text-amber-400 bg-amber-900/20 rounded px-2 py-1"></div>
+        </div>
+
+        <div class="flex gap-2 mt-2">
+            <button onclick="startGA()" id="ga-start-btn"
+                    class="bg-emerald-600 hover:bg-emerald-500 text-white px-6 py-2 rounded text-sm font-bold">
+                {{ _("Start Evolution") }}
+            </button>
+            <button onclick="stopGA()" id="ga-stop-btn"
+                    class="bg-red-600 hover:bg-red-500 text-white px-6 py-2 rounded text-sm font-bold hidden">
+                {{ _("Stop") }}
+            </button>
+            <button onclick="resumeGA()" id="ga-resume-btn"
+                    class="bg-amber-600 hover:bg-amber-500 text-white px-6 py-2 rounded text-sm font-bold hidden">
+                {{ _("Resume") }}
+            </button>
+            <span id="ga-status-text" class="text-sm text-slate-400 self-center"></span>
+        </div>
+    </div>
+
+    <!-- Error -->
+    <div id="ga-error" class="hidden bg-red-900/30 border border-red-600 rounded p-3 text-red-400 text-sm mb-3"></div>
+
+    <!-- Progress (hidden until started) -->
+    <div id="ga-progress" class="hidden mb-4">
+        <div class="flex justify-between text-xs text-slate-400 mb-1">
+            <span id="ga-phase-text">{{ _("Initializing population...") }}</span>
+            <span id="ga-step-text">0 / 0</span>
+        </div>
+        <!-- Double progress bar: intra-gen (thin) + generation (thick) -->
+        <div class="w-full bg-slate-700 rounded-full h-2 mb-1 overflow-hidden">
+            <div id="ga-eval-fill" class="bg-sky-400 h-2 rounded-full transition-all duration-300" style="width:0%"></div>
+        </div>
+        <div class="flex justify-between text-xs text-slate-500 mb-1">
+            <span id="ga-eval-text">{{ _("Evaluating...") }}</span>
+            <span id="ga-eta-text">ETA: --</span>
+        </div>
+        <div class="w-full bg-slate-700 rounded-full h-4 mb-2 overflow-hidden">
+            <div id="ga-progress-fill" class="bg-emerald-500 h-4 rounded-full transition-all duration-500" style="width:0%"></div>
+        </div>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs text-slate-400">
+            <span>{{ _("Generation") }}: <strong id="ga-gen" class="text-slate-300">-</strong></span>
+            <span>{{ _("Best Fitness") }}: <strong id="ga-fitness" class="text-emerald-400">-</strong></span>
+            <span>Sharpe: <strong id="ga-sharpe" class="text-slate-300">-</strong></span>
+            <span>Win Rate: <strong id="ga-winrate" class="text-slate-300">-</strong></span>
+        </div>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs text-slate-400 mt-1">
+            <span>Trades: <strong id="ga-trades" class="text-slate-300">-</strong></span>
+            <span>{{ _("Avg Fitness") }}: <strong id="ga-avg-fit" class="text-slate-300">-</strong></span>
+            <span>{{ _("Diversity") }}: <strong id="ga-diversity" class="text-slate-300">-</strong></span>
+            <span>{{ _("Elapsed") }}: <strong id="ga-elapsed" class="text-slate-300">-</strong></span>
+        </div>
+    </div>
+
+    <!-- Champion -->
+    <div id="ga-champion" class="hidden bg-emerald-900/30 border border-emerald-600 rounded p-4">
+        <h4 class="text-emerald-400 font-bold mb-2">{{ _("Champion Strategy") }}</h4>
+        <div id="ga-champion-info" class="text-sm text-slate-300"></div>
+        <button onclick="loadStrategyFromGA()" class="mt-2 bg-sky-600 hover:bg-sky-500 text-white px-3 py-1 rounded text-xs">
+            {{ _("Load in Editor") }}
+        </button>
+    </div>
+</div>
+
+<script>
+var _gaPollTimer = null;
+var _gaTickTimer = null;
+var _gaStartTime = 0;
+var _gaOverallPct = 0;
+var _gaElapsed = 0;
+
+// ── Client-side clock — always ticks even if poll is slow ──
+function startTickTimer() {
+    if (_gaTickTimer) clearInterval(_gaTickTimer);
+    _gaTickTimer = setInterval(function() {
+        if (_gaStartTime > 0) {
+            _gaElapsed = Math.round((Date.now() - _gaStartTime) / 1000);
+            var mins = Math.floor(_gaElapsed / 60);
+            var secs = Math.round(_gaElapsed % 60);
+            var el = document.getElementById('ga-elapsed');
+            if (el) el.textContent = mins + 'm ' + secs + 's';
+            // Update ETA
+            var eta = document.getElementById('ga-eta-text');
+            if (eta && _gaOverallPct > 0 && _gaOverallPct < 100) {
+                var totalEst = _gaElapsed / (_gaOverallPct / 100);
+                var rem = totalEst - _gaElapsed;
+                var rm = Math.floor(rem / 60);
+                var rs = Math.round(rem % 60);
+                eta.textContent = 'ETA: ' + (rm > 0 ? rm + 'm ' : '') + rs + 's';
+            }
+        }
+    }, 1000);
+}
+
+function stopTickTimer() {
+    if (_gaTickTimer) { clearInterval(_gaTickTimer); _gaTickTimer = null; }
+}
+
+// ── Resource Estimation ──
+var EST_BASE_OVERHEAD = 15;      // seconds: data load + engine init per process
+var EST_PER_STRATEGY = 6.8;      // seconds per strategy evaluation
+var EST_MEM_PER_PROCESS = 650;   // MB per process
+
+function formatDuration(totalSec) {
+    if (totalSec < 60) return Math.round(totalSec) + 's';
+    if (totalSec < 3600) {
+        var m = Math.floor(totalSec / 60);
+        var s = Math.round(totalSec % 60);
+        return m + 'm ' + s + 's';
+    }
+    var h = Math.floor(totalSec / 3600);
+    var m = Math.floor((totalSec % 3600) / 60);
+    return h + 'h ' + m + 'm';
+}
+
+function updateResourceEstimate() {
+    var popSize = parseInt(document.getElementById('ga-pop-size').value) || 30;
+    var generations = parseInt(document.getElementById('ga-generations').value) || 15;
+    var workers = parseInt(document.getElementById('ga-workers').value) || 4;
+
+    var startDate = new Date(document.getElementById('ga-date-start').value);
+    var endDate = new Date(document.getElementById('ga-date-end').value);
+    var monthsDiff = (endDate.getFullYear() - startDate.getFullYear()) * 12
+                   + (endDate.getMonth() - startDate.getMonth());
+    if (monthsDiff < 1) monthsDiff = 1;
+
+    // Clamp workers
+    workers = Math.max(1, Math.min(workers, 16));
+
+    // Per-generation time (scaled by date range months)
+    var strategiesPerWorker = Math.ceil(popSize / workers);
+    var timePerGen = (EST_BASE_OVERHEAD + EST_PER_STRATEGY * strategiesPerWorker) * monthsDiff;
+    var totalTime = timePerGen * generations;
+
+    // Memory
+    var totalMemMB = workers * EST_MEM_PER_PROCESS;
+    var totalMemGB = totalMemMB / 1024;
+
+    // WF windows
+    var trainMo = parseInt(document.getElementById('ga-wf-train-mo').value) || 6;
+    var stepMo = parseInt(document.getElementById('ga-wf-step-mo').value) || 1;
+    var wfWindows = Math.max(0, Math.floor((monthsDiff - trainMo) / stepMo));
+    var wfTotalTime = totalTime * Math.max(wfWindows, 1);
+
+    // Update display
+    var perGenEl = document.getElementById('ga-est-pergen');
+    var totalEl = document.getElementById('ga-est-total');
+    var memEl = document.getElementById('ga-est-memory');
+    var wfWinEl = document.getElementById('ga-est-wf-windows');
+    var warningEl = document.getElementById('ga-est-warning');
+
+    var isWF = document.getElementById('ga-wf-enabled').checked;
+
+    if (perGenEl) perGenEl.textContent = formatDuration(timePerGen);
+    if (totalEl) totalEl.textContent = formatDuration(isWF ? wfTotalTime : totalTime);
+    if (memEl) memEl.textContent = totalMemGB.toFixed(1) + ' GB';
+    if (wfWinEl) wfWinEl.textContent = isWF ? wfWindows : '--';
+
+    // Warnings
+    if (warningEl) {
+        var warnings = [];
+        if (totalMemMB > 16000) {
+            warnings.push('High memory! Reduce workers.');
+        }
+        if (workers > 8 && popSize < workers * 5) {
+            warnings.push('Many workers for small population — diminishing returns.');
+        }
+        if (isWF && wfTotalTime > 7200) {
+            warnings.push('Long WF run (' + formatDuration(wfTotalTime) + '). Consider narrowing date range.');
+        }
+        if (wfWindows <= 0 && isWF) {
+            warnings.push('Date range too short for WF — need at least ' + (trainMo + 1) + ' months.');
+        }
+        if (warnings.length > 0) {
+            warningEl.classList.remove('hidden');
+            warningEl.innerHTML = warnings.join('<br>');
+        } else {
+            warningEl.classList.add('hidden');
+        }
+    }
+}
+
+function startGA() {
+    var btn = document.getElementById('ga-start-btn');
+    var errorDiv = document.getElementById('ga-error');
+    btn.disabled = true;
+    btn.textContent = '{{ _("Starting...") }}';
+    errorDiv.classList.add('hidden');
+
+    // Lock all inputs while running
+    setInputsLocked(true);
+
+    _gaStartTime = Date.now();
+    _gaOverallPct = 0;
+    startTickTimer();
+
+    var isWF = document.getElementById('ga-wf-enabled').checked;
+    var endpoint = isWF ? '/api/ga/walkforward' : '/api/ga/evolve';
+    var pollFn = isWF ? pollWFStatus : pollGAStatus;
+    var body = {
+        symbols: ['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT'],
+        date_start: document.getElementById('ga-date-start').value,
+        date_end: document.getElementById('ga-date-end').value,
+        validation_start: isWF ? null : (document.getElementById('ga-val-start').value || null),
+        population_size: parseInt(document.getElementById('ga-pop-size').value) || 30,
+        generations: parseInt(document.getElementById('ga-generations').value) || 15,
+        max_workers: parseInt(document.getElementById('ga-workers').value) || 4,
+        seed_strategies: ['mean_reversion_rsi_bollinger_bands'],
+        cost_enabled: true,
+        taker_fee_pct: parseFloat(document.getElementById('ga-cost-fee').value) || 0.04,
+        spread_pct: {
+            BTCUSDT: parseFloat(document.getElementById('ga-spread-btc').value) || 0.01,
+            ETHUSDT: parseFloat(document.getElementById('ga-spread-eth').value) || 0.02,
+            BNBUSDT: parseFloat(document.getElementById('ga-spread-bnb').value) || 0.03,
+            SOLUSDT: parseFloat(document.getElementById('ga-spread-sol').value) || 0.03,
+            XRPUSDT: parseFloat(document.getElementById('ga-spread-xrp').value) || 0.04,
+        },
+    };
+    if (isWF) {
+        body.train_months = parseInt(document.getElementById('ga-wf-train-mo').value) || 6;
+        body.val_months = parseInt(document.getElementById('ga-wf-val-mo').value) || 1;
+        body.step_months = parseInt(document.getElementById('ga-wf-step-mo').value) || 1;
+    }
+    fetch(endpoint, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        credentials: 'same-origin',
+        body: JSON.stringify(body)
+    }).then(function(r) {
+        if (!r.ok) {
+            return r.json().then(function(d) { throw new Error(d.error || 'HTTP ' + r.status); });
+        }
+        return r.json();
+    }).then(function(data) {
+        if (data.ok) {
+            document.getElementById('ga-start-btn').classList.add('hidden');
+            document.getElementById('ga-stop-btn').classList.remove('hidden');
+            document.getElementById('ga-progress').classList.remove('hidden');
+            document.getElementById('ga-champion').classList.add('hidden');
+            document.getElementById('ga-phase-text').textContent = isWF ? '{{ _("Walk-Forward starting...") }}' : '{{ _("Evaluating generation 1...") }}';
+            _gaPollTimer = setInterval(pollFn, 2000);
+            pollFn();
+        } else {
+            showError(data.error || '{{ _("Unknown error") }}');
+            btn.disabled = false;
+            btn.textContent = '{{ _("Start Evolution") }}';
+        }
+    }).catch(function(err) {
+        showError(err.message || '{{ _("Connection failed") }}');
+        btn.disabled = false;
+        btn.textContent = '{{ _("Start Evolution") }}';
+    });
+}
+
+function toggleWFConfig() {
+    var wf = document.getElementById('ga-wf-enabled');
+    if (!wf) return;
+    var checked = wf.checked;
+    document.getElementById('ga-wf-config').style.display = checked ? '' : 'none';
+    document.getElementById('ga-val-start').parentElement.parentElement.style.display = checked ? 'none' : '';
+}
+
+// ── Lock/unlock all GA inputs when job is running ──
+var _gaInputIds = ['ga-pop-size', 'ga-generations', 'ga-workers', 'ga-date-start', 'ga-date-end',
+    'ga-val-start', 'ga-wf-enabled', 'ga-wf-train-mo', 'ga-wf-val-mo', 'ga-wf-step-mo',
+    'ga-cost-fee', 'ga-spread-btc', 'ga-spread-eth', 'ga-spread-bnb', 'ga-spread-sol', 'ga-spread-xrp'];
+
+function setInputsLocked(locked) {
+    _gaInputIds.forEach(function(id) {
+        var el = document.getElementById(id);
+        if (el) el.disabled = locked;
+    });
+}
+
+function restoreParams(params) {
+    if (!params) return;
+    if (params.date_start) document.getElementById('ga-date-start').value = params.date_start;
+    if (params.date_end) document.getElementById('ga-date-end').value = params.date_end;
+    if (params.population_size) document.getElementById('ga-pop-size').value = params.population_size;
+    if (params.generations) document.getElementById('ga-generations').value = params.generations;
+    if (params.max_workers) document.getElementById('ga-workers').value = params.max_workers;
+    if (params.mode === 'walkforward') {
+        document.getElementById('ga-wf-enabled').checked = true;
+        toggleWFConfig();
+        if (params.train_months) document.getElementById('ga-wf-train-mo').value = params.train_months;
+        if (params.val_months) document.getElementById('ga-wf-val-mo').value = params.val_months;
+        if (params.step_months) document.getElementById('ga-wf-step-mo').value = params.step_months;
+        document.getElementById('ga-val-start').parentElement.parentElement.style.display = 'none';
+    } else {
+        document.getElementById('ga-wf-enabled').checked = false;
+        toggleWFConfig();
+        if (params.validation_start) document.getElementById('ga-val-start').value = params.validation_start;
+    }
+}
+
+function showError(msg) {
+    var errorDiv = document.getElementById('ga-error');
+    errorDiv.classList.remove('hidden');
+    errorDiv.textContent = '{{ _("Error") }}: ' + msg;
+}
+
+function stopGA() {
+    document.getElementById('ga-stop-btn').disabled = true;
+    document.getElementById('ga-stop-btn').textContent = '{{ _("Stopping...") }}';
+    document.getElementById('ga-phase-text').textContent = '{{ _("Stopping after current generation...") }}';
+    fetch('/api/ga/stop', {method: 'POST', credentials: 'same-origin'}).then(function() {
+        // Will complete after current generation finishes
+    }).catch(function() { resetUI(); });
+}
+
+function resumeGA() {
+    var btn = document.getElementById('ga-resume-btn');
+    btn.disabled = true;
+    btn.textContent = '{{ _("Resuming...") }}';
+    fetch('/api/ga/evolve', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        credentials: 'same-origin',
+        body: JSON.stringify({
+            symbols: ['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT'],
+            date_start: document.getElementById('ga-date-start').value,
+            date_end: document.getElementById('ga-date-end').value,
+            validation_start: document.getElementById('ga-val-start').value || null,
+            population_size: parseInt(document.getElementById('ga-pop-size').value) || 30,
+            generations: parseInt(document.getElementById('ga-generations').value) || 15,
+            max_workers: parseInt(document.getElementById('ga-workers').value) || 4,
+            seed_strategies: ['mean_reversion_rsi_bollinger_bands'],
+            resume: true,
+            cost_enabled: true,
+            taker_fee_pct: parseFloat(document.getElementById('ga-cost-fee').value) || 0.04,
+            spread_pct: {
+                BTCUSDT: parseFloat(document.getElementById('ga-spread-btc').value) || 0.01,
+                ETHUSDT: parseFloat(document.getElementById('ga-spread-eth').value) || 0.02,
+                BNBUSDT: parseFloat(document.getElementById('ga-spread-bnb').value) || 0.03,
+                SOLUSDT: parseFloat(document.getElementById('ga-spread-sol').value) || 0.03,
+                XRPUSDT: parseFloat(document.getElementById('ga-spread-xrp').value) || 0.04,
+            },
+        })
+    }).then(function(r) { return r.json(); }).then(function(data) {
+        if (data.ok) {
+            document.getElementById('ga-start-btn').classList.add('hidden');
+            document.getElementById('ga-resume-btn').classList.add('hidden');
+            document.getElementById('ga-stop-btn').classList.remove('hidden');
+            document.getElementById('ga-stop-btn').disabled = false;
+            document.getElementById('ga-stop-btn').textContent = '{{ _("Stop") }}';
+            document.getElementById('ga-progress').classList.remove('hidden');
+            document.getElementById('ga-champion').classList.add('hidden');
+            _gaStartTime = Date.now();
+            startTickTimer();
+            _gaPollTimer = setInterval(pollGAStatus, 2000);
+            pollGAStatus();
+        }
+    }).catch(function(err) {
+        btn.disabled = false;
+        btn.textContent = '{{ _("Resume") }}';
+        showError(err.message);
+    });
+}
+
+function resetUI() {
+    clearInterval(_gaPollTimer);
+    stopTickTimer();
+    setInputsLocked(false);
+    document.getElementById('ga-start-btn').classList.remove('hidden');
+    document.getElementById('ga-start-btn').disabled = false;
+    document.getElementById('ga-start-btn').textContent = '{{ _("Start Evolution") }}';
+    document.getElementById('ga-stop-btn').classList.add('hidden');
+}
+
+function pollGAStatus() {
+    fetch('/api/ga/status', {credentials: 'same-origin'}).then(function(r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+    }).then(function(s) {
+        if (!s || s.error) {
+            showError(s && s.error ? s.error : '{{ _("No data") }}');
+            resetUI();
+            return;
+        }
+
+        var running = s.running;
+        var gen = s.generation || 0;
+        var total = s.total_generations || 1;
+
+        // ── Compute detailed progress ──
+        // Generation progress (0-100%) + intra-generation evaluation progress
+        var genPct = total > 0 ? (gen / total * 100) : 0;
+
+        // Intra-gen: how many chromosomes evaluated in current gen?
+        var evalDone = s.eval_completed || 0;
+        var evalTotal = s.eval_total || s.population_size || 30;
+        var evalPct = evalTotal > 0 ? Math.round(evalDone / evalTotal * 100) : 0;
+
+        // Overall progress: blend gen-level and intra-gen
+        _gaOverallPct = genPct + (evalPct / total);
+        _gaOverallPct = Math.min(_gaOverallPct, 100);
+        if (!running && gen > 0) _gaOverallPct = 100;
+
+        document.getElementById('ga-progress-fill').style.width = _gaOverallPct + '%';
+        document.getElementById('ga-eval-fill').style.width = evalPct + '%';
+        document.getElementById('ga-gen').textContent = gen + ' / ' + total;
+
+        if (running) {
+            var phase = s.phase || 'evolving';
+            if (phase === 'init') {
+                document.getElementById('ga-phase-text').textContent = '{{ _("Initializing population...") }}';
+            } else {
+                document.getElementById('ga-phase-text').textContent =
+                    '{{ _("Gen") }} ' + gen + '/' + total + ' ' + '{{ _("evaluating") }} ' + evalDone + '/' + evalTotal;
+            }
+        } else if (gen > 0) {
+            if (s.stopped) {
+                document.getElementById('ga-phase-text').textContent = '{{ _("Stopped") }} — Gen ' + gen + '/' + total;
+                document.getElementById('ga-status-text').textContent = '{{ _("Checkpoint saved, can resume") }}';
+            } else {
+                document.getElementById('ga-phase-text').textContent = '{{ _("Complete") }}';
+                document.getElementById('ga-status-text').textContent = '{{ _("Evolution finished") }}';
+            }
+            clearInterval(_gaPollTimer);
+            resetUI();
+            if (s.resumable) {
+                document.getElementById('ga-resume-btn').classList.remove('hidden');
+            }
+        } else {
+            document.getElementById('ga-phase-text').textContent = '{{ _("Initializing population...") }}';
+        }
+
+        document.getElementById('ga-eval-text').textContent =
+            '{{ _("Evaluating chromosomes") }}: ' + evalDone + ' / ' + evalTotal;
+        document.getElementById('ga-step-text').textContent = _gaOverallPct.toFixed(1) + '%';
+
+        // ── ETA is handled by tick timer (always ticking) ──
+        if (_gaOverallPct >= 100) {
+            document.getElementById('ga-eta-text').textContent = '';
+        }
+
+        if (s.champion_name) {
+            document.getElementById('ga-champion').classList.remove('hidden');
+            var info = '<strong>' + s.champion_name + '</strong><br>';
+            info += '<div class=\'grid grid-cols-1 sm:grid-cols-2 gap-2 mt-1\'>';
+            info += '<div><span class=\'text-slate-400\'>Train Sharpe:</span> ' + (s.best_sharpe || 0).toFixed(2) + '</div>';
+            info += '<div><span class=\'text-slate-400\'>Train Win Rate:</span> ' + (s.best_win_rate || 0).toFixed(1) + '%</div>';
+
+            if (s.validation) {
+                var v = s.validation;
+                var valSharpe = v.sharpe || 0;
+                var trainSharpe = s.best_sharpe || 0;
+                var drop = trainSharpe > 0 ? Math.round((1 - valSharpe / trainSharpe) * 100) : 0;
+                var color = drop < 20 ? 'text-emerald-400' : (drop < 50 ? 'text-yellow-400' : 'text-red-400');
+                info += '<div><span class=\'text-slate-400\'>Val Sharpe:</span> <span class=\'' + color + '\'>' + valSharpe.toFixed(2) + '</span></div>';
+                info += '<div><span class=\'text-slate-400\'>Val Win Rate:</span> ' + (v.win_rate || 0).toFixed(1) + '%</div>';
+
+                if (s.dsr) {
+                    var dsr = s.dsr;
+                    var sigColor = dsr.significant ? 'text-emerald-400' : 'text-red-400';
+                    info += '<div class=\'col-span-2 mt-1\'>';
+                    info += '<span class=\'text-slate-400\'>DSR:</span> <span class=\'' + sigColor + '\'>' + (dsr.dsr || 0).toFixed(3) + '</span>';
+                    info += ' <span class=\'text-xs text-slate-500\'>(' + (dsr.significant ? 'significant' : 'NOT significant') + ', p=' + (dsr.p_value || 1).toFixed(3) + ')</span>';
+                    info += '</div>';
+                }
+            }
+            info += '</div>';
+            document.getElementById('ga-champion-info').innerHTML = info;
+        }
+
+        if (s.error) {
+            showError(s.error);
+            resetUI();
+        }
+    }).catch(function(err) {
+        // Polling failed silently - will retry on next interval
+        console.log('GA poll error:', err);
+    });
+}
+
+function loadStrategyFromGA() {
+    fetch('/api/ga/status', {credentials: 'same-origin'}).then(function(r) { return r.json(); }).then(function(s) {
+        if (s.champion_name) {
+            location.reload();
+        }
+    });
+}
+
+// ── Auto-reconnect on page load ──
+(function() {
+    // Check both GA and WF status
+    Promise.all([
+        fetch('/api/ga/status', {credentials: 'same-origin'}).then(function(r) { return r.json(); }).catch(function() { return null; }),
+        fetch('/api/ga/wf_status', {credentials: 'same-origin'}).then(function(r) { return r.json(); }).catch(function() { return null; })
+    ]).then(function(results) {
+        var gaState = results[0];
+        var wfState = results[1];
+
+        // ── WF reconnection ──
+        if (wfState && wfState.running) {
+            restoreParams(wfState.params);
+            setInputsLocked(true);
+            document.getElementById('ga-start-btn').classList.add('hidden');
+            document.getElementById('ga-stop-btn').classList.remove('hidden');
+            document.getElementById('ga-progress').classList.remove('hidden');
+            document.getElementById('ga-champion').classList.add('hidden');
+            document.getElementById('ga-phase-text').textContent = '{{ _("Reconnected to Walk-Forward...") }}';
+            _gaStartTime = (wfState.started || (Date.now()/1000 - (wfState.elapsed_seconds || 0))) * 1000;
+            _gaOverallPct = 0;
+            startTickTimer();
+            _gaPollTimer = setInterval(pollWFStatus, 2000);
+            pollWFStatus();
+            return;
+        }
+
+        // ── Regular GA reconnection ──
+        if (gaState) {
+            // Show previous champion
+            if (gaState.champion_name) {
+                document.getElementById('ga-champion').classList.remove('hidden');
+                document.getElementById('ga-champion-info').innerHTML =
+                    '<strong>' + gaState.champion_name + '</strong><br>' +
+                    'Fitness: ' + (gaState.best_fitness || 0).toFixed(2) +
+                    ' | Sharpe: ' + (gaState.best_sharpe || 0).toFixed(2) +
+                    ' | Win Rate: ' + (gaState.best_win_rate || 0).toFixed(1) + '%';
+            }
+
+            if (gaState.running) {
+                restoreParams(gaState.params);
+                setInputsLocked(true);
+                document.getElementById('ga-start-btn').classList.add('hidden');
+                document.getElementById('ga-stop-btn').classList.remove('hidden');
+                document.getElementById('ga-progress').classList.remove('hidden');
+                document.getElementById('ga-champion').classList.add('hidden');
+                document.getElementById('ga-phase-text').textContent = '{{ _("Reconnected to running evolution...") }}';
+                _gaStartTime = (gaState.started || (Date.now()/1000 - (gaState.elapsed_seconds || 0))) * 1000;
+                _gaOverallPct = 0;
+                startTickTimer();
+                _gaPollTimer = setInterval(pollGAStatus, 2000);
+                pollGAStatus();
+            }
+        }
+    }).catch(function() { /* server not ready yet */ });
+    // Initial resource estimate
+    updateResourceEstimate();
+})();
+
+function pollWFStatus() {
+    fetch('/api/ga/wf_status', {credentials: 'same-origin'}).then(function(r) {
+        return r.json();
+    }).then(function(s) {
+        if (!s.running) {
+            clearInterval(_gaPollTimer); _gaPollTimer = null;
+            stopTickTimer();
+            setInputsLocked(false);
+            document.getElementById('ga-stop-btn').classList.add('hidden');
+            document.getElementById('ga-start-btn').classList.remove('hidden');
+            document.getElementById('ga-start-btn').disabled = false;
+            document.getElementById('ga-start-btn').textContent = '{{ _("Start Evolution") }}';
+            if (s.report) {
+                var rpt = s.report;
+                document.getElementById('ga-champion').classList.remove('hidden');
+                document.getElementById('ga-champion-info').innerHTML =
+                    '<strong>{{ _("Walk-Forward Complete") }}</strong><br>' +
+                    'WF Efficiency: ' + (rpt.wf_efficiency || 0).toFixed(2) +
+                    ' | Mean Val Sharpe: ' + (rpt.mean_val_sharpe || 0).toFixed(2) +
+                    ' | +Win%: ' + (rpt.positive_window_pct || 0).toFixed(0) + '%' +
+                    ' | Best: ' + (rpt.best_val_sharpe || 0).toFixed(2);
+            } else if (s.error) {
+                showError(s.error);
+            }
+            document.getElementById('ga-phase-text').textContent = s.error ? '{{ _("WF failed") }}' : '{{ _("WF complete") }}';
+            document.getElementById('ga-progress-fill').style.width = '100%';
+            return;
+        }
+        var cur = s.current_window || 0;
+        var tot = s.total_windows || 0;
+        var pct = tot > 0 ? (cur / tot * 100) : 0;
+        document.getElementById('ga-progress-fill').style.width = pct.toFixed(0) + '%';
+        document.getElementById('ga-phase-text').textContent =
+            'WF Window ' + cur + '/' + tot + ' (' + (s.phase || 'running') + ')';
+        document.getElementById('ga-step-text').textContent =
+            'Window ' + cur + '/' + tot;
+    }).catch(function() { /* server not ready yet */ });
+}
+</script>

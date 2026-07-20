@@ -1,0 +1,91 @@
+id,round,severity,module,file,title,priority
+R1-001,R1,Critical,Strategy,core/strategy/indicators.py:134,pd.eval() 代码注入可执行任意 Python,P0
+R1-002,R1,High,Strategy,core/strategy/indicators.py:51,多处除零无保护(bollinger_width/volume_ratio/atr_ratio),P1
+R1-003,R1,High,Strategy,core/strategy/engine.py:166,多时间框架_TF_MIN映射不完整+偏差阈值硬编码,P2
+R1-004,R1,High,Strategy,core/strategy/engine.py:288,Reduce counter key不含策略名-跨策略干扰,P2
+R1-005,R1,High,Strategy,core/strategy/engine.py:393,直接访问私有属性_watched_symbols,P2
+R1-006,R1,Medium,Strategy,core/strategy/engine.py:118,多空信号冲突静默丢弃无告警,P3
+R1-007,R1,Medium,Strategy,core/strategy/engine.py:200,Exit signal在无executor时静默忽略,P3
+R1-008,R1,Medium,EventBus,app/event_bus.py:57,EventBus队列满阻塞所有生产者,P3
+R1-009,R1,Medium,EventBus,app/event_bus.py:47,subscribe_all致高频事件触发所有告警规则,P3
+R1-010,R1,Medium,Strategy,core/strategy/loader.py:61,load_all单文件失败致全量加载失败,P3
+R1-011,R1,Low,Strategy,core/strategy/indicators.py:87,STOCH slowk_period/slowd_period硬编码为3,P3
+R1-012,R1,Low,Strategy,core/strategy/indicators.py:93,OBV SMA周期硬编码为20忽略用户配置,P3
+R1-013,R1,Low,Strategy,core/strategy/loader.py:71,策略保存无同名冲突检测,P3
+R2-001,R2,Critical,Risk,core/risk/circuit_breaker.py:48,回撤从peak_equity计算跨日未重置时误触发,P0
+R2-002,R2,High,Risk,core/risk/manager.py:113,Total Exposure使用entry_price而非current_price,P2
+R2-003,R2,High,Risk,core/risk/manager.py:58,_pending_signals无超时清理机制永久阻止交易,P1
+R2-004,R2,High,Risk,core/risk/manager.py:142,Max Open Trades使用本地缓存非executor实时数据,P2
+R2-005,R2,Medium,Risk,core/risk/circuit_breaker.py:33,add_trade_result浮点舍入致连续亏损计数偏差,P3
+R2-006,R2,Medium,Risk,core/risk/circuit_breaker.py:69,is_new_trip仅基于reason字符串去重,P3
+R2-007,R2,Medium,Risk,core/risk/manager.py:182,update_balance中invested与balance时序不一致,P3
+R2-008,R2,Low,Risk,core/risk/manager.py:106,_trip_callback异常处理仅记录日志,P3
+R2-009,R2,Low,Risk,core/risk/circuit_breaker.py:41,consecutive_losses被单笔盈利重置可被规避,P3
+R3-001,R3,Critical,Risk,core/risk/position_guard.py:108,止损设置但从未enforce-无代码检查价格触发止损,P0
+R3-002,R3,Critical,Risk,core/risk/position_sizer.py:20,soft position_size_pct floor 1%覆盖AI降仓位意图,P0
+R3-003,R3,High,Risk,core/risk/position_sizer.py:25,quantity无最小notional检查和取整,P2
+R3-004,R3,Medium,Risk,core/risk/position_guard.py:15,15秒检查间隔可能在闪崩中错过止损,P3
+R3-005,R3,Medium,Risk,core/risk/position_sizer.py:12,capital_pool使用总余额而非可用余额,P3
+R3-006,R3,Low,Risk,core/risk/position_guard.py:140,trailing stop 0.01更新阈值硬编码魔法数字,P3
+R4-001,R4,Critical,Executor,db/database.py:263,atomic_adjust_balance非真正原子-读写分离DB连接,P0
+R4-002,R4,High,Executor,core/executor/executor.py:79,order_id使用毫秒时间戳同毫秒并发碰撞,P2
+R4-003,R4,High,Executor,core/executor/executor.py:101,_execute_sim直接覆盖同symbol已有仓位,P1
+R4-004,R4,High,Executor,core/executor/executor.py:244,close_position PNL计算不含手续费-模拟与实盘不一致,P1
+R4-005,R4,Medium,Executor,app/main.py:117,exit/reduce handler中PNL+invested使用快照数据,P3
+R4-006,R4,Medium,Executor,core/executor/executor.py:38,restore_positions恢复的仓位无止损/止盈参数,P3
+R4-007,R4,Medium,Executor,core/executor/executor.py:174,_execute_live中order[price]可能为0,P3
+R4-008,R4,Medium,Executor,core/executor/executor.py:158,实盘下单失败后无余额回滚逻辑,P3
+R4-009,R4,Low,Executor,app/main.py:350,遗留仓位处理仅对初始余额判断,P3
+R5-001,R5,High,MarketData,core/market_data/provider.py:157,价格缓存在isFinal检查之前更新,P1
+R5-002,R5,High,MarketData,core/market_data/provider.py:143,固定5秒重连延迟无指数退避,P2
+R5-003,R5,Medium,MarketData,core/market_data/provider.py:278,REST降级与WS的K线可能重复发布,P3
+R5-004,R5,Medium,MarketData,core/market_data/ohlcv_cache.py,缓存无LRU淘汰长时间运行内存无限增长,P3
+R5-005,R5,Medium,MarketData,core/market_data/provider.py:73,_prefetch_history跳过已缓存但忽略增量更新,P3
+R5-006,R5,Medium,MarketData,core/market_data/provider.py:82,_prefetch_history多批次请求无容量限制,P3
+R5-007,R5,Low,MarketData,core/market_data/provider.py:204,_price_history每秒重建列表O(n)效率低,P3
+R5-008,R5,Low,MarketData,core/market_data/provider.py:242,get_current_price可能返回过时价格无TTL,P3
+R6-001,R6,Critical,Backtest,core/backtest/engine.py:844,回测入口条件AND逻辑实盘OR逻辑-结果不可比,P0
+R6-002,R6,High,Backtest,core/backtest/engine.py:540,ML准确率追踪使用未来数据-前瞻偏差,P1
+R6-003,R6,High,Backtest,core/backtest/event_executor.py:244,Hybrid executor仓位计算不使用strategy.risk_exit,P2
+R6-004,R6,Medium,Backtest,core/backtest/engine.py:806,dominant_regime假设BTCUSDT始终在symbols中,P3
+R6-005,R6,Medium,Backtest,core/backtest/metrics.py:47,Win/Loss分类基于未扣费PNL-0 PNL被遗漏,P3
+R6-006,R6,Medium,Backtest,core/backtest/signal_matrix.py:58,JSON序列化float可能导致hash不一致,P3
+R6-007,R6,Medium,Backtest,core/backtest/engine.py:165,Hybrid引擎失败静默fallback无告警,P3
+R6-008,R6,Low,Backtest,core/backtest/engine.py:926,Kelly-lite固定1%风险预算与可配置值不一致,P3
+R6-009,R6,Low,Backtest,core/backtest/event_executor.py:251,Hybrid executor sl_dist硬编码0.02忽略配置,P3
+R7-001,R7,Critical,AI,core/ai/deepseek_ctl.py:268,AI full_auto可设置position_size_pct无上限,P0
+R7-002,R7,High,AI,core/ai/deepseek_ctl.py:283,API调用bare except吞没所有异常,P1
+R7-003,R7,High,AI,core/ai/deepseek_ctl.py:225,AI返回signal_weights无范围验证直接应用,P1
+R7-004,R7,High,AI,core/ai/deepseek_ctl.py:101,breaker决策15s超时fallback到close_all过于激进,P1
+R7-005,R7,Medium,AI,core/ai/deepseek_ctl.py:109,JSON解析使用strip+removeprefix链脆弱可绕过,P3
+R7-006,R7,Medium,AI,core/ai/deepseek_ctl.py:309,_build_market_context拼接不可信字段到prompt,P3
+R7-007,R7,Medium,AI,core/ai/deepseek_ctl.py:98,Prompt模板使用.format()花括号异常风险,P3
+R7-008,R7,Low,AI,core/ai/deepseek_ctl.py:83,Context构建裸except吞价格获取失败,P3
+R7-009,R7,Low,AI,core/ai/strategy_lifecycle.py,AI生成策略部署前无强制回测验证,P3
+R8-001,R8,Critical,Auth,core/auth/auth.py:42,JWT secret每次启动随机生成-所有token重启失效,P1
+R8-002,R8,High,Auth,web/server.py:175,WebSocket /ws/路径无认证,P1
+R8-003,R8,High,Auth,core/auth/auth.py:57,Session token存储于内存dict重启丢失,P1
+R8-004,R8,High,Auth,web/server.py:121,登录端点无限速可暴力破解,P2
+R8-005,R8,Medium,Auth,core/auth/auth.py:211,初始admin密码打印到stderr可能被日志持久化,P3
+R8-006,R8,Medium,Auth,core/auth/auth.py:35,bcrypt无pepper仅依赖salt防护,P3
+R8-007,R8,Medium,Auth,web/server.py,部分API端点trader权限检查覆盖不完整,P3
+R8-008,R8,Medium,Auth,web/server.py:147,Cookie secure=False生产环境风险,P3
+R8-009,R8,Low,Auth,core/auth/auth.py:38,bcrypt work factor未显式配置,P3
+R8-010,R8,Low,Auth,web/server.py,Jinja2模板autoescape需确认启用,P3
+R9-001,R9,Critical,DB,db/database.py:263,余额非事务性操作DB异常可丢失状态,P0
+R9-002,R9,High,DB,db/database.py:20,Schema迁移bare except+无版本化静默失败,P2
+R9-003,R9,High,Config,app/config.py:65,secrets.yaml无文件权限检查,P2
+R9-004,R9,Medium,Alerts,alerts/manager.py:28,每个事件评估所有规则无事件类型预过滤,P3
+R9-005,R9,Medium,Alerts,alerts/manager.py:89,WebSocket广播put_nowait丢弃客户端无感知,P3
+R9-006,R9,Medium,Config,app/config.py:46,Config单例模式运行时修改无锁保护,P3
+R9-007,R9,Low,Alerts,alerts/manager.py:119,LIKE查询使用字符串拼接构建SQL,P3
+R9-008,R9,Low,Alerts,alerts/rules.py,告警cooldown使用内存状态重启丢失,P3
+R10-001,R10,Critical,Integration,跨模块,交易信号链中任一环节失败导致状态不一致,P0
+R10-002,R10,High,ML,core/ml/predictor.py,ML模型预测特征顺序与训练时不一致,P2
+R10-003,R10,High,News,core/news/fetcher.py,HTTP请求无URL验证-SSRF风险,P1
+R10-004,R10,High,Integration,跨模块,_pending_signals超时+余额操作非原子叠加,P1
+R10-005,R10,Medium,ML,core/ml/features.py,特征计算NaN处理不完整传播到ML模型,P3
+R10-006,R10,Medium,News,core/news/analyzer.py,异常触发紧急抓取无双重检查保护,P3
+R10-007,R10,Medium,Integration,跨模块,数据库连接在异常路径中可能泄漏,P3
+R10-008,R10,Low,ML,core/ml/trainer.py,ML模型文件无完整性校验,P3
+R10-009,R10,Low,News,core/news/source_manager.py,新闻源配置无URL scheme验证,P3
