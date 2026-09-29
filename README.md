@@ -2,7 +2,7 @@
 
 面向币安现货的 Python 3.12 自动化交易系统。以 asyncio 事件总线为骨架，把**行情 → 策略信号 → 风控 → 下单 → 持仓守护**串成一条可观测的流水线；行情来自币安主网公开镜像、下单走 testnet；配套一个 FastAPI + aiosqlite + ECharts 的 Web 控制台（现货交易页、全币种行情、币种信息、市场数据总览、代币启发式筛查、策略监控、回测/GA、AI 面板、预警中心、设置、DB 管理）。模拟盘带真实成本模型（手续费分档 + 盘口半价差 + 滑点），账本恒等式有专门的回归测试守护；回测有 legacy 与 hybrid 两套引擎，共用同一个评估内核，并有逐笔等价门禁。
 
-> **状态**: `VERSION` **2.0.0** · 本 README 核对于 **2026-09-30** · 测试 **667 collected → 667 passed, 0 failed**（`76.64s`，详见 [§10 测试](#10-测试与质量)；干净克隆另见 §10.1 的前提说明）
+> **状态**: `VERSION` **2.0.1** · 本 README 核对于 **2026-09-30** · 测试 **693 collected → 693 passed, 0 failed**（`76.64s`，详见 [§10 测试](#10-测试与质量)；干净克隆另见 §10.1 的前提说明）
 > **文档索引**：详细变更史见 [`docs/overhaul/CHANGELOG.md`](docs/overhaul/CHANGELOG.md)；本 README 只陈述**当前代码事实**，与陈旧描述冲突时**以代码为准**（见 [§11.3](#113-残余耦合与陈旧之处当前审计清单)）
 > **运行环境**: Python 3.12 · Windows / Linux · 默认只监听 `127.0.0.1:8899`
 > **一句话前提**: 本机 **无法访问 `api.binance.com`**，因此**行情**走 `data-api.binance.vision`（主网公开镜像），**下单**走 `testnet.binance.vision`。见 [§3](#3-关键环境约束必读)。
@@ -296,7 +296,7 @@ python-binance 的 `BinanceSocketManager` 硬编码 `wss://stream.binance.com:94
 | `requirements.txt` | 运行 + 测试依赖（含 `python-multipart`——starlette 无条件导入它，缺了 FastAPI 起不来） |
 | `.gitignore` | 忽略 `data/`、`strategies/ga_champion_*.yaml`、`secrets.yaml`、`run_logs/`，以及本地 DB 副本 `*.bak` / `*.db.bak` / `*.db.pre_restore` |
 | `pytest.ini` | `testpaths=tests`、`asyncio_mode=strict`、`slow` marker |
-| `VERSION` | `2.0.0` |
+| `VERSION` | `2.0.1` |
 
 ---
 
@@ -787,17 +787,17 @@ python -m pytest tests/ -q -m "not slow"
 
 `pytest.ini`：`testpaths=tests`、`asyncio_mode=strict`、`markers=slow`、忽略 DeprecationWarning。**没有安装 `pytest-timeout`**，所以 `--timeout=` 会直接报参数错误。
 
-**收集数：667 项**（核验时快照），**一次完整运行的结果**：
+**收集数：693 项**（核验时快照），**一次完整运行的结果**：
 
 ```
-667 passed, 3 warnings in 76.64s (0:01:16)
+693 passed, 3 warnings in 76.64s (0:01:16)
 ```
 
 全部通过（0 failed）。`tests/` 里 45 个 `.py`（含 `__init__.py` 与 `conftest.py`，即 43 个 `test_*.py`）。核验期间仓库仍在被并行改动（本 README 只保证数字来自核验当次运行），但**没有任何已知失败用例**：曾经的 `tests/test_database.py::test_init_database_creates_tables`（它要求 v4 迁移**已经故意删除**的 `orders` 表存在）断言已修正，现在校验 `pending_orders`/`positions` 等真实表；`orders` 表在全仓库（代码、允许表清单、`reset-sim` 语句）里已无残留引用。曾被记录为"跟随 `test_ledger_invariant.py` 之后会失败"的 `test_money_concurrency.py::test_concurrent_opens_of_different_symbols_still_run_in_parallel` **在完整串行运行里通过**（`tests/conftest.py` 的 autouse fixture 在每个用例后还原进程级 `db.database.DB_PATH`，消除了跨文件状态污染）。
 
 #### 干净克隆的测试结果（重要）
 
-`data/market/**` 是 gitignore 的，所以**刚克隆下来直接跑全量测试并不是全绿**：回测等价性用例需要 `2026-05-25..2026-05-31` 的 **BTCUSDT + ETHUSDT** 缓存历史。空缓存实测（同一份 667 项的代码）：
+`data/market/**` 是 gitignore 的，所以**刚克隆下来直接跑全量测试并不是全绿**：回测等价性用例需要 `2026-05-25..2026-05-31` 的 **BTCUSDT + ETHUSDT** 缓存历史。空缓存实测（同一份 693 项的代码）：
 
 ```
 8 failed, 658 passed, 1 skipped in 69.11s (0:01:09)
@@ -809,7 +809,7 @@ python -m pytest tests/ -q -m "not slow"
 - `tests/test_hybrid_equivalence.py::test_signal_matrix_summary_statistics`（同一句 `NO_MARKET_DATA_MESSAGE`）；
 - 唯一的 1 个 skipped 是 `tests/test_hybrid_equivalence.py:179`（"No trades in either engine -- not enough data variation"）。
 
-同一文件里不受影响的用例：`test_engine_parity_variants.py::test_parity_uses_synthetic_market_without_cached_data`（自己往临时目录写合成 parquet）与 `::test_reduce_conditions_route_to_legacy`，以及 `test_hybrid_equivalence.py::test_no_lookahead_bias`。下好历史后重跑即全绿（667 passed）：
+同一文件里不受影响的用例：`test_engine_parity_variants.py::test_parity_uses_synthetic_market_without_cached_data`（自己往临时目录写合成 parquet）与 `::test_reduce_conditions_route_to_legacy`，以及 `test_hybrid_equivalence.py::test_no_lookahead_bias`。下好历史后重跑即全绿（693 passed）：
 
 ```bash
 python scripts/download_history.py --symbols BTCUSDT,ETHUSDT --intervals 1h --start 2026-05-25 --end 2026-05-31
@@ -966,7 +966,7 @@ python -m app.main --mode sim --port 8900
 
 ### 下一步（按价值排序）
 
-1. **配置/审计卫生**：~~清掉 `db_manager.py`、`pages.py`、`settings.py` 里对已删除 `orders` 表的引用；修 `tests/test_database.py` 的陈旧断言。~~ **已完成**：三处 `orders` 引用与陈旧断言均已清理，套件 **667 passed / 0 failed**（见 [§10.1](#101-怎么跑)）。
+1. **配置/审计卫生**：~~清掉 `db_manager.py`、`pages.py`、`settings.py` 里对已删除 `orders` 表的引用；修 `tests/test_database.py` 的陈旧断言。~~ **已完成**：三处 `orders` 引用与陈旧断言均已清理，套件 **693 passed / 0 failed**（见 [§10.1](#101-怎么跑)）。
 2. **统一价差兜底**：让回测的 `default_spread_pct`（0.03）与 sim 盘的 `default`（0.02）取同一个常量，消除口径分歧。
 3. **拆掉 hybrid 的价差临时改写**：给 `run_hybrid` 传一个显式的 `spread_pct` 参数，不再副作用式改 `config`。
 4. **授权依赖化**：把 `_require_trader` / `_require_admin` 从 handler 内联改成 FastAPI 依赖（`HTTPException(403)`），并补 CSRF token。
