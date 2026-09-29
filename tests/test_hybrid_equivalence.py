@@ -200,10 +200,33 @@ def test_hybrid_matches_legacy_trade_for_trade():
                 f"Strategy mismatch: {lt['strategy']} vs {ht['strategy']}"
             assert abs(lt["entry_price"] - ht["entry_price"]) < 2.0, \
                 f"Entry price mismatch: {lt['entry_price']} vs {ht['entry_price']}"
+            assert abs(lt["exit_price"] - ht["exit_price"]) < 2.0, \
+                f"Exit price mismatch: {lt['exit_price']} vs {ht['exit_price']}"
+            assert abs(lt["quantity"] - ht["quantity"]) < 1e-6, \
+                f"Position size mismatch: {lt['quantity']} vs {ht['quantity']}"
+            assert abs(lt["pnl"] - ht["pnl"]) < 0.05, \
+                f"PnL mismatch: {lt['pnl']} vs {ht['pnl']}"
 
-    # At least one common trade must match: proves the signal matrix produces
-    # the same entry signals the legacy engine acts on.
-    assert matched >= 1, \
-        f"No common trades found between legacy ({len(legacy_trades)}) " \
-        f"and hybrid ({len(hybrid_trades)}) engines"
+    # FULL trade-level equivalence — this is the property GA depends on: the
+    # engine that optimises strategies must select and size the same trades as
+    # the engine used to validate/deploy them. Weaker assertions (e.g. "at least
+    # one trade matches") previously hid a 20-vs-45 trade divergence.
+    assert matched == len(legacy_trades), (
+        f"Only {matched}/{len(legacy_trades)} legacy trades matched in the hybrid "
+        f"engine (hybrid produced {len(hybrid_trades)} trades) — engines diverged"
+    )
+    assert len(hybrid_trades) == len(legacy_trades), (
+        f"Trade count mismatch: legacy={len(legacy_trades)} hybrid={len(hybrid_trades)}"
+    )
+
+    # Headline metrics must agree as well (they drive GA fitness ranking).
+    for metric in ("total_return_pct", "sharpe_ratio", "max_drawdown_pct",
+                   "win_rate_pct", "profit_factor"):
+        lv = legacy_result["metrics"].get(metric)
+        hv = hybrid_result["metrics"].get(metric)
+        assert lv == pytest.approx(hv, abs=1e-6, rel=1e-6), (
+            f"Metric '{metric}' differs between engines: legacy={lv} hybrid={hv}"
+        )
+
     print(f"Matched {matched}/{len(legacy_trades)} legacy trades in hybrid engine output")
+    print("Metrics identical across engines")

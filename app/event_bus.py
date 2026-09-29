@@ -64,10 +64,20 @@ class EventBus:
         while self._running:
             try:
                 event = await asyncio.wait_for(self._queue.get(), timeout=0.1)
-                subscribers = self._subscribers.get(event.type, [])
+                subscribers = list(self._subscribers.get(event.type, []))
                 tasks = [cb(event) for cb in subscribers]
                 if tasks:
-                    await asyncio.gather(*tasks, return_exceptions=True)
+                    # return_exceptions=True keeps one bad subscriber from killing the
+                    # bus, but the exceptions MUST be surfaced — silently dropping them
+                    # hid a total failure of the live signal path (see engine.py fix).
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    for cb, res in zip(subscribers, results):
+                        if isinstance(res, BaseException):
+                            name = getattr(cb, "__qualname__", repr(cb))
+                            logger.error(
+                                f"EventBus subscriber {name} failed on "
+                                f"{event.type.value}: {res!r}"
+                            )
             except asyncio.TimeoutError:
                 continue
             except Exception as e:

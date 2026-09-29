@@ -9,11 +9,12 @@
     <button class="bt-tab px-4 py-2 rounded-t text-sm bg-slate-700 text-slate-400" data-tab="history" onclick="switchBtTab('history')">{{ _("History") }}</button>
 </div>
 
-<!-- Tab: Config -->
-<div id="bt-tab-config" class="bt-tab-content">
-    <div hx-get="/partials/backtest-config" hx-trigger="load">
-        <div class="text-slate-500">{{ _("Loading...") }}</div>
-    </div>
+<!-- Tab: Config — rendered server-side (same context as
+     /partials/backtest-config, which stays available for HTMX reloads).
+     The symbol selector lives in #bt-symbol-selector and is hydrated from
+     GET /api/market/symbols, with a server-rendered fallback universe. -->
+<div id="bt-tab-config" class="bt-tab-content" data-bt-config-host="server">
+    {% include "partials/backtest_config.html" %}
 </div>
 
 <!-- Tab: Results -->

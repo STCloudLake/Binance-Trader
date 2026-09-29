@@ -5,10 +5,36 @@ from pathlib import Path
 from loguru import logger
 
 from core.backtest.data_feeder import DataFeeder
-from core.backtest.signal_matrix import SignalMatrixBuilder
+from core.backtest.signal_matrix import NO_MARKET_DATA_MESSAGE, SignalMatrixBuilder
 from core.backtest.event_executor import EventDrivenExecutor
 from core.backtest.metrics import calculate_metrics
 from core.risk.position_sizer import PositionSizer
+from core.strategy.evaluation_kernel import detect_market_regime
+
+
+def _detect_regimes(feeder, symbols: list[str], date_start: str) -> dict[str, str]:
+    """Per-symbol market regime using data up to the first evaluated timestamp.
+
+    Mirrors `BacktestEngine`'s one-shot detection so the regime-aware entry
+    threshold behaves identically in both engines.
+    """
+    regimes: dict[str, str] = {}
+    for sym in symbols:
+        try:
+            df_1h = feeder.get_all_data_for_symbol(sym, "1h")
+        except Exception:
+            regimes[sym] = "range"
+            continue
+        if df_1h is None or len(df_1h) == 0:
+            regimes[sym] = "range"
+            continue
+        try:
+            first_ts = feeder.first_timestamp
+            window = df_1h[df_1h.index <= first_ts] if first_ts is not None else df_1h
+        except Exception:
+            window = df_1h
+        regimes[sym] = detect_market_regime(window if len(window) else df_1h)
+    return regimes
 
 
 def run_hybrid(strategies, symbols, date_start, date_end,
@@ -59,12 +85,24 @@ def run_hybrid(strategies, symbols, date_start, date_end,
     feeder.load()
 
     if len(feeder) == 0:
-        return {"error": "No historical data found"}
+        return {"error": NO_MARKET_DATA_MESSAGE}
 
     # Phase 1: Build signal matrix
     logger.info(f"Hybrid engine: building signal matrix for {len(strategy_configs)} strategies")
+
+    # Market regime per symbol — detected exactly like the legacy engine (once,
+    # from the data available before the first evaluated timestamp) so both
+    # engines apply the same counter-trend penalty.
+    regimes = _detect_regimes(feeder, symbols, date_start)
+
     builder = SignalMatrixBuilder(feeder)
-    matrix = builder.build(strategy_configs, symbols)
+    matrix = builder.build(strategy_configs, symbols,
+                           signal_weights=getattr(config, "signal_weights", None),
+                           regimes=regimes)
+    if matrix.metadata.get("error"):
+        # No candles on the primary timeframe: return the unified, actionable
+        # message instead of executing an empty matrix as a "successful" run.
+        return {"error": matrix.metadata["error"]}
     logger.info(f"Signal matrix built in {matrix.metadata['build_time_seconds']}s: "
                 f"{matrix.metadata['total_signals']} signals, "
                 f"{matrix.metadata['timestamp_count']} timestamps, "
@@ -87,6 +125,20 @@ def run_hybrid(strategies, symbols, date_start, date_end,
         per_strategy_isolation=per_strategy_isolation,
         max_positions=max_positions,
         cost_config=cost_cfg,
+        strategy_risk={
+            s.name: {
+                "max_hold_hours": s.risk_exit.max_hold_hours if s.risk_exit else 0,
+                "use_indicator_exits": s.risk_exit.use_indicator_exits if s.risk_exit else True,
+                # Also propagate the per-strategy stop/trailing distances: the
+                # executor needs them to mirror the legacy engine exactly, and the
+                # Kelly-lite sizing branch is dead without stop_loss_pct.
+                "stop_loss_pct": (s.risk_exit.stop_loss_pct if s.risk_exit else None),
+                "trailing_stop_pct": (s.risk_exit.trailing_stop_pct if s.risk_exit else None),
+                # Indicator exits are evaluated on every configured timeframe.
+                "timeframes": list(s.timeframes or []),
+            }
+            for s in strategy_configs
+        },
     )
 
     logger.info(f"Hybrid engine: executing trades ({matrix.metadata['timestamp_count']} ticks)")

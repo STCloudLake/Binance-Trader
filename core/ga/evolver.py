@@ -24,7 +24,6 @@ from core.ga.genome import (
     strategy_to_chromosome, chromosome_to_strategy,
     random_chromosome, ContinuousGene, CategoricalGene, StructuralGene,
 )
-from core.ga.fitness import evaluate_population, parameter_sensitivity_test
 from core.strategy.loader import StrategyLoader
 
 

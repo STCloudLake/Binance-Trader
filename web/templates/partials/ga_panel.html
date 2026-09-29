@@ -48,6 +48,29 @@
             </div>
         </div>
 
+        <!-- Symbols — searchable multi-select fed by GET /api/market/symbols.
+             Defaults to the persisted watchlist (GET /api/market/watchlist);
+             the server validates the choice against the universe and caps it. -->
+        <div id="ga-symbol-selector" class="mt-2" data-max-symbols="{{ ga_max_symbols }}">
+            <label class="text-sm text-slate-400 mb-1 block">{{ _("Symbols") }}
+                <span class="text-xs text-slate-500 ml-2" id="ga-symbol-source">{{ _("自选列表") }}</span>
+                <span class="text-xs text-slate-500 ml-2" id="ga-symbol-count"></span>
+                <button type="button" class="text-xs text-sky-400 hover:underline ml-2" onclick="gaSelectAllKnown()">{{ _("Select All") }}</button>
+                <button type="button" class="text-xs text-slate-500 hover:underline ml-1" onclick="gaClearSymbols()">{{ _("Clear") }}</button>
+            </label>
+            <div class="relative">
+                <input id="ga-symbol-search" type="text" autocomplete="off"
+                       placeholder="{{ _('搜索任意 USDT 交易对（如 SOL 或 SOLUSDT）') }}"
+                       class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm"
+                       oninput="gaOnSearchInput()" onfocus="gaOpenDropdown()">
+                <div id="ga-symbol-dropdown"
+                     class="hidden absolute z-20 mt-1 w-full max-h-56 overflow-y-auto bg-slate-900 border border-slate-600 rounded shadow-lg"></div>
+            </div>
+            <div id="ga-symbol-chips"
+                 class="flex flex-wrap gap-2 mt-2 bg-slate-800 rounded p-2 border border-slate-600 min-h-[2.5rem]"></div>
+            <div id="ga-symbol-warning" class="mt-1 text-xs"></div>
+        </div>
+
         <!-- Walk-Forward Mode -->
         <div class="flex items-center gap-3 mt-2">
             <label class="flex items-center gap-2 text-sm text-amber-400 cursor-pointer">
@@ -192,6 +215,214 @@ var _gaStartTime = 0;
 var _gaOverallPct = 0;
 var _gaElapsed = 0;
 
+// ── Symbol selection (server defaults = the persisted watchlist) ──
+window.GA_DEFAULT_SYMBOLS = {{ ga_default_symbols|tojson }};
+window.GA_MAX_SYMBOLS = {{ ga_max_symbols }};
+
+var gaState = {
+    selected: (window.GA_DEFAULT_SYMBOLS || []).slice(),
+    universe: {},     // symbol -> {symbol, baseAsset, last, change_pct}
+    apiError: '',
+    locked: false
+};
+
+var GA_T = {
+    watchlist: {{ _("自选列表")|tojson }},
+    exchangeList: {{ _("交易所全量列表")|tojson }},
+    apiFailed: {{ _("全币种接口不可用")|tojson }},
+    empty: {{ _("未选择交易对")|tojson }},
+    cap: {{ _("GA 单次最多")|tojson }},
+    cap2: {{ _("个交易对")|tojson }},
+    none: {{ _("请至少选择一个交易对")|tojson }}
+};
+
+function gaEsc(value) {
+    return String(value == null ? '' : value).replace(/[&<>"']/g, function(c) {
+        return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c];
+    });
+}
+
+function gaSetSource(text, warn) {
+    var el = document.getElementById('ga-symbol-source');
+    if (!el) return;
+    el.textContent = text;
+    el.className = 'text-xs ml-2 ' + (warn ? 'text-amber-400' : 'text-slate-500');
+}
+
+function gaRegisterSymbols(list) {
+    (list || []).forEach(function(item) {
+        var sym = typeof item === 'string' ? item : item.symbol;
+        if (!sym) return;
+        var prev = gaState.universe[sym] || {symbol: sym};
+        gaState.universe[sym] = (typeof item === 'object')
+            ? Object.assign(prev, item, {symbol: sym}) : prev;
+    });
+}
+
+function gaLoadUniverse() {
+    // Fallback first: the watchlist default keeps the panel usable offline.
+    gaRegisterSymbols(window.GA_DEFAULT_SYMBOLS || []);
+    gaRenderSymbols();
+    fetch('/api/market/symbols?limit=200&sort=volume')
+        .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+        .then(function(data) {
+            gaState.apiError = '';
+            gaRegisterSymbols(data.symbols || []);
+            gaSetSource(GA_T.exchangeList + ' · ' + (data.total || (data.symbols || []).length) + ' USDT', false);
+            gaRenderSymbols();
+        })
+        .catch(function(e) {
+            gaState.apiError = (e && e.message) ? e.message : String(e);
+            gaSetSource(GA_T.watchlist + ' · ' + GA_T.apiFailed + ' (' + gaState.apiError + ')', true);
+            gaRenderSymbols();
+        });
+}
+
+var gaSearchTimer = null;
+function gaOnSearchInput() {
+    var q = (document.getElementById('ga-symbol-search').value || '').trim();
+    gaOpenDropdown();
+    gaRenderDropdown();
+    if (!q) return;
+    clearTimeout(gaSearchTimer);
+    gaSearchTimer = setTimeout(function() {
+        fetch('/api/market/symbols?limit=50&sort=volume&q=' + encodeURIComponent(q))
+            .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+            .then(function(data) {
+                gaRegisterSymbols(data.symbols || []);
+                gaRenderDropdown();
+            })
+            .catch(function(e) {
+                gaState.apiError = (e && e.message) ? e.message : String(e);
+                gaRenderDropdown();
+            });
+    }, 250);
+}
+
+function gaToggleSymbol(sym) {
+    if (gaState.locked) return;
+    var idx = gaState.selected.indexOf(sym);
+    if (idx >= 0) {
+        gaState.selected.splice(idx, 1);
+    } else if (gaState.selected.length >= window.GA_MAX_SYMBOLS) {
+        gaWarn(GA_T.cap + ' ' + window.GA_MAX_SYMBOLS + ' ' + GA_T.cap2);
+        return;
+    } else {
+        gaState.selected.push(sym);
+    }
+    gaRenderSymbols();
+}
+
+function gaSelectAllKnown() {
+    if (gaState.locked) return;
+    var q = (document.getElementById('ga-symbol-search').value || '').trim().toUpperCase();
+    Object.keys(gaState.universe).forEach(function(sym) {
+        var base = (gaState.universe[sym].baseAsset || '').toUpperCase();
+        var match = !q || sym.indexOf(q) >= 0 || base.indexOf(q) >= 0;
+        if (match && gaState.selected.indexOf(sym) < 0 && gaState.selected.length < window.GA_MAX_SYMBOLS) {
+            gaState.selected.push(sym);
+        }
+    });
+    gaRenderSymbols();
+}
+
+function gaClearSymbols() {
+    if (gaState.locked) return;
+    gaState.selected = [];
+    gaRenderSymbols();
+}
+
+function gaWarn(message) {
+    var host = document.getElementById('ga-symbol-warning');
+    if (!host) return;
+    host.innerHTML = message
+        ? '<span class="text-amber-400">⚠ ' + gaEsc(message) + '</span>' : '';
+}
+
+function gaRenderChips() {
+    var host = document.getElementById('ga-symbol-chips');
+    if (!host) return;
+    if (!gaState.selected.length) {
+        host.innerHTML = '<span class="text-xs text-slate-500">' + GA_T.empty + '</span>';
+        return;
+    }
+    var html = '';
+    gaState.selected.forEach(function(sym) {
+        html += '<span class="flex items-center gap-1 text-xs px-2 py-1 rounded border border-slate-600 bg-slate-700 text-slate-200">' +
+                '<span>' + gaEsc(sym.replace('USDT', '/USDT')) + '</span>' +
+                '<button type="button" class="text-slate-400 hover:text-red-400" data-symbol="' + gaEsc(sym) +
+                '" onclick="gaToggleSymbol(this.dataset.symbol)">×</button></span>';
+    });
+    host.innerHTML = html;
+}
+
+function gaRenderDropdown() {
+    var host = document.getElementById('ga-symbol-dropdown');
+    if (!host) return;
+    var q = (document.getElementById('ga-symbol-search').value || '').trim().toUpperCase();
+    var symbols = Object.keys(gaState.universe).filter(function(sym) {
+        if (!q) return true;
+        var base = (gaState.universe[sym].baseAsset || sym.replace('USDT', '')).toUpperCase();
+        return sym.indexOf(q) >= 0 || base.indexOf(q) >= 0;
+    });
+    symbols.sort(function(a, b) {
+        var va = (gaState.universe[a].quote_volume || 0), vb = (gaState.universe[b].quote_volume || 0);
+        if (va !== vb) return vb - va;
+        return a < b ? -1 : 1;
+    });
+    var html = '';
+    symbols.slice(0, 100).forEach(function(sym) {
+        var info = gaState.universe[sym] || {};
+        var picked = gaState.selected.indexOf(sym) >= 0;
+        var meta = [];
+        if (info.last != null) meta.push(Number(info.last).toPrecision(6));
+        if (info.change_pct != null) {
+            var ch = Number(info.change_pct);
+            meta.push('<span class="' + (ch >= 0 ? 'text-green-400' : 'text-red-400') + '">' +
+                      (ch >= 0 ? '+' : '') + ch.toFixed(2) + '%</span>');
+        }
+        html += '<div class="flex items-center justify-between px-3 py-1.5 text-sm cursor-pointer hover:bg-slate-800 ' +
+                (picked ? 'text-sky-300' : 'text-slate-300') + '" data-symbol="' + gaEsc(sym) +
+                '" onclick="gaToggleSymbol(this.dataset.symbol)">' +
+                '<span>' + gaEsc(sym) + '</span>' +
+                '<span class="text-xs text-slate-500">' + meta.join(' · ') + '</span></div>';
+    });
+    if (!symbols.length) {
+        html = '<div class="px-3 py-2 text-xs text-slate-500">' +
+               (gaState.apiError ? GA_T.apiFailed + ': ' + gaEsc(gaState.apiError) : '—') + '</div>';
+    }
+    host.innerHTML = html;
+    host.classList.remove('hidden');
+}
+
+function gaOpenDropdown() {
+    var host = document.getElementById('ga-symbol-dropdown');
+    if (host) host.classList.remove('hidden');
+}
+
+function gaCloseDropdown() {
+    var host = document.getElementById('ga-symbol-dropdown');
+    if (host) host.classList.add('hidden');
+}
+
+document.addEventListener('click', function(e) {
+    var sel = document.getElementById('ga-symbol-selector');
+    if (sel && !sel.contains(e.target)) gaCloseDropdown();
+});
+
+function gaRenderSymbols() {
+    gaRenderChips();
+    gaRenderDropdown();
+    var count = document.getElementById('ga-symbol-count');
+    if (count) {
+        count.textContent = gaState.selected.length + ' / ' + window.GA_MAX_SYMBOLS;
+        count.className = 'text-xs ml-2 ' +
+            (gaState.selected.length ? 'text-slate-500' : 'text-amber-400');
+    }
+    if (gaState.selected.length) gaWarn('');
+    updateResourceEstimate();
+}
+
 // ── Client-side clock — always ticks even if poll is slow ──
 function startTickTimer() {
     if (_gaTickTimer) clearInterval(_gaTickTimer);
@@ -247,12 +478,16 @@ function updateResourceEstimate() {
                    + (endDate.getMonth() - startDate.getMonth());
     if (monthsDiff < 1) monthsDiff = 1;
 
+    // More symbols = proportionally more work (the reference estimate assumed
+    // the five-pair default), so scale the per-generation time by the selection.
+    var symbolFactor = Math.max(0.2, (gaState.selected.length || 5) / 5);
+
     // Clamp workers
     workers = Math.max(1, Math.min(workers, 16));
 
-    // Per-generation time (scaled by date range months)
+    // Per-generation time (scaled by date range months and symbol count)
     var strategiesPerWorker = Math.ceil(popSize / workers);
-    var timePerGen = (EST_BASE_OVERHEAD + EST_PER_STRATEGY * strategiesPerWorker) * monthsDiff;
+    var timePerGen = (EST_BASE_OVERHEAD + EST_PER_STRATEGY * strategiesPerWorker) * monthsDiff * symbolFactor;
     var totalTime = timePerGen * generations;
 
     // Memory
@@ -310,6 +545,13 @@ function startGA() {
     btn.textContent = '{{ _("Starting...") }}';
     errorDiv.classList.add('hidden');
 
+    if (!gaState.selected.length) {
+        showError(GA_T.none);
+        btn.disabled = false;
+        btn.textContent = '{{ _("Start Evolution") }}';
+        return;
+    }
+
     // Lock all inputs while running
     setInputsLocked(true);
 
@@ -321,7 +563,7 @@ function startGA() {
     var endpoint = isWF ? '/api/ga/walkforward' : '/api/ga/evolve';
     var pollFn = isWF ? pollWFStatus : pollGAStatus;
     var body = {
-        symbols: ['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT'],
+        symbols: gaState.selected.slice(),
         date_start: document.getElementById('ga-date-start').value,
         date_end: document.getElementById('ga-date-end').value,
         validation_start: isWF ? null : (document.getElementById('ga-val-start').value || null),
@@ -386,13 +628,16 @@ function toggleWFConfig() {
 // ── Lock/unlock all GA inputs when job is running ──
 var _gaInputIds = ['ga-pop-size', 'ga-generations', 'ga-workers', 'ga-date-start', 'ga-date-end',
     'ga-val-start', 'ga-wf-enabled', 'ga-wf-train-mo', 'ga-wf-val-mo', 'ga-wf-step-mo',
-    'ga-cost-fee', 'ga-spread-btc', 'ga-spread-eth', 'ga-spread-bnb', 'ga-spread-sol', 'ga-spread-xrp'];
+    'ga-cost-fee', 'ga-spread-btc', 'ga-spread-eth', 'ga-spread-bnb', 'ga-spread-sol', 'ga-spread-xrp',
+    'ga-symbol-search'];
 
 function setInputsLocked(locked) {
+    gaState.locked = !!locked;
     _gaInputIds.forEach(function(id) {
         var el = document.getElementById(id);
         if (el) el.disabled = locked;
     });
+    if (locked) gaCloseDropdown();
 }
 
 function restoreParams(params) {
@@ -402,6 +647,11 @@ function restoreParams(params) {
     if (params.population_size) document.getElementById('ga-pop-size').value = params.population_size;
     if (params.generations) document.getElementById('ga-generations').value = params.generations;
     if (params.max_workers) document.getElementById('ga-workers').value = params.max_workers;
+    if (params.symbols && params.symbols.length) {
+        gaState.selected = params.symbols.slice();
+        gaRegisterSymbols(params.symbols);
+        gaRenderSymbols();
+    }
     if (params.mode === 'walkforward') {
         document.getElementById('ga-wf-enabled').checked = true;
         toggleWFConfig();
@@ -440,7 +690,7 @@ function resumeGA() {
         headers: {'Content-Type': 'application/json'},
         credentials: 'same-origin',
         body: JSON.stringify({
-            symbols: ['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT'],
+            symbols: gaState.selected.slice(),
             date_start: document.getElementById('ga-date-start').value,
             date_end: document.getElementById('ga-date-end').value,
             validation_start: document.getElementById('ga-val-start').value || null,
@@ -659,7 +909,8 @@ function loadStrategyFromGA() {
             }
         }
     }).catch(function() { /* server not ready yet */ });
-    // Initial resource estimate
+    // Initial symbol universe + resource estimate
+    gaLoadUniverse();
     updateResourceEstimate();
 })();
 

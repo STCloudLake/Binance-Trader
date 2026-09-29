@@ -1,5 +1,10 @@
 """Feature Store — pre-computed ML feature cache shared by backtest and live.
 
+MOVED OUT OF PRODUCTION: this module used to live at ``core/ml/feature_store.py``.
+It was never imported by anything (no backtest or live caller), so it is kept
+here as the design record for the pre-computed feature-matrix idea.  See
+``README.md`` in this directory for how to wire it back.
+
 Eliminates redundant feature computation by materialising the 40-dim
 feature matrix to Parquet once, then serving O(1) lookups.
 
@@ -241,10 +246,6 @@ class FeatureStore:
             p = self._path(symbol, interval)
             if p.exists():
                 p.unlink()
-
-    def has_data(self, symbol: str, interval: str) -> bool:
-        """Check if features exist for this symbol/interval."""
-        return self._path(symbol, interval).exists()
 
     # ── Internals ──────────────────────────────────────────────────────
 

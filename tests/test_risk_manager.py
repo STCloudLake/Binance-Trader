@@ -73,3 +73,50 @@ def test_take_profits():
     tps = sizer.calculate_take_profits(50000, "long")
     assert len(tps) == 3
     assert tps[0][0] == 51500.0
+
+
+# ── Weekly drawdown guard (regression: the config advertised a weekly limit
+#    that was never enforced anywhere in check()) ──────────────────────────
+
+def test_circuit_breaker_trips_on_weekly_drawdown():
+    from core.risk.circuit_breaker import CircuitBreaker
+    cb = CircuitBreaker(max_daily_drawdown_pct=10.0, max_weekly_drawdown_pct=8.0)
+    cb.set_equity(10000)          # weekly peak
+    cb.set_equity(9000)           # -10% from weekly peak, within daily limit? no: daily peak also 10000
+    tripped, reason = cb.check()
+    assert tripped
+    assert "weekly drawdown" in reason.lower()
+
+
+def test_weekly_drawdown_survives_daily_reset():
+    """A fresh daily peak must not hide a cumulative weekly slide."""
+    from core.risk.circuit_breaker import CircuitBreaker
+    cb = CircuitBreaker(max_daily_drawdown_pct=5.0, max_weekly_drawdown_pct=6.0)
+    cb.set_equity(10000)
+    cb.set_equity(9600)          # -4% week, -4% day: no trip
+    assert cb.check()[0] is False
+    cb.reset_daily()             # new day: daily peak moves down to 9600
+    cb.set_equity(9300)          # -7% from the weekly peak (10000) but only -3.1% daily
+    tripped, reason = cb.check()
+    assert tripped, "weekly drawdown was masked by the daily peak reset"
+    assert "weekly" in reason.lower()
+
+
+def test_weekly_reset_clears_weekly_peak():
+    from core.risk.circuit_breaker import CircuitBreaker
+    cb = CircuitBreaker(max_daily_drawdown_pct=20.0, max_weekly_drawdown_pct=5.0)
+    cb.set_equity(10000)
+    cb.set_equity(9000)
+    assert cb.check()[0] is True
+    cb.reset_trip()
+    cb.reset_weekly()            # new week starts from the current equity
+    assert cb.check()[0] is False
+
+
+def test_circuit_breaker_ok_within_both_limits():
+    from core.risk.circuit_breaker import CircuitBreaker
+    cb = CircuitBreaker(max_daily_drawdown_pct=5.0, max_weekly_drawdown_pct=10.0)
+    cb.set_equity(10000)
+    cb.set_equity(9700)          # -3% both
+    cb.set_equity(9800)
+    assert cb.check()[0] is False

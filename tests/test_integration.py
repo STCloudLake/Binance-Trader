@@ -126,14 +126,3 @@ async def test_same_symbol_rejection():
     await risk.stop()
     await bus.shutdown()
     os.unlink(db_path)
-
-
-def test_vibe_connector_offline():
-    from core.ai.vibe_connector import VibeTradingConnector
-    from app.event_bus import EventBus
-    Config._instance = None
-    config = Config.load("sim")
-    bus = EventBus()
-    conn = VibeTradingConnector(config, bus)
-    assert conn is not None
-    assert not conn.is_available()  # Not installed in test environment

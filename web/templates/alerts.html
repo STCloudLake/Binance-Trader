@@ -52,6 +52,15 @@ function connectWS() {
 }
 connectWS();
 
+/* SECURITY: every field below is WebSocket-pushed (alert message/rule/symbol
+   come from news + AI text) and was concatenated into innerHTML raw.  Escape
+   with the same esc() helper the trade page uses. */
+function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+}
+
 function prependAlert(data) {
     var list = document.getElementById('alert-list');
     if (!list) return;
@@ -64,11 +73,11 @@ function prependAlert(data) {
     div.className = 'py-2 border-b border-slate-800 flex justify-between items-center';
     var levelColors = {critical: 'text-red-400', warning: 'text-yellow-400', info: 'text-blue-400'};
     div.innerHTML = '<div><span class="text-xs ' + (levelColors[data.level] || '') + '">' +
-        (levelNames[data.level] || data.level) + '</span>' +
-        '<span class="text-xs text-slate-500 ml-2">' + (data.rule || data.type || '') + '</span>' +
-        '<span class="text-sm ml-2">' + (data.message || '').substring(0, 120) + '</span>' +
-        (data.symbol ? '<span class="text-xs text-sky-400 ml-2">' + data.symbol + '</span>' : '') + '</div>' +
-        '<div class="text-xs text-slate-500">' + (data.timestamp || '') + '</div>';
+        esc(levelNames[data.level] || data.level) + '</span>' +
+        '<span class="text-xs text-slate-500 ml-2">' + esc(data.rule || data.type || '') + '</span>' +
+        '<span class="text-sm ml-2">' + esc((data.message || '').substring(0, 120)) + '</span>' +
+        (data.symbol ? '<span class="text-xs text-sky-400 ml-2">' + esc(data.symbol) + '</span>' : '') + '</div>' +
+        '<div class="text-xs text-slate-500">' + esc(data.timestamp || '') + '</div>';
     list.insertBefore(div, list.firstChild);
 }
 

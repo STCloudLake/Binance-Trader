@@ -34,8 +34,9 @@ class AlertManager:
             try:
                 if rule.evaluate(event_type, data):
                     await self._fire_alert(rule, event_type, data)
-            except Exception:
-                pass
+            except Exception as e:
+                # A broken rule must not silently disable alerting.
+                logger.warning(f"Alert rule '{rule.name}' failed on {event_type}: {e}")
 
     async def _fire_alert(self, rule: AlertRule, event_type: str, data: dict):
         """Persist alert and broadcast to WebSocket clients."""
@@ -67,8 +68,8 @@ class AlertManager:
             c = _Cfg._instance
             lang = getattr(c, "language", "zh") if c and c._loaded else "zh"
             rule_name = _gt(lang)(rule.name)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Alert rule name translation unavailable ({e}); using raw name")
 
         # Broadcast to WebSocket clients
         alert_data = {

@@ -1,0 +1,583 @@
+{% extends "base.html" %}
+{% block content %}
+{#- 全币种行情 / 币种信息列表。
+    只消费 docs/overhaul/MARKET_PAGES_API.md §1 冻结的接口：
+      GET  /api/market/symbols?q=&quote=&limit=&offset=&sort=
+      GET  /api/market/ticker24h
+      GET  /api/market/watchlist
+      POST /api/market/watchlist   (Form symbols=逗号分隔, 仅 trader/admin)
+    行内不出现任何其它接口。所有请求走同一个 apiGet() 助手，失败时把
+    {"error":...} / 非 200 / 网络错误写进所属面板，绝不留空白。 -#}
+
+<div class="flex flex-wrap items-center gap-3 mb-3">
+    <h2 class="text-xl font-bold text-slate-100">{{ _("行情 / 币种信息") }}</h2>
+    <span class="badge badge-blue text-[10px]">{{ _("模式") }}: {{ mode }}</span>
+    <span class="text-xs text-slate-500">{{ _("数据源") }}: data-api.binance.vision</span>
+    <button id="market-refresh" onclick="refreshAll()"
+            class="ml-auto px-3 py-1 rounded text-xs bg-slate-700 text-slate-200 hover:bg-slate-600">{{ _("刷新") }}</button>
+</div>
+
+{#- ─────────────── 1. 顶部统计条（/api/market/ticker24h + symbols total） ─────────────── -#}
+<div class="card mb-3 py-2 px-3" id="market-summary">
+    <div class="flex flex-wrap items-center gap-x-5 gap-y-2 text-xs">
+        <div><span class="text-slate-500">{{ _("匹配币种") }}</span>
+            <span id="sum-symbols" class="text-slate-100 font-bold ml-1">--</span></div>
+        <div><span class="text-slate-500">{{ _("全市场") }} {{ _("上涨") }}</span>
+            <span id="sum-up" class="text-green-400 font-bold ml-1">--</span></div>
+        <div><span class="text-slate-500">{{ _("全市场") }} {{ _("下跌") }}</span>
+            <span id="sum-down" class="text-red-400 font-bold ml-1">--</span></div>
+        <div><span class="text-slate-500">{{ _("全市场") }} {{ _("平盘") }}</span>
+            <span id="sum-flat" class="text-slate-400 font-bold ml-1">--</span></div>
+        <div><span class="text-slate-500">{{ _("USDT 对 24h 成交额") }}</span>
+            <span id="sum-qvol" class="text-sky-400 font-bold ml-1">--</span>
+            <span class="text-slate-500">USDT</span></div>
+        <div><span class="text-slate-500">{{ _("成交笔数") }}</span>
+            <span id="sum-count" class="text-slate-200 font-bold ml-1">--</span></div>
+        <div class="ml-auto text-slate-500">{{ _("更新时间") }}
+            <span id="sum-updated">--</span></div>
+    </div>
+    <div id="sum-err" class="text-[11px] text-amber-400 mt-1"></div>
+</div>
+
+{#- ─────────────── 2. 搜索 / 筛选 / 排序 / 分页 + 自选编辑 ─────────────── -#}
+<div class="card mb-3 p-3" id="market-controls">
+    <div class="flex flex-wrap items-end gap-3">
+        <div>
+            <label class="block text-[11px] text-slate-400 mb-1" for="f-q">{{ _("搜索") }}</label>
+            <input id="f-q" type="text" autocomplete="off" placeholder="{{ _("币种或基础资产, 如 SOL / SOLUSDT") }}"
+                   class="w-56 bg-slate-800 border border-slate-600 rounded px-2 py-1 text-sm text-white">
+        </div>
+        <div>
+            <label class="block text-[11px] text-slate-400 mb-1" for="f-quote">{{ _("计价币") }}</label>
+            <select id="f-quote" class="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-sm text-white">
+                <option value="USDT">USDT</option>
+                <option value="USDC">USDC</option>
+                <option value="FDUSD">FDUSD</option>
+                <option value="TUSD">TUSD</option>
+                <option value="BTC">BTC</option>
+                <option value="ETH">ETH</option>
+                <option value="BNB">BNB</option>
+                <option value="TRY">TRY</option>
+            </select>
+        </div>
+        <div>
+            <label class="block text-[11px] text-slate-400 mb-1" for="f-sort">{{ _("排序") }}</label>
+            <select id="f-sort" class="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-sm text-white">
+                <option value="volume">{{ _("成交额") }}</option>
+                <option value="change">{{ _("涨跌幅") }}</option>
+                <option value="symbol">{{ _("币种名称") }}</option>
+            </select>
+        </div>
+        <div>
+            <label class="block text-[11px] text-slate-400 mb-1" for="f-size">{{ _("每页") }}</label>
+            <select id="f-size" class="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-sm text-white">
+                <option value="20">20</option>
+                <option value="50" selected>50</option>
+                <option value="100">100</option>
+                <option value="200">200</option>
+            </select>
+        </div>
+        <div>
+            <button id="f-watch" onclick="toggleWatchOnly()"
+                    class="px-3 py-1.5 rounded text-xs font-bold bg-slate-700 text-slate-200 hover:bg-slate-600">☆ {{ _("仅看自选") }}</button>
+        </div>
+        <div class="text-[11px] text-slate-500" id="f-note"></div>
+    </div>
+
+    {#- 可编辑自选列表：添加 / 移除都走 POST /api/market/watchlist -#}
+    <div class="mt-3 pt-3 border-t border-slate-700" id="watchlist-panel">
+        <div class="flex flex-wrap items-center gap-2">
+            <span class="text-xs text-slate-400">{{ _("自选列表") }}
+                <span id="wl-count" class="text-slate-200 font-bold">--</span>
+                <span class="text-slate-500">/ <span id="wl-max">30</span></span>
+            </span>
+            <input id="wl-add-input" type="text" placeholder="{{ _("添加币种, 如 BTCUSDT") }}" autocomplete="off"
+                   class="w-44 bg-slate-800 border border-slate-600 rounded px-2 py-1 text-xs text-white disabled:opacity-50">
+            <button id="wl-add-btn" onclick="addWatchFromInput()"
+                    class="px-2 py-1 rounded text-xs bg-sky-700 text-white hover:bg-sky-600 disabled:opacity-50 disabled:cursor-not-allowed">{{ _("加入自选") }}</button>
+            <span id="wl-err" class="text-[11px] text-amber-400"></span>
+            {% if not can_trade %}
+            <span class="text-[11px] text-amber-400">{{ _("当前账户无权修改自选列表（需要 trader 或 admin 角色），仅可查看。") }}</span>
+            {% endif %}
+        </div>
+        <div id="wl-chips" class="flex flex-wrap gap-1 mt-2">
+            <span class="text-[11px] text-slate-500">{{ _("加载中") }}...</span>
+        </div>
+    </div>
+</div>
+
+{#- ─────────────── 3. 币种表格 ─────────────── -#}
+<div class="card p-0 overflow-hidden" id="market-table-card">
+    <div class="flex items-center justify-between px-3 py-2 border-b border-slate-700">
+        <h3 class="text-sm font-bold text-slate-200">{{ _("币种列表") }}</h3>
+        <span id="market-table-err" class="text-xs text-amber-400 truncate max-w-[60%]"></span>
+    </div>
+    <div id="market-state" class="text-xs text-slate-500 px-3 py-2">{{ _("加载中") }}...</div>
+    <div class="overflow-x-auto">
+        <table class="w-full text-sm" id="market-table">
+            <thead class="text-slate-400 border-b border-slate-700 text-xs">
+                <tr>
+                    <th class="text-left p-2">{{ _("交易对") }}</th>
+                    <th class="text-right p-2">{{ _("最新价") }}</th>
+                    <th class="text-right p-2">{{ _("24h 涨跌") }}</th>
+                    <th class="text-right p-2">{{ _("24h 高") }}</th>
+                    <th class="text-right p-2">{{ _("24h 低") }}</th>
+                    <th class="text-right p-2">{{ _("24h 量") }}</th>
+                    <th class="text-right p-2">{{ _("24h 额") }}</th>
+                    <th class="text-right p-2">{{ _("笔数") }}</th>
+                    <th class="text-center p-2">{{ _("本地数据") }}</th>
+                    <th class="text-center p-2">{{ _("自选") }}</th>
+                </tr>
+            </thead>
+            <tbody id="market-tbody"></tbody>
+        </table>
+    </div>
+    <div class="flex flex-wrap items-center gap-2 px-3 py-2 border-t border-slate-700 text-xs text-slate-400" id="market-pagination">
+        <span>{{ _("共") }} <span id="pg-total" class="text-slate-200 font-bold">0</span> {{ _("条") }}
+            · {{ _("第") }} <span id="pg-page" class="text-slate-200">1</span> / <span id="pg-pages" class="text-slate-200">1</span> {{ _("页") }}</span>
+        <button id="pg-prev" onclick="pageStep(-1)"
+                class="ml-auto px-3 py-1 rounded bg-slate-700 text-slate-200 hover:bg-slate-600 disabled:opacity-40 disabled:cursor-not-allowed">{{ _("上一页") }}</button>
+        <button id="pg-next" onclick="pageStep(1)"
+                class="px-3 py-1 rounded bg-slate-700 text-slate-200 hover:bg-slate-600 disabled:opacity-40 disabled:cursor-not-allowed">{{ _("下一页") }}</button>
+    </div>
+</div>
+
+<script>
+/* =========================================================================
+ * /market — 全币种行情表（契约 §1）
+ * 接口: /api/market/symbols, /api/market/ticker24h, /api/market/watchlist
+ * ========================================================================= */
+var CAN_TRADE = {{ 'true' if can_trade else 'false' }};
+var MODE = {{ mode | tojson }};
+
+/* ── 统一请求助手：非 200 / {"error":...} / 网络错误 → 交给 onErr ── */
+var INFLIGHT = {};
+function busy(u, on) { if (on) { INFLIGHT[u] = true; } else { delete INFLIGHT[u]; } }
+function isBusy(u) { return !!INFLIGHT[u]; }
+function apiGet(url, onOk, onErr) {
+    if (isBusy(url)) { return; }                 // 同一 URL 不并发重叠
+    busy(url, true);
+    fetch(url, { credentials: 'same-origin' }).then(function (r) {
+        return r.json().catch(function () { return null; }).then(function (j) {
+            busy(url, false);
+            if (!r.ok) { if (onErr) onErr(errText(j, r.status)); return; }
+            if (j && j.error) { if (onErr) onErr(String(j.error)); return; }
+            if (onOk) onOk(j);
+        });
+    }).catch(function (e) {
+        busy(url, false);
+        if (onErr) onErr('网络错误: ' + e.message);
+    });
+}
+function errText(j, status) {
+    if (j && j.detail) { return typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail); }
+    if (j && j.error) { return String(j.error); }
+    if (status === 401) { return '登录已过期，请重新登录'; }
+    if (status === 403) { return '无权访问 (需要 trader 权限)'; }
+    if (status === 404) { return '接口不存在 (404)'; }
+    if (status) { return 'HTTP ' + status; }
+    return '网络错误';
+}
+
+/* ── 格式化 ── */
+function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+}
+function num(v, dflt) { var n = parseFloat(v); return isFinite(n) ? n : (dflt === undefined ? NaN : dflt); }
+function fmtPrice(v) {
+    var n = num(v); if (!isFinite(n)) { return '--'; }
+    var a = Math.abs(n);
+    if (a >= 1000) { return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+    if (a >= 10) { return n.toFixed(2); }
+    if (a >= 1) { return n.toFixed(4); }
+    if (a >= 0.01) { return n.toFixed(6); }
+    return n.toFixed(8);
+}
+function bigQty(v) {
+    var n = num(v); if (!isFinite(n)) { return '--'; }
+    if (Math.abs(n) >= 1e9) { return (n / 1e9).toFixed(2) + 'B'; }
+    if (Math.abs(n) >= 1e6) { return (n / 1e6).toFixed(2) + 'M'; }
+    if (Math.abs(n) >= 1e3) { return (n / 1e3).toFixed(2) + 'K'; }
+    return n.toFixed(2);
+}
+function fmtPct(v) { var n = num(v); return isFinite(n) ? (n >= 0 ? '+' : '') + n.toFixed(2) + '%' : '--'; }
+function pctClass(v) { var n = num(v, 0); return n > 0 ? 'text-green-400' : (n < 0 ? 'text-red-400' : 'text-slate-400'); }
+function intFmt(v) { var n = num(v); return isFinite(n) ? Math.round(n).toLocaleString('en-US') : '--'; }
+function safeSym(s) { return (typeof s === 'string' && /^[A-Za-z0-9_]{2,24}$/.test(s)) ? s : ''; }
+function localTime(ts) {
+    var n = num(ts);
+    if (!isFinite(n) || n <= 0) { return '--'; }
+    if (n < 1e11) { n = n * 1000; }
+    var d = new Date(n);
+    function p(x) { return (x < 10 ? '0' : '') + x; }
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
+        p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+
+/* ── 轮询：document.hidden 时清空定时器，恢复可见时重建 ── */
+var TIMERS = [];
+function every(ms, fn) { TIMERS.push(setInterval(fn, ms)); }
+function clearTimers() { for (var i = 0; i < TIMERS.length; i++) { clearInterval(TIMERS[i]); } TIMERS = []; }
+function startPolling() {
+    clearTimers();
+    every(60000, function () { loadSummary(); if (state.watchOnly) { loadWatchRows(); } else { loadSymbols(); } });
+}
+document.addEventListener('visibilitychange', function () {
+    if (document.hidden) { clearTimers(); } else { refreshAll(); startPolling(); }
+});
+
+/* ── 页面状态 ── */
+var state = {
+    q: '', quote: 'USDT', sort: 'volume', limit: 50, offset: 0,
+    total: 0, rows: [], watchOnly: false, watchlist: [], wlMax: 30
+};
+var wlLoaded = false, pendingWatch = false;
+
+/* =========================================================================
+ * 1. 顶部统计（/api/market/ticker24h，缓存 60s）
+ * ========================================================================= */
+function loadSummary() {
+    apiGet('/api/market/ticker24h', function (j) {
+        var map = (j && j.tickers) || {};
+        var list = [];
+        if (Array.isArray(map)) { list = map; }
+        else { for (var k in map) { if (Object.prototype.hasOwnProperty.call(map, k)) { var t = map[k] || {}; t.symbol = t.symbol || k; list.push(t); } } }
+        var up = 0, down = 0, flat = 0, qv = 0, cnt = 0, any = false;
+        for (var i = 0; i < list.length; i++) {
+            var c = num(list[i].change_pct);
+            if (isFinite(c)) { any = true; if (c > 0) { up++; } else if (c < 0) { down++; } else { flat++; } }
+            // ticker24h 覆盖全部计价币种（3716 个），只有 *USDT 的 quote_volume 才是 USDT 计价额
+            if (String(list[i].symbol || '').slice(-4) === 'USDT') {
+                var q = num(list[i].quote_volume); if (isFinite(q)) { qv += q; }
+            }
+            var n = num(list[i].count); if (isFinite(n)) { cnt += n; }
+        }
+        document.getElementById('sum-up').textContent = any ? up : '--';
+        document.getElementById('sum-down').textContent = any ? down : '--';
+        document.getElementById('sum-flat').textContent = any ? flat : '--';
+        document.getElementById('sum-qvol').textContent = qv > 0 ? bigQty(qv) : '--';
+        document.getElementById('sum-count').textContent = cnt > 0 ? intFmt(cnt) : '--';
+        document.getElementById('sum-updated').textContent = (j && j.updated_at) ? localTime(j.updated_at) : '--';
+        document.getElementById('sum-err').textContent = '';
+    }, function (e) {
+        document.getElementById('sum-err').textContent = '全市场 24h 概览不可用: ' + e;
+    });
+}
+
+/* =========================================================================
+ * 2. 自选列表（GET/POST /api/market/watchlist）
+ * ========================================================================= */
+function loadWatchlist() {
+    apiGet('/api/market/watchlist', function (j) {
+        state.watchlist = (j && j.symbols) || [];
+        state.wlMax = num(j && j.max, 30) || 30;
+        wlLoaded = true;
+        renderChips();
+        document.getElementById('wl-err').textContent = '';
+        if (pendingWatch && state.watchOnly) { pendingWatch = false; loadWatchRows(); }
+    }, function (e) {
+        document.getElementById('wl-err').textContent = '自选列表不可用: ' + e;
+        document.getElementById('wl-chips').innerHTML =
+            '<span class="text-[11px] text-amber-400">自选列表加载失败: ' + esc(e) + '</span>';
+        if (pendingWatch && state.watchOnly) {
+            pendingWatch = false;
+            setState('error', '自选列表不可用: ' + e);
+        }
+    });
+}
+
+function renderChips() {
+    var box = document.getElementById('wl-chips');
+    document.getElementById('wl-count').textContent = state.watchlist.length;
+    document.getElementById('wl-max').textContent = state.wlMax;
+    if (!state.watchlist.length) {
+        box.innerHTML = '<span class="text-[11px] text-slate-500">暂无自选，点击列表中的 ☆ 或在上方输入币种添加</span>';
+        return;
+    }
+    box.innerHTML = state.watchlist.map(function (s) {
+        var rm = CAN_TRADE
+            ? '<button class="ml-1 text-red-400 hover:text-red-300" onclick="removeWatch(\'' + esc(s) + '\')" title="移出自选">×</button>'
+            : '';
+        return '<span class="badge badge-blue text-[11px] inline-flex items-center">' +
+            '<a href="/coin/' + esc(s) + '" class="hover:underline">' + esc(s) + '</a>' + rm + '</span>';
+    }).join('');
+}
+
+function saveWatchlist(list) {
+    var out = document.getElementById('wl-err');
+    if (!CAN_TRADE) { out.textContent = '当前账户无权修改自选列表（需要 trader 或 admin 角色）'; return; }
+    var body = new URLSearchParams();
+    body.set('symbols', list.join(','));
+    out.textContent = '保存中...';
+    fetch('/api/market/watchlist', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: body.toString()
+    }).then(function (r) {
+        return r.json().catch(function () { return null; }).then(function (j) {
+            if (!r.ok || !j || j.ok !== true) {
+                out.textContent = '保存失败: ' + errText(j, r.status);
+                return;
+            }
+            state.watchlist = j.symbols || list;
+            renderChips();
+            out.textContent = j.restart_required ? '已保存（部分功能需重启后生效）' : '已保存';
+            out.className = 'text-[11px] text-green-400';
+            setTimeout(function () { out.className = 'text-[11px] text-amber-400'; out.textContent = ''; }, 4000);
+            if (state.watchOnly) { loadWatchRows(); } else { renderBody(); }
+        });
+    }).catch(function (e) { out.textContent = '保存请求失败: ' + e.message; });
+}
+
+function addWatchFromInput() {
+    var inp = document.getElementById('wl-add-input');
+    var sym = (inp.value || '').trim().toUpperCase();
+    if (!safeSym(sym)) { document.getElementById('wl-err').textContent = '请输入有效的币种代码，如 SOLUSDT'; return; }
+    if (state.watchlist.indexOf(sym) >= 0) { document.getElementById('wl-err').textContent = sym + ' 已在自选中'; return; }
+    if (state.watchlist.length >= state.wlMax) {
+        document.getElementById('wl-err').textContent = '自选数量已达上限 ' + state.wlMax + ' 个'; return;
+    }
+    inp.value = '';
+    var next = state.watchlist.concat([sym]);
+    saveWatchlist(next);
+}
+
+function removeWatch(sym) {
+    var next = state.watchlist.filter(function (s) { return s !== sym; });
+    saveWatchlist(next);
+}
+
+function toggleWatchSymbol(sym) {
+    sym = safeSym(sym);
+    if (!sym) { return; }
+    if (!CAN_TRADE) { document.getElementById('wl-err').textContent = '当前账户无权修改自选列表（需要 trader 或 admin 角色）'; return; }
+    if (state.watchlist.indexOf(sym) >= 0) { removeWatch(sym); } else {
+        if (state.watchlist.length >= state.wlMax) {
+            document.getElementById('wl-err').textContent = '自选数量已达上限 ' + state.wlMax + ' 个'; return;
+        }
+        saveWatchlist(state.watchlist.concat([sym]));
+    }
+}
+
+/* =========================================================================
+ * 3. 表格数据：GET /api/market/symbols
+ * ========================================================================= */
+function symbolsUrl(offset, limit) {
+    return '/api/market/symbols?q=' + encodeURIComponent(state.q) +
+        '&quote=' + encodeURIComponent(state.quote) +
+        '&limit=' + limit + '&offset=' + offset +
+        '&sort=' + encodeURIComponent(state.sort);
+}
+
+function setState(kind, text) {
+    var el = document.getElementById('market-state');
+    if (kind === 'ok') { el.className = 'hidden'; el.textContent = ''; return; }
+    el.className = 'text-xs px-3 py-2 ' + (kind === 'error' ? 'text-amber-400' : 'text-slate-500');
+    el.textContent = text;
+}
+
+function loadSymbols() {
+    if (state.watchOnly) { loadWatchRows(); return; }
+    var url = symbolsUrl(state.offset, state.limit);
+    setState('loading', '加载中...');
+    apiGet(url, function (j) {
+        var rows = (j && j.symbols) || [];
+        state.rows = rows;
+        state.total = num(j && j.total, rows.length);
+        if (state.offset > 0 && !rows.length && state.offset >= state.total) {
+            state.offset = Math.max(0, (Math.ceil(state.total / state.limit) - 1) * state.limit);
+            loadSymbols();
+            return;
+        }
+        setState('ok');
+        renderBody();
+        document.getElementById('sum-symbols').textContent = intFmt(state.total);
+        document.getElementById('market-table-err').textContent = '';
+    }, function (e) {
+        state.rows = [];
+        document.getElementById('market-tbody').innerHTML = '';
+        document.getElementById('market-table-err').textContent = e;
+        setState('error', '行情列表不可用: ' + e + '（接口 /api/market/symbols）');
+        renderPager();
+    });
+}
+
+/* 仅看自选：用 limit=200 的分页请求解析出自选币种，最多 5 页 / 1000 条 */
+function loadWatchRows() {
+    var wl = state.watchlist.slice();
+    if (!wl.length) {
+        state.rows = [];
+        document.getElementById('market-tbody').innerHTML = '';
+        document.getElementById('market-table-err').textContent = '';
+        setState('empty', '自选列表为空，点击表格中的 ☆ 或在上方输入币种添加');
+        document.getElementById('pg-total').textContent = '0';
+        return;
+    }
+    setState('loading', '正在解析自选行情...');
+    var found = [], seen = {}, offset = 0, pages = 0, CHUNK = 200;
+    function finish() {
+        state.rows = found;
+        setState(found.length ? 'ok' : 'empty', found.length ? '' : '自选中没有 ' + state.quote + ' 计价的币种');
+        renderBody();
+        var info = document.getElementById('pg-total');
+        info.textContent = found.length + ' / ' + wl.length;
+    }
+    function step() {
+        if (pages >= 5) { finish(); return; }
+        var url = symbolsUrl(offset, CHUNK);
+        apiGet(url, function (j) {
+            var rows = (j && j.symbols) || [];
+            var total = num(j && j.total, 0);
+            pages++;
+            for (var i = 0; i < rows.length; i++) {
+                var s = rows[i] && safeSym(rows[i].symbol);
+                if (s && wl.indexOf(s) >= 0 && !seen[s]) { seen[s] = 1; found.push(rows[i]); }
+            }
+            if (found.length >= wl.length || !rows.length || (offset + CHUNK) >= total) { finish(); return; }
+            offset += CHUNK;
+            step();
+        }, function (e) {
+            state.rows = [];
+            document.getElementById('market-tbody').innerHTML = '';
+            document.getElementById('market-table-err').textContent = e;
+            setState('error', '自选行情解析失败: ' + e);
+        });
+    }
+    step();
+}
+
+function cell(v, cls) { return '<td class="p-2 text-right ' + (cls || 'text-slate-300') + '">' + v + '</td>'; }
+
+function renderBody() {
+    var tb = document.getElementById('market-tbody');
+    if (!state.rows.length) {
+        tb.innerHTML = '';
+        if (document.getElementById('market-state').className.indexOf('error') < 0) {
+            setState('empty', state.watchOnly ? '自选中没有匹配的币种' : '没有匹配的币种');
+        }
+        renderPager();
+        return;
+    }
+    tb.innerHTML = state.rows.map(function (r) {
+        var sym = safeSym(r.symbol);
+        if (!sym) { return ''; }
+        var inWl = state.watchlist.indexOf(sym) >= 0;
+        var star = CAN_TRADE
+            ? '<button class="text-base leading-none ' + (inWl ? 'text-amber-400' : 'text-slate-500') +
+              ' hover:text-amber-300" title="' + (inWl ? '移出自选' : '加入自选') +
+              '" onclick="event.stopPropagation();toggleWatchSymbol(\'' + esc(sym) + '\')">' + (inWl ? '★' : '☆') + '</button>'
+            : '<span class="text-slate-600" title="需要 trader 权限">☆</span>';
+        var cached = r.has_cached_data
+            ? '<span class="badge badge-blue text-[10px]">本地</span>'
+            : '<span class="text-slate-600">-</span>';
+        var chg = num(r.change_pct);
+        return '<tr class="border-b border-slate-800 hover:bg-slate-800/60 cursor-pointer" onclick="gotoTrade(\'' + esc(sym) + '\')">' +
+            '<td class="p-2">' +
+                '<a href="/coin/' + esc(sym) + '" onclick="event.stopPropagation()" class="text-sky-400 font-bold hover:underline">' + esc(sym) + '</a>' +
+                '<div class="text-[10px] text-slate-500">' + esc(r.baseAsset || '') + ' / ' + esc(r.quoteAsset || '') +
+                (r.status && r.status !== 'TRADING' ? ' · ' + esc(r.status) : '') + '</div>' +
+            '</td>' +
+            cell(fmtPrice(r.last), 'text-slate-100 font-bold') +
+            cell(fmtPct(chg) + (isFinite(chg) && Math.abs(chg) >= 8 ? ' <span class="text-[10px] text-amber-400">!</span>' : ''), pctClass(chg)) +
+            cell(fmtPrice(r.high), 'text-green-400/80') +
+            cell(fmtPrice(r.low), 'text-red-400/80') +
+            cell(bigQty(r.volume)) +
+            cell(bigQty(r.quote_volume), 'text-sky-300') +
+            cell(intFmt(r.count)) +
+            '<td class="p-2 text-center">' + cached + '</td>' +
+            '<td class="p-2 text-center" onclick="event.stopPropagation()">' + star + '</td>' +
+            '</tr>';
+    }).join('');
+    renderPager();
+}
+
+function renderPager() {
+    var pager = document.getElementById('market-pagination');
+    if (state.watchOnly) {                       // 自选模式为客户端集合，不再分页
+        document.getElementById('pg-pages').textContent = '1';
+        document.getElementById('pg-page').textContent = '1';
+        document.getElementById('pg-prev').disabled = true;
+        document.getElementById('pg-next').disabled = true;
+        pager.classList.remove('hidden');
+        return;
+    }
+    var pages = Math.max(1, Math.ceil(state.total / state.limit));
+    var page = Math.floor(state.offset / state.limit) + 1;
+    document.getElementById('pg-total').textContent = intFmt(state.total);
+    document.getElementById('pg-pages').textContent = pages;
+    document.getElementById('pg-page').textContent = page;
+    document.getElementById('pg-prev').disabled = state.offset <= 0;
+    document.getElementById('pg-next').disabled = (state.offset + state.limit) >= state.total;
+}
+
+function pageStep(dir) {
+    if (state.watchOnly) { return; }
+    var next = state.offset + dir * state.limit;
+    if (next < 0) { return; }
+    if (next >= state.total) { return; }
+    state.offset = next;
+    loadSymbols();
+}
+
+function gotoTrade(sym) { window.location.href = '/trade?symbol=' + encodeURIComponent(sym); }
+
+/* =========================================================================
+ * 4. 控件绑定
+ * ========================================================================= */
+var searchTimer = null;
+function bindControls() {
+    var q = document.getElementById('f-q');
+    q.addEventListener('input', function () {
+        if (searchTimer) { clearTimeout(searchTimer); }
+        searchTimer = setTimeout(function () {
+            state.q = q.value.trim();
+            state.offset = 0;
+            loadSymbols();
+        }, 350);                                  // 防抖 350ms
+    });
+    document.getElementById('f-quote').addEventListener('change', function () {
+        state.quote = this.value; state.offset = 0;
+        if (state.watchOnly) { loadWatchRows(); } else { loadSymbols(); }
+    });
+    document.getElementById('f-sort').addEventListener('change', function () {
+        state.sort = this.value; state.offset = 0; loadSymbols();
+    });
+    document.getElementById('f-size').addEventListener('change', function () {
+        state.limit = parseInt(this.value, 10) || 50; state.offset = 0; loadSymbols();
+    });
+    document.getElementById('wl-add-input').addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter') { addWatchFromInput(); }
+    });
+    if (!CAN_TRADE) {
+        document.getElementById('wl-add-input').disabled = true;
+        document.getElementById('wl-add-btn').disabled = true;
+    }
+}
+
+function toggleWatchOnly() {
+    state.watchOnly = !state.watchOnly;
+    var btn = document.getElementById('f-watch');
+    btn.className = 'px-3 py-1.5 rounded text-xs font-bold ' +
+        (state.watchOnly ? 'bg-amber-600 text-white hover:bg-amber-500' : 'bg-slate-700 text-slate-200 hover:bg-slate-600');
+    btn.textContent = (state.watchOnly ? '★ ' : '☆ ') + '仅看自选';
+    document.getElementById('f-note').textContent = state.watchOnly
+        ? '仅显示自选列表中的币种（' + state.watchlist.length + ' 项）' : '';
+    state.offset = 0;
+    if (!state.watchOnly) { loadSymbols(); return; }
+    if (wlLoaded) { loadWatchRows(); }
+    else { pendingWatch = true; setState('loading', '正在加载自选列表...'); loadWatchlist(); }
+}
+
+function refreshAll() {
+    loadSummary();
+    loadWatchlist();
+    if (state.watchOnly) { loadWatchRows(); } else { loadSymbols(); }
+}
+
+bindControls();
+refreshAll();
+startPolling();
+</script>
+{% endblock %}

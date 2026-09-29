@@ -1,0 +1,2034 @@
+{% extends "base.html" %}
+{% block content %}
+{#- ─── page-scoped density layer ───────────────────────────────────────────────
+    The user reported large empty areas: every panel below is driven by these
+    compact primitives instead of per-element utility soup, so paddings/gaps/
+    font sizes stay consistent and shrink together.
+      .card-h    → ONE panel-header style (small uppercase label + rule)
+      .panel-h   → the same label used outside a .card-h
+      .tcard     → 8px/10px card padding (replaces p-3); .tcard-0 → no padding
+      .ltab      → 订单簿 / 最新成交 tab buttons of the left column
+      .lpane     → the scrollable pane of those two tabs (equal heights → no jump)
+      .brow      → one order-book row (bar + 4 columns), 17px tall
+      .stat      → one labelled figure (used by account + fee panels)
+      .tiny      → 10px helper text
+    These declarations live in the body, i.e. AFTER Tailwind's injected sheet, so
+    on equal specificity (.tcard vs p-3) the compact values win. -#}
+<style>
+  .card-h { display:flex; align-items:center; justify-content:space-between; gap:6px;
+            padding:3px 8px; min-height:22px; border-bottom:1px solid #334155; }
+  .card-h h3, .panel-h { font-size:10px; font-weight:700; letter-spacing:.08em;
+            text-transform:uppercase; color:#94a3b8; line-height:1.2; margin:0; }
+  .sub { font-size:10px; color:#64748b; }
+  .tcard { padding:8px 10px; }
+  .tcard.tcard-0 { padding:0; overflow:hidden; }
+  .ltab { font-size:11px; line-height:1.15; padding:2px 8px; border-radius:4px; color:#94a3b8; }
+  .ltab.on { background:#0f172a; color:#38bdf8; font-weight:700; }
+  .lpane { position:relative; overflow-y:auto; overflow-x:hidden; scrollbar-width:thin; }
+  /* Fixed pane height for BOTH tabs → switching never jumps the layout. The
+   * 20+20-level book scrolls inside it and is centred on the spread row. */
+  #lpane-book, #lpane-trades { height:clamp(360px, calc(100vh - 620px), 580px); }
+  .brow { position:relative; height:17px; line-height:17px; }
+  .brow .bar { position:absolute; top:0; bottom:0; right:0; }
+  .brow .cells { position:relative; display:flex; align-items:center; height:17px; }
+  .rnum { font-variant-numeric: tabular-nums; }
+  .btab-panel table { font-size:11.5px; line-height:1.35; }
+  .btab-panel table th, .btab-panel table td { padding:3px 8px; }
+  .stat { background:#0f172a; border:1px solid #1e293b; border-radius:4px; padding:2px 5px; min-width:0; }
+  .stat .k { font-size:9px; color:#64748b; display:block; line-height:1.25; white-space:nowrap;
+             overflow:hidden; text-overflow:ellipsis; }
+  .stat .v { font-size:12px; font-weight:700; line-height:1.35; display:block;
+             white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .cost-row { display:none; }
+  .cost-row.on { display:grid; }
+  .btab { font-size:11px; padding:3px 10px; border-radius:4px 4px 0 0; color:#94a3b8; }
+  .btab.on { background:#0f172a; color:#38bdf8; font-weight:700; }
+  #trade-chart { width:100%; height:clamp(320px, calc(100vh - 420px), 780px); }
+  .tiny { font-size:10px; line-height:1.4; }
+</style>
+
+{#- Binance-style spot trade page (docs/overhaul/MARKET_PAGES_API.md §5 `/trade`).
+    Endpoints: /api/market/{ticker,depth,trades,overview}, /api/market/symbols
+    (full-universe search, §1), /api/kline/{symbol} (§1/§6), /api/account,
+    /api/order, /api/orders, /api/history/trades, /api/strategy-monitor.
+    DATA SOURCE: prices/klines come from Binance MAINNET public data through the
+    backend (data-api.binance.vision), so the numbers match binance.com — they
+    must never be rescaled in the browser.
+    K-LINE UNIT CONTRACT (§6.5): /api/kline returns `time` in EPOCH SECONDS.
+    Every value handed to ECharts is converted once via toMs() → epoch
+    MILLISECONDS (×1000); the same ms array feeds the category x-axis of every
+    grid, so candles, volume and RSI/MACD share one zoom window. -#}
+
+{#- ───────────────  1. top market strip + symbol selector  ─────────────── -#}
+<div class="card mb-2 py-1.5 px-2">
+    <div class="flex flex-wrap items-center gap-x-3 gap-y-1">
+        {#- full-universe searchable selector (#sym-*), replaces the 5-item <select> -#}
+        <div id="sym-picker" class="relative" style="min-width:190px">
+            <input type="hidden" id="symbol-select" value="">
+            <button type="button" id="sym-trigger" onclick="symToggle()"
+                    aria-haspopup="listbox" aria-expanded="false"
+                    class="bg-slate-700 border border-slate-600 rounded px-2 py-0.5 text-sm text-white font-bold w-full text-left flex items-center gap-2">
+                <span id="sym-label">BTC/USDT</span>
+                <span id="sym-caret" class="ml-auto text-slate-400 text-xs">▾</span>
+            </button>
+            <div id="sym-menu" class="hidden absolute z-30 mt-1 w-full bg-slate-800 border border-slate-600 rounded shadow-lg">
+                <input id="sym-search" type="text" autocomplete="off" spellcheck="false"
+                       placeholder="{{ _('搜索币种') }} (BTC / ETH…)"
+                       class="w-full bg-slate-900 border-b border-slate-600 rounded-t px-2 py-1.5 text-sm text-white"
+                       oninput="symOnSearch()" onkeydown="symOnKey(event)">
+                <div id="sym-list" class="max-h-72 overflow-y-auto text-sm"></div>
+                <div id="sym-err" class="px-2 py-1 text-[11px] text-amber-400 border-t border-slate-700"></div>
+                <div class="px-2 py-1 text-[10px] text-slate-500 border-t border-slate-700">{{ _("数据源") }}: Binance {{ _("主网公开行情") }}</div>
+            </div>
+        </div>
+        <div class="flex items-baseline gap-1.5">
+            <span id="strip-last" class="text-lg font-bold text-slate-200">--</span>
+            <span id="strip-change" class="text-xs text-slate-400">--</span>
+        </div>
+        <div class="text-[11px] text-slate-400">
+            <span>{{ _("24h 高") }}</span> <span id="strip-high" class="text-green-400 font-bold">--</span>
+        </div>
+        <div class="text-[11px] text-slate-400">
+            <span>{{ _("24h 低") }}</span> <span id="strip-low" class="text-red-400 font-bold">--</span>
+        </div>
+        <div class="text-[11px] text-slate-400">
+            <span>{{ _("24h 量") }}</span> <span id="strip-vol" class="text-slate-200 font-bold">--</span>
+        </div>
+        <div class="text-[11px] text-slate-400">
+            <span>{{ _("24h 额") }}</span> <span id="strip-qvol" class="text-slate-200 font-bold">--</span>
+        </div>
+        <div class="ml-auto text-[11px] text-slate-500">
+            <span id="strip-status" class="text-slate-500"></span>
+            <span id="strip-clock" class="text-sky-400 font-bold">--:--:--</span>
+        </div>
+    </div>
+</div>
+
+{#- ───────────────  main 3-column grid  ─────────────── -#}
+<div class="grid grid-cols-1 xl:grid-cols-4 gap-2 mb-2 xl:items-start">
+
+    {#- ─── left column: 订单簿 / 最新成交 (tabbed — side-by-side would leave each
+        panel ~150px at 1280px, too narrow for price+qty+notional) + 账户总览 -#}
+    <div class="xl:col-span-1 flex flex-col gap-2 min-w-0">
+        <div class="card tcard tcard-0">
+            <div class="card-h">
+                <div class="flex items-center gap-0.5">
+                    <button type="button" id="ltab-book" class="ltab on" onclick="switchLeft('book')">{{ _("订单簿") }}</button>
+                    <button type="button" id="ltab-trades" class="ltab" onclick="switchLeft('trades')">{{ _("最新成交") }}</button>
+                </div>
+                <span class="sub" id="left-sub">{{ _("2s 刷新") }}</span>
+            </div>
+
+            {#- ── 订单簿: price | qty | 成交额(价×量) | 累计成交额, bar = cumulative qty ── -#}
+            <div id="lpane-book" class="lpane">
+                <div class="flex text-[10px] text-slate-500 px-2 pt-0.5 pb-0.5">
+                    <span class="flex-1 text-left">{{ _("价格") }}(USDT)</span>
+                    <span class="w-[62px] text-right">{{ _("数量") }}</span>
+                    <span class="w-[58px] text-right" title="{{ _('价 × 量') }}">{{ _("成交额") }}</span>
+                    <span class="w-[56px] text-right" title="{{ _('自最优价起累计') }}">{{ _("累计") }}</span>
+                </div>
+                <div id="depth-err" class="text-[10px] text-amber-400 px-2 pb-0.5"></div>
+                <div id="order-book-asks" class="px-1 text-[11px]">
+                    <div class="text-slate-500 px-2 py-2">{{ _("加载中") }}...</div>
+                </div>
+                <div id="order-book-spread" class="px-2 py-0.5 my-0.5 bg-slate-800 border-y border-slate-700 flex items-center justify-between">
+                    <span id="spread-mid" class="text-sm font-bold text-slate-200">--</span>
+                    <span class="text-[10px] text-slate-400">{{ _("价差") }}
+                        <span id="spread-val" class="text-slate-300">--</span>
+                        <span id="spread-pct" class="text-slate-500"></span>
+                    </span>
+                </div>
+                <div id="order-book-bids" class="px-1 text-[11px]">
+                    <div class="text-slate-500 px-2 py-2">{{ _("加载中") }}...</div>
+                </div>
+                <div class="px-2 py-0.5 border-t border-slate-800 text-[10px] text-slate-500 flex flex-wrap justify-between gap-x-2">
+                    <span>{{ _("买盘成交额") }} <span id="bid-total" class="text-green-400 rnum">--</span></span>
+                    <span>{{ _("卖盘成交额") }} <span id="ask-total" class="text-red-400 rnum">--</span></span>
+                    <span class="text-slate-600">{{ _("前20档合计") }}</span>
+                </div>
+                <div class="px-2 pb-1 text-[10px] text-slate-600">{{ _("成交额 = 价 × 量；深度条按累计数量着色") }}</div>
+            </div>
+
+            {#- ── 最新成交: price | qty | 成交额 | time ── -#}
+            <div id="lpane-trades" class="lpane hidden">
+                <div class="flex text-[10px] text-slate-500 px-2 pt-0.5 pb-0.5">
+                    <span class="flex-1 text-left">{{ _("价格") }}(USDT)</span>
+                    <span class="w-[70px] text-right">{{ _("数量") }}</span>
+                    <span class="w-[66px] text-right">{{ _("成交额") }}</span>
+                    <span class="w-[56px] text-right">{{ _("时间") }}</span>
+                </div>
+                <div id="trades-err" class="text-[10px] text-amber-400 px-2 pb-0.5"></div>
+                <div id="trades-list" class="px-2 pb-1 text-[11px]">
+                    <div class="text-slate-500 py-2">{{ _("加载中") }}...</div>
+                </div>
+            </div>
+        </div>
+
+        {#- account card — moved here so both side columns end at a similar height;
+            it is content-sized (never stretched to fill the column). -#}
+        <div class="card tcard">
+            <div class="flex items-center justify-between mb-1.5">
+                <h3 class="panel-h">{{ _("账户总览") }}</h3>
+                <span id="acct-mode" class="badge badge-blue text-[10px]">--</span>
+            </div>
+            <div class="grid grid-cols-3 gap-1">
+                <div class="stat"><span class="k">{{ _("账户余额") }}</span><span class="v text-slate-200 rnum" id="acct-balance">--</span></div>
+                <div class="stat"><span class="k">{{ _("可用") }}</span><span class="v text-green-400 rnum" id="acct-available">--</span></div>
+                <div class="stat"><span class="k">{{ _("冻结") }}</span><span class="v text-amber-400 rnum" id="acct-frozen">--</span></div>
+                <div class="stat"><span class="k">{{ _("权益") }}</span><span class="v text-sky-400 rnum" id="acct-equity">--</span></div>
+                <div class="stat"><span class="k">{{ _("持仓市值") }}</span><span class="v text-slate-200 rnum" id="acct-posvalue">--</span></div>
+                <div class="stat"><span class="k">{{ _("未实现盈亏(毛)") }}</span><span class="v text-slate-200 rnum" id="acct-upnl">--</span></div>
+            </div>
+            {#- cost totals: only rendered when GET /api/account returns them -#}
+            <div id="acct-cost-row" class="cost-row grid-cols-3 gap-1 mt-1">
+                <div class="stat"><span class="k">{{ _("累计手续费") }}</span><span class="v text-amber-400 rnum" id="acct-fees">--</span></div>
+                <div class="stat"><span class="k">{{ _("累计滑点") }}</span><span class="v text-amber-400 rnum" id="acct-slip">--</span></div>
+                <div class="stat"><span class="k">{{ _("净盈亏") }}</span><span class="v rnum" id="acct-netpnl">--</span></div>
+            </div>
+            <div class="mt-1 tiny text-slate-500">
+                {{ _("当前委托") }}: <span id="acct-pending" class="text-slate-300">--</span>
+                <span id="acct-err" class="text-amber-400"></span>
+            </div>
+            <div id="acct-cost-note" class="tiny text-slate-600"></div>
+        </div>
+    </div>
+
+    {#- ─── center column: candles + shared-zoom VOL/RSI/MACD subplots ─── -#}
+    <div class="xl:col-span-2 min-w-0">
+        <div class="card tcard">
+            <div class="flex flex-wrap items-center gap-1.5 mb-1">
+                <h3 class="panel-h mr-1">{{ _("K线图表") }}</h3>
+                <button class="tf-btn px-1.5 py-px rounded text-xs bg-slate-700 text-slate-300" data-tf="1m" onclick="switchTF('1m', this)">1{{ _("分") }}</button>
+                <button class="tf-btn px-1.5 py-px rounded text-xs bg-sky-700 text-white" data-tf="5m" onclick="switchTF('5m', this)">5{{ _("分") }}</button>
+                <button class="tf-btn px-1.5 py-px rounded text-xs bg-slate-700 text-slate-300" data-tf="15m" onclick="switchTF('15m', this)">15{{ _("分") }}</button>
+                <button class="tf-btn px-1.5 py-px rounded text-xs bg-slate-700 text-slate-300" data-tf="1h" onclick="switchTF('1h', this)">1{{ _("时") }}</button>
+                <button class="tf-btn px-1.5 py-px rounded text-xs bg-slate-700 text-slate-300" data-tf="4h" onclick="switchTF('4h', this)">4{{ _("时") }}</button>
+                <button class="tf-btn px-1.5 py-px rounded text-xs bg-slate-700 text-slate-300" data-tf="1d" onclick="switchTF('1d', this)">1{{ _("日") }}</button>
+                <button class="tf-btn px-1.5 py-px rounded text-xs bg-slate-700 text-slate-300" data-tf="1w" onclick="switchTF('1w', this)">1{{ _("周") }}</button>
+                <span class="text-slate-600">|</span>
+                <label class="text-xs text-slate-400" title="{{ _('加载的 K 线根数（缩放窗口自动对准最新 N 根）') }}">{{ _("最近") }}
+                    <select id="kline-limit" class="bg-slate-800 border border-slate-600 rounded px-1 py-0.5 text-xs text-white" onchange="switchKlineLimit()">
+                        <option value="100">100 {{ _("根") }}</option>
+                        <option value="200">200 {{ _("根") }}</option>
+                        <option value="500" selected>500 {{ _("根") }}</option>
+                        <option value="1000">1000 {{ _("根") }}</option>
+                    </select>
+                </label>
+            </div>
+            <div class="flex flex-wrap items-center gap-2 mb-1">
+                <label class="text-xs text-slate-400 cursor-pointer"><input type="checkbox" id="ind-vol" checked> VOL</label>
+                <label class="text-xs text-slate-400 cursor-pointer"><input type="checkbox" id="ind-ma" checked> MA7/25/99</label>
+                <label class="text-xs text-slate-400 cursor-pointer"><input type="checkbox" id="ind-ema"> EMA9/21/50</label>
+                <label class="text-xs text-slate-400 cursor-pointer"><input type="checkbox" id="ind-boll"> BOLL(20,2)</label>
+                <label class="text-xs text-slate-400 cursor-pointer"><input type="checkbox" id="ind-rsi"> RSI14</label>
+                <label class="text-xs text-slate-400 cursor-pointer"><input type="checkbox" id="ind-macd"> MACD</label>
+                <span class="text-[10px] text-slate-600">{{ _("滚轮缩放") }} · {{ _("拖动平移") }} · {{ _("下方滑块选区间") }}</span>
+                <span id="kline-err" class="ml-auto text-xs text-amber-400 truncate max-w-[45%]"></span>
+            </div>
+            <div id="trade-chart"></div>
+        </div>
+    </div>
+
+    {#- ─── right column: order form + fee tier / live cost estimate ─── -#}
+    <div class="xl:col-span-1 flex flex-col gap-2 min-w-0">
+        <div class="card tcard">
+            <div class="grid grid-cols-2 gap-1.5 mb-1.5">
+                <button id="tab-buy" onclick="setSide('long')" class="py-1 rounded text-[13px] font-bold bg-green-600 text-white">{{ _("买入") }}</button>
+                <button id="tab-sell" onclick="setSide('short')" class="py-1 rounded text-[13px] font-bold bg-slate-700 text-slate-300">{{ _("卖出") }}</button>
+            </div>
+            <div class="grid grid-cols-2 gap-1.5 mb-1.5">
+                <button id="tab-limit" onclick="setType('limit')" class="py-0.5 rounded text-[11px] bg-sky-700 text-white">{{ _("限价") }}</button>
+                <button id="tab-market" onclick="setType('market')" class="py-0.5 rounded text-[11px] bg-slate-700 text-slate-300">{{ _("市价") }}</button>
+            </div>
+            <div id="order-form-note" class="text-[10px] text-slate-500 mb-1">{{ _("按金额下单") }} (USDT)</div>
+
+            <label class="block text-[11px] text-slate-400 mb-0.5">{{ _("价格") }} (USDT)</label>
+            <input type="number" id="ord-price" step="0.01" min="0"
+                   class="w-full bg-slate-800 border border-slate-600 rounded px-2 py-1 text-[13px] text-white mb-1.5 disabled:opacity-50"
+                   placeholder="{{ _("市价自动取最新价") }}" oninput="updatePreview()">
+
+            <div class="flex items-center justify-between mb-0.5">
+                <label class="text-[11px] text-slate-400">{{ _("投入金额") }} (USDT)</label>
+                <span class="text-[10px] text-slate-500">{{ _("可用") }} <span id="ord-avail">--</span></span>
+            </div>
+            <input type="number" id="ord-amount" step="1" min="0" value="100"
+                   class="w-full bg-slate-800 border border-slate-600 rounded px-2 py-1 text-[13px] text-white mb-1" oninput="updatePreview()">
+            <div class="grid grid-cols-4 gap-1 mb-1.5">
+                <button onclick="setPct(25)" class="py-0.5 rounded text-[11px] bg-slate-800 text-slate-300 hover:bg-slate-700">25%</button>
+                <button onclick="setPct(50)" class="py-0.5 rounded text-[11px] bg-slate-800 text-slate-300 hover:bg-slate-700">50%</button>
+                <button onclick="setPct(75)" class="py-0.5 rounded text-[11px] bg-slate-800 text-slate-300 hover:bg-slate-700">75%</button>
+                <button onclick="setPct(100)" class="py-0.5 rounded text-[11px] bg-slate-800 text-slate-300 hover:bg-slate-700">100%</button>
+            </div>
+
+            <div class="grid grid-cols-2 gap-1.5 mb-1.5">
+                <div>
+                    <label class="block text-[10px] text-slate-400 mb-0.5">{{ _("仓位类型") }}</label>
+                    <select id="ord-ptype" class="w-full bg-slate-800 border border-slate-600 rounded px-1 py-0.5 text-[11px] text-white">
+                        <option value="satellite">{{ _("卫星仓位") }}</option>
+                        <option value="core">{{ _("核心仓位") }}</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-[10px] text-slate-400 mb-0.5">{{ _("止损比例") }} (%)</label>
+                    <input type="number" id="ord-sl" step="0.5" min="0" max="20" value="2"
+                           class="w-full bg-slate-800 border border-slate-600 rounded px-1 py-0.5 text-[11px] text-white">
+                </div>
+            </div>
+
+            <div class="flex justify-between text-[11px] text-slate-400 mb-1.5 bg-slate-800 rounded px-2 py-1">
+                <span>{{ _("预计数量") }}</span>
+                <span id="ord-qty" class="text-slate-200 font-bold">--</span>
+            </div>
+
+            <button id="ord-submit" onclick="submitOrder()"
+                    class="w-full py-1.5 rounded text-[13px] font-bold bg-green-600 text-white hover:bg-green-500 disabled:opacity-50 disabled:cursor-not-allowed">
+                {{ _("买入") }}
+            </button>
+            <div id="order-result" class="mt-1 text-[11px] min-h-[14px]"></div>
+            {% if not can_trade %}
+            <div class="mt-1 text-[10px] text-amber-400">{{ _("当前账户无权交易") }} (trader/admin)</div>
+            {% endif %}
+        </div>
+
+        {#- ─── fee tier + live cost estimate ───────────────────────────────────
+            GET  /api/fee/tier      → tiers + current selection + BNB toggle
+            POST /api/fee/tier      → trader/admin only (form-encoded, JSON retry)
+            GET  /api/fee/estimate  → live fee/slippage/cost for the order form
+            Both endpoints degrade: the reason is printed in-panel, values stay
+            "--" (never a blank panel, never a stale number). -#}
+        <div class="card tcard" id="fee-card">
+            <div class="flex items-center justify-between mb-1">
+                <h3 class="panel-h">{{ _("手续费 / 成本预估") }}</h3>
+                <span id="fee-tier-state" class="badge badge-blue text-[10px]">--</span>
+            </div>
+            <div class="flex items-center gap-1.5 mb-1">
+                <select id="fee-tier" onchange="onTierChange()" {% if not can_trade %}disabled{% endif %}
+                        class="flex-1 min-w-0 bg-slate-800 border border-slate-600 rounded px-1 py-0.5 text-[11px] text-white disabled:opacity-60">
+                    <option value="">{{ _("加载中") }}…</option>
+                </select>
+                <label class="flex items-center gap-1 text-[11px] text-slate-400 whitespace-nowrap {% if can_trade %}cursor-pointer{% endif %}">
+                    <input type="checkbox" id="fee-bnb" onchange="onTierChange()" {% if not can_trade %}disabled{% endif %}>
+                    BNB {{ _("抵扣") }} <span id="fee-bnb-pct" class="text-slate-500"></span>
+                </label>
+            </div>
+            <div class="grid grid-cols-3 gap-1">
+                <div class="stat"><span class="k">{{ _("名义金额") }}</span><span class="v text-slate-200 rnum" id="fee-notional">--</span></div>
+                <div class="stat"><span class="k">{{ _("费率") }}({{ _("单边") }})</span><span class="v text-sky-400 rnum" id="fee-pct">--</span></div>
+                <div class="stat"><span class="k">{{ _("手续费") }}</span><span class="v text-amber-400 rnum" id="fee-usdt">--</span></div>
+                <div class="stat"><span class="k">{{ _("滑点 / 价差") }}</span><span class="v text-amber-400 rnum" id="fee-slip">--</span></div>
+                <div class="stat"><span class="k">{{ _("预计总成本") }}</span><span class="v text-red-400 rnum" id="fee-total">--</span></div>
+                <div class="stat"><span class="k">{{ _("有效成交价") }}</span><span class="v text-slate-200 rnum" id="fee-effpx">--</span></div>
+            </div>
+            <div id="fee-err" class="tiny text-amber-400"></div>
+            <div id="fee-notes" class="tiny text-slate-500"></div>
+            <div class="tiny text-slate-500 mt-0.5">{{ _("档位为手动设置：本机无法读取币安账户的 30 天交易量与 BNB 持仓（主网账户接口不可达），费率表为币安现货标准档位。") }}</div>
+            {% if not can_trade %}
+            <div class="tiny text-amber-400">{{ _("当前账户为只读 (viewer)：档位与 BNB 折扣仅可查看。") }}</div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+
+{#- ───────────────  bottom tabs (client-side switching; content-sized)  ─────────────── -#}
+<div class="card tcard tcard-0">
+    <div class="flex flex-wrap items-center gap-1 border-b border-slate-700 px-1.5 pt-1">
+        <button class="btab on" data-btab="orders" onclick="switchBottom('orders')">{{ _("当前委托") }} <span id="cnt-orders" class="text-slate-500"></span></button>
+        <button class="btab" data-btab="positions" onclick="switchBottom('positions')">{{ _("持仓") }} <span id="cnt-positions" class="text-slate-500"></span></button>
+        <button class="btab" data-btab="trades" onclick="switchBottom('trades')">{{ _("成交历史") }}</button>
+        <button class="btab" data-btab="history" onclick="switchBottom('history')">{{ _("订单历史") }}</button>
+        <button class="btab" data-btab="strategy" onclick="switchBottom('strategy')">{{ _("策略信号") }} <span id="cnt-strategy" class="text-slate-500"></span></button>
+        <span class="ml-auto text-[10px] text-slate-500 pr-1.5">{{ _("委托/持仓") }} 3s · {{ _("策略") }} 5s</span>
+    </div>
+    {#- no min-height anywhere: each panel is content-sized, only capped by max-h -#}
+    <div class="p-1.5">
+        <div id="btab-orders" class="btab-panel max-h-72 overflow-auto">
+            <div class="text-slate-500 text-xs">{{ _("加载中") }}...</div>
+        </div>
+        <div id="btab-positions" class="btab-panel hidden max-h-72 overflow-auto">
+            <div class="text-slate-500 text-xs">{{ _("加载中") }}...</div>
+        </div>
+        <div id="btab-trades" class="btab-panel hidden max-h-72 overflow-auto">
+            <div class="text-slate-500 text-xs">{{ _("加载中") }}...</div>
+        </div>
+        <div id="btab-history" class="btab-panel hidden max-h-72 overflow-auto">
+            <div class="text-slate-500 text-xs">{{ _("加载中") }}...</div>
+        </div>
+        <div id="btab-strategy" class="btab-panel hidden max-h-72 overflow-auto">
+            <div class="text-slate-500 text-xs">{{ _("加载中") }}...</div>
+        </div>
+    </div>
+</div>
+
+<script>
+/* =========================================================================
+ * Binance-style spot trade page — self-contained vanilla JS.
+ * Endpoints: /api/market/{symbols,ticker,depth,trades,overview},
+ *            /api/kline/{symbol}, /api/account, /api/order, /api/orders,
+ *            /api/orders/{id}/cancel, /api/history/trades, /api/strategy-monitor
+ * ========================================================================= */
+var SYMBOLS = {{ symbols | tojson }};
+var CAN_TRADE = {{ 'true' if can_trade else 'false' }};
+var SYM_INFO = {};                 // symbol -> last/change_pct, for the picker rows
+
+var symbol = 'BTCUSDT';
+var interval = '5m';
+var klineLimit = 500;
+var side = 'long';
+var ordType = 'limit';
+var account = null;
+
+/* ── in-flight guards: a tick is skipped while the previous one is running ── */
+var INFLIGHT = {};
+function busy(url, on) { if (on) { INFLIGHT[url] = true; } else { delete INFLIGHT[url]; } }
+function isBusy(url) { return !!INFLIGHT[url]; }
+function visible() { return !document.hidden; }
+
+/* ── helpers ─────────────────────────────────────────────────────────────── */
+function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+}
+function num(v, dflt) {
+    var n = parseFloat(v);
+    return isFinite(n) ? n : (dflt === undefined ? NaN : dflt);
+}
+function fmtPrice(v) {
+    var n = num(v); if (!isFinite(n)) return '--';
+    var a = Math.abs(n);
+    if (a >= 1000) return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    if (a >= 10) return n.toFixed(2);
+    if (a >= 1) return n.toFixed(4);
+    if (a >= 0.01) return n.toFixed(6);
+    return n.toFixed(8);
+}
+function fmtQty(v) {
+    var n = num(v); if (!isFinite(n)) return '--';
+    var s = n.toFixed(6);
+    if (s.indexOf('.') >= 0) s = s.replace(/0+$/, '').replace(/\.$/, '');
+    return s;
+}
+function fmtUsdt(v) {
+    var n = num(v); if (!isFinite(n)) return '--';
+    return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function fmtSigned(v) {
+    var n = num(v); if (!isFinite(n)) return '--';
+    return (n >= 0 ? '+' : '') + fmtUsdt(n);
+}
+function pnlClass(v) { var n = num(v, 0); return n > 0 ? 'text-green-400' : (n < 0 ? 'text-red-400' : 'text-slate-300'); }
+function bigQty(v) {
+    var n = num(v); if (!isFinite(n)) return '--';
+    if (Math.abs(n) >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+    if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+    if (Math.abs(n) >= 1e3) return (n / 1e3).toFixed(2) + 'K';
+    return n.toFixed(4);
+}
+/* 成交额 (notional) = price × qty, Binance-style K/M/B suffixes for large values.
+ * Separate from bigQty() because the sub-K scale must stay readable: Binance
+ * prints 2 decimals above 1 USDT and more below (e.g. 0.0012 BTC → 101.03). */
+function fmtNotional(v) {
+    var n = num(v); if (!isFinite(n)) return '--';
+    var a = Math.abs(n), sign = n < 0 ? '-' : '';
+    if (a >= 1e9) return sign + (a / 1e9).toFixed(2) + 'B';
+    if (a >= 1e6) return sign + (a / 1e6).toFixed(2) + 'M';
+    if (a >= 1e3) return sign + (a / 1e3).toFixed(2) + 'K';
+    if (a >= 100) return sign + a.toFixed(1);
+    if (a >= 1) return sign + a.toFixed(2);
+    if (a >= 0.01) return sign + a.toFixed(4);
+    return sign + a.toFixed(6);
+}
+/* USDT cost figures keep cents but fall back to more precision for dust. */
+function fmtCost(v) {
+    var n = num(v); if (!isFinite(n)) return '--';
+    var a = Math.abs(n);
+    if (a >= 1) return fmtUsdt(n);
+    if (a === 0) return '0.00';
+    return n.toFixed(4);
+}
+/* THE K-line unit fix: the API returns epoch SECONDS; ECharts needs MILLISECONDS.
+ * Convert exactly once, here, and reuse the same ms values everywhere. */
+function toMs(ts) {
+    var n = num(ts);
+    if (!isFinite(n) || n <= 0) return NaN;
+    if (n < 1e11) n = n * 1000;      // epoch seconds  → ms  (/api/kline, /api/market/trades)
+    if (n > 1e14) n = n / 1000;      // tolerate microseconds
+    return n;
+}
+function pad2(x) { return (x < 10 ? '0' : '') + x; }
+function tsText(ms) {
+    var n = toMs(ms);
+    if (!isFinite(n)) return '--';
+    var d = new Date(n);
+    return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) +
+        ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+}
+function hhmmss(ts) {
+    var n = toMs(ts);
+    if (!isFinite(n)) return '--';
+    var d = new Date(n);
+    return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+}
+function localTime(s) {
+    if (!s) return '-';
+    var t = Date.parse(String(s).replace(' ', 'T') + (String(s).indexOf('Z') < 0 && String(s).indexOf('+') < 0 ? 'Z' : ''));
+    if (!isFinite(t)) return esc(String(s).slice(0, 19));
+    var d = new Date(t);
+    return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) +
+        ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+}
+function errText(j, status) {
+    if (j && j.detail) return String(j.detail);
+    if (j && j.error) return String(j.error);
+    if (status === 401) return '登录已过期，请重新登录';
+    if (status === 403) return '无权访问 (需要 trader 权限)';
+    if (status) return 'HTTP ' + status;
+    return '网络错误';
+}
+function showMsg(el, text, kind) {
+    if (!el) return;
+    el.className = 'mt-2 text-xs ' + (kind === 'ok' ? 'text-green-400' : kind === 'err' ? 'text-red-400' : 'text-slate-400');
+    el.innerHTML = esc(text);
+}
+function symLabel(s) { return String(s).replace('USDT', '/USDT'); }
+function baseAsset(s) { return String(s).replace('USDT', ''); }
+
+/* ── generic JSON GET: never throws, always reports the server reason ───────
+ * The in-flight key includes a sequence suffix when a caller tags the request
+ * (`tag`), so a symbol/interval switch starts a fresh request instead of being
+ * swallowed by a still-running poll for the previous symbol. A late response
+ * tagged with an outdated sequence is dropped by apiSeq/the `match` check.
+ * A hard client timeout guarantees NO request can hang the UI forever (the
+ * /api/market/symbols upstream is slow on a cold cache). */
+var apiSeq = {};
+var API_TIMEOUT_MS = 20000;
+function apiGet(url, onOk, onErr, tag, timeoutMs) {
+    var seq = tag ? (apiSeq[tag] = (apiSeq[tag] || 0) + 1) : null;
+    var key = tag ? tag + '#' + seq : url;
+    if (isBusy(key)) { return; }
+    busy(key, true);
+    var ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    var timedOut = false;
+    var watchdog = setTimeout(function () {
+        timedOut = true;
+        if (ctl) { try { ctl.abort(); } catch (e) { } }
+    }, timeoutMs || API_TIMEOUT_MS);
+    function done() { clearTimeout(watchdog); busy(key, false); }
+    fetch(url, { credentials: 'same-origin', signal: ctl ? ctl.signal : undefined }).then(function (r) {
+        return r.json().catch(function () { return null; }).then(function (j) {
+            done();
+            if (tag && apiSeq[tag] !== seq) { return; }   // superseded — drop silently
+            if (!r.ok) { if (onErr) onErr(errText(j, r.status)); return; }
+            if (j && j.error) { if (onErr) onErr(String(j.error)); return; }
+            if (onOk) onOk(j);
+        });
+    }).catch(function (e) {
+        done();
+        if (tag && apiSeq[tag] !== seq) { return; }
+        if (onErr) onErr(timedOut ? '请求超时' : ('网络错误: ' + e.message));
+    });
+}
+
+/* =========================================================================
+ * 1. top strip: deep link + ticker + clock
+ * ========================================================================= */
+function setStripStatus(text, isErr) {
+    var el = document.getElementById('strip-status');
+    el.textContent = text ? (' · ' + text) : '';
+    el.className = isErr ? 'text-amber-400' : 'text-slate-500';
+}
+
+/* ?symbol=XXX deep link (arriving from /market or /coin) — honoured before the
+ * first request, and also on back/forward navigation. */
+function symbolFromUrl() {
+    var raw = '';
+    try { raw = new URLSearchParams(window.location.search).get('symbol') || ''; } catch (e) { raw = ''; }
+    if (!raw) return '';
+    var s = String(raw).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (!s) return '';
+    if (s.indexOf('USDT') !== s.length - 4) s = s + 'USDT';
+    return s;
+}
+
+function loadTicker() {
+    apiGet('/api/market/ticker?symbol=' + encodeURIComponent(symbol), function (j) {
+        var last = num(j.last);
+        var chg = num(j.change_pct);
+        var lastEl = document.getElementById('strip-last');
+        lastEl.textContent = isFinite(last) ? fmtPrice(last) : '--';
+        lastEl.className = 'text-2xl font-bold ' + (isFinite(chg) ? (chg >= 0 ? 'text-green-400' : 'text-red-400') : 'text-slate-200');
+        var chgEl = document.getElementById('strip-change');
+        if (isFinite(chg)) {
+            chgEl.textContent = (chg >= 0 ? '+' : '') + chg.toFixed(2) + '%';
+            chgEl.className = 'text-sm ' + (chg >= 0 ? 'text-green-400' : 'text-red-400');
+        } else { chgEl.textContent = '--'; }
+        document.getElementById('strip-high').textContent = fmtPrice(j.high);
+        document.getElementById('strip-low').textContent = fmtPrice(j.low);
+        document.getElementById('strip-vol').textContent = bigQty(j.volume) + ' ' + baseAsset(symbol);
+        document.getElementById('strip-qvol').textContent = bigQty(j.quote_volume) + ' USDT';
+        SYM_INFO[symbol] = { last: last, change_pct: chg };
+        if (isFinite(last) && ordType === 'market') { updatePreview(); }
+        setStripStatus('');
+    }, function (e) { setStripStatus('行情: ' + e, true); });
+}
+
+function tickClock() {
+    var d = new Date();
+    document.getElementById('strip-clock').textContent =
+        pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+}
+
+/* =========================================================================
+ * 2. order book + latest trades
+ * ========================================================================= */
+/* ── left column: 订单簿 / 最新成交 tabs ────────────────────────────────────
+ * Side-by-side is only readable above ~1536px, so the two panels are tabbed at
+ * every width: both are polled continuously, switching is instant, and the
+ * freed height goes to the chart. */
+var leftTab = 'book';
+function switchLeft(name) {
+    leftTab = (name === 'trades') ? 'trades' : 'book';
+    var book = document.getElementById('lpane-book'), trades = document.getElementById('lpane-trades');
+    if (book) book.classList.toggle('hidden', leftTab !== 'book');
+    if (trades) trades.classList.toggle('hidden', leftTab !== 'trades');
+    var b1 = document.getElementById('ltab-book'), b2 = document.getElementById('ltab-trades');
+    if (b1) b1.className = 'ltab' + (leftTab === 'book' ? ' on' : '');
+    if (b2) b2.className = 'ltab' + (leftTab === 'trades' ? ' on' : '');
+}
+
+/* One order-book row: price | qty | 成交额(价×量) | 累计成交额.
+ * barPct = cumulative QUANTITY of this level / max cumulative (that is what
+ * Binance sizes the depth bar by, not the per-level size). */
+function depthRow(sideName, price, qty, cumNotional, barPct) {
+    var color = sideName === 'ask' ? 'text-red-400' : 'text-green-400';
+    var bar = sideName === 'ask' ? 'rgba(248,113,113,0.14)' : 'rgba(52,211,153,0.14)';
+    var notional = num(price, 0) * num(qty, 0);
+    return '<div class="brow">' +
+        '<div class="bar" style="width:' + Math.max(0, Math.min(100, num(barPct, 0))).toFixed(1) + '%;background:' + bar + '"></div>' +
+        '<div class="cells">' +
+        '<span class="flex-1 ' + color + ' rnum">' + fmtPrice(price) + '</span>' +
+        '<span class="w-[62px] text-right text-slate-300 rnum">' + fmtQty(qty) + '</span>' +
+        '<span class="w-[58px] text-right text-slate-400 rnum">' + fmtNotional(notional) + '</span>' +
+        '<span class="w-[56px] text-right text-slate-500 rnum">' + fmtNotional(cumNotional) + '</span>' +
+        '</div></div>';
+}
+
+/* Per-side running totals: cumulative qty (bar) + cumulative notional (column). */
+function depthCum(rows) {
+    var out = [], cq = 0, cn = 0;
+    for (var i = 0; i < rows.length; i++) {
+        var p = num(rows[i][0], 0), q = num(rows[i][1], 0);
+        if (!isFinite(p) || !isFinite(q)) continue;
+        cq += q; cn += p * q;
+        out.push({ p: p, q: q, cq: cq, cn: cn });
+    }
+    return out;
+}
+
+var LAST_SPREAD_PCT = NaN;      // used by the local cost fallback (market orders)
+var depthCentered = false;      // the pane is centred on the spread row once
+
+function loadDepth() {
+    var url = '/api/market/depth?symbol=' + encodeURIComponent(symbol) + '&limit=20';
+    apiGet(url, function (j) {
+        document.getElementById('depth-err').textContent = '';
+        var asks = depthCum(j.asks || []);   // ascending from API
+        var bids = depthCum(j.bids || []);   // descending from API
+        var maxCum = Math.max(asks.length ? asks[asks.length - 1].cq : 0,
+                              bids.length ? bids[bids.length - 1].cq : 0);
+        if (!(maxCum > 0)) maxCum = 1;
+
+        var pane = document.getElementById('lpane-book');
+        var keepTop = pane ? pane.scrollTop : 0;
+
+        var html = '', i;
+        for (i = asks.length - 1; i >= 0; i--) {          // best ask nearest the spread
+            html += depthRow('ask', asks[i].p, asks[i].q, asks[i].cn, asks[i].cq / maxCum * 100);
+        }
+        document.getElementById('order-book-asks').innerHTML = html || '<div class="text-slate-500 px-2 py-2">无数据</div>';
+
+        html = '';
+        for (i = 0; i < bids.length; i++) {               // best bid first
+            html += depthRow('bid', bids[i].p, bids[i].q, bids[i].cn, bids[i].cq / maxCum * 100);
+        }
+        document.getElementById('order-book-bids').innerHTML = html || '<div class="text-slate-500 px-2 py-2">无数据</div>';
+
+        /* 20 levels/side do not fit a compact pane, so the FIRST paint centres it
+         * on the spread row (mid price always visible); later polls keep whatever
+         * scroll offset the user chose. */
+        if (pane) {
+            var mid = document.getElementById('order-book-spread');
+            if (!depthCentered && mid) {
+                pane.scrollTop = Math.max(0, mid.offsetTop - (pane.clientHeight - mid.offsetHeight) / 2);
+                depthCentered = true;
+            } else {
+                pane.scrollTop = keepTop;
+            }
+        }
+
+        var bestBid = bids.length ? bids[0].p : NaN;
+        var bestAsk = asks.length ? asks[0].p : NaN;
+        var mid = (isFinite(bestBid) && isFinite(bestAsk)) ? (bestBid + bestAsk) / 2 : (isFinite(bestAsk) ? bestAsk : bestBid);
+        document.getElementById('spread-mid').textContent = isFinite(mid) ? fmtPrice(mid) : '--';
+        var sp = num(j.spread, isFinite(bestAsk) && isFinite(bestBid) ? bestAsk - bestBid : NaN);
+        document.getElementById('spread-val').textContent = isFinite(sp) ? fmtPrice(sp) : '--';
+        var spct = num(j.spread_pct);
+        LAST_SPREAD_PCT = isFinite(spct) ? spct : (isFinite(sp) && isFinite(mid) && mid > 0 ? sp / mid * 100 : NaN);
+        document.getElementById('spread-pct').textContent = isFinite(spct) ? '(' + spct.toFixed(3) + '%)' : '';
+
+        /* Side totals: prefer the API's own bid_total/ask_total (sum of price×qty
+         * over every returned level), fall back to the locally summed notionals. */
+        var bidTot = num(j.bid_total);
+        var askTot = num(j.ask_total);
+        if (!isFinite(bidTot) && bids.length) bidTot = bids[bids.length - 1].cn;
+        if (!isFinite(askTot) && asks.length) askTot = asks[asks.length - 1].cn;
+        document.getElementById('bid-total').textContent = isFinite(bidTot) ? fmtNotional(bidTot) : '--';
+        document.getElementById('ask-total').textContent = isFinite(askTot) ? fmtNotional(askTot) : '--';
+    }, function (e) {
+        document.getElementById('depth-err').textContent = e;
+        document.getElementById('order-book-asks').innerHTML = '<div class="text-amber-400 px-2 py-2">订单簿不可用: ' + esc(e) + '</div>';
+        document.getElementById('order-book-bids').innerHTML = '';
+    });
+}
+
+function loadTrades() {
+    var url = '/api/market/trades?symbol=' + encodeURIComponent(symbol) + '&limit=30';
+    apiGet(url, function (j) {
+        document.getElementById('trades-err').textContent = '';
+        var list = j.trades || [];
+        if (!list.length) {
+            document.getElementById('trades-list').innerHTML = '<div class="text-slate-500 py-2">暂无成交</div>';
+            return;
+        }
+        document.getElementById('trades-list').innerHTML = list.map(function (t) {
+            // is_buyer_maker=true  → the aggressor was the seller (red)
+            var cls = t.is_buyer_maker ? 'text-red-400' : 'text-green-400';
+            var nq = num(t.quote_qty);
+            if (!isFinite(nq)) nq = num(t.price, 0) * num(t.qty, 0);   // 成交额 = 价 × 量
+            return '<div class="brow">' +
+                '<div class="cells">' +
+                '<span class="flex-1 ' + cls + ' rnum">' + fmtPrice(t.price) + '</span>' +
+                '<span class="w-[70px] text-right text-slate-300 rnum">' + fmtQty(t.qty) + '</span>' +
+                '<span class="w-[66px] text-right text-slate-400 rnum">' + fmtNotional(nq) + '</span>' +
+                '<span class="w-[56px] text-right text-slate-500 rnum">' + hhmmss(t.time) + '</span>' +
+                '</div></div>';
+        }).join('');
+    }, function (e) {
+        document.getElementById('trades-err').textContent = e;
+        document.getElementById('trades-list').innerHTML = '<div class="text-amber-400 py-2">成交不可用: ' + esc(e) + '</div>';
+    });
+}
+
+/* =========================================================================
+ * 3. K-line chart (ECharts)
+ *    FIXES vs. the broken version (§6):
+ *      · time unit: epoch SECONDS → MILLISECONDS exactly once (toMs)
+ *      · 1m/5m/15m/1h/4h/1d/1w intervals (1d/1w were missing)
+ *      · dataZoom (inside + slider) bound to EVERY grid → volume shares the
+ *        candle x-axis zoom; axisPointer.link keeps the crosshair aligned
+ *      · "最近 N 根" control (100/200/500/1000) instead of a fixed 200
+ *      · rich crosshair tooltip: O/H/L/C + 涨跌幅 + 量 + full time
+ *      · MA7/25/99 + EMA9/21/50 + BOLL(20,2) overlay toggles, VOL/RSI/MACD
+ *        subplots kept
+ *      · a failed request CLEARS the chart and shows the reason — never a
+ *        stale chart (old candles used to stay on screen after an error)
+ * ========================================================================= */
+var chart = null, klineRows = [], klineErrMsg = '', klineLoadedCount = 0;
+var klineFirstPaint = true, klineViewMode = '', chartWarned = false;
+
+function calcSMA(d, p) {
+    var r = [], s = 0;
+    for (var i = 0; i < d.length; i++) {
+        s += d[i];
+        if (i >= p) s -= d[i - p];
+        r.push(i >= p - 1 ? s / p : null);
+    }
+    return r;
+}
+function calcEMA(d, p) {
+    var k = 2 / (p + 1), r = [], e = d.length ? d[0] : 0;
+    for (var i = 0; i < d.length; i++) { e = d[i] * k + e * (1 - k); r.push(e); }
+    return r;
+}
+function calcBB(d, p, sd) {
+    var m = calcSMA(d, p), u = [], l = [], s2 = 0;
+    for (var i = 0; i < d.length; i++) {
+        s2 += d[i] * d[i];
+        if (i >= p) s2 -= d[i - p] * d[i - p];
+        if (i < p - 1 || m[i] === null) { u.push(null); l.push(null); continue; }
+        var mean = m[i];
+        var varr = Math.max(0, s2 / p - mean * mean);
+        var std = Math.sqrt(varr);
+        u.push(mean + sd * std); l.push(mean - sd * std);
+    }
+    return [u, m, l];
+}
+function calcMACD(d) {
+    var e12 = calcEMA(d, 12), e26 = calcEMA(d, 26), dif = [], dea = [], hist = [];
+    for (var i = 0; i < d.length; i++) dif.push(e12[i] - e26[i]);
+    var da = calcEMA(dif, 9);
+    for (var i = 0; i < d.length; i++) { dea.push(da[i]); hist.push((dif[i] - da[i]) * 2); }
+    return [dif, dea, hist];
+}
+function calcRSI(d, p) {
+    var r = [];
+    if (d.length < p + 1) { for (var i = 0; i < d.length; i++) r.push(null); return r; }
+    var g = 0, l = 0, i;
+    for (i = 1; i <= p; i++) { var ch = d[i] - d[i - 1]; if (ch > 0) g += ch; else l -= ch; }
+    var ag = g / p, al = l / p;
+    for (i = 0; i < p; i++) r.push(null);
+    r.push(al > 0 ? 100 - 100 / (1 + ag / al) : 100);
+    for (i = p + 1; i < d.length; i++) {
+        var c = d[i] - d[i - 1];
+        ag = (ag * (p - 1) + (c > 0 ? c : 0)) / p;
+        al = (al * (p - 1) + (c < 0 ? -c : 0)) / p;
+        r.push(al > 0 ? 100 - 100 / (1 + ag / al) : 100);
+    }
+    return r;
+}
+function ind(id) { var el = document.getElementById(id); return !!(el && el.checked); }
+
+function axisLabelText(ms) {
+    var d = new Date(ms);
+    var hm = pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+    if (interval === '1d' || interval === '1w') return (d.getMonth() + 1) + '-' + pad2(d.getDate());
+    if (interval === '4h' || interval === '1h') return (d.getMonth() + 1) + '-' + pad2(d.getDate()) + ' ' + hm;
+    return hm;
+}
+
+/* Rich crosshair tooltip: 时间 / 开高低收 / 涨跌幅 / 成交量 / 叠加指标值 */
+function klineTooltip(params) {
+    if (!params || !params.length) return '';
+    var idx = params[0].dataIndex;
+    var row = klineRows[idx];
+    if (!row) return '';
+    var t = toMs(row.time);
+    var lines = [tsText(t)];
+    if (row.open !== undefined) {
+        var prev = idx > 0 ? num(klineRows[idx - 1].close) : NaN;
+        var diff = isFinite(prev) ? row.close - prev : NaN;
+        var pct = isFinite(prev) && prev !== 0 ? (diff / prev * 100) : NaN;
+        lines.push('开: ' + fmtPrice(row.open) + '   高: ' + fmtPrice(row.high));
+        lines.push('低: ' + fmtPrice(row.low) + '   收: ' + fmtPrice(row.close));
+        if (isFinite(pct)) lines.push('涨跌幅: ' + (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%' + (isFinite(diff) ? '  (' + fmtPrice(diff) + ')' : ''));
+        if (row.volume !== undefined) lines.push('成交量: ' + fmtQty(row.volume) + ' ' + baseAsset(symbol));
+    }
+    for (var i = 0; i < params.length; i++) {
+        var p = params[i];
+        if (!p || p.seriesName === 'K线' || p.seriesName === 'VOL') continue;
+        var v = p.value;
+        if (v && v.length === 2) v = v[1];
+        var nv = num(v);
+        if (isFinite(nv)) lines.push(p.seriesName + ': ' + fmtPrice(nv));
+    }
+    return lines.join('\n');
+}
+
+function renderChart() {
+    var box = document.getElementById('trade-chart');
+    if (!box) return;
+    if (typeof echarts === 'undefined') {
+        if (!chartWarned) { chartWarned = true; box.innerHTML = '<div class="text-amber-400 text-sm p-4">图表库 (ECharts) 未加载，无法绘图</div>'; }
+        return;
+    }
+    if (!chart) {
+        try { chart = echarts.init(box); } catch (e) {
+            box.innerHTML = '<div class="text-amber-400 text-sm p-4">图表初始化失败: ' + esc(e.message) + '</div>';
+            return;
+        }
+    }
+    document.getElementById('kline-err').textContent = klineErrMsg;
+
+    if (klineRows.length) { klineFirstPaint = false; }   // first real paint fits all bars
+
+    /* No data (initial load OR a failure): clear everything so a stale chart can
+     * never survive a failed request — and print the reason in the panel. */
+    if (!klineRows.length) {
+        chart.clear();
+        chart.setOption({
+            backgroundColor: '#0f172a', animation: false, dataZoom: [], series: [],
+            grid: { left: 0, right: 0, top: 0, bottom: 0 },
+            xAxis: [], yAxis: [],
+            title: {
+                text: klineErrMsg || '等待 K 线数据…', left: 'center', top: 'middle',
+                textStyle: { color: klineErrMsg ? '#fbbf24' : '#64748b', fontSize: 13, fontWeight: 'normal' }
+            }
+        }, true);
+        return;
+    }
+
+    // Convert epoch SECONDS → epoch MILLISECONDS once; every axis/series below
+    // consumes this same ms array (the §6.5 unit contract).
+    var times = klineRows.map(function (d) { return toMs(d.time); });
+    var closes = klineRows.map(function (d) { return d.close; });
+    var volumes = klineRows.map(function (d) { return d.volume; });
+    // CATEGORICAL candlestick data MUST be exactly [open, close, low, high].
+    // A 5-element array is read by ECharts as [open, close, low, high, extra] —
+    // so the old `[time, open, close, low, high]` form fed the epoch timestamp
+    // in as the *open* price, which stretched the y-axis to [0, 1.8e12] and made
+    // the candles render as a flat line (the "crammed / broken K-line" bug).
+    // The x position comes from the shared category axis (`times`) instead.
+    var ohlc = klineRows.map(function (d) { return [d.open, d.close, d.low, d.high]; });
+
+    // grid 0 = candles, optional subplots follow.
+    var panels = [];
+    if (ind('ind-vol')) panels.push('vol');
+    if (ind('ind-macd')) panels.push('macd');
+    if (ind('ind-rsi')) panels.push('rsi');
+
+    /* Vertical budget (%) — the subplots, the gaps and the dataZoom slider must
+     * all fit inside 100%, otherwise the last panel is pushed off-canvas (the
+     * old dashboard stacked the panels from 55% with no bottom reservation). */
+    var SLIDER_BAND = 8;      // dataZoom slider + its labels
+    var TAIL = 4;             // x-axis labels of the last panel
+    var GAP = 6;              // legend row + gaps between panels
+    var mainH, panelH;
+    if (!panels.length) { mainH = 100 - SLIDER_BAND - TAIL - 4; panelH = 0; }
+    else {
+        panelH = [0, 20, 15, 12][panels.length];
+        mainH = 100 - SLIDER_BAND - TAIL - GAP - panelH * panels.length;
+    }
+    var grids = [{ left: 62, right: 16, top: 10, height: mainH + '%' }];
+
+    var labelFmt = function (v) {
+        // category axis values are epoch ms (numbers); be tolerant of strings
+        var n = num(v);
+        if (!isFinite(n)) { var d0 = new Date(v); return isFinite(d0.getTime()) ? axisLabelText(d0.getTime()) : String(v); }
+        return axisLabelText(n < 1e11 ? n * 1000 : n);
+    };
+    var xAxes = [{
+        gridIndex: 0, type: 'category', data: times, boundaryGap: true,
+        axisLine: { lineStyle: { color: '#334155' } },
+        axisLabel: { color: '#94a3b8', fontSize: 10, formatter: labelFmt }
+    }];
+    var yAxes = [{ gridIndex: 0, scale: true, splitLine: { lineStyle: { color: '#1e293b' } }, axisLabel: { color: '#94a3b8', fontSize: 10, formatter: function (v) { return fmtPrice(v); } } }];
+
+    var series = [{
+        name: 'K线', type: 'candlestick', data: ohlc,
+        itemStyle: { color: '#34d399', color0: '#f87171', borderColor: '#34d399', borderColor0: '#f87171' }
+    }];
+    if (ind('ind-ma')) {
+        series.push({ name: 'MA7', type: 'line', data: calcSMA(closes, 7), smooth: true, symbol: 'none', lineStyle: { width: 1, color: '#fbbf24' } });
+        series.push({ name: 'MA25', type: 'line', data: calcSMA(closes, 25), smooth: true, symbol: 'none', lineStyle: { width: 1, color: '#f472b6' } });
+        series.push({ name: 'MA99', type: 'line', data: calcSMA(closes, 99), smooth: true, symbol: 'none', lineStyle: { width: 1, color: '#818cf8' } });
+    }
+    if (ind('ind-ema')) {
+        series.push({ name: 'EMA9', type: 'line', data: calcEMA(closes, 9), smooth: true, symbol: 'none', lineStyle: { width: 1, color: '#38bdf8' } });
+        series.push({ name: 'EMA21', type: 'line', data: calcEMA(closes, 21), smooth: true, symbol: 'none', lineStyle: { width: 1, color: '#fb923c' } });
+        series.push({ name: 'EMA50', type: 'line', data: calcEMA(closes, 50), smooth: true, symbol: 'none', lineStyle: { width: 1, color: '#a3e635' } });
+    }
+    if (ind('ind-boll')) {
+        var bb = calcBB(closes, 20, 2);
+        series.push({ name: 'BOLL上', type: 'line', data: bb[0], symbol: 'none', lineStyle: { width: 1, color: '#f87171', type: 'dashed' } });
+        series.push({ name: 'BOLL中', type: 'line', data: bb[1], symbol: 'none', lineStyle: { width: 1, color: '#94a3b8' } });
+        series.push({ name: 'BOLL下', type: 'line', data: bb[2], symbol: 'none', lineStyle: { width: 1, color: '#34d399', type: 'dashed' } });
+    }
+
+    var top = 10 + mainH + GAP / 2;
+    panels.forEach(function (p, k) {
+        var gi = k + 1;
+        grids.push({ left: 62, right: 16, top: top + '%', height: panelH + '%' });
+        xAxes.push({
+            gridIndex: gi, type: 'category', data: times, boundaryGap: true,
+            axisLine: { lineStyle: { color: '#334155' } },
+            axisTick: { show: false },
+            axisLabel: (k === panels.length - 1) ? { color: '#94a3b8', fontSize: 9, formatter: labelFmt } : { show: false }
+        });
+        var y = { gridIndex: gi, splitLine: { lineStyle: { color: '#1e293b' } }, axisLabel: { color: '#94a3b8', fontSize: 9 }, splitNumber: 2 };
+        if (p === 'vol') {
+            y.axisLabel.formatter = function (v) { return bigQty(v); };
+            series.push({
+                name: 'VOL', type: 'bar', xAxisIndex: gi, yAxisIndex: gi, data: volumes,
+                itemStyle: { color: function (pp) { var r = klineRows[pp.dataIndex]; return r && r.close >= r.open ? '#34d399' : '#f87171'; } }
+            });
+        } else if (p === 'macd') {
+            var macd = calcMACD(closes);
+            series.push({ name: 'DIF', type: 'line', xAxisIndex: gi, yAxisIndex: gi, data: macd[0], symbol: 'none', lineStyle: { width: 1, color: '#fbbf24' } });
+            series.push({ name: 'DEA', type: 'line', xAxisIndex: gi, yAxisIndex: gi, data: macd[1], symbol: 'none', lineStyle: { width: 1, color: '#f472b6' } });
+            series.push({
+                name: 'MACD', type: 'bar', xAxisIndex: gi, yAxisIndex: gi, data: macd[2],
+                itemStyle: { color: function (pp) { return (pp.value >= 0) ? '#34d399' : '#f87171'; } }
+            });
+        } else {
+            y.min = 0; y.max = 100;
+            series.push({
+                name: 'RSI14', type: 'line', xAxisIndex: gi, yAxisIndex: gi, data: calcRSI(closes, 14), symbol: 'none',
+                lineStyle: { width: 1.5, color: '#c084fc' },
+                markLine: {
+                    silent: true, symbol: 'none',
+                    data: [{ yAxis: 70, lineStyle: { color: '#f87171', type: 'dashed', width: 1 } },
+                           { yAxis: 30, lineStyle: { color: '#34d399', type: 'dashed', width: 1 } }]
+                }
+            });
+        }
+        yAxes.push(y);
+        top += panelH + GAP / 2;
+    });
+
+    var dzIdx = []; for (var i = 0; i < grids.length; i++) dzIdx.push(i);
+
+    /* Zoom policy (explicit, set by the context-switch controls):
+     *   'keep'  — polling unchanged context → keep the user's zoomed window
+     *   'all'   — interval/symbol changed → fit all loaded bars
+     *   'reset' — 最近N根 changed or the first paint → snap to the newest N bars
+     *   'fresh' — the very first successful paint → fit all loaded bars */
+    var keepZoom = (klineLoadedCount === klineRows.length && klineViewMode !== 'all');
+    var want = klineFirstPaint ? 'fresh' : (klineViewMode === 'all' ? 'all' : (keepZoom ? 'keep' : 'reset'));
+    klineViewMode = '';
+    klineLoadedCount = klineRows.length;
+    var dzStart = 0, dzEnd = 100, savedStart = null, savedEnd = null;
+    if (want === 'keep') {
+        try {
+            var cur = chart.getOption();
+            if (cur && cur.dataZoom && cur.dataZoom.length && cur.dataZoom[0] && cur.dataZoom[0].start !== undefined) {
+                savedStart = cur.dataZoom[0].start; savedEnd = cur.dataZoom[0].end;
+            }
+        } catch (e) { }
+    } else if (want === 'reset' && klineRows.length > klineLimit) {
+        // show the newest `klineLimit` bars
+        dzStart = Math.max(0, 100 - klineLimit / klineRows.length * 100);
+    }
+
+    chart.setOption({
+        backgroundColor: '#0f172a', animation: false, animationDuration: 0,
+        legend: { top: 0, right: 12, textStyle: { color: '#94a3b8', fontSize: 10 }, icon: 'roundRect', itemWidth: 10, itemHeight: 6 },
+        tooltip: {
+            trigger: 'axis', axisPointer: { type: 'cross' },
+            backgroundColor: '#1e293b', borderColor: '#334155',
+            textStyle: { color: '#e2e8f0', fontSize: 11 },
+            extraCssText: 'white-space:pre-line;',
+            formatter: klineTooltip
+        },
+        axisPointer: { link: [{ xAxisIndex: 'all' }], label: { backgroundColor: '#334155', color: '#e2e8f0', fontSize: 10 } },
+        dataZoom: [
+            { type: 'inside', xAxisIndex: dzIdx, zoomOnMouseWheel: true, moveOnMouseMove: true, start: dzStart, end: 100 },
+            { type: 'slider', xAxisIndex: dzIdx, bottom: 4, height: 16, borderColor: '#334155', backgroundColor: '#1e293b', fillerColor: 'rgba(56,189,248,0.2)', handleStyle: { color: '#38bdf8' }, textStyle: { color: '#64748b', fontSize: 9 }, start: dzStart, end: 100 }
+        ],
+        grid: grids, xAxis: xAxes, yAxis: yAxes, series: series
+    }, true);
+
+    if (want === 'keep' && savedStart !== null && savedStart !== undefined) {
+        chart.setOption({ dataZoom: [{ start: savedStart, end: savedEnd }, { start: savedStart, end: savedEnd }], animation: false, animationDuration: 0 });
+    }
+}
+
+function loadKline() {
+    if (!symbol) return;
+    var lim = klineLimit;
+    var url = '/api/kline/' + encodeURIComponent(symbol) + '?interval=' + encodeURIComponent(interval) + '&limit=' + lim;
+    apiGet(url, function (j) {
+        var rows = [];
+        if (Array.isArray(j)) {
+            for (var i = 0; i < j.length; i++) {
+                var d = j[i];
+                if (!d) continue;
+                var t = toMs(d.time);
+                if (!isFinite(t) || !isFinite(num(d.close))) continue;
+                rows.push({ time: t, open: num(d.open), high: num(d.high), low: num(d.low), close: num(d.close), volume: num(d.volume, 0) });
+            }
+            rows.sort(function (a, b) { return a.time - b.time; });
+            if (rows.length) {
+                klineRows = rows;
+                klineErrMsg = '';
+            } else {
+                klineRows = [];                                  // never keep stale candles
+                klineErrMsg = 'K线无数据 (symbol=' + symbol + ' interval=' + interval + ')';
+            }
+        } else {
+            klineRows = [];                                      // never keep stale candles
+            klineErrMsg = 'K线数据格式异常: ' + errText(j, 200);
+        }
+        renderChart();
+    }, function (e) {
+        klineRows = [];                                          // no stale chart on failure
+        klineErrMsg = 'K线获取失败: ' + e;
+        renderChart();
+    }, 'kline');
+}
+
+function switchTF(tf, btn) {
+    interval = tf;
+    var all = document.querySelectorAll('.tf-btn');
+    for (var i = 0; i < all.length; i++) { all[i].className = 'tf-btn px-1.5 py-px rounded text-xs bg-slate-700 text-slate-300'; }
+    if (btn) btn.className = 'tf-btn px-1.5 py-px rounded text-xs bg-sky-700 text-white';
+    klineRows = [];            // drop old-interval candles immediately
+    klineViewMode = 'all';     // fit the whole series for the new interval
+    loadKline();
+    restartKlineTimer();
+}
+
+function switchKlineLimit() {
+    var v = parseInt(document.getElementById('kline-limit').value, 10);
+    if (!isFinite(v) || v <= 0 || v === klineLimit) return;
+    klineLimit = v;
+    klineRows = [];            // bar count will differ → window snaps to the newest N
+    klineViewMode = 'reset';
+    loadKline();
+}
+
+/* =========================================================================
+ * 4. full-universe symbol selector  (/api/market/symbols?q=&limit=50)
+ * ========================================================================= */
+var symIndex = [];          // [{symbol,last,change_pct}] — rows currently rendered
+var symFull = [];           // full (unfiltered) snapshot: instant local filtering
+var symOpen = false, symLoading = false, symSeq = 0, symTimer = null, symErrMsg = '';
+var symFallback = false;    // /api/market/symbols failed → server-rendered list in use
+var symBuilt = false;
+
+function setSymErr(msg) {
+    symErrMsg = msg || '';
+    var el = document.getElementById('sym-err');
+    if (el) el.textContent = msg || '';
+}
+
+function buildSymIndex() {
+    var seen = {}, out = [];
+    function push(s, last, chg) {
+        if (!s || seen[s]) { return; }
+        seen[s] = 1;
+        out.push({ symbol: String(s).toUpperCase(), last: last, change_pct: chg });
+    }
+    // server-rendered fallback list first (always available, never empty)
+    for (var i = 0; i < SYMBOLS.length; i++) { push(SYMBOLS[i], NaN, NaN); }
+    push(symbol, NaN, NaN);
+    for (var k in SYM_INFO) { push(k, SYM_INFO[k].last, SYM_INFO[k].change_pct); }
+    return out;
+}
+
+function renderSymList(q) {
+    var box = document.getElementById('sym-list');
+    var needle = String(q || '').trim().toUpperCase();
+    var list = [];
+    var i;
+    for (i = 0; i < symIndex.length; i++) {
+        var r = symIndex[i];
+        if (!needle || r.symbol.indexOf(needle) >= 0) list.push(r);
+    }
+    function rank(s) {
+        if (s === needle) return 0;
+        if (needle && s.indexOf(needle) === 0) return 1;
+        return 2;
+    }
+    list.sort(function (a, b) { return rank(a.symbol) - rank(b.symbol); });   // stable: upstream order kept inside a rank
+    if (!list.length) {
+        box.innerHTML = '<div class="px-2 py-2 text-slate-500">' +
+            (symLoading ? '搜索全币种中…' : ('无匹配币种' + (needle ? ': ' + esc(needle) : ''))) +
+            '</div>';
+        return;
+    }
+    box.innerHTML = list.slice(0, 50).map(function (r) {
+        var chg = num(r.change_pct);
+        var cls = !isFinite(chg) ? 'text-slate-500' : (chg >= 0 ? 'text-green-400' : 'text-red-400');
+        var price = isFinite(num(r.last)) ? fmtPrice(r.last) : '--';
+        var pc = isFinite(chg) ? ((chg >= 0 ? '+' : '') + chg.toFixed(2) + '%') : '';
+        return '<div class="sym-row px-2 py-1.5 flex items-center gap-2 cursor-pointer hover:bg-slate-700 ' + (r.symbol === symbol ? 'bg-slate-700' : '') + '" data-symbol="' + esc(r.symbol) + '" onclick="pickSymbol(this.getAttribute(\'data-symbol\'))">' +
+            '<span class="font-bold text-slate-100">' + esc(symLabel(r.symbol)) + '</span>' +
+            '<span class="ml-auto text-xs text-slate-400">' + price + '</span>' +
+            '<span class="text-xs ' + cls + '" style="min-width:56px;text-align:right">' + pc + '</span>' +
+            '</div>';
+    }).join('');
+}
+
+/* Debounced server search; on failure falls back to the local (server-rendered)
+ * symbol list and renders the reason in the picker. A failure only pauses the
+ * server search for 30s — the next search retries (a cold upstream cache is
+ * slow, not broken). */
+var SYM_RETRY_MS = 30000, symDownUntil = 0;
+function searchSymbols(q) {
+    if (symTimer) { clearTimeout(symTimer); }
+    symTimer = setTimeout(function () {
+        symTimer = null;
+        if (Date.now() < symDownUntil) { renderSymList(q); return; }
+        symLoading = true;
+        var seq = ++symSeq;
+        setSymErr('');
+        renderSymList(q);
+        var url = '/api/market/symbols?q=' + encodeURIComponent(q || '') + '&limit=50';
+        apiGet(url, function (j) {
+            if (seq !== symSeq) { return; }
+            symLoading = false;
+            symFallback = false;
+            var rows = (j && (j.symbols || j.results)) || [];
+            if (!Array.isArray(rows)) { rows = []; }
+            if (!rows.length && String(q || '').trim()) {
+                // a search that finds nothing is not an error — show the empty state
+                symIndex = [];
+                renderSymList(q);
+                return;
+            }
+            symIndex = rows.map(function (r) {
+                return {
+                    symbol: String(r.symbol || '').toUpperCase(),
+                    last: num(r.last),
+                    change_pct: num(r.change_pct)
+                };
+            }).filter(function (r) { return !!r.symbol; });
+            if (!String(q || '').trim()) { symFull = symIndex.slice(); }
+            renderSymList(q);
+        }, function (e) {
+            if (seq !== symSeq) { return; }
+            symLoading = false;
+            symDownUntil = Date.now() + SYM_RETRY_MS;   // pause, then retry automatically
+            symFallback = true;
+            symFull = buildSymIndex();
+            symIndex = symFull.slice();
+            setSymErr('全币种列表暂不可用，已回退到内置列表: ' + e);
+            renderSymList(q);
+        }, null, 20000);              // the universe upstream is slow on a cold cache
+    }, 250);                          // debounce
+}
+
+function symToggle(force) {
+    var open = (force === undefined) ? !symOpen : !!force;
+    symOpen = open;
+    var menu = document.getElementById('sym-menu');
+    menu.classList.toggle('hidden', !open);
+    document.getElementById('sym-trigger').setAttribute('aria-expanded', open ? 'true' : 'false');
+    document.getElementById('sym-caret').textContent = open ? '▴' : '▾';
+    if (open) {
+        if (!symBuilt) { symBuilt = true; symFull = buildSymIndex(); }
+        var s = document.getElementById('sym-search');
+        s.value = '';
+        symIndex = symFull.length ? symFull : buildSymIndex();
+        renderSymList('');
+        setTimeout(function () { try { s.focus(); } catch (e) { } }, 0);
+        if (Date.now() >= symDownUntil) { searchSymbols(''); }   // refresh from /api/market/symbols
+    }
+}
+
+function symOnSearch() {
+    var q = document.getElementById('sym-search').value;
+    if (Date.now() < symDownUntil) { renderSymList(q); return; }
+    // instant local filter over the full snapshot; the debounced server search
+    // below then narrows it to the whole universe
+    symIndex = symFull.length ? symFull : buildSymIndex();
+    renderSymList(q);
+    searchSymbols(q);
+}
+
+function symOnKey(ev) {
+    if (ev.key === 'Escape') { symToggle(false); }
+    else if (ev.key === 'Enter') {
+        var q = document.getElementById('sym-search').value.trim().toUpperCase();
+        if (!q) return;
+        var first = null, rows = document.querySelectorAll('#sym-list .sym-row');
+        if (rows.length) first = rows[0].getAttribute('data-symbol');
+        if (first) { pickSymbol(first); }
+        else if (/^[A-Z0-9]{2,20}$/.test(q)) { pickSymbol(q.indexOf('USDT') === q.length - 4 ? q : q + 'USDT'); }
+    }
+}
+
+function pickSymbol(s) {
+    if (!s) return;
+    s = String(s).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (!s) return;
+    symToggle(false);
+    if (s === symbol) { return; }
+    symbol = s;
+    document.getElementById('symbol-select').value = symbol;
+    document.getElementById('sym-label').textContent = symLabel(symbol);
+    klineRows = [];
+    klineViewMode = 'all';     // new symbol → fit everything loaded
+    depthCentered = false;     // re-centre the book pane on the new spread row
+    document.getElementById('strip-last').textContent = '--';
+    document.getElementById('strip-change').textContent = '--';
+    // keep the URL deep-link in sync so a refresh / shared link lands here
+    try {
+        var u = new URL(window.location.href);
+        u.searchParams.set('symbol', symbol);
+        window.history.replaceState(null, '', u.pathname + u.search + u.hash);
+    } catch (e) { }
+    loadTicker(); loadDepth(); loadTrades(); loadKline(); loadStrategySignals(); updatePreview();
+}
+
+/* =========================================================================
+ * 5. strategy signal panel (/api/strategy-monitor, symbol-filtered, ~5s)
+ * ========================================================================= */
+var STRAT_ERR = '', STRAT_HITS = 0;
+
+function normSymbol(s) {
+    return String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+function signalScoreClass(v) {
+    var n = num(v, 0);
+    if (n >= 0.5) return 'text-green-400 font-bold';
+    if (n > 0.3) return 'text-green-400';
+    if (n <= -0.5) return 'text-red-400 font-bold';
+    if (n < -0.3) return 'text-red-400';
+    return 'text-slate-400';
+}
+
+function strategyBadge(sig) {
+    var triggered = !!sig.threshold_met && !sig.exit_blocks_entry;
+    return triggered
+        ? '<span class="badge badge-green text-xs">阈值满足</span>'
+        : '<span class="badge badge-yellow text-xs">未触发</span>';
+}
+
+function renderStrategyPanel(j) {
+    var box = document.getElementById('btab-strategy');
+    var hits = [];
+    var strategies = (j && j.strategies) || [];
+    for (var i = 0; i < strategies.length; i++) {
+        var st = strategies[i];
+        if (!st) continue;
+        var sigs = st.signals || {};
+        for (var k in sigs) {
+            if (normSymbol(k) === symbol) { hits.push({ strat: st, sig: sigs[k], key: k }); }
+        }
+    }
+    STRAT_HITS = hits.length;
+    document.getElementById('cnt-strategy').innerHTML = hits.length
+        ? '<span class="text-sky-400">(' + hits.length + ')</span>' : '';
+
+    var head = '<div class="text-xs text-slate-500 mb-2">' + esc(symLabel(symbol)) +
+        ' · ' + esc(interval) + ' · ' + (j && j.active_count !== undefined ? j.active_count : '?') + ' 个启用策略' +
+        (STRAT_ERR ? ' · <span class="text-amber-400">上次错误: ' + esc(STRAT_ERR) + '</span>' : '') + '</div>';
+    if (!hits.length) {
+        box.innerHTML = head + '<div class="text-slate-500 text-xs text-center py-3">该交易对暂无策略信号（策略引擎可能尚未评估到它）</div>';
+        return;
+    }
+    var html = head;
+    for (var h = 0; h < hits.length; h++) {
+        var st2 = hits[h].strat, sig = hits[h].sig;
+        var ind = num(sig.indicator), fin = num(sig.final_score);
+        var ml = num(sig.ml_confidence), news = num(sig.news_sentiment);
+        var exits = [];
+        if (sig.exit_signal_long) exits.push('多头出场');
+        if (sig.exit_signal_short) exits.push('空头出场');
+        if (sig.exit_signal && !exits.length) exits.push(String(sig.exit_signal));
+        html += '<div class="bg-slate-800 rounded p-2 border border-slate-700 mb-2">' +
+            '<div class="flex items-center gap-2 flex-wrap">' +
+            '<b class="text-sm text-slate-100">' + esc(st2.name) + '</b>' +
+            '<span class="badge ' + (st2.enabled ? 'badge-green' : 'badge-red') + ' text-xs">' + (st2.enabled ? '启用' : '禁用') + '</span>' + strategyBadge(sig) +
+            '<span class="text-[11px] text-slate-500">' + esc((st2.timeframes || []).join(',')) + '</span>' +
+            '<span class="text-[11px] text-slate-500 ml-auto">' + esc(st2.mode || '') + '</span>' +
+            '</div>' +
+            '<div class="flex flex-wrap gap-3 mt-1 text-xs">' +
+            '<span class="text-slate-400">指标分 <b class="' + signalScoreClass(ind) + '">' + (isFinite(ind) ? ind.toFixed(2) : '--') + '</b></span>' +
+            '<span class="text-slate-400">最终分 <b class="' + signalScoreClass(fin) + '">' + (isFinite(fin) ? fin.toFixed(3) : '--') + '</b></span>' +
+            '<span class="text-slate-400">阈值 <b class="' + (sig.threshold_met ? 'text-green-400' : 'text-amber-400') + '">' + (sig.threshold_met ? '满足' : '未满足') + '</b></span>' +
+            '<span class="text-slate-400">出场信号 <b class="' + (exits.length ? 'text-red-400' : 'text-slate-500') + '">' + (exits.length ? esc(exits.join('/')) : '无') + '</b></span>' +
+            '<span class="text-slate-500">ML ' + (isFinite(ml) ? ml.toFixed(2) : '--') + ' · 新闻 ' + (isFinite(news) ? news.toFixed(2) : '--') + '</span>' +
+            '</div>';
+        if (sig.exit_blocks_entry) {
+            html += '<div class="text-orange-400 text-[11px] mt-1">同向出场信号满足 → 入场被抑制</div>';
+        }
+        var conds = sig.entry_conditions || {};
+        ['long', 'short'].forEach(function (sd) {
+            var list = conds[sd] || [];
+            if (!list.length) return;
+            html += '<div class="mt-1 text-[11px]"><span class="text-slate-500">' + (sd === 'long' ? '做多条件' : '做空条件') + ':</span>';
+            for (var c = 0; c < list.length; c++) {
+                html += '<div class="ml-2 ' + (list[c].met ? 'text-green-400' : 'text-red-400') + '">' + (list[c].met ? '✓' : '✗') + ' ' + esc(list[c].condition) + '</div>';
+            }
+            html += '</div>';
+        });
+        html += '</div>';
+    }
+    box.innerHTML = html;
+}
+
+function loadStrategySignals() {
+    apiGet('/api/strategy-monitor', function (j) {
+        STRAT_ERR = '';
+        renderStrategyPanel(j || {});
+    }, function (e) {
+        STRAT_ERR = e;
+        document.getElementById('cnt-strategy').textContent = '';
+        document.getElementById('btab-strategy').innerHTML =
+            '<div class="text-amber-400 text-xs">策略信号接口不可用: ' + esc(e) + '</div>';
+    }, 'strategy');
+}
+
+/* =========================================================================
+ * 6. order form
+ * ========================================================================= */
+function setSide(s) {
+    side = s;
+    var buy = document.getElementById('tab-buy'), sell = document.getElementById('tab-sell');
+    buy.className = 'py-1 rounded text-[13px] font-bold ' + (s === 'long' ? 'bg-green-600 text-white' : 'bg-slate-700 text-slate-300');
+    sell.className = 'py-1 rounded text-[13px] font-bold ' + (s === 'short' ? 'bg-red-600 text-white' : 'bg-slate-700 text-slate-300');
+    var sub = document.getElementById('ord-submit');
+    sub.className = 'w-full py-1.5 rounded text-[13px] font-bold text-white ' + (s === 'long' ? 'bg-green-600 hover:bg-green-500' : 'bg-red-600 hover:bg-red-500');
+    sub.textContent = s === 'long' ? '买入 / 做多' : '卖出 / 做空';
+    scheduleEstimate();            // side changes the fee/slippage direction
+}
+
+function setType(t) {
+    ordType = t;
+    var lim = document.getElementById('tab-limit'), mkt = document.getElementById('tab-market');
+    lim.className = 'py-0.5 rounded text-[11px] ' + (t === 'limit' ? 'bg-sky-700 text-white' : 'bg-slate-700 text-slate-300');
+    mkt.className = 'py-0.5 rounded text-[11px] ' + (t === 'market' ? 'bg-sky-700 text-white' : 'bg-slate-700 text-slate-300');
+    var p = document.getElementById('ord-price');
+    p.disabled = (t === 'market');
+    if (t === 'market') p.value = '';
+    document.getElementById('order-form-note').textContent =
+        t === 'market' ? '市价单：按金额以最新价立即成交' : '限价单：价格到达后挂单成交（冻结资金）';
+    updatePreview();
+}
+
+function refPrice() {
+    var p = num(document.getElementById('ord-price').value);
+    if (isFinite(p) && p > 0) return p;
+    return num(document.getElementById('strip-last').textContent.replace(/,/g, ''));
+}
+
+function updatePreview() {
+    var amt = num(document.getElementById('ord-amount').value);
+    var px = refPrice();
+    var qtyEl = document.getElementById('ord-qty');
+    if (!isFinite(amt) || amt <= 0 || !isFinite(px) || px <= 0) {
+        qtyEl.textContent = '--';
+        scheduleEstimate();
+        return;
+    }
+    qtyEl.textContent = fmtQty(amt / px) + ' ' + baseAsset(symbol);
+    scheduleEstimate();       // live cost estimate, 300ms debounced
+}
+
+function setPct(pct) {
+    if (!account) { showMsg(document.getElementById('order-result'), '账户信息未就绪，无法按比例下单', 'err'); return; }
+    var avail = num(account.available, 0);
+    var px = refPrice();
+    if (!isFinite(px) || px <= 0) { showMsg(document.getElementById('order-result'), '缺少参考价格（限价请先填写价格）', 'err'); return; }
+    var amt = avail * pct / 100;
+    document.getElementById('ord-amount').value = amt >= 1 ? amt.toFixed(2) : amt.toFixed(4);
+    updatePreview();
+}
+
+function submitOrder() {
+    var out = document.getElementById('order-result');
+    if (!CAN_TRADE) { showMsg(out, '当前账户无权交易（需要 trader 或 admin 角色）', 'err'); return; }
+    var amt = num(document.getElementById('ord-amount').value);
+    if (!isFinite(amt) || amt <= 0) { showMsg(out, '请输入有效的投入金额 (USDT)', 'err'); return; }
+    var px = null;
+    if (ordType === 'limit') {
+        px = num(document.getElementById('ord-price').value);
+        if (!isFinite(px) || px <= 0) { showMsg(out, '限价单必须填写大于 0 的价格', 'err'); return; }
+    }
+    var body = new URLSearchParams();
+    body.set('symbol', symbol);
+    body.set('side', side);
+    body.set('type', ordType);
+    body.set('amount_usdt', String(amt));
+    if (px !== null) body.set('price', String(px));
+    body.set('position_type', document.getElementById('ord-ptype').value);
+    var sl = num(document.getElementById('ord-sl').value);
+    if (isFinite(sl) && sl > 0) body.set('stop_loss_pct', String(sl));
+
+    var btn = document.getElementById('ord-submit');
+    btn.disabled = true;
+    showMsg(out, '提交中...', 'wait');
+    fetch('/api/order', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: body.toString()
+    }).then(function (r) {
+        return r.json().catch(function () { return null; }).then(function (j) {
+            btn.disabled = false;
+            var ok = j && j.ok === true;
+            if (ok) {
+                var o = j.order || {};
+                showMsg(out, '下单成功 · ' + (o.status || '') + ' · ' + (o.side || side) + ' ' +
+                    fmtQty(o.quantity) + ' @ ' + fmtPrice(o.price) + ' (' + fmtUsdt(o.amount_usdt) + ' USDT)', 'ok');
+                document.getElementById('ord-price').value = '';
+                loadAccount(); loadOpenOrders(); loadDepth();
+            } else {
+                showMsg(out, '下单失败: ' + errText(j, r.status), 'err');
+            }
+        });
+    }).catch(function (e) {
+        btn.disabled = false;
+        showMsg(out, '下单请求失败: ' + e.message, 'err');
+    });
+}
+
+/* =========================================================================
+ * 6b. fee tier + live cost estimate  (docs/overhaul/TRADE_PAGE_API.md §五之二)
+ *     GET  /api/fee/tier      (login)  — tier table, current tier, BNB flag
+ *     POST /api/fee/tier      (trader) — manual tier / BNB-discount setting
+ *     GET  /api/fee/estimate  (login)  — notional/fee/slippage/cost/effective
+ *     The contract freezes the GET shapes but NOT the POST body, so the write is
+ *     sent form-encoded first and retried as JSON on 400/415/422.
+ *     Every failure prints its reason in-panel; values fall back to "--" (or a
+ *     clearly-labelled local estimate) — never a blank or stale panel.
+ * ========================================================================= */
+var FEE = {
+    tier: '', useBnb: false, tiers: [], data: null,
+    tierOk: false, tierErr: '', timer: null, lastKey: ''
+};
+
+function setEst(id, txt, cls) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = txt;
+    if (cls) el.className = 'v rnum ' + cls;
+}
+function clearEst() {
+    ['fee-notional', 'fee-pct', 'fee-usdt', 'fee-slip', 'fee-total', 'fee-effpx'].forEach(function (id) {
+        setEst(id, '--', 'text-slate-500');
+    });
+}
+function setFeeErr(msg) {
+    var el = document.getElementById('fee-err');
+    if (el) el.textContent = msg || '';
+}
+function setFeeNotes(msg) {
+    var el = document.getElementById('fee-notes');
+    if (el) el.textContent = msg || '';
+}
+
+/* A form change → at most one request per 300ms; an unchanged input set does not
+ * re-request at all (the ticker poll calls updatePreview() every 3s). */
+function scheduleEstimate(force) {
+    if (FEE.timer) { clearTimeout(FEE.timer); }
+    FEE.timer = setTimeout(function () { FEE.timer = null; loadEstimate(force); }, 300);
+}
+
+function feeKey(amt, px) {
+    return [symbol, side, ordType, isFinite(amt) ? amt : '', isFinite(px) ? px : '',
+            FEE.tier, FEE.useBnb ? 1 : 0].join('|');
+}
+
+function loadEstimate(force) {
+    var amt = num(document.getElementById('ord-amount').value);
+    var px = refPrice();
+    var key = feeKey(amt, px);
+    if (!force && key === FEE.lastKey) { return; }        // nothing changed
+    FEE.lastKey = key;
+
+    if (!isFinite(amt) || amt <= 0 || !isFinite(px) || px <= 0) {
+        clearEst();
+        setFeeNotes('');
+        setFeeErr(FEE.tierOk ? '' : FEE.tierErr);
+        return;
+    }
+    var qs = 'symbol=' + encodeURIComponent(symbol) +
+             '&side=' + encodeURIComponent(side) +
+             '&type=' + encodeURIComponent(ordType) +
+             '&amount_usdt=' + encodeURIComponent(String(amt)) +
+             '&price=' + encodeURIComponent(String(px));
+    apiGet('/api/fee/estimate?' + qs, function (j) {
+        FEE.estOk = true;
+        setFeeErr(FEE.tierOk ? '' : FEE.tierErr);
+        setEst('fee-notional', fmtCost(j.notional), 'text-slate-200');
+        setEst('fee-pct', isFinite(num(j.fee_pct)) ? num(j.fee_pct).toFixed(4) + '%' : '--', 'text-sky-400');
+        setEst('fee-usdt', fmtCost(j.fee_usdt), 'text-amber-400');
+        setEst('fee-slip', fmtCost(j.slippage_usdt), 'text-amber-400');
+        setEst('fee-total', fmtCost(j.total_cost_usdt), 'text-red-400');
+        setEst('fee-effpx', isFinite(num(j.effective_price)) ? fmtPrice(j.effective_price) : '--', 'text-slate-200');
+        var notes = [];
+        if (isFinite(num(j.slippage_bps)) && num(j.slippage_bps) > 0) notes.push('滑点 ' + num(j.slippage_bps) + ' bps');
+        if (isFinite(num(j.spread_pct)) && num(j.spread_pct) > 0) notes.push('价差 ' + num(j.spread_pct).toFixed(4) + '%');
+        if (j.notes) {
+            /* the manual-tier disclosure is already printed statically below */
+            notes = notes.concat((Array.isArray(j.notes) ? j.notes : [String(j.notes)])
+                .filter(function (n) { return String(n).indexOf('手动选择') < 0; }));
+        }
+        setFeeNotes(notes.join(' · '));
+    }, function (e) {
+        FEE.estOk = false;
+        setFeeErr((FEE.tierOk ? '' : FEE.tierErr + ' ') +
+                  '成本预估不可用: ' + e + ' (/api/fee/estimate 未部署或返回错误)');
+        localEstimate(amt, px);                           // labelled fallback
+    }, 'feeEst', 8000);
+}
+
+/* Local fallback: tier table (if we have it) + the live depth spread + the
+ * contract's 2 bps market slippage. Clearly marked as 本地估算 so it can never
+ * be mistaken for the server's number. */
+function localEstimate(amt, px) {
+    var row = null, tiers = FEE.tiers || [];
+    for (var i = 0; i < tiers.length; i++) {
+        if (String(tiers[i] && tiers[i].tier) === String(FEE.tier)) { row = tiers[i]; }
+    }
+    if (!row) {
+        clearEst();
+        setFeeNotes('费率档位未知（/api/fee/tier 也不可用），无法估算成本。');
+        return;
+    }
+    var pct = num(ordType === 'limit' ? row.maker_pct : row.taker_pct);
+    if (!isFinite(pct)) { clearEst(); setFeeNotes('费率数据缺失，无法估算。'); return; }
+    var discount = num(FEE.data && FEE.data.bnb_discount_pct, 25);
+    if (FEE.useBnb) { pct = pct * (1 - discount / 100); }
+    var notional = amt;
+    var fee = notional * pct / 100;
+    var slipBps = (ordType === 'market') ? 2 : 0;
+    var spread = (ordType === 'market' && isFinite(LAST_SPREAD_PCT)) ? LAST_SPREAD_PCT : (ordType === 'market' ? 0.02 : 0);
+    var slip = notional * (spread / 100 / 2 + slipBps / 10000);
+    var total = fee + slip;
+    var dir = (side === 'long') ? 1 : -1;
+    var effPx = px * (1 + dir * ((fee + slip) / notional));
+    setEst('fee-notional', fmtCost(notional), 'text-slate-200');
+    setEst('fee-pct', pct.toFixed(4) + '%', 'text-sky-400');
+    setEst('fee-usdt', fmtCost(fee), 'text-amber-400');
+    setEst('fee-slip', fmtCost(slip), 'text-amber-400');
+    setEst('fee-total', fmtCost(total), 'text-red-400');
+    setEst('fee-effpx', fmtPrice(effPx), 'text-slate-200');
+    setFeeNotes('本地估算（接口不可用）：' + (ordType === 'limit' ? 'maker' : 'taker') + ' ' +
+        pct.toFixed(4) + '%' + (FEE.useBnb ? '（含 BNB 折扣）' : '') +
+        ' + ' + (ordType === 'market' ? ('价差 ' + (isFinite(spread) ? spread.toFixed(4) : '--') + '%/2 + 滑点 ' + slipBps + 'bps') : '限价单无滑点'));
+}
+
+function fillTierSelect() {
+    var sel = document.getElementById('fee-tier');
+    if (!sel) return;
+    var tiers = FEE.tiers || [];
+    if (!tiers.length) { return; }
+    sel.innerHTML = tiers.map(function (t) {
+        var mk = num(t.maker_pct), tk = num(t.taker_pct);
+        var label = String(t.tier) + ' · 挂单 ' + (isFinite(mk) ? mk.toFixed(4) : '--') +
+                    '% / 吃单 ' + (isFinite(tk) ? tk.toFixed(4) : '--') + '%';
+        return '<option value="' + esc(t.tier) + '"' + (String(t.tier) === String(FEE.tier) ? ' selected' : '') + '>' + esc(label) + '</option>';
+    }).join('');
+    sel.value = FEE.tier;
+    sel.disabled = !CAN_TRADE;
+}
+
+function updateFeeBadge() {
+    var el = document.getElementById('fee-tier-state');
+    if (!el) return;
+    if (!FEE.tierOk) { el.textContent = '不可用'; el.className = 'badge badge-red text-[10px]'; return; }
+    var row = null;
+    for (var i = 0; i < FEE.tiers.length; i++) {
+        if (String(FEE.tiers[i] && FEE.tiers[i].tier) === String(FEE.tier)) { row = FEE.tiers[i]; }
+    }
+    var txt = FEE.tier || '--';
+    if (row) {
+        txt += ' ' + num(row.taker_pct).toFixed(4) + '%';
+        if (FEE.useBnb) txt += ' (BNB)';
+    }
+    el.textContent = txt;
+    el.className = 'badge ' + (FEE.useBnb ? 'badge-green' : 'badge-blue') + ' text-[10px]';
+    var bp = document.getElementById('fee-bnb-pct');
+    if (bp) bp.textContent = isFinite(num(FEE.data && FEE.data.bnb_discount_pct)) ? ('-' + num(FEE.data.bnb_discount_pct) + '%') : '';
+}
+
+function loadFeeTier() {
+    apiGet('/api/fee/tier', function (j) {
+        FEE.data = j;
+        FEE.tierOk = true;
+        FEE.tierErr = '';
+        FEE.tier = (j.current === undefined || j.current === null) ? '' : String(j.current);
+        FEE.useBnb = !!j.use_bnb_discount;
+        FEE.tiers = Array.isArray(j.tiers) ? j.tiers : [];
+        var sel = document.getElementById('fee-tier');
+        if (sel) sel.disabled = !CAN_TRADE;
+        var bnb = document.getElementById('fee-bnb');
+        if (bnb) { bnb.checked = FEE.useBnb; bnb.disabled = !CAN_TRADE; }
+        fillTierSelect();
+        updateFeeBadge();
+        setFeeErr('');
+        FEE.lastKey = '';                 // force a re-estimate with the real tier
+        scheduleEstimate(true);
+    }, function (e) {
+        FEE.tierOk = false;
+        FEE.tierErr = '手续费档位不可用: ' + e + ' (/api/fee/tier 未部署或返回错误)。';
+        var sel = document.getElementById('fee-tier');
+        if (sel) { sel.innerHTML = '<option value="">费率档位不可用</option>'; sel.disabled = true; }
+        var bnb = document.getElementById('fee-bnb');
+        if (bnb) bnb.disabled = true;
+        updateFeeBadge();
+        setFeeErr(FEE.tierErr + (FEE.estOk ? '' : ' 成本预估同样不可用。'));
+        setFeeNotes('后端手续费接口尚未就绪：页面保持可下单，成本数字以 "--" 占位并与接口错误原因一同显示。');
+        FEE.lastKey = '';
+        scheduleEstimate(true);
+    }, 'feeTier', 8000);
+}
+
+/* POST /api/fee/tier — trader only. The contract freezes the route but not the
+ * parameter name, so BOTH spellings are sent (`fee_tier`, which the shipped
+ * endpoint reads, and `tier`), form-encoded first (house style) with a JSON
+ * retry on 400/415/422. */
+function postFeeTier(tier, bnb) {
+    if (!CAN_TRADE) return;
+    var body = new URLSearchParams();
+    body.set('fee_tier', tier);
+    body.set('tier', tier);
+    body.set('use_bnb_discount', bnb ? 'true' : 'false');
+    fetch('/api/fee/tier', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: body.toString()
+    }).then(function (r) {
+        if (r.ok) { onTierSaved(); return; }
+        if (r.status === 400 || r.status === 415 || r.status === 422) { postFeeTierJson(tier, bnb); return; }
+        return r.json().catch(function () { return null; }).then(function (j) {
+            setFeeErr('档位保存失败: ' + errText(j, r.status));
+        });
+    }).catch(function (e) { setFeeErr('档位保存失败: 网络错误 ' + e.message); });
+}
+
+function postFeeTierJson(tier, bnb) {
+    fetch('/api/fee/tier', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fee_tier: tier, tier: tier, use_bnb_discount: !!bnb })
+    }).then(function (r) {
+        if (r.ok) { onTierSaved(); return; }
+        return r.json().catch(function () { return null; }).then(function (j) {
+            setFeeErr('档位保存失败: ' + errText(j, r.status) + '（已按表单与 JSON 两种方式提交）');
+        });
+    }).catch(function (e) { setFeeErr('档位保存失败: 网络错误 ' + e.message); });
+}
+
+function onTierSaved() {
+    setFeeErr('');
+    loadFeeTier();          // confirm the server accepted it, then re-estimate
+}
+
+function onTierChange() {
+    var sel = document.getElementById('fee-tier');
+    var bnb = document.getElementById('fee-bnb');
+    FEE.tier = sel ? sel.value : FEE.tier;
+    FEE.useBnb = !!(bnb && bnb.checked);
+    updateFeeBadge();
+    FEE.lastKey = '';
+    scheduleEstimate(true);
+    postFeeTier(FEE.tier, FEE.useBnb);
+}
+
+/* =========================================================================
+ * 7. account (/api/account) — summary card + positions tab
+ * ========================================================================= */
+function loadAccount() {
+    apiGet('/api/account', function (j) {
+        account = j;
+        document.getElementById('acct-err').textContent = '';
+        document.getElementById('acct-balance').textContent = fmtUsdt(j.balance);
+        document.getElementById('acct-available').textContent = fmtUsdt(j.available);
+        document.getElementById('acct-frozen').textContent = fmtUsdt(j.frozen);
+        document.getElementById('acct-equity').textContent = fmtUsdt(j.equity);
+        document.getElementById('acct-posvalue').textContent = fmtUsdt(j.positions_value);
+        var up = document.getElementById('acct-upnl');
+        up.textContent = fmtSigned(j.unrealized_pnl);
+        up.className = 'v rnum ' + pnlClass(j.unrealized_pnl);
+        document.getElementById('acct-pending').textContent = (j.pending_count === undefined || j.pending_count === null) ? '--' : j.pending_count;
+        document.getElementById('acct-mode').textContent = j.mode || '--';
+        document.getElementById('ord-avail').textContent = fmtUsdt(j.available);
+        renderAccountCosts(j);
+        renderPositions(j.positions || []);
+    }, function (e) {
+        document.getElementById('acct-err').textContent = '账户: ' + e;
+        document.getElementById('btab-positions').innerHTML = '<div class="text-amber-400 text-xs">账户接口不可用: ' + esc(e) + '</div>';
+    });
+}
+
+/* fees_paid_total / slippage_paid_total / net_pnl_total are optional (the cost
+ * model may not be deployed yet) → the row is shown only when the API actually
+ * returns numbers, otherwise a one-line reason replaces it. */
+function numOrNull(v) {
+    if (v === undefined || v === null || v === '') return null;
+    var n = num(v);
+    return isFinite(n) ? n : null;
+}
+
+function renderAccountCosts(j) {
+    var fees = numOrNull(j && j.fees_paid_total);
+    var slip = numOrNull(j && j.slippage_paid_total);
+    var net = numOrNull(j && j.net_pnl_total);
+    var row = document.getElementById('acct-cost-row');
+    var note = document.getElementById('acct-cost-note');
+    if (fees === null && slip === null && net === null) {
+        if (row) row.classList.remove('on');
+        if (note) note.textContent = '成本合计不可用：/api/account 未返回 fees_paid_total / slippage_paid_total / net_pnl_total（手续费模型未部署），以上为毛额。';
+        return;
+    }
+    if (row) row.classList.add('on');
+    if (note) note.textContent = '';
+    document.getElementById('acct-fees').textContent = fmtCost(fees === null ? 0 : fees);
+    document.getElementById('acct-slip').textContent = fmtCost(slip === null ? 0 : slip);
+    var np = document.getElementById('acct-netpnl');
+    np.textContent = (net === null) ? '--' : fmtSigned(net);
+    np.className = 'v rnum ' + (net === null ? 'text-slate-400' : pnlClass(net));
+}
+
+function renderPositions(positions) {
+    document.getElementById('cnt-positions').textContent = positions.length ? '(' + positions.length + ')' : '';
+    var box = document.getElementById('btab-positions');
+    if (!positions.length) {
+        box.innerHTML = '<div class="text-slate-500 text-xs text-center py-3">暂无持仓</div>';
+        return;
+    }
+    /* Net PnL is shown whenever the API exposes fee/slippage/net_pnl for at least
+     * one position; gross 未实现盈亏 is always kept. */
+    var hasCost = positions.some(function (p) {
+        return p && (numOrNull(p.net_pnl) !== null || numOrNull(p.fee) !== null || numOrNull(p.slippage) !== null);
+    });
+    var rows = positions.map(function (p) {
+        var fee = numOrNull(p.fee), slip = numOrNull(p.slippage), net = numOrNull(p.net_pnl);
+        if (net === null && (fee !== null || slip !== null)) {
+            net = num(p.unrealized_pnl, 0) - (fee === null ? 0 : fee) - (slip === null ? 0 : slip);
+        }
+        var cost = hasCost
+            ? '<td class="text-right text-amber-400">' + (fee === null ? '-' : fmtCost(fee)) + '</td>' +
+              '<td class="text-right text-amber-400">' + (slip === null ? '-' : fmtCost(slip)) + '</td>' +
+              '<td class="text-right ' + (net === null ? 'text-slate-500' : pnlClass(net)) + '">' + (net === null ? '-' : fmtSigned(net)) + '</td>'
+            : '';
+        return '<tr class="border-b border-slate-800">' +
+            '<td class="font-bold">' + esc(p.symbol) + '</td>' +
+            '<td><span class="badge ' + (p.side === 'long' ? 'badge-green' : 'badge-red') + '">' + (p.side === 'long' ? '做多' : '做空') + '</span></td>' +
+            '<td class="text-right">' + fmtQty(p.quantity) + '</td>' +
+            '<td class="text-right">' + fmtPrice(p.entry_price) + '</td>' +
+            '<td class="text-right">' + fmtPrice(p.current_price) + '</td>' +
+            '<td class="text-right">' + fmtUsdt(p.position_value) + '</td>' +
+            '<td class="text-right ' + pnlClass(p.unrealized_pnl) + '">' + fmtSigned(p.unrealized_pnl) + '</td>' +
+            '<td class="text-right ' + pnlClass(p.pnl_pct) + '">' + (isFinite(num(p.pnl_pct)) ? num(p.pnl_pct).toFixed(2) + '%' : '-') + '</td>' +
+            cost +
+            '<td class="text-right text-amber-400">' + (p.stop_loss ? fmtPrice(p.stop_loss) : '-') + '</td>' +
+            '<td class="text-right text-slate-400">' + fmtUsdt(p.amount_usdt) + '</td>' +
+            '<td><span class="badge badge-blue text-[10px]">' + (p.position_type === 'core' ? '核心' : '卫星') + '</span></td>' +
+            '<td class="text-slate-400 max-w-[140px] truncate">' + esc(p.strategy_name || '-') + '</td>' +
+            '</tr>';
+    }).join('');
+    box.innerHTML = (hasCost ? '' : '<div class="text-slate-500 tiny mb-1">接口未返回 fee / slippage / net_pnl，仅显示毛盈亏。</div>') +
+        '<table class="w-full"><thead class="text-slate-400 border-b border-slate-700"><tr>' +
+        '<th class="text-left">交易对</th><th class="text-left">方向</th><th class="text-right">数量</th>' +
+        '<th class="text-right">入场价</th><th class="text-right">现价</th><th class="text-right">市值</th>' +
+        '<th class="text-right">未实现盈亏(毛)</th><th class="text-right">盈亏%</th>' +
+        (hasCost ? '<th class="text-right">手续费</th><th class="text-right">滑点</th><th class="text-right">净盈亏</th>' : '') +
+        '<th class="text-right">止损</th>' +
+        '<th class="text-right">金额</th><th class="text-left">类型</th><th class="text-left">策略</th>' +
+        '</tr></thead><tbody>' + rows + '</tbody></table>';
+}
+
+/* =========================================================================
+ * orders: open orders tab + order history tab + cancel
+ * ========================================================================= */
+function orderRows(orders, withCancel) {
+    var head = '<table class="w-full"><thead class="text-slate-400 border-b border-slate-700"><tr>' +
+        '<th class="text-left p-2">ID</th><th class="text-left p-2">交易对</th><th class="text-left p-2">方向</th>' +
+        '<th class="text-left p-2">类型</th><th class="text-right p-2">价格</th><th class="text-right p-2">数量</th>' +
+        '<th class="text-right p-2">金额</th><th class="text-left p-2">状态</th><th class="text-right p-2">成交价</th>' +
+        '<th class="text-left p-2">创建时间</th><th class="text-left p-2">完成时间</th>' +
+        (withCancel ? '<th class="text-left p-2">操作</th>' : '') + '</tr></thead><tbody>';
+    var body = orders.map(function (o) {
+        var st = o.status || '';
+        var badge = st === 'open' ? 'badge-yellow' : (st === 'filled' ? 'badge-green' : 'badge-red');
+        var stLabel = st === 'open' ? '挂单中' : (st === 'filled' ? '已成交' : (st === 'cancelled' ? '已撤销' : st));
+        var act = withCancel
+            ? '<td class="p-2"><button class="text-red-400 text-xs hover:underline" onclick="cancelOrder(' + o.id + ')">撤单</button></td>'
+            : '';
+        return '<tr class="border-b border-slate-800">' +
+            '<td class="p-2 text-slate-400">' + esc(o.id) + '</td>' +
+            '<td class="p-2 font-bold">' + esc(o.symbol) + '</td>' +
+            '<td class="p-2 ' + (o.side === 'long' ? 'text-green-400' : 'text-red-400') + '">' + (o.side === 'long' ? '做多/买入' : '做空/卖出') + '</td>' +
+            '<td class="p-2">' + (o.type === 'limit' ? '限价' : '市价') + '</td>' +
+            '<td class="p-2 text-right">' + (o.price ? fmtPrice(o.price) : '-') + '</td>' +
+            '<td class="p-2 text-right">' + fmtQty(o.quantity) + '</td>' +
+            '<td class="p-2 text-right">' + fmtUsdt(o.amount_usdt) + '</td>' +
+            '<td class="p-2"><span class="badge ' + badge + ' text-xs">' + esc(stLabel) + '</span></td>' +
+            '<td class="p-2 text-right">' + (o.fill_price ? fmtPrice(o.fill_price) : '-') + '</td>' +
+            '<td class="p-2 text-xs text-slate-500">' + localTime(o.created_at) + '</td>' +
+            '<td class="p-2 text-xs text-slate-500">' + localTime(o.filled_at) + '</td>' +
+            act +
+            '</tr>' + (o.reason ? '<tr><td colspan="' + (withCancel ? 12 : 11) + '" class="px-2 pb-1 text-[11px] text-amber-400">原因: ' + esc(o.reason) + '</td></tr>' : '');
+    }).join('');
+    return head + body + '</tbody></table>';
+}
+
+function loadOpenOrders() {
+    apiGet('/api/orders?status=open', function (j) {
+        var orders = j.orders || [];
+        document.getElementById('cnt-orders').textContent = orders.length ? '(' + orders.length + ')' : '';
+        document.getElementById('btab-orders').innerHTML = orders.length
+            ? orderRows(orders, true)
+            : '<div class="text-slate-500 text-xs text-center py-3">暂无未成交委托</div>';
+    }, function (e) {
+        document.getElementById('btab-orders').innerHTML = '<div class="text-amber-400 text-xs">委托接口不可用: ' + esc(e) + '</div>';
+    });
+}
+
+function loadOrderHistory() {
+    apiGet('/api/orders?status=history&limit=100', function (j) {
+        var orders = j.orders || [];
+        document.getElementById('btab-history').innerHTML = orders.length
+            ? orderRows(orders, false)
+            : '<div class="text-slate-500 text-xs text-center py-3">暂无历史订单</div>';
+    }, function (e) {
+        document.getElementById('btab-history').innerHTML = '<div class="text-amber-400 text-xs">订单历史接口不可用: ' + esc(e) + '</div>';
+    });
+}
+
+function cancelOrder(id) {
+    fetch('/api/orders/' + encodeURIComponent(id) + '/cancel', { method: 'POST', credentials: 'same-origin' })
+        .then(function (r) {
+            return r.json().catch(function () { return null; }).then(function (j) {
+                if (r.ok && j && j.ok) {
+                    loadOpenOrders(); loadAccount(); loadOrderHistory();
+                } else {
+                    showMsg(document.getElementById('order-result'), '撤单失败: ' + errText(j, r.status), 'err');
+                }
+            });
+        }).catch(function (e) {
+            showMsg(document.getElementById('order-result'), '撤单请求失败: ' + e.message, 'err');
+        });
+}
+
+function loadTradeHistory() {
+    apiGet('/api/history/trades?limit=100', function (j) {
+        var trades = j.trades || [];
+        if (!trades.length) {
+            document.getElementById('btab-trades').innerHTML = '<div class="text-slate-500 text-xs text-center py-3">暂无成交记录</div>';
+            return;
+        }
+        /* fee / slippage / net_pnl are optional per trade (contract §五之二). */
+        var hasCost = trades.some(function (t) {
+            return t && (numOrNull(t.net_pnl) !== null || numOrNull(t.fee) !== null || numOrNull(t.slippage) !== null);
+        });
+        var rows = trades.map(function (t) {
+            var fee = numOrNull(t.fee), slip = numOrNull(t.slippage), net = numOrNull(t.net_pnl);
+            if (net === null && (fee !== null || slip !== null)) {
+                net = num(t.pnl, 0) - (fee === null ? 0 : fee) - (slip === null ? 0 : slip);
+            }
+            var cost = hasCost
+                ? '<td class="text-right text-amber-400">' + (fee === null ? '-' : fmtCost(fee)) + '</td>' +
+                  '<td class="text-right text-amber-400">' + (slip === null ? '-' : fmtCost(slip)) + '</td>' +
+                  '<td class="text-right ' + (net === null ? 'text-slate-500' : pnlClass(net)) + '">' + (net === null ? '-' : fmtSigned(net)) + '</td>'
+                : '';
+            return '<tr class="border-b border-slate-800">' +
+                '<td class="text-slate-400">' + esc(t.id) + '</td>' +
+                '<td class="font-bold">' + esc(t.symbol) + '</td>' +
+                '<td class="' + (t.side === 'long' ? 'text-green-400' : 'text-red-400') + '">' + (t.side === 'long' ? '做多' : '做空') + '</td>' +
+                '<td class="text-right">' + fmtPrice(t.entry_price) + '</td>' +
+                '<td class="text-right">' + (t.exit_price ? fmtPrice(t.exit_price) : (numOrNull(t.fill_price) !== null ? fmtPrice(t.fill_price) : '-')) + '</td>' +
+                '<td class="text-right">' + fmtQty(t.quantity) + '</td>' +
+                '<td class="text-right ' + pnlClass(t.pnl) + '">' + fmtSigned(t.pnl) + '</td>' +
+                cost +
+                '<td class="text-right ' + pnlClass(t.pnl_pct) + '">' + (isFinite(num(t.pnl_pct)) ? num(t.pnl_pct).toFixed(2) + '%' : '-') + '</td>' +
+                '<td class="text-slate-400 max-w-[140px] truncate">' + esc(t.strategy || '-') + '</td>' +
+                '<td class="text-slate-400">' + esc(t.exit_reason || '-') + '</td>' +
+                '<td class="text-slate-500">' + localTime(t.opened_at) + '</td>' +
+                '<td class="text-slate-500">' + localTime(t.closed_at) + '</td>' +
+                '</tr>';
+        }).join('');
+        document.getElementById('btab-trades').innerHTML =
+            (hasCost ? '' : '<div class="text-slate-500 tiny mb-1">接口未返回 fee / slippage / net_pnl，仅显示毛盈亏。</div>') +
+            '<table class="w-full"><thead class="text-slate-400 border-b border-slate-700"><tr>' +
+            '<th class="text-left">ID</th><th class="text-left">交易对</th><th class="text-left">方向</th>' +
+            '<th class="text-right">入场价</th><th class="text-right">出场价</th><th class="text-right">数量</th>' +
+            '<th class="text-right">盈亏(毛)</th>' +
+            (hasCost ? '<th class="text-right">手续费</th><th class="text-right">滑点</th><th class="text-right">净盈亏</th>' : '') +
+            '<th class="text-right">盈亏%</th><th class="text-left">策略</th>' +
+            '<th class="text-left">出场原因</th><th class="text-left">开仓时间</th><th class="text-left">平仓时间</th>' +
+            '</tr></thead><tbody>' + rows + '</tbody></table>';
+    }, function (e) {
+        document.getElementById('btab-trades').innerHTML = '<div class="text-amber-400 text-xs">成交历史接口不可用: ' + esc(e) + '</div>';
+    });
+}
+
+/* =========================================================================
+ * bottom tabs (client-side, no reload)
+ * ========================================================================= */
+var bottomTab = 'orders';
+function switchBottom(name) {
+    bottomTab = name;
+    var btns = document.querySelectorAll('.btab');
+    for (var i = 0; i < btns.length; i++) {
+        var on = btns[i].getAttribute('data-btab') === name;
+        btns[i].className = 'btab' + (on ? ' on' : '');
+    }
+    var panels = document.querySelectorAll('.btab-panel');
+    for (var k = 0; k < panels.length; k++) {
+        panels[k].classList.add('hidden');
+    }
+    var p = document.getElementById('btab-' + name);
+    if (p) p.classList.remove('hidden');
+    if (name === 'orders') loadOpenOrders();
+    else if (name === 'positions') loadAccount();
+    else if (name === 'trades') loadTradeHistory();
+    else if (name === 'history') loadOrderHistory();
+    else if (name === 'strategy') loadStrategySignals();
+}
+
+/* =========================================================================
+ * polling: depth/trades 2s, account/orders 3s, kline 5s (15s for 1h+),
+ * strategy 5s — all paused while the tab is hidden, guarded while in flight.
+ * ========================================================================= */
+var timers = {
+    clock: null, ticker: null, depth: null, trades: null, kline: null,
+    account: null, orders: null, history: null, tradesHist: null,
+    strategy: null
+};
+
+function klinePollMs() {
+    return (interval === '1m' || interval === '5m' || interval === '15m') ? 5000 : 15000;
+}
+
+function restartKlineTimer() {
+    if (timers.kline) { clearInterval(timers.kline); }
+    timers.kline = setInterval(function () { if (visible()) loadKline(); }, klinePollMs());
+}
+
+function startPolling() {
+    stopPolling();
+    tickClock();
+    loadTicker(); loadDepth(); loadTrades(); loadKline(); loadAccount();
+    switchBottom(bottomTab);          // loads the active bottom tab
+    loadStrategySignals();
+    loadTradeHistory(); loadOrderHistory();
+
+    timers.clock = setInterval(function () { if (visible()) tickClock(); }, 1000);
+    timers.ticker = setInterval(function () { if (visible()) loadTicker(); }, 3000);
+    timers.depth = setInterval(function () { if (visible()) loadDepth(); }, 2000);
+    timers.trades = setInterval(function () { if (visible()) loadTrades(); }, 2000);
+    restartKlineTimer();
+    timers.account = setInterval(function () { if (visible()) loadAccount(); }, 3000);
+    timers.orders = setInterval(function () { if (visible()) loadOpenOrders(); }, 3000);
+    timers.history = setInterval(function () { if (visible()) loadOrderHistory(); }, 3000);
+    timers.tradesHist = setInterval(function () { if (visible()) loadTradeHistory(); }, 3000);
+    timers.strategy = setInterval(function () { if (visible()) loadStrategySignals(); }, 5000);
+}
+
+function stopPolling() {
+    for (var k in timers) { if (timers[k]) { clearInterval(timers[k]); timers[k] = null; } }
+}
+
+document.addEventListener('visibilitychange', function () {
+    if (document.hidden) {
+        stopPolling();
+    } else {
+        startPolling();
+    }
+});
+
+document.addEventListener('click', function (ev) {
+    if (!symOpen) return;
+    var picker = document.getElementById('sym-picker');
+    if (picker && !picker.contains(ev.target)) { symToggle(false); }
+});
+
+window.addEventListener('popstate', function () {
+    var s = symbolFromUrl();
+    if (s && s !== symbol) { pickSymbol(s); }
+});
+
+document.addEventListener('DOMContentLoaded', function () {
+    // deep link ?symbol=XXX wins over the server-rendered first symbol
+    var deep = symbolFromUrl();
+    if (deep && SYMBOLS.indexOf(deep) < 0 && !/^[A-Z0-9]{3,20}USDT$/.test(deep)) { deep = ''; }
+    symbol = deep || (SYMBOLS.length ? String(SYMBOLS[0]).toUpperCase() : 'BTCUSDT');
+    document.getElementById('symbol-select').value = symbol;
+    document.getElementById('sym-label').textContent = symLabel(symbol);
+    symIndex = buildSymIndex();
+
+    // indicators: volume/MA on by default, RSI/MACD/EMA/BOLL toggleable without refetching
+    ['ind-vol', 'ind-ma', 'ind-ema', 'ind-boll', 'ind-rsi', 'ind-macd'].forEach(function (id) {
+        var el = document.getElementById(id);
+        if (el) el.addEventListener('change', renderChart);
+    });
+    setSide('long');
+    setType('limit');
+    switchLeft('book');
+    loadFeeTier();                 // tier table + first cost estimate
+    var q = new URLSearchParams(window.location.search).get('tab');
+    if (q && ['orders', 'positions', 'trades', 'history', 'strategy'].indexOf(q) >= 0) bottomTab = q;
+    startPolling();
+});
+
+window.addEventListener('resize', function () { if (chart) chart.resize(); });
+</script>
+{% endblock %}

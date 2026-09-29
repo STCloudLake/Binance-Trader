@@ -3,13 +3,19 @@
 <h2 class="text-xl mb-4">{{ _("系统设置") }}</h2>
 
 <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+{% if is_admin %}
     <div class="card">
         <h3 class="text-lg mb-3">Binance API</h3>
         <form hx-post="/api/settings/binance" hx-target="#binance-msg" hx-swap="innerHTML">
+            {# SECURITY: the live key/secret are never rendered.  Blank = "keep the
+               stored value" on save (web/routes/settings.py), so an empty
+               password field cannot wipe or leak a credential. #}
             <div class="mb-3"><label class="text-sm text-slate-400">API Key</label>
-                <input type="text" name="api_key" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm" value="{{ binance_api_key or '' }}"></div>
+                <input type="password" name="api_key" autocomplete="new-password" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm" value="" placeholder="{{ _('已配置') if has_binance_key else _('未配置') }}">
+                <p class="text-xs text-slate-500 mt-1">{{ _('已配置') if has_binance_key else _('未配置') }}{{ _('（留空表示保持不变）') }}</p></div>
             <div class="mb-3"><label class="text-sm text-slate-400">API Secret</label>
-                <input type="text" name="api_secret" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm" value="{{ binance_api_secret or '' }}"></div>
+                <input type="password" name="api_secret" autocomplete="new-password" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm" value="" placeholder="{{ _('已配置') if has_binance_secret else _('未配置') }}">
+                <p class="text-xs text-slate-500 mt-1">{{ _('已配置') if has_binance_secret else _('未配置') }}{{ _('（留空表示保持不变）') }}</p></div>
             <div class="mb-3"><label class="flex items-center gap-2 text-sm text-slate-400">
                 <input type="checkbox" name="testnet" value="1" {{ 'checked' if binance_testnet else '' }}> {{ _("使用测试网") }}</label></div>
             <button type="submit" class="bg-sky-600 hover:bg-sky-500 text-white px-4 py-2 rounded text-sm">{{ _("保存 Binance") }}</button>
@@ -20,8 +26,10 @@
     <div class="card">
         <h3 class="text-lg mb-3">DeepSeek API</h3>
         <form hx-post="/api/settings/deepseek" hx-target="#deepseek-msg" hx-swap="innerHTML">
+            {# SECURITY: the live key is never rendered (see the Binance form above). #}
             <div class="mb-3"><label class="text-sm text-slate-400">API Key</label>
-                <input type="text" name="api_key" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm" value="{{ deepseek_key or '' }}" placeholder="sk-..."></div>
+                <input type="password" name="api_key" autocomplete="new-password" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm" value="" placeholder="{{ _('已配置') if has_deepseek_key else _('未配置') }}">
+                <p class="text-xs text-slate-500 mt-1">{{ _('已配置') if has_deepseek_key else _('未配置') }}{{ _('（留空表示保持不变）') }}</p></div>
             <div class="mb-3"><label class="text-sm text-slate-400">Base URL</label>
                 <input type="text" name="base_url" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm" value="{{ ai_base_url or 'https://api.deepseek.com' }}"></div>
             <div class="mb-3"><label class="text-sm text-slate-400">{{ _("模型") }}</label>
@@ -34,6 +42,12 @@
             <span id="deepseek-msg"></span>
         </form>
     </div>
+{% else %}
+    <div class="card md:col-span-2">
+        <h3 class="text-lg mb-3">{{ _("API 凭据") }}</h3>
+        <p class="text-sm text-slate-400">{{ _("交易所与 AI 凭据仅管理员可修改。请联系管理员。") }}</p>
+    </div>
+{% endif %}
 </div>
 
 <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6">
@@ -45,9 +59,6 @@
                     <option value="zh" {{ 'selected' if language == 'zh' }}>{{ _("中文") }}</option>
                     <option value="en" {{ 'selected' if language == 'en' }}>English</option>
                 </select></div>
-            <div class="mb-3"><label class="text-sm text-slate-400">{{ _("AI 自动咨询间隔 (分钟)") }}</label>
-                <input type="number" name="ai_consult_interval" value="{{ ai_consult_interval or 60 }}" min="5" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
-                <p class="text-xs text-slate-500 mt-1">{{ _("AI 自动评估当前市场状况的时间间隔") }}</p></div>
             <div class="mb-3"><label class="text-sm text-slate-400">{{ _("新闻抓取间隔 (分钟)") }}</label>
                 <input type="number" name="news_fetch_interval" value="{{ news_fetch_interval or 30 }}" min="5" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm"></div>
             <div class="mb-3"><label class="text-sm text-slate-400">{{ _("每币种最大文章数") }}</label>
@@ -84,6 +95,7 @@
             <span id="cb-msg"></span>
         </div>
         {% endif %}
+        {% if is_admin %}
         <form hx-post="/api/settings/risk" hx-target="#risk-msg" hx-swap="innerHTML">
             <div class="mb-3"><label class="text-sm text-slate-400">{{ _("最大日回撤 %") }}</label>
                 <input type="number" name="max_daily_drawdown" value="{{ hard_limits.max_daily_drawdown_pct }}" step="0.5" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm"></div>
@@ -116,15 +128,18 @@
                 <input type="number" name="max_position_size_pct" value="{{ hard_limits.max_position_size_pct }}" step="0.5" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm"></div>
             <div class="mb-3"><label class="text-sm text-slate-400">{{ _("最大杠杆") }}</label>
                 <input type="number" name="max_leverage" value="{{ hard_limits.max_leverage }}" min="1" max="125" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm"></div>
-            <div class="mb-3"><label class="text-sm text-slate-400">{{ _("现货交易") }}</label>
-                <select name="spot_enabled" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
-                    <option value="1" {{ 'selected' if spot_enabled }}>{{ _("开启") }}</option><option value="0" {{ 'selected' if not spot_enabled }}>{{ _("关闭") }}</option></select></div>
-            <div class="mb-3"><label class="text-sm text-slate-400">{{ _("合约交易") }}</label>
-                <select name="futures_enabled" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
-                    <option value="1" {{ 'selected' if futures_enabled }}>{{ _("开启") }}</option><option value="0" {{ 'selected' if not futures_enabled }}>{{ _("关闭") }}</option></select></div>
             <button type="submit" class="bg-sky-600 hover:bg-sky-500 text-white px-4 py-2 rounded text-sm">{{ _('保存') }}{{ _("风险参数") }}</button>
             <span id="risk-msg"></span>
         </form>
+        {% else %}
+        <div class="text-sm text-slate-400 space-y-1">
+            <div>{{ _("最大日回撤 %") }}: <span class="text-slate-200">{{ hard_limits.max_daily_drawdown_pct }}</span></div>
+            <div>{{ _("最大日亏损 (USDT)") }}: <span class="text-slate-200">{{ hard_limits.max_daily_loss_usdt }}</span></div>
+            <div>{{ _("最大杠杆") }}: <span class="text-slate-200">{{ hard_limits.max_leverage }}</span></div>
+            <div>{{ _("最大持仓数") }}: <span class="text-slate-200">{{ hard_limits.max_open_trades }}</span></div>
+            <p class="text-xs text-amber-400 pt-2">{{ _("风控阈值仅管理员可修改。") }}</p>
+        </div>
+        {% endif %}
     </div>
 </div>
 

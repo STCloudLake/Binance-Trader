@@ -13,6 +13,7 @@ class CircuitBreaker:
     daily_pnl: float = 0.0
     weekly_pnl: float = 0.0
     peak_equity: float = 0.0
+    week_peak_equity: float = 0.0
     current_equity: float = 0.0
     consecutive_losses: int = 0
     daily_start_equity: float = 0.0
@@ -32,6 +33,8 @@ class CircuitBreaker:
         self.current_equity = equity
         if equity > self.peak_equity:
             self.peak_equity = equity
+        if equity > self.week_peak_equity:
+            self.week_peak_equity = equity
 
     def add_trade_result(self, pnl: float):
         # Round to 2dp — same precision as trade history DB storage,
@@ -64,7 +67,16 @@ class CircuitBreaker:
                 self._trip(f"Daily drawdown {daily_dd:.2f}% exceeds limit {self.max_daily_drawdown_pct}%")
                 return True, self.trip_reason
 
-        if abs(self.daily_pnl) >= self.max_daily_loss_usdt and self.daily_pnl < 0:
+        # Weekly drawdown uses its own peak so the daily peak reset cannot mask a
+        # multi-day slide. (Previously max_weekly_drawdown_pct was never checked:
+        # the config advertised a weekly guard that did not exist.)
+        if self.max_weekly_drawdown_pct > 0 and self.week_peak_equity > 0:
+            weekly_dd = (self.week_peak_equity - self.current_equity) / self.week_peak_equity * 100
+            if weekly_dd > self.max_weekly_drawdown_pct:
+                self._trip(f"Weekly drawdown {weekly_dd:.2f}% exceeds limit {self.max_weekly_drawdown_pct}%")
+                return True, self.trip_reason
+
+        if self.daily_pnl < 0 and abs(self.daily_pnl) >= self.max_daily_loss_usdt:
             self._trip(f"Daily loss ${abs(self.daily_pnl):.2f} exceeds limit ${self.max_daily_loss_usdt}")
             return True, self.trip_reason
 
@@ -91,6 +103,8 @@ class CircuitBreaker:
         self.daily_pnl = 0.0
         self.daily_start_equity = self.current_equity
         self.peak_equity = self.current_equity
+        # NOTE: week_peak_equity is deliberately NOT reset here — a fresh daily
+        # peak must not hide a cumulative weekly drawdown.
 
     def clamp_peak_to_current(self):
         """Only reset peak_equity to current — does NOT reset daily PnL.
@@ -101,6 +115,7 @@ class CircuitBreaker:
     def reset_weekly(self):
         self.weekly_pnl = 0.0
         self.week_start_equity = self.current_equity
+        self.week_peak_equity = self.current_equity
         self.peak_equity = self.current_equity
 
     def reset_trip(self):

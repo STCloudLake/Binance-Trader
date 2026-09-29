@@ -29,6 +29,11 @@ class AuthManager:
         self.jwt_secret = jwt_secret
         self.session_hours = session_hours
         self._sessions: dict[str, dict] = {}
+        #: jti -> expiry of revoked JWTs (in-memory, like the sessions store).
+        self._revoked_jti: dict[str, float] = {}
+        #: session token -> {jti: exp} for the JWTs minted with that session, so
+        #: destroying the session also kills every token issued for it.
+        self._session_jti: dict[str, dict[str, float]] = {}
 
     @staticmethod
     def hash_password(password: str) -> str:
@@ -38,20 +43,60 @@ class AuthManager:
     def verify_password(password: str, hashed: str) -> bool:
         return bcrypt.checkpw(password.encode(), hashed.encode())
 
-    def create_jwt(self, user: User) -> str:
+    def create_jwt(self, user: User, session_token: Optional[str] = None) -> str:
+        """Mint a signed token.
+
+        Every token carries a ``jti`` so it can be revoked server-side (logout),
+        and is tied to ``session_token`` when one is supplied: destroying that
+        session (``destroy_session``) revokes the token too.  Tokens minted
+        without a session stay usable until they expire — that keeps the
+        standalone-Bearer flow working for scripts into a server restart.
+        """
+        now = time.time()
+        jti = secrets.token_hex(16)
         payload = {
             "user_id": user.id,
             "username": user.username,
             "role": user.role,
-            "exp": int(time.time()) + self.session_hours * 3600,
+            "exp": int(now) + self.session_hours * 3600,
+            "jti": jti,
         }
-        return jwt.encode(payload, self.jwt_secret, algorithm="HS256")
+        if session_token:
+            payload["sid"] = session_token
+        token = jwt.encode(payload, self.jwt_secret, algorithm="HS256")
+        if session_token:
+            self._session_jti.setdefault(session_token, {})[jti] = float(payload["exp"])
+        return token
+
+    def _prune_revoked(self, now: float = None) -> None:
+        now = time.time() if now is None else now
+        for jti in [j for j, exp in self._revoked_jti.items() if exp <= now]:
+            self._revoked_jti.pop(jti, None)
 
     def verify_jwt(self, token: str) -> Optional[dict]:
         try:
-            return jwt.decode(token, self.jwt_secret, algorithms=["HS256"])
+            payload = jwt.decode(token, self.jwt_secret, algorithms=["HS256"])
         except jwt.PyJWTError:
             return None
+        jti = payload.get("jti")
+        if jti:
+            self._prune_revoked()
+            if jti in self._revoked_jti:
+                return None
+        return payload
+
+    def revoke_jwt(self, token: str) -> bool:
+        """Revoke one token (by ``jti``) until its own expiry. Returns True if
+        the token was a valid, unexpired JWT we could recognise."""
+        try:
+            payload = jwt.decode(token, self.jwt_secret, algorithms=["HS256"])
+        except jwt.PyJWTError:
+            return False
+        jti = payload.get("jti")
+        if not jti:
+            return False
+        self._revoked_jti[jti] = float(payload.get("exp") or (time.time() + 3600))
+        return True
 
     def create_session(self, user: User) -> str:
         token = secrets.token_hex(32)
@@ -67,12 +112,17 @@ class AuthManager:
         if not session:
             return None
         if time.time() > session["expires"]:
-            del self._sessions[token]
+            self.destroy_session(token)
             return None
         return session
 
     def destroy_session(self, token: str):
         self._sessions.pop(token, None)
+        # Revoke every JWT that was minted together with this session, so a
+        # stolen copy of the token dies with the logout even though the logout
+        # request itself only carried the session cookie.
+        for jti, exp in (self._session_jti.pop(token, None) or {}).items():
+            self._revoked_jti[jti] = exp
 
     async def _connect(self):
         """Open and configure a DB connection."""
@@ -172,7 +222,7 @@ class AuthManager:
         class AuthMiddleware(BaseHTTPMiddleware):
             async def dispatch(self, request: Request, call_next):
                 path = request.url.path
-                if path in ("/login", "/api/auth/login", "/api/auth/logout") or path.startswith("/static") or path.startswith("/ws/"):
+                if path in ("/login", "/api/auth/login", "/api/auth/logout", "/health") or path.startswith("/static") or path.startswith("/ws/"):
                     return await call_next(request)
 
                 user = None

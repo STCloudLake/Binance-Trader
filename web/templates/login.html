@@ -52,7 +52,7 @@
         });
         var data = await resp.json();
         if (data.ok) {
-            window.location.href = '/dashboard';
+            window.location.href = '/trade';
         } else {
             err.textContent = data.error || '{{ _("Login failed") }}';
             err.classList.remove('hidden');

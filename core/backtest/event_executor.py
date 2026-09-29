@@ -8,6 +8,7 @@ import pandas as pd
 from loguru import logger
 
 from core.backtest.signal_matrix import SignalMatrix
+from core.backtest.trade_book import close_position
 from core.risk.position_sizer import PositionSizer
 
 
@@ -31,78 +32,55 @@ class EventDrivenExecutor:
     def __init__(self, sizer: PositionSizer, hard_limits,
                  per_strategy_isolation: bool = False,
                  max_positions: int = 15,
-                 cost_config=None):
+                 cost_config=None,
+                 strategy_risk: dict | None = None):
         self.sizer = sizer
         self.hard_limits = hard_limits
         self.per_strategy_isolation = per_strategy_isolation
         self.max_positions = max_positions
         self.cost_config = cost_config  # optional: (enabled, fee_pct, spread_dict)
+        # strategy_name → {max_hold_hours, use_indicator_exits}
+        self.strategy_risk = strategy_risk or {}
 
     def _pkey(self, sym: str, s_name: str = "") -> str:
         return f"{s_name}|{sym}" if self.per_strategy_isolation else sym
 
+    @staticmethod
+    def _volatility_expanding(df: pd.DataFrame) -> pd.Series:
+        """Vectorized volatility-expansion flag (mirrors the legacy engine).
+
+        True when the 10-bar return std exceeds the 21-bar std — i.e. volatility
+        is picking up. Position size is reduced when this is True.
+        """
+        if df is None or len(df) < 21:
+            return pd.Series(False, index=df.index if df is not None else [], dtype=bool)
+        ret = df["close"].pct_change()
+        recent = ret.rolling(10).std()
+        hist = ret.rolling(21).std()
+        flag = (recent > hist)
+        flag[recent.isna() | hist.isna()] = False
+        return flag.astype(bool)
+
     def _close_position(self, pos_key: str, pos: dict, exit_price: float,
                         ts, reason: str, trades: list, balance: float,
                         positions: dict, per_matrix: dict) -> float:
-        """Close a position. Identical logic to BacktestEngine._close_position."""
-        sym = pos["symbol"]
-        entry_price = pos["entry_price"]
-        qty = pos["quantity"]
-        amount = pos.get("amount_usdt", qty * entry_price)
-        side = pos["side"]
-        strategy_name = pos.get("strategy_name", "")
-
-        if side == "long":
-            pnl = (exit_price - entry_price) * qty
-        else:
-            pnl = (entry_price - exit_price) * qty
-
-        # ── Trading costs (fees + spread) ──
-        costs = 0.0
+        """Close a position — delegates to the shared trade book."""
+        cost_fn = None
         if self.cost_config:
             enabled, fee_pct, spread_dict = self.cost_config
             if enabled:
-                spread_pct = spread_dict.get(sym, 0.03) / 100.0
-                fee = fee_pct / 100.0
-                entry_notional = qty * entry_price
-                exit_notional = qty * exit_price
-                costs = (entry_notional + exit_notional) * fee
-                costs += (entry_notional + exit_notional) * (spread_pct / 2.0)
-        pnl -= costs
+                def cost_fn(entry_price, exit_p, qty, sym):  # noqa: F811
+                    spread_pct = spread_dict.get(sym, 0.03) / 100.0
+                    fee = fee_pct / 100.0
+                    entry_notional = qty * entry_price
+                    exit_notional = qty * exit_p
+                    return ((entry_notional + exit_notional) * fee
+                            + (entry_notional + exit_notional) * (spread_pct / 2.0))
 
-        trades.append({
-            "symbol": sym, "side": side,
-            "entry_price": round(entry_price, 4),
-            "exit_price": round(exit_price, 4),
-            "quantity": round(qty, 6),
-            "pnl": round(pnl, 2),
-            "pnl_pct": round(pnl / (entry_price * qty) * 100, 2) if entry_price > 0 else 0,
-            "strategy": strategy_name,
-            "opened_at": str(pos.get("opened_at", ts)),
-            "closed_at": str(ts),
-            "amount_usdt": round(amount, 2),
-            "exit_reason": reason,
-            "cost": round(costs, 4),
-        })
-        balance += amount + pnl
-
-        if strategy_name in per_matrix and sym in per_matrix[strategy_name]:
-            cell = per_matrix[strategy_name][sym]
-            cell["trades"] += 1
-            cell["pnl"] += pnl
-            if pnl > 0:
-                cell["winning"] += 1
-                cell["gross_win_pnl"] += pnl
-            else:
-                cell["losing"] += 1
-                cell["gross_loss_pnl"] += abs(pnl)
-            if side == "long":
-                cell["long_trades"] += 1
-            else:
-                cell["short_trades"] += 1
-
-        del positions[pos_key]
-        return balance
+        return close_position(
+            pos_key, pos, exit_price, ts, reason, trades, balance, positions, per_matrix,
+            cost_fn=cost_fn,
+        )
 
     def run(self, matrix: SignalMatrix,
             initial_balance: float = 10000.0,
@@ -123,6 +101,12 @@ class EventDrivenExecutor:
         trades: list[dict] = []
         equity_curve: list[dict] = []
         pos_counter = 0
+
+        # Precompute the volatility-expansion flag per (symbol, timeframe)
+        vol_cache: dict[tuple[str, str], pd.Series] = {}
+        for _sym, tf_map in (matrix.price_data or {}).items():
+            for _tf, _df in (tf_map or {}).items():
+                vol_cache[(_sym, _tf)] = self._volatility_expanding(_df)
 
         # ── Initialize per_matrix ──
         per_matrix: dict[str, dict[str, dict]] = {}
@@ -206,12 +190,47 @@ class EventDrivenExecutor:
                     else:
                         pos["stop_loss"] = best_price * (1 + trailing_pct)
 
-                # Indicator exit check
-                exit_hit = matrix.get_exit(s_name, sym, tf, side, ts)
-                if exit_hit:
-                    balance = self._close_position(
-                        pos_key, pos, current_price, ts, "indicator",
-                        trades, balance, positions, per_matrix)
+                # Indicator exit check — evaluated on EVERY timeframe the strategy
+                # configures, matching the legacy engine's exit loop (it iterates
+                # strategy.timeframes). Checking only the position's own timeframe
+                # made multi-timeframe strategies exit at different ticks.
+                if pos.get("use_indicator_exits", True):
+                    exit_timeframes = self.strategy_risk.get(s_name, {}).get("timeframes") or [tf]
+                    # Iterate in the strategy's DECLARED timeframe order and close at
+                    # the first match, exactly like the legacy loop. The exit price is
+                    # the triggering timeframe's close (legacy: float(df["close"].iloc[-1])
+                    # for that interval), not the position's own timeframe close.
+                    for exit_tf in exit_timeframes:
+                        if not matrix.get_exit(s_name, sym, exit_tf, side, ts):
+                            continue
+                        exit_price = current_price
+                        tf_df = matrix.price_data.get(sym, {}).get(exit_tf)
+                        if tf_df is not None and len(tf_df) > 0:
+                            # Last bar of that timeframe at or before ts (mirrors
+                            # legacy's `df[df.index <= ts].iloc[-1]`); an exact
+                            # get_loc would fail for higher timeframes on most ticks.
+                            pos_i = int(tf_df.index.searchsorted(ts, side="right")) - 1
+                            if pos_i >= 0:
+                                exit_price = float(tf_df.iloc[pos_i]["close"])
+                        balance = self._close_position(
+                            pos_key, pos, exit_price, ts, "indicator",
+                            trades, balance, positions, per_matrix)
+                        break
+
+                if pos_key not in positions:
+                    continue
+
+                # Max hold time check (strategy.risk_exit.max_hold_hours)
+                max_hours = pos.get("max_hold_hours", 0) or 0
+                if max_hours > 0:
+                    try:
+                        held_hours = (pd.Timestamp(ts) - pd.Timestamp(pos["opened_at"])).total_seconds() / 3600
+                    except Exception:
+                        held_hours = 0.0
+                    if held_hours >= max_hours:
+                        balance = self._close_position(
+                            pos_key, pos, current_price, ts, "max_hold",
+                            trades, balance, positions, per_matrix)
 
             # ── Check entries ──
             for idx_tuple in matrix.signals.index:
@@ -241,17 +260,28 @@ class EventDrivenExecutor:
                 except (KeyError, IndexError):
                     continue
 
-                # Position sizing (with risk-based sizing if cost model is active)
+                # ── Position sizing — identical rules to the legacy engine ──
+                vol_series = vol_cache.get((sym, tf))
+                vol_expanding = bool(vol_series.get(ts, False)) if vol_series is not None else False
                 qty, risk_amount = self.sizer.calculate_position_size(
                     account_balance=balance, current_price=price,
-                    position_type="satellite")
-                # ── Risk-based adjustment: tighter stop → larger position ──
-                # Use configured soft_params for consistent sizing with live trading
-                if self.cost_config:
-                    risk_capital = balance * (self.sizer.soft.position_size_pct / 100)
-                    sl_dist = self.sizer.soft.stop_loss_pct / 100
-                    qty_risk = risk_capital / (price * sl_dist) if sl_dist > 0 else qty
+                    position_type="satellite",
+                    volatility_expanding=vol_expanding)
+
+                # Kelly-lite: when the strategy declares an explicit stop distance,
+                # risk 1% of capital per trade (mirrors BacktestEngine exactly).
+                risk_cfg = self.strategy_risk.get(s_name, {})
+                sl_pct_override = risk_cfg.get("stop_loss_pct") or 0
+                if sl_pct_override:
+                    qty_risk = (balance * 0.01) / (price * (sl_pct_override / 100.0))
                     qty = min(qty, qty_risk) if qty_risk > 0 else qty
+
+                # Hard cap on position notional
+                max_amount = balance * (self.hard_limits.max_position_size_pct / 100)
+                if risk_amount > max_amount:
+                    risk_amount = max_amount
+                    qty = risk_amount / price if price > 0 else 0
+
                 if qty <= 0:
                     continue
 
@@ -262,9 +292,18 @@ class EventDrivenExecutor:
                 pos_counter += 1
                 balance -= amount_usdt
 
-                sl = self.sizer.calculate_stop_loss(entry_price=price, side=side)
+                # Stop-loss / trailing distance: honour the strategy's risk_exit
+                # overrides exactly like the legacy engine does.
+                sl_pct_override = risk_cfg.get("stop_loss_pct")
+                if sl_pct_override:
+                    sl = (price * (1 - sl_pct_override / 100.0) if side == "long"
+                          else price * (1 + sl_pct_override / 100.0))
+                else:
+                    sl = self.sizer.calculate_stop_loss(entry_price=price, side=side)
                 tps = self.sizer.calculate_take_profits(entry_price=price, side=side)
-                trailing_pct = self.sizer.soft.stop_loss_pct  # configured, not hardcoded
+                trailing_override = risk_cfg.get("trailing_stop_pct")
+                trailing_pct = (float(trailing_override) if trailing_override is not None
+                                else self.sizer.trailing_stop_distance_pct())
 
                 positions[pos_key] = {
                     "symbol": sym, "side": side,
@@ -276,6 +315,10 @@ class EventDrivenExecutor:
                     "trailing_stop_pct": trailing_pct,
                     "best_price": price,
                     "timeframe": tf, "reduce_count": 0,
+                    # Per-strategy risk-exit overrides (empty for GA strategies,
+                    # which never set risk_exit).
+                    "max_hold_hours": float(risk_cfg.get("max_hold_hours", 0) or 0),
+                    "use_indicator_exits": bool(risk_cfg.get("use_indicator_exits", True)),
                 }
 
             # ── Equity curve ──
@@ -308,6 +351,14 @@ class EventDrivenExecutor:
                 pos_key, pos, final_price, last_ts, "end_of_backtest",
                 trades, balance, positions, per_matrix)
 
+        # Realise the closing PnL into the final equity point, otherwise the last
+        # equity value (and therefore final_balance / total_return) omitted the
+        # PnL of positions still open at the end of the window.
+        if equity_curve and not positions:
+            equity_curve[-1]["balance"] = round(balance, 2)
+            equity_curve[-1]["invested"] = 0.0
+            equity_curve[-1]["equity"] = round(balance, 2)
+
         # ── Finalize per_matrix ──
         for s_name in per_matrix:
             for sym in per_matrix[s_name]:
@@ -320,6 +371,6 @@ class EventDrivenExecutor:
             trades=trades,
             equity_curve=equity_curve,
             per_matrix=per_matrix,
-            final_balance=round(equity_curve[-1]["equity"] if equity_curve else balance, 2),
+            final_balance=round(balance, 2),
             runtime_seconds=round(time.time() - t0, 2),
         )

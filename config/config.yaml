@@ -1,8 +1,7 @@
 ai:
   base_url: https://api.deepseek.com
-  consult_interval_minutes: 15
   mode: full_auto
-  model: deepseek-v4-pro
+  model: deepseek-v4-flash
   tasks:
     coin_selection_minutes: 240
     market_assessment_minutes: 60
@@ -12,24 +11,43 @@ auth:
   jwt_secret: ''
   session_hours: 24
 backtest:
-  engine_mode: "auto"       # "auto" | "hybrid" | "legacy"
-  ml_enabled: false          # enable ML training/prediction during backtest
-  cost_model:                # trading cost simulation
-    enabled: true             # apply fees + spread to backtest PnL
-    taker_fee_pct: 0.04       # Binance spot taker fee (%)
-    spread_pct:               # per-symbol estimated spread (%)
+  # NOTE: the backtest cost model is deliberately kept separate from `sim:` below
+  # (it charges fees at close time only, on top of the entry/exit prices, so that
+  # stop-loss / take-profit levels are untouched).  Do not merge the two.
+  cost_model:
+    enabled: true
+    # Per-symbol spread (%) OVERRIDES.  Resolution order for every pair a run
+    # actually uses: override (this map, or a value typed in the UI) →
+    # live-derived from GET {binance.market_data_host}/api/v3/depth
+    # (best bid/ask, cached `live_spread.ttl_seconds`) → `default_spread_pct`.
+    # A `default: 0.x` key here overrides the fallback for every symbol.
+    spread_pct:
+      BNBUSDT: 0.03
       BTCUSDT: 0.01
       ETHUSDT: 0.02
-      BNBUSDT: 0.03
       SOLUSDT: 0.03
       XRPUSDT: 0.04
+    # Documented last resort for an unknown pair / unreachable data host.
+    default_spread_pct: 0.03
+    # Live spread derivation from the public order book.
+    live_spread:
+      enabled: true
+      ttl_seconds: 300
+      timeout_seconds: 3
+    taker_fee_pct: 0.04
+  engine_mode: auto
+  ml_enabled: false
 binance:
+  # Trading/account client (orders, balances). testnet.binance.vision is reachable.
   testnet: true
+  # Public mainnet market data mirror: api.binance.com is unreachable from this
+  # host, data-api.binance.vision serves the whole spot market (3716 symbols).
+  market_data_host: https://data-api.binance.vision
+  market_stream_host: wss://data-stream.binance.vision
 core_position:
   capital_pct: 0.7
   max_symbols: 5
 language: zh
-mode: sim
 news:
   anomaly_threshold_pct: 3.0
   fetch_interval_minutes: 30
@@ -42,7 +60,30 @@ signal_weights:
   indicator: 0.5
   ml: 0.3
   news: 0.2
-trading:
-  futures_enabled: true
-  spot_enabled: true
+sim:
+  # Real cost model for the SIMULATED account (docs/overhaul/TRADE_PAGE_API.md §五之二).
+  # Fills are made cost-aware instead of free: the buy fill is marked up and the
+  # sell fill is marked down by (spread/2 + slippage), a fee is charged on each
+  # side, and `pnl` is stored NET of all of it, so the balance identity
+  # (10000 − open notional + realised = balance) keeps holding.
+  cost_model:
+    # Master switch. false → legacy behaviour: fill at the quoted price, zero fees.
+    enabled: true
+    # Default fee tier; the trader's manual selection in the UI persists to
+    # system_config (`sim.fee_tier`) and overrides this on the next fill/estimate.
+    fee_tier: VIP0
+    # BNB fee discount. When true every rate is multiplied by 0.75 (25% off).
+    use_bnb_discount: false
+    # Per-side slippage in basis points (1 bp = 0.01%). Only market orders slip;
+    # a limit order fills at its own limit price.
+    slippage_bps: 2
+    # Per-side half-spread in percent, per symbol. `BTCUSDT: 0.01` means the half
+    # spread is 0.01% of the price. Missing symbol → `default` → 0.02.
+    spread_pct:
+      default: 0.02
+      BNBUSDT: 0.03
+      BTCUSDT: 0.01
+      ETHUSDT: 0.02
+      SOLUSDT: 0.03
+      XRPUSDT: 0.04
 web_port: 8899

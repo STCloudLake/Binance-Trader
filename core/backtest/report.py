@@ -1,5 +1,4 @@
 """Backtest report generator — produces structured JSON for Web UI display."""
-import json
 
 
 def generate_report(backtest_result: dict) -> dict:
@@ -114,7 +113,3 @@ def _compute_monthly_returns(equity_curve: list[dict]) -> list[dict]:
     return [{"month": k, "return_pct": round(v, 2)}
             for k, v in sorted(monthly.items())]
 
-
-def report_to_json(report: dict, indent: int = 2) -> str:
-    """Serialize report to JSON string."""
-    return json.dumps(report, ensure_ascii=False, indent=indent, default=str)

@@ -6,9 +6,16 @@ from core.backtest.signal_matrix import SignalMatrix
 
 
 def _make_dummy_matrix(with_signals=True):
-    """Create a minimal SignalMatrix for testing the executor."""
+    """Create a minimal SignalMatrix for testing the executor.
+
+    The price walk is SEEDED: with an unseeded `np.random.randn`, the entry→exit
+    price move occasionally rounds to a PnL of exactly 0.00, which made
+    `test_executor_enter_long`'s `final_balance != 10000.0` assertion flake
+    (~1 in 7 full-suite runs).
+    """
+    rng = np.random.default_rng(20260929)
     dates = pd.date_range("2026-01-01", periods=100, freq="1h")
-    close = 50000 + np.cumsum(np.random.randn(100) * 50)
+    close = 50000 + np.cumsum(rng.standard_normal(100) * 50)
 
     entry_data = np.zeros(100, dtype="int8")
     exit_data = np.zeros(100, dtype=bool)

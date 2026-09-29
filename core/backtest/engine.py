@@ -7,25 +7,48 @@ from loguru import logger
 from core.backtest.data_feeder import DataFeeder
 from core.backtest.metrics import calculate_metrics
 from core.backtest.engine_hybrid import run_hybrid
-from core.backtest.cost_model import apply_trading_costs
+from core.backtest.signal_matrix import NO_MARKET_DATA_MESSAGE
+from core.backtest.cost_model import apply_trading_costs, freeze_run_spreads
+from core.backtest.trade_book import close_position
 from core.strategy.indicators import compute_all, evaluate_condition
 from core.strategy.evaluation_kernel import (
     evaluate_entry_conditions,
     evaluate_exit_conditions,
     fuse_signals,
     check_higher_tf_trend,
+    detect_market_regime,
 )
+from core.market_data.provider import INTERVAL_SPEC, interval_minutes
 
-# Timeframe → minutes mapping for sorting and trend-filter logic
-_TIMEFRAME_MINUTES = {
-    "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
-    "1h": 60, "2h": 120, "4h": 240, "6h": 360, "8h": 480,
-    "12h": 720, "1d": 1440, "3d": 4320, "1w": 10080,
-}
 
 def _tf_minutes(tf: str) -> int:
-    """Convert a timeframe string to minutes for comparison/sorting."""
-    return _TIMEFRAME_MINUTES.get(tf, 60)
+    """Convert a timeframe string to minutes for comparison/sorting.
+
+    Delegates to the shared :data:`~core.market_data.provider.INTERVAL_SPEC`
+    registry (this module used to keep a private copy of the same map).
+    """
+    return interval_minutes(tf, 60)
+
+
+#: Config attribute naming the symbol whose regime drives the AI weight profile.
+REGIME_PROXY_CONFIG_KEY = "backtest_regime_symbol"
+
+
+def _resolve_regime_proxy(config, symbols, market_regime) -> str | None:
+    """Symbol whose detected regime represents the broad market for a run.
+
+    ``config.backtest_regime_symbol`` overrides; the default is the FIRST symbol
+    of this run (not a hard-coded BTCUSDT, which pinned every run without BTC to
+    "range").  A configured proxy that is not part of the run — or has no
+    detected regime — falls back to the first symbol that does.
+    """
+    regime = market_regime or {}
+    proxy = getattr(config, REGIME_PROXY_CONFIG_KEY, None) or (
+        symbols[0] if symbols else None)
+    if proxy not in regime:
+        proxy = next((s for s in (symbols or []) if s in regime), None)
+    return proxy
+
 
 class BacktestEngine:
     """Synchronous backtesting engine with ML prediction and signal fusion."""
@@ -68,6 +91,13 @@ class BacktestEngine:
         # engine_mode == "auto"
         n = len(strategies) if isinstance(strategies, list) else 1
         if n >= 3 and not has_ml:
+            # Strategies with partial-reduce rules cannot be modelled by the hybrid
+            # engine (it has no reduce path), so route them to the legacy engine
+            # rather than silently under-reporting their trades.
+            if any(getattr(s, "reduce_conditions", None) for s in strategy_configs):
+                logger.warning("Strategy set contains reduce_conditions — using the legacy "
+                               "engine (hybrid does not support partial reduces)")
+                return "legacy"
             return "hybrid"
         return "legacy"
 
@@ -76,14 +106,16 @@ class BacktestEngine:
             initial_balance: float = 10000.0, mode: str = "full",
             progress_callback=None,
             strategy_symbols: dict[str, list[str]] = None,
-            simulate_ai_weights: bool = True) -> dict:
+            simulate_ai_weights: bool = True,
+            spread_overrides: dict | None = None) -> dict:
         """Alias for run_with_exit_evaluation (parameter order matches)."""
         return self.run_with_exit_evaluation(
             strategies, symbols, date_start, date_end,
             initial_balance, mode,
             progress_callback=progress_callback,
             strategy_symbols=strategy_symbols,
-            simulate_ai_weights=simulate_ai_weights)
+            simulate_ai_weights=simulate_ai_weights,
+            spread_overrides=spread_overrides)
 
     def run_with_exit_evaluation(self, strategies, symbols, date_start, date_end,
                                   initial_balance=10000.0, mode="full",
@@ -92,7 +124,8 @@ class BacktestEngine:
                                   simulate_ai_weights: bool = True,
                                   ml_engine: str = "lightgbm",
                                   skip_ml_training: bool = False,
-                                  per_strategy_isolation: bool = False):
+                                  per_strategy_isolation: bool = False,
+                                  spread_overrides: dict | None = None):
         """Full backtest with ML predictions, signal fusion, and risk controls.
 
         Args:
@@ -105,8 +138,18 @@ class BacktestEngine:
             ml_engine: 'lightgbm' (tree), 'tft' (transformer), 'patchtst' (patch-transformer).
             skip_ml_training: If True, load pre-trained models from disk instead of
                 training. Useful for repeat backtests over the same period.
+            spread_overrides: Optional per-symbol spread (%) map for THIS run —
+                an explicit override beats the live depth-derived value and the
+                documented default (core/backtest/cost_model.py).
         """
         t0 = time.time()
+
+        # ── Cost model: derive the spread for the symbols THIS run uses ──
+        # Override → live depth-derived → documented default (cost_model.py).
+        # Resolved once here (cached ~5 min) and pinned on the instance so the
+        # trade loop never does I/O and every symbol of the run gets its own
+        # spread instead of the old "5 hardcoded pairs, else 0.03" guess.
+        self._run_spread_pct = freeze_run_spreads(symbols, self.config, spread_overrides)
 
         # ── Engine mode selection ──
         _engine_mode = getattr(self.config, 'backtest_engine_mode', 'auto')
@@ -134,7 +177,12 @@ class BacktestEngine:
             use_hybrid = False
 
         if use_hybrid:
+            # engine_hybrid/EventDrivenExecutor read the spread table off the
+            # config object; expose the run's derived per-symbol spreads for the
+            # duration of the call only (restored in `finally`).
+            _saved_spreads = getattr(self.config, "backtest_spread_pct", None)
             try:
+                self.config.backtest_spread_pct = dict(self._run_spread_pct)
                 return run_hybrid(
                     strategies, symbols, date_start, date_end,
                     self.config, self.strategy_engine.loader,
@@ -146,6 +194,14 @@ class BacktestEngine:
                 logger.warning(f"Hybrid engine failed ({e}), falling back to legacy. "
                               "Results may differ from hybrid mode.")
                 # Fall through to legacy engine below
+            finally:
+                if _saved_spreads is None:
+                    try:
+                        del self.config.backtest_spread_pct
+                    except AttributeError:
+                        pass
+                else:
+                    self.config.backtest_spread_pct = _saved_spreads
 
         # Load strategy configs — support direct config objects for GA
         strategy_configs = []
@@ -173,7 +229,7 @@ class BacktestEngine:
         feeder.load()
 
         if len(feeder) == 0:
-            return {"error": "No historical data found for the given symbols and date range"}
+            return {"error": NO_MARKET_DATA_MESSAGE}
 
         # ---- Backtest State ----
         balance = initial_balance
@@ -199,15 +255,22 @@ class BacktestEngine:
             ml_retrain_interval = 100
         market_regime: dict[str, str] = {}
 
-        # Per-timeframe ML parameters: forward_periods and threshold
-        # Shorter TFs need more lookahead periods to capture a meaningful move
-        _ML_TF_PARAMS = {
+        # Per-timeframe ML parameters.
+        #
+        # The *interval set* comes from ``INTERVAL_SPEC`` (the single registry),
+        # so adding an interval there teaches the ML path about it automatically
+        # (falls back to ``_ML_PARAM_DEFAULT`` until it is tuned).  ``forward``
+        # (lookahead bars) and ``threshold`` are ML-only tuning values that the
+        # registry deliberately does not carry, and ``min_candles`` here is the
+        # *model-training* gate, which is intentionally stricter than the
+        # registry's prefetch "enough data on disk" threshold.
+        _ML_PARAM_DEFAULT = {"forward": 4, "threshold": 0.005, "min_candles": 100}
+        _ML_PARAM_TUNED = {
             "1m":  {"forward": 20, "threshold": 0.003, "min_candles": 300},
             "3m":  {"forward": 15, "threshold": 0.004, "min_candles": 200},
             "5m":  {"forward": 12, "threshold": 0.005, "min_candles": 200},
             "15m": {"forward": 8,  "threshold": 0.005, "min_candles": 150},
             "30m": {"forward": 6,  "threshold": 0.005, "min_candles": 120},
-            "1h":  {"forward": 4,  "threshold": 0.005, "min_candles": 100},
             "2h":  {"forward": 4,  "threshold": 0.006, "min_candles": 80},
             "4h":  {"forward": 4,  "threshold": 0.008, "min_candles": 60},
             "6h":  {"forward": 4,  "threshold": 0.010, "min_candles": 50},
@@ -216,6 +279,10 @@ class BacktestEngine:
             "1d":  {"forward": 4,  "threshold": 0.020, "min_candles": 25},
             "3d":  {"forward": 4,  "threshold": 0.030, "min_candles": 20},
             "1w":  {"forward": 4,  "threshold": 0.050, "min_candles": 15},
+        }
+        _ML_TF_PARAMS = {
+            tf: {**_ML_PARAM_DEFAULT, **_ML_PARAM_TUNED.get(tf, {})}
+            for tf in INTERVAL_SPEC
         }
 
         # Build round-robin model keys (staggered retraining — 1 model/step)
@@ -449,6 +516,25 @@ class BacktestEngine:
             if progress_callback and (step % 10 == 0 or step == 1 or step == total_steps):
                 progress_callback(step, total_steps, ts)
 
+            # --- MARKET REGIME (once per symbol) ---
+            # Must run for EVERY step regardless of ML: the regime gates the
+            # counter-trend entry threshold (0.65 vs 0.5). Previously this lived
+            # inside the ML branch below, so with ML disabled the regime was always
+            # "range" and the legacy engine disagreed with the hybrid engine.
+            for sym in symbols:
+                if sym in market_regime:
+                    continue
+                df_1h = feeder.get_all_data_for_symbol(sym, "1h")
+                if df_1h is None or len(df_1h) == 0:
+                    market_regime[sym] = "range"
+                    continue
+                try:
+                    pos_1h = df_1h.index.get_loc(ts)
+                    if isinstance(pos_1h, slice): pos_1h = pos_1h.stop - 1
+                    market_regime[sym] = detect_market_regime(df_1h.iloc[:pos_1h + 1])
+                except KeyError:
+                    market_regime[sym] = detect_market_regime(df_1h[df_1h.index <= ts])
+
             # --- ML PREDICTION (walk-forward, per-strategy×symbol) ---
             # Each strategy gets its own ML model matched to its primary timeframe.
             for strategy in strategy_configs:
@@ -471,16 +557,8 @@ class BacktestEngine:
                         step > 0
                     )
 
-                    # Regime detection on 1h for this symbol (once)
-                    if sym not in market_regime:
-                        df_1h = feeder.get_all_data_for_symbol(sym, "1h")
-                        try:
-                            pos_1h = df_1h.index.get_loc(ts)
-                            if isinstance(pos_1h, slice): pos_1h = pos_1h.stop - 1
-                            market_regime[sym] = self._detect_market_regime(df_1h.iloc[:pos_1h + 1])
-                        except KeyError:
-                            market_regime[sym] = self._detect_market_regime(df_1h[df_1h.index <= ts])
-
+                    # Regime detection happens once per symbol in the main loop
+                    # (see below) so it applies with or without ML.
                     # Fast slice: get_loc is O(log n) vs boolean indexing O(n)
                     try:
                         pos_tf = df_tf.index.get_loc(ts)
@@ -669,11 +747,15 @@ class BacktestEngine:
                 pos = positions[pos_key]
                 sym = pos["symbol"]
 
-                # Get current close price from the feeder data (using primary TF)
+                # Get current close price from the feeder data (using the position's
+                # own timeframe). Must match the entry price basis and the hybrid
+                # engine: previously this read the *1m* bar labelled at the start of
+                # the higher-TF bar, mixing two price bases between the engines.
                 price_now = 0.0
+                pos_tf = pos.get("timeframe", "1h")
                 try:
-                    df_1m = feeder.get_all_data_for_symbol(sym, "1m")
-                    df_slice = df_1m[df_1m.index <= ts]
+                    df_tf = feeder.get_all_data_for_symbol(sym, pos_tf)
+                    df_slice = df_tf[df_tf.index <= ts]
                     if len(df_slice) > 0:
                         price_now = float(df_slice.iloc[-1]["close"])
                 except Exception:
@@ -681,12 +763,17 @@ class BacktestEngine:
 
                 if price_now > 0:
                     # ---- STOP-LOSS CHECK ----
+                    # Fill at the stop level (not the bar close): with bar-close-only
+                    # evaluation the close can be far through the level, and filling
+                    # at the close made the legacy engine systematically more
+                    # pessimistic than the hybrid engine on stop-outs. Slippage is
+                    # modelled by the cost model, not by the gap between close and stop.
                     sl_price = pos.get("stop_loss", 0)
                     if sl_price > 0:
                         if (pos["side"] == "long" and price_now <= sl_price) or \
                            (pos["side"] == "short" and price_now >= sl_price):
                             balance = self._close_position(
-                                pos_key, pos, price_now, ts, "stop_loss",
+                                pos_key, pos, sl_price, ts, "stop_loss",
                                 trades, events, balance, positions, per_matrix)
                             continue
 
@@ -696,11 +783,11 @@ class BacktestEngine:
                         if (pos["side"] == "long" and price_now >= tp_price) or \
                            (pos["side"] == "short" and price_now <= tp_price):
                             balance = self._close_position(
-                                pos_key, pos, price_now, ts, f"tp_{int(tp_pct*100)}pct",
+                                pos_key, pos, tp_price, ts, f"tp_{int(tp_pct*100)}pct",
                                 trades, events, balance, positions, per_matrix)
                             break
 
-                if sym not in positions:
+                if pos_key not in positions:
                     continue
 
                 # ---- TRAILING STOP UPDATE ----
@@ -734,7 +821,7 @@ class BacktestEngine:
                     except Exception:
                         pass
 
-                if sym not in positions:
+                if pos_key not in positions:
                     continue
 
                 # ---- INDICATOR EXITS (skip if strategy uses risk-only exits) ----
@@ -758,14 +845,20 @@ class BacktestEngine:
                                 balance = self._close_position(
                                     pos_key, pos, exit_price, ts, "indicator",
                                     trades, events, balance, positions, per_matrix)
-                            if sym not in positions:
+                            if pos_key not in positions:
                                 break
-                        if sym not in positions:
+                        if pos_key not in positions:
                             break
 
             # --- UPDATE SIGNAL WEIGHTS (simulate AI market assessment) ---
-            # Use BTC regime as the broad market indicator
-            dominant_regime = market_regime.get("BTCUSDT", "range")
+            # The broad-market regime proxy is configurable
+            # (``config.backtest_regime_symbol``); by default it is the FIRST
+            # symbol of this run, no longer a hard-coded BTCUSDT.  Pinning the
+            # weights to BTC silently forced every run whose symbol list did not
+            # contain BTC to "range", so e.g. an altcoin-only run never got the
+            # bull/bear weight profile its own regime implied.
+            proxy = _resolve_regime_proxy(self.config, symbols, market_regime)
+            dominant_regime = market_regime.get(proxy, "range") if proxy else "range"
             w_ind, w_ml, w_news = _update_weights(dominant_regime, step)
 
             # --- CHECK ENTRIES ---
@@ -898,10 +991,11 @@ class BacktestEngine:
                     if re is not None:
                         sl_pct = re.stop_loss_pct / 100.0
                         sl = price * (1 - sl_pct) if side == "long" else price * (1 + sl_pct)
-                        tp_dist = re.trailing_stop_pct / 100.0
                     else:
                         sl = sizer.calculate_stop_loss(price, side)
-                        tp_dist = 1.5 / 100.0  # default trailing stop distance
+                    # Trailing distance comes from the shared sizer helper so live,
+                    # legacy and hybrid all trail identically (was a hardcoded 1.5%).
+                    tp_dist = sizer.trailing_stop_distance_pct(re) / 100.0
 
                     pos_key = _pkey(sym, strategy.name)
                     positions[pos_key] = {
@@ -910,6 +1004,7 @@ class BacktestEngine:
                         "amount_usdt": amount_usdt,
                         "strategy_name": strategy.name,
                         "opened_at": str(ts), "trade_group": trade_group,
+                        "timeframe": primary_tf,
                         "stop_loss": sl,
                         "trailing_stop_pct": round(tp_dist * 100, 1),
                         "best_price": price,  # for trailing stop tracking
@@ -927,7 +1022,14 @@ class BacktestEngine:
                         "ml_confidence": round(ml_conf, 3),
                         "timeframe": primary_tf,
                     })
-                    break  # one entry per symbol per timestamp
+                    # NOTE: `continue`, not `break`. This loop iterates the symbols of
+                    # the current strategy; breaking after the first entry silently
+                    # starved every later symbol in the list (BTCUSDT always won over
+                    # ETHUSDT), so a strategy could never open more than one position
+                    # per timestamp. "One entry per symbol" is already guaranteed by
+                    # the `_pkey(...) in positions` check above. The hybrid engine
+                    # never had this artefact, which is why the two engines disagreed.
+                    continue  # next symbol for this strategy
 
             # --- EQUITY CURVE ---
             invested = sum(p.get("amount_usdt", 0) for p in positions.values())
@@ -935,6 +1037,33 @@ class BacktestEngine:
                 "time": str(ts), "equity": round(balance + invested, 2),
                 "balance": round(balance, 2), "invested": round(invested, 2),
             })
+
+        # ── Force-close positions still open at the end ──
+        # Without this, open positions never appear in `trades`, so win rate,
+        # profit factor, Sharpe and max consecutive losses silently ignored the
+        # final (possibly largest) PnL while the equity curve still counted the
+        # capital as invested. The hybrid engine always did this, which is why
+        # the two engines reported different trade sets.
+        if positions and len(equity_curve) > 0:
+            last_ts = pd.Timestamp(equity_curve[-1]["time"])
+            for pos_key in list(positions.keys()):
+                pos = positions[pos_key]
+                sym = pos["symbol"]
+                final_price = pos["entry_price"]
+                try:
+                    df_tf = feeder.get_all_data_for_symbol(sym, pos.get("timeframe", "1h"))
+                    df_slice = df_tf[df_tf.index <= last_ts]
+                    if len(df_slice) > 0:
+                        final_price = float(df_slice.iloc[-1]["close"])
+                except Exception:
+                    pass
+                balance = self._close_position(
+                    pos_key, pos, final_price, last_ts, "end_of_backtest",
+                    trades, events, balance, positions, per_matrix)
+            # Reflect the realised cash in the final equity point.
+            equity_curve[-1]["balance"] = round(balance, 2)
+            equity_curve[-1]["invested"] = 0.0
+            equity_curve[-1]["equity"] = round(balance, 2)
 
         # Use last equity value (includes open position value), not just cash balance
         final_balance = equity_curve[-1]["equity"] if equity_curve else balance
@@ -982,62 +1111,19 @@ class BacktestEngine:
 
     def _close_position(self, pos_key, pos, exit_price, ts, reason, trades, events,
                          balance, positions, per_matrix):
-        """Close a position and record the trade. Used for SL/TP/indicator exits."""
-        sym = pos["symbol"]
-        entry_price = pos["entry_price"]
-        qty = pos["quantity"]
-        amount = pos.get("amount_usdt", qty * entry_price)
-        side = pos["side"]
-        strategy_name = pos.get("strategy_name", "")
+        """Close a position and record the trade. Used for SL/TP/indicator exits.
 
-        if side == "long":
-            pnl = (exit_price - entry_price) * qty
-        else:
-            pnl = (entry_price - exit_price) * qty
-
-        # ── Trading costs (fees + spread) ──
-        costs = apply_trading_costs(entry_price, exit_price, qty, sym, self.config)
-        pnl -= costs
-
-        trades.append({
-            "symbol": sym, "side": side,
-            "entry_price": round(entry_price, 4),
-            "exit_price": round(exit_price, 4),
-            "quantity": round(qty, 6),
-            "pnl": round(pnl, 2),
-            "pnl_pct": round(pnl / (entry_price * qty) * 100, 2) if entry_price > 0 else 0,
-            "strategy": strategy_name,
-            "opened_at": str(pos.get("opened_at", ts)),
-            "closed_at": str(ts),
-            "amount_usdt": round(amount, 2),
-            "exit_reason": reason,
-            "cost": round(costs, 4),
-        })
-        balance += amount + pnl
-        events.append({
-            "time": str(ts), "type": "exit", "reason": reason,
-            "symbol": sym, "price": exit_price,
-            "pnl": round(pnl, 2), "strategy": strategy_name,
-        })
-
-        # Track per-strategy×symbol
-        if strategy_name in per_matrix and sym in per_matrix[strategy_name]:
-            cell = per_matrix[strategy_name][sym]
-            cell["trades"] += 1
-            cell["pnl"] += pnl
-            if pnl > 0:
-                cell["winning"] += 1
-                cell["gross_win_pnl"] += pnl
-            else:
-                cell["losing"] += 1
-                cell["gross_loss_pnl"] += abs(pnl)
-            if side == "long":
-                cell["long_trades"] += 1
-            else:
-                cell["short_trades"] += 1
-
-        del positions[pos_key]
-        return balance
+        Thin wrapper over the shared implementation in
+        :mod:`core.backtest.trade_book` (previously a copy-paste clone that the
+        hybrid engine duplicated).
+        """
+        return close_position(
+            pos_key, pos, exit_price, ts, reason, trades, balance, positions, per_matrix,
+            cost_fn=lambda ep, xp, q, s: apply_trading_costs(
+                ep, xp, q, s, self.config,
+                overrides=getattr(self, "_run_spread_pct", None)),
+            events=events,
+        )
 
     # ---- ML Helpers ----
 
@@ -1291,21 +1377,3 @@ class BacktestEngine:
         except Exception as e:
             logger.debug(f"PatchTST predict failed: {e}")
             return None
-
-    def _detect_market_regime(self, df: pd.DataFrame) -> str:
-        """Detect the prevailing market regime from 1h data.
-
-        Returns 'bull', 'bear', or 'range' based on EMA alignment and ADX.
-        """
-        if len(df) < 100:
-            return "range"
-        close = df["close"].values
-        ema20 = float(pd.Series(close).ewm(span=20, adjust=False).mean().iloc[-1])
-        ema50 = float(pd.Series(close).ewm(span=50, adjust=False).mean().iloc[-1])
-        last_close = float(close[-1])
-        if last_close > ema20 > ema50:
-            return "bull"
-        elif last_close < ema20 < ema50:
-            return "bear"
-        else:
-            return "range"

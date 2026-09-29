@@ -1,0 +1,310 @@
+{% extends "base.html" %}
+{% block content %}
+{#- 全市场数据总览 /data。
+    只消费 docs/overhaul/MARKET_PAGES_API.md §3 冻结的接口：
+      GET /api/data/overview
+    每个榜单都来自同一个响应；接口失败时每个面板都显示自己的错误文本，
+    不留空白。60s 自动刷新，document.hidden 时清空定时器。 -#}
+
+<div class="flex flex-wrap items-center gap-3 mb-3">
+    <h2 class="text-xl font-bold text-slate-100">{{ _("市场数据") }}</h2>
+    <span class="badge badge-blue text-[10px]">{{ _("模式") }}: {{ mode }}</span>
+    <span class="text-xs text-slate-500">{{ _("数据源") }}: data-api.binance.vision ·
+        {{ _("每 60s 自动刷新（页面隐藏时暂停）") }}</span>
+    <span class="text-xs text-slate-500 ml-auto">{{ _("更新时间") }}
+        <span id="data-updated" class="text-slate-200">--</span></span>
+    <button id="data-refresh" onclick="loadOverview()"
+            class="px-3 py-1 rounded text-xs bg-slate-700 text-slate-200 hover:bg-slate-600">{{ _("刷新") }}</button>
+</div>
+<div id="data-err" class="text-xs text-amber-400 mb-2"></div>
+
+{#- ─────────────── 总览卡片（totals） ─────────────── -#}
+<div class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-3" id="data-totals">
+    <div class="card py-2 px-3"><div class="text-[11px] text-slate-500">{{ _("币种数") }}</div>
+        <div id="tot-symbols" class="text-xl font-bold text-slate-200">--</div></div>
+    <div class="card py-2 px-3"><div class="text-[11px] text-slate-500">{{ _("24h 成交额") }} (USDT)</div>
+        <div id="tot-qvol" class="text-xl font-bold text-sky-400">--</div></div>
+    <div class="card py-2 px-3"><div class="text-[11px] text-slate-500">{{ _("上涨") }}</div>
+        <div id="tot-up" class="text-xl font-bold text-green-400">--</div></div>
+    <div class="card py-2 px-3"><div class="text-[11px] text-slate-500">{{ _("下跌") }}</div>
+        <div id="tot-down" class="text-xl font-bold text-red-400">--</div></div>
+    <div class="card py-2 px-3"><div class="text-[11px] text-slate-500">{{ _("平盘") }}</div>
+        <div id="tot-flat" class="text-xl font-bold text-slate-400">--</div></div>
+</div>
+
+{#- ─────────────── BTC / ETH 成交额占比 ─────────────── -#}
+<div class="card mb-3" id="data-share">
+    <div class="flex items-center justify-between mb-2">
+        <h3 class="text-sm font-bold text-slate-200">{{ _("BTC / ETH 成交额占比") }}</h3>
+        <span id="data-share-err" class="text-[11px] text-amber-400"></span>
+    </div>
+    <div id="share-rows" class="text-xs">
+        <div class="text-slate-500">{{ _("加载中") }}...</div>
+    </div>
+</div>
+
+{#- ─────────────── 六个榜单 ─────────────── -#}
+<div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+    <div class="card p-0 overflow-hidden">
+        <div class="flex items-center justify-between px-3 py-2 border-b border-slate-700">
+            <h3 class="text-sm font-bold text-green-400">{{ _("涨幅榜") }}</h3>
+            <span id="err-gainers" class="text-[11px] text-amber-400"></span>
+        </div>
+        <div id="list-gainers" class="p-2 text-xs text-slate-500">{{ _("加载中") }}...</div>
+    </div>
+    <div class="card p-0 overflow-hidden">
+        <div class="flex items-center justify-between px-3 py-2 border-b border-slate-700">
+            <h3 class="text-sm font-bold text-red-400">{{ _("跌幅榜") }}</h3>
+            <span id="err-losers" class="text-[11px] text-amber-400"></span>
+        </div>
+        <div id="list-losers" class="p-2 text-xs text-slate-500">{{ _("加载中") }}...</div>
+    </div>
+    <div class="card p-0 overflow-hidden">
+        <div class="flex items-center justify-between px-3 py-2 border-b border-slate-700">
+            <h3 class="text-sm font-bold text-sky-400">{{ _("成交额榜") }}</h3>
+            <span id="err-volume" class="text-[11px] text-amber-400"></span>
+        </div>
+        <div id="list-volume" class="p-2 text-xs text-slate-500">{{ _("加载中") }}...</div>
+    </div>
+    <div class="card p-0 overflow-hidden">
+        <div class="flex items-center justify-between px-3 py-2 border-b border-slate-700">
+            <h3 class="text-sm font-bold text-amber-400">{{ _("最活跃") }}</h3>
+            <span id="err-active" class="text-[11px] text-amber-400"></span>
+        </div>
+        <div id="list-active" class="p-2 text-xs text-slate-500">{{ _("加载中") }}...</div>
+    </div>
+    <div class="card p-0 overflow-hidden">
+        <div class="flex items-center justify-between px-3 py-2 border-b border-slate-700">
+            <h3 class="text-sm font-bold text-fuchsia-400">{{ _("波动率榜") }}</h3>
+            <span id="err-volatility" class="text-[11px] text-amber-400"></span>
+        </div>
+        <div id="list-volatility" class="p-2 text-xs text-slate-500">{{ _("加载中") }}...</div>
+    </div>
+    <div class="card p-0 overflow-hidden">
+        <div class="flex items-center justify-between px-3 py-2 border-b border-slate-700">
+            <h3 class="text-sm font-bold text-slate-200">{{ _("价差榜") }}</h3>
+            <span id="err-spread" class="text-[11px] text-amber-400"></span>
+        </div>
+        <div id="list-spread" class="p-2 text-xs text-slate-500">{{ _("加载中") }}...</div>
+    </div>
+</div>
+
+<script>
+/* =========================================================================
+ * /data — 全市场数据总览（契约 §3）
+ * 接口: /api/data/overview
+ * ========================================================================= */
+var MODE = {{ mode | tojson }};
+
+/* ── 统一请求助手：非 200 / {"error":...} / 网络错误 → 交给 onErr ── */
+var INFLIGHT = {};
+function busy(u, on) { if (on) { INFLIGHT[u] = true; } else { delete INFLIGHT[u]; } }
+function isBusy(u) { return !!INFLIGHT[u]; }
+function apiGet(url, onOk, onErr) {
+    if (isBusy(url)) { return; }                 // 同一 URL 不并发重叠
+    busy(url, true);
+    fetch(url, { credentials: 'same-origin' }).then(function (r) {
+        return r.json().catch(function () { return null; }).then(function (j) {
+            busy(url, false);
+            if (!r.ok) { if (onErr) onErr(errText(j, r.status)); return; }
+            if (j && j.error) { if (onErr) onErr(String(j.error)); return; }
+            if (onOk) onOk(j);
+        });
+    }).catch(function (e) {
+        busy(url, false);
+        if (onErr) onErr('网络错误: ' + e.message);
+    });
+}
+function errText(j, status) {
+    if (j && j.detail) { return typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail); }
+    if (j && j.error) { return String(j.error); }
+    if (status === 401) { return '登录已过期，请重新登录'; }
+    if (status === 403) { return '无权访问 (需要 trader 权限)'; }
+    if (status === 404) { return '接口不存在 (404)'; }
+    if (status) { return 'HTTP ' + status; }
+    return '网络错误';
+}
+
+/* ── 格式化 ── */
+function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+}
+function num(v, dflt) { var n = parseFloat(v); return isFinite(n) ? n : (dflt === undefined ? NaN : dflt); }
+function fmtPrice(v) {
+    var n = num(v); if (!isFinite(n)) { return '--'; }
+    var a = Math.abs(n);
+    if (a >= 1000) { return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+    if (a >= 10) { return n.toFixed(2); }
+    if (a >= 1) { return n.toFixed(4); }
+    if (a >= 0.01) { return n.toFixed(6); }
+    return n.toFixed(8);
+}
+function bigQty(v) {
+    var n = num(v); if (!isFinite(n)) { return '--'; }
+    if (Math.abs(n) >= 1e12) { return (n / 1e12).toFixed(2) + 'T'; }
+    if (Math.abs(n) >= 1e9) { return (n / 1e9).toFixed(2) + 'B'; }
+    if (Math.abs(n) >= 1e6) { return (n / 1e6).toFixed(2) + 'M'; }
+    if (Math.abs(n) >= 1e3) { return (n / 1e3).toFixed(2) + 'K'; }
+    return n.toFixed(2);
+}
+function fmtPct(v) { var n = num(v); return isFinite(n) ? (n >= 0 ? '+' : '') + n.toFixed(2) + '%' : '--'; }
+function pctClass(v) { var n = num(v, 0); return n > 0 ? 'text-green-400' : (n < 0 ? 'text-red-400' : 'text-slate-400'); }
+function intFmt(v) { var n = num(v); return isFinite(n) ? Math.round(n).toLocaleString('en-US') : '--'; }
+function safeSym(s) { return (typeof s === 'string' && /^[A-Za-z0-9_]{2,24}$/.test(s)) ? s : ''; }
+/* 年化波动率：契约示例为比率（0.85 → 85%）；已明显是百分数时不再乘 100 */
+function volPct(v) {
+    var n = num(v);
+    if (!isFinite(n)) { return '--'; }
+    return (Math.abs(n) > 5 ? n : n * 100).toFixed(1) + '%';
+}
+/* 价差百分比可能极小（1e-5 量级），太小则用科学计数法避免显示成 0 */
+function spreadPct(v) {
+    var n = num(v);
+    if (!isFinite(n)) { return '--'; }
+    if (n === 0) { return '0%'; }
+    if (Math.abs(n) >= 0.01) { return n.toFixed(4) + '%'; }
+    return n.toExponential(2) + '%';
+}
+function localTime(ts) {
+    var n = num(ts);
+    if (!isFinite(n) || n <= 0) { return '--'; }
+    if (n < 1e11) { n = n * 1000; }
+    var d = new Date(n);
+    function p(x) { return (x < 10 ? '0' : '') + x; }
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
+        p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+function setText(id, text, cls) {
+    var el = document.getElementById(id);
+    if (!el) { return; }
+    el.textContent = text;
+    if (cls) { el.className = cls; }
+}
+
+/* ── 轮询：document.hidden 时清空定时器，恢复可见时重新拉取并重建 ── */
+var TIMERS = [];
+function every(ms, fn) { TIMERS.push(setInterval(fn, ms)); }
+function clearTimers() { for (var i = 0; i < TIMERS.length; i++) { clearInterval(TIMERS[i]); } TIMERS = []; }
+function startPolling() { clearTimers(); every(60000, loadOverview); }
+document.addEventListener('visibilitychange', function () {
+    if (document.hidden) { clearTimers(); } else { loadOverview(); startPolling(); }
+});
+
+/* =========================================================================
+ * 总览 + 六个榜单（单次 GET /api/data/overview）
+ * ========================================================================= */
+var LISTS = [
+    { key: 'top_gainers', box: 'list-gainers', err: 'err-gainers' },
+    { key: 'top_losers', box: 'list-losers', err: 'err-losers' },
+    { key: 'top_volume', box: 'list-volume', err: 'err-volume' },
+    { key: 'most_active', box: 'list-active', err: 'err-active' },
+    { key: 'volatility_leaders', box: 'list-volatility', err: 'err-volatility' },
+    { key: 'spread_widest', box: 'list-spread', err: 'err-spread' }
+];
+
+function rankRow(rank, sym, primary, primaryCls, secondary) {
+    return '<a href="/coin/' + esc(sym) + '" class="flex items-center gap-2 px-1.5 py-1 rounded hover:bg-slate-800">' +
+        '<span class="text-slate-600 w-5 text-right shrink-0">' + rank + '</span>' +
+        '<span class="font-bold text-sky-400">' + esc(sym) + '</span>' +
+        '<span class="ml-auto text-right ' + (primaryCls || 'text-slate-200') + '">' + primary + '</span>' +
+        (secondary ? '<span class="text-right text-slate-500 w-20 shrink-0">' + secondary + '</span>' : '') +
+        '</a>';
+}
+
+function renderList(cfg, rows) {
+    var box = document.getElementById(cfg.box);
+    setText(cfg.err, '');
+    if (!rows || !rows.length) {
+        box.innerHTML = '<div class="text-slate-500 px-1 py-2">暂无数据</div>';
+        return;
+    }
+    var html = '', shown = 0;
+    for (var i = 0; i < rows.length; i++) {
+        var r = rows[i] || {};
+        var sym = safeSym(r.symbol);
+        if (!sym) { continue; }
+        shown++;
+        var row;
+        if (cfg.key === 'most_active') {
+            row = rankRow(shown, sym, intFmt(r.count) + ' 笔', 'text-amber-400', bigQty(r.quote_volume));
+        } else if (cfg.key === 'volatility_leaders') {
+            row = rankRow(shown, sym, volPct(r.volatility_30d_annualized), 'text-fuchsia-400', '');
+        } else if (cfg.key === 'spread_widest') {
+            row = rankRow(shown, sym, spreadPct(r.spread_pct), 'text-slate-200', '');
+        } else {
+            row = rankRow(shown, sym,
+                fmtPrice(r.last) + ' <span class="' + pctClass(r.change_pct) + '">' + fmtPct(r.change_pct) + '</span>',
+                'text-slate-200', bigQty(r.quote_volume));
+        }
+        html += row;
+    }
+    box.innerHTML = html || '<div class="text-slate-500 px-1 py-2">暂无数据</div>';
+}
+
+function renderShare(share) {
+    var box = document.getElementById('share-rows');
+    setText('data-share-err', '');
+    share = share || {};
+    var keys = [];
+    for (var k in share) { if (Object.prototype.hasOwnProperty.call(share, k)) { keys.push(k); } }
+    if (!keys.length) {
+        box.innerHTML = '<div class="text-slate-500">暂无占比数据</div>';
+        return;
+    }
+    keys.sort(function (a, b) { return num(share[b], 0) - num(share[a], 0); });
+    box.innerHTML = keys.map(function (k) {
+        var v = num(share[k], 0);
+        var pct = v <= 1 ? v * 100 : v;               // 契约给的是比例
+        var sym = safeSym(k) || k;
+        var color = sym.indexOf('BTC') === 0 ? '#fbbf24' : (sym.indexOf('ETH') === 0 ? '#818cf8' : '#38bdf8');
+        return '<div class="flex items-center gap-2 mb-1">' +
+            '<a href="/coin/' + esc(sym) + '" class="w-24 shrink-0 text-sky-400 hover:underline">' + esc(sym) + '</a>' +
+            '<div class="flex-1 h-3 bg-slate-800 rounded overflow-hidden">' +
+                '<div style="width:' + Math.max(0, Math.min(100, pct)).toFixed(2) + '%;height:100%;background:' + color + '"></div>' +
+            '</div>' +
+            '<span class="w-16 text-right text-slate-200 font-bold">' + pct.toFixed(2) + '%</span>' +
+            '</div>';
+    }).join('');
+}
+
+function renderTotals(t) {
+    t = t || {};
+    setText('tot-symbols', intFmt(t.symbols));
+    setText('tot-qvol', bigQty(t.quote_volume_usdt));
+    setText('tot-up', intFmt(t.up));
+    setText('tot-down', intFmt(t.down));
+    setText('tot-flat', intFmt(t.flat));
+}
+
+function failAll(msg) {
+    setText('data-err', '市场总览接口不可用: ' + msg + '（接口 /api/data/overview）');
+    for (var i = 0; i < LISTS.length; i++) {
+        setText(LISTS[i].err, '不可用');
+        document.getElementById(LISTS[i].box).innerHTML =
+            '<div class="text-amber-400 px-1 py-2">接口不可用: ' + esc(msg) + '</div>';
+    }
+    setText('data-share-err', '不可用');
+    document.getElementById('share-rows').innerHTML =
+        '<div class="text-amber-400">占比数据不可用: ' + esc(msg) + '</div>';
+}
+
+function loadOverview() {
+    apiGet('/api/data/overview', function (j) {
+        setText('data-err', '');
+        setText('data-updated', j && j.updated_at ? localTime(j.updated_at) : '--');
+        renderTotals(j && j.totals);
+        renderShare(j && j.btc_eth_share);
+        for (var i = 0; i < LISTS.length; i++) {
+            renderList(LISTS[i], (j && j[LISTS[i].key]) || []);
+        }
+    }, function (e) {
+        failAll(e);
+    });
+}
+
+loadOverview();
+startPolling();
+</script>
+{% endblock %}

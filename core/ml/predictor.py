@@ -7,13 +7,12 @@ Set model_type='tft' in config or per-strategy ml_config to use TFT.
 
 import asyncio
 import pandas as pd
-import numpy as np
-from pathlib import Path
 from loguru import logger
 
 from app.event_bus import EventBus, Event, EventType
 from app.config import Config
-from core.market_data.provider import MarketDataProvider
+from core.market_data.provider import (
+    DEFAULT_ML_INTERVAL, MarketDataProvider, ml_intervals)
 from core.ml.trainer import MLTrainer
 from core.ml.features import (
     compute_features, create_binary_label, create_volatility_label,
@@ -77,11 +76,11 @@ class MLPredictor:
                 try:
                     # Direction model (existing)
                     if self._model_type == 'tft':
-                        await self.train_tft_model(symbol, "periodic", "1h")
+                        await self.train_tft_model(symbol, "periodic", DEFAULT_ML_INTERVAL)
                     else:
-                        await self.train_model(symbol, "periodic", "1h")
+                        await self.train_model(symbol, "periodic", DEFAULT_ML_INTERVAL)
                     # Volatility model (NEW)
-                    await self.train_volatility_model(symbol, "volatility", "1h")
+                    await self.train_volatility_model(symbol, "volatility", DEFAULT_ML_INTERVAL)
                 except Exception as e:
                     logger.warning(f"ML retrain failed for {symbol}: {e}")
             await asyncio.sleep(86400)
@@ -94,7 +93,9 @@ class MLPredictor:
         symbol = event.data["symbol"]
         interval = event.data["interval"]
 
-        if interval not in ["1h", "4h"]:
+        # The ML-enabled intervals are declared once in INTERVAL_SPEC
+        # (core/market_data/provider.py), so a new interval needs no edit here.
+        if interval not in ml_intervals():
             return
 
         df = await self.market_data.get_historical(symbol, interval)
@@ -280,154 +281,6 @@ class MLPredictor:
         model = self.trainer.load_model(model_path)
         if model:
             self._models[f"{symbol}_binary"] = model
-
-    def load_tft_model(self, symbol: str, strategy_name: str):
-        tft = self._get_tft_trainer()
-        model = tft.load(symbol, strategy_name)
-        if model:
-            self._tft_models[symbol] = model
-
-    # ── Ensemble prediction (Phase 4d) ─────────────────────────────────
-
-    async def ensemble_predict(self, symbol: str, X: pd.DataFrame) -> dict:
-        """Weighted ensemble across all available model architectures.
-
-        Combines LightGBM, TFT, and PatchTST predictions.  Weights are
-        fixed for now (can be evolved by future GA work).
-
-        Returns:
-            dict with ``confidence`` (float [0,1]) and ``volatility_expanding`` (bool).
-            Falls back to individual models when only one is available.
-        """
-        predictions: dict[str, float | None] = {}
-
-        # LightGBM direction
-        if f"{symbol}_binary" in self._models:
-            predictions["lgb"] = await self._predict_lgb(symbol, X)
-
-        # TFT
-        if symbol in self._tft_models:
-            predictions["tft"] = await self._predict_tft(symbol, X)
-
-        # PatchTST (lazy init)
-        if hasattr(self, '_patch_models') and symbol in self._patch_models:
-            predictions["patch"] = await self._predict_patchtst(symbol, X)
-
-        # Ensemble: weighted average of valid predictions
-        weights = {"lgb": 0.40, "tft": 0.35, "patch": 0.25}
-        valid = {k: v for k, v in predictions.items()
-                 if v is not None and not np.isnan(v)}
-
-        if not valid:
-            return {"confidence": 0.5, "volatility_expanding": False}
-
-        total_w = sum(weights.get(k, 0.0) for k in valid)
-        if total_w > 0:
-            confidence = sum(v * weights[k] / total_w for k, v in valid.items())
-        else:
-            confidence = 0.5
-
-        vol_expanding = await self._predict_volatility(symbol, X)
-        return {"confidence": float(confidence),
-                "volatility_expanding": vol_expanding}
-
-    # ── Online / incremental learning (Phase 4d) ───────────────────────
-
-    async def incremental_retrain(self, symbol: str, interval: str = "1h") -> dict:
-        """Incrementally update the LightGBM direction model.
-
-        Uses LightGBM's ``init_model`` parameter to continue training
-        from the existing booster rather than training from scratch.
-        Falls back to full retrain if no model exists yet.
-
-        This reduces retrain time from ~30s to ~2s and preserves knowledge
-        accumulated over previous training cycles.
-        """
-        df = await self.market_data.get_historical(symbol, interval, limit=500)
-        if df is None or len(df) < 100:
-            return {"error": f"Insufficient data: {len(df) if df is not None else 0} rows"}
-
-        from core.strategy.indicators import compute_all
-        df = compute_all(df, REQUIRED_INDICATORS)
-        X = compute_features(df, self._feature_list)
-        y = create_binary_label(df, forward_periods=4, threshold=0.005)
-
-        common_idx = X.index.intersection(y.dropna().index)
-        if len(common_idx) < 40:
-            return {"error": f"Insufficient labelled: {len(common_idx)}"}
-        X = X.loc[common_idx].replace([np.inf, -np.inf], np.nan).fillna(0)
-        y = y.loc[common_idx]
-
-        model_key = f"{symbol}_binary"
-        existing_model = self._models.get(model_key)
-
-        if existing_model is not None:
-            # Incremental: use init_model to continue training
-            try:
-                import lightgbm as lgb
-                latest = X.iloc[-200:]  # only recent data for incremental
-                y_latest = y.iloc[-200:]
-                existing_model.fit(
-                    latest, y_latest,
-                    init_model=existing_model.booster_,
-                    keep_training_booster=True,
-                )
-                self._models[model_key] = existing_model
-                return {"status": "incremental", "n_samples": len(latest)}
-            except Exception as e:
-                logger.warning(f"Incremental retrain failed ({e}), falling back to full")
-                # Fall through to full retrain
-                self._models.pop(model_key, None)
-
-        # Full retrain (first time or fallback)
-        result = self.trainer.train_binary(symbol, "periodic", X, y, engine="lightgbm")
-        if "model_path" in result:
-            model = self.trainer.load_model(result["model_path"])
-            if model:
-                self._models[model_key] = model
-        return {**result, "status": "full"}
-
-    # ── PatchTST support (Phase 4d, lightweight integration) ───────────
-
-    def load_patchtst_model(self, symbol: str, strategy_name: str):
-        """Load a pre-trained PatchTST model for ensemble participation."""
-        try:
-            from core.ml.patchtst_trainer import PatchTSTTrainer
-            if not hasattr(self, '_patch_trainer') or self._patch_trainer is None:
-                self._patch_trainer = PatchTSTTrainer(
-                    data_dir=str(self.config.data_dir),
-                    seq_len=100, patch_len=16, stride=8,
-                    d_model=128, num_heads=8, num_layers=3, dropout=0.15)
-            if not hasattr(self, '_patch_models'):
-                self._patch_models = {}
-            model = self._patch_trainer.load(symbol, strategy_name)
-            if model:
-                self._patch_models[symbol] = model
-        except Exception as e:
-            logger.warning(f"PatchTST model not available: {e}")
-
-    async def _predict_patchtst(self, symbol: str, X: pd.DataFrame) -> float | None:
-        """Predict with PatchTST model (used by ensemble)."""
-        if not hasattr(self, '_patch_trainer') or not hasattr(self, '_patch_models'):
-            return None
-        model = self._patch_models.get(symbol)
-        trainer = self._patch_trainer
-        if model is None or trainer is None:
-            return None
-        try:
-            result = trainer.predict(model, X)
-            if result is None:
-                return None
-            direction = result["direction"]
-            confidence = result["confidence"]
-            if direction > 0:
-                return confidence
-            elif direction < 0:
-                return 1.0 - confidence
-            else:
-                return 0.5
-        except Exception:
-            return None
 
     @property
     def feature_count(self) -> int:

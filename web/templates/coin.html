@@ -1,0 +1,591 @@
+{% extends "base.html" %}
+{% block content %}
+{#- 币种详情 /coin/{symbol}。
+    只消费 docs/overhaul/MARKET_PAGES_API.md 冻结的接口：
+      GET /api/coin/{symbol}            (§2: 基本信息/规则/24h/表现/风险/相关性/缓存区间)
+      GET /api/kline/{symbol}?interval=1h&limit=200   (§1, time 为秒)
+      GET /api/market/depth?symbol=&limit=20          (盘口摘要)
+      GET /api/market/trades?symbol=&limit=30         (最近成交)
+    所有请求走同一个 apiGet() 助手，失败时写进所属面板，绝不留空白。 -#}
+
+<div class="flex flex-wrap items-center gap-3 mb-3">
+    <h2 class="text-xl font-bold text-slate-100">
+        <span id="coin-symbol">{{ symbol }}</span>
+        <span class="text-sm text-slate-400 font-normal">
+            <span id="coin-base">--</span>/<span id="coin-quote">--</span>
+        </span>
+    </h2>
+    <span id="coin-status" class="badge badge-blue text-[10px]">--</span>
+    <span class="badge badge-blue text-[10px]">{{ _("模式") }}: {{ mode }}</span>
+    <span class="text-xs text-slate-500">{{ _("上市日期") }}: <span id="coin-listing">--</span></span>
+    <div class="ml-auto flex items-center gap-2">
+        <a href="/trade?symbol={{ symbol }}" id="btn-trade"
+           class="px-3 py-1.5 rounded text-xs font-bold bg-green-600 text-white hover:bg-green-500">{{ _("去交易") }}</a>
+        <a href="/audit" id="btn-audit"
+           class="px-3 py-1.5 rounded text-xs font-bold bg-slate-700 text-slate-200 hover:bg-slate-600">{{ _("去检测") }}</a>
+    </div>
+</div>
+<div id="coin-header-err" class="text-xs text-amber-400 mb-2"></div>
+
+{#- ─────────────── 交易规则 ─────────────── -#}
+<div class="card mb-3 py-2 px-3" id="coin-rules">
+    <div class="flex flex-wrap items-center gap-x-6 gap-y-2 text-xs">
+        <span class="text-slate-500">{{ _("最小价格变动") }} (tick)
+            <span id="coin-tick" class="text-slate-100 font-bold ml-1">--</span></span>
+        <span class="text-slate-500">{{ _("最小数量变动") }} (step)
+            <span id="coin-step" class="text-slate-100 font-bold ml-1">--</span></span>
+        <span class="text-slate-500">{{ _("最小名义金额") }} (min notional)
+            <span id="coin-minnotional" class="text-slate-100 font-bold ml-1">--</span> USDT</span>
+        <span class="text-slate-500">{{ _("BTC 30d 相关性") }}
+            <span id="coin-corr" class="text-sky-400 font-bold ml-1">--</span></span>
+        <span class="ml-auto text-slate-500">{{ _("本地缓存周期") }}: <span id="coin-cached">--</span></span>
+    </div>
+</div>
+
+{#- ─────────────── 24h 统计卡片 ─────────────── -#}
+<div class="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-7 gap-3 mb-3" id="coin-stats">
+    <div class="card py-2 px-3"><div class="text-[11px] text-slate-500">{{ _("最新价") }}</div>
+        <div id="coin-last" class="text-lg font-bold text-slate-200">--</div></div>
+    <div class="card py-2 px-3"><div class="text-[11px] text-slate-500">{{ _("24h 涨跌") }}</div>
+        <div id="coin-change" class="text-lg font-bold text-slate-200">--</div></div>
+    <div class="card py-2 px-3"><div class="text-[11px] text-slate-500">{{ _("24h 高") }}</div>
+        <div id="coin-high" class="text-lg font-bold text-green-400">--</div></div>
+    <div class="card py-2 px-3"><div class="text-[11px] text-slate-500">{{ _("24h 低") }}</div>
+        <div id="coin-low" class="text-lg font-bold text-red-400">--</div></div>
+    <div class="card py-2 px-3"><div class="text-[11px] text-slate-500">{{ _("24h 量") }}</div>
+        <div id="coin-vol" class="text-lg font-bold text-slate-200">--</div></div>
+    <div class="card py-2 px-3"><div class="text-[11px] text-slate-500">{{ _("24h 成交额") }}</div>
+        <div id="coin-qvol" class="text-lg font-bold text-sky-400">--</div></div>
+    <div class="card py-2 px-3"><div class="text-[11px] text-slate-500">{{ _("24h 笔数") }}</div>
+        <div id="coin-count" class="text-lg font-bold text-slate-200">--</div></div>
+</div>
+<div id="coin-stats-err" class="text-xs text-amber-400 mb-2"></div>
+
+{#- ─────────────── 走势图 + 盘口摘要 ─────────────── -#}
+<div class="grid grid-cols-1 xl:grid-cols-3 gap-3 mb-3">
+    <div class="xl:col-span-2 min-w-0">
+        <div class="card p-3">
+            <div class="flex flex-wrap items-center gap-2 mb-2">
+                <h3 class="text-sm font-bold text-slate-200">{{ _("走势图") }} (1h · 200{{ _("根") }})</h3>
+                <button id="view-candle" onclick="setView('candle')"
+                        class="px-2 py-0.5 rounded text-xs bg-sky-700 text-white">{{ _("蜡烛图") }}</button>
+                <button id="view-line" onclick="setView('line')"
+                        class="px-2 py-0.5 rounded text-xs bg-slate-700 text-slate-300">{{ _("折线图") }}</button>
+                <span id="coin-chart-err" class="ml-auto text-xs text-amber-400 truncate max-w-[50%]"></span>
+            </div>
+            <div id="coin-chart" style="width:100%;height:360px;min-height:280px;"></div>
+        </div>
+    </div>
+    <div class="xl:col-span-1 flex flex-col gap-3 min-w-0">
+        <div class="card p-3" id="coin-depth">
+            <div class="flex items-center justify-between mb-2">
+                <h3 class="text-sm font-bold text-slate-200">{{ _("盘口摘要") }}</h3>
+                <span id="coin-depth-src" class="text-[10px] text-slate-500"></span>
+            </div>
+            <div class="grid grid-cols-2 gap-2 text-xs">
+                <div class="bg-slate-800 rounded px-2 py-1"><div class="text-slate-500">{{ _("价差") }}</div>
+                    <div id="coin-spread" class="font-bold text-slate-200">--</div></div>
+                <div class="bg-slate-800 rounded px-2 py-1"><div class="text-slate-500">{{ _("价差%") }}</div>
+                    <div id="coin-spread-pct" class="font-bold text-slate-200">--</div></div>
+                <div class="bg-slate-800 rounded px-2 py-1"><div class="text-slate-500">{{ _("买盘 ±1% 深度") }}</div>
+                    <div id="coin-bid-1pct" class="font-bold text-green-400">--</div></div>
+                <div class="bg-slate-800 rounded px-2 py-1"><div class="text-slate-500">{{ _("卖盘 ±1% 深度") }}</div>
+                    <div id="coin-ask-1pct" class="font-bold text-red-400">--</div></div>
+                <div class="bg-slate-800 rounded px-2 py-1"><div class="text-slate-500">{{ _("买盘总额") }}</div>
+                    <div id="coin-bid-total" class="font-bold text-slate-200">--</div></div>
+                <div class="bg-slate-800 rounded px-2 py-1"><div class="text-slate-500">{{ _("卖盘总额") }}</div>
+                    <div id="coin-ask-total" class="font-bold text-slate-200">--</div></div>
+            </div>
+            <div id="coin-depth-err" class="text-[11px] text-amber-400 mt-2"></div>
+        </div>
+
+        <div class="card p-3" id="coin-perf">
+            <h3 class="text-sm font-bold text-slate-200 mb-2">{{ _("多周期表现") }}</h3>
+            <div class="grid grid-cols-2 gap-2 text-xs">
+                <div class="bg-slate-800 rounded px-2 py-1"><div class="text-slate-500">1{{ _("天") }}</div>
+                    <div id="coin-perf-d1" class="font-bold text-slate-200">--</div></div>
+                <div class="bg-slate-800 rounded px-2 py-1"><div class="text-slate-500">7{{ _("天") }}</div>
+                    <div id="coin-perf-d7" class="font-bold text-slate-200">--</div></div>
+                <div class="bg-slate-800 rounded px-2 py-1"><div class="text-slate-500">30{{ _("天") }}</div>
+                    <div id="coin-perf-d30" class="font-bold text-slate-200">--</div></div>
+                <div class="bg-slate-800 rounded px-2 py-1"><div class="text-slate-500">90{{ _("天") }}</div>
+                    <div id="coin-perf-d90" class="font-bold text-slate-200">--</div></div>
+            </div>
+            <div id="coin-perf-err" class="text-[11px] text-amber-400 mt-2"></div>
+        </div>
+    </div>
+</div>
+
+{#- ─────────────── 风险评分（启发式，非链上审计） ─────────────── -#}
+<div class="card mb-3" id="coin-risk">
+    <div class="flex flex-wrap items-center gap-2 mb-2">
+        <h3 class="text-sm font-bold text-slate-200">{{ _("风险画像") }}</h3>
+        <span id="coin-risk-note" class="badge badge-yellow text-[10px]">
+            {{ _("启发式指标，基于交易所公开数据，非链上合约审计") }}</span>
+        <span id="coin-risk-err" class="ml-auto text-xs text-amber-400"></span>
+    </div>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div class="md:col-span-2" id="coin-score-bars">
+            <div class="text-xs text-slate-500">{{ _("评分维度（0-100，越高越好）") }}</div>
+        </div>
+        <div>
+            <div class="grid grid-cols-2 gap-2 text-xs">
+                <div class="bg-slate-800 rounded px-2 py-1"><div class="text-slate-500">{{ _("30d 年化波动率") }}</div>
+                    <div id="coin-risk-vol" class="font-bold text-slate-200">--</div></div>
+                <div class="bg-slate-800 rounded px-2 py-1"><div class="text-slate-500">{{ _("90d 最大回撤") }}</div>
+                    <div id="coin-risk-mdd" class="font-bold text-amber-400">--</div></div>
+            </div>
+            <div class="mt-2 text-xs text-slate-500">{{ _("风险标记") }}</div>
+            <div id="coin-risk-flags" class="flex flex-wrap gap-1 mt-1">
+                <span class="text-[11px] text-slate-500">{{ _("加载中") }}...</span>
+            </div>
+        </div>
+    </div>
+</div>
+
+{#- ─────────────── 最近成交 ─────────────── -#}
+<div class="card p-0 overflow-hidden mb-3" id="coin-trades">
+    <div class="flex items-center justify-between px-3 py-2 border-b border-slate-700">
+        <h3 class="text-sm font-bold text-slate-200">{{ _("最近成交") }}</h3>
+        <span id="coin-trades-err" class="text-xs text-amber-400 truncate max-w-[60%]"></span>
+    </div>
+    <div class="overflow-x-auto max-h-80 overflow-y-auto">
+        <table class="w-full text-xs">
+            <thead class="text-slate-400 border-b border-slate-700">
+                <tr>
+                    <th class="text-left p-2">{{ _("时间") }}</th>
+                    <th class="text-right p-2">{{ _("价格") }}</th>
+                    <th class="text-right p-2">{{ _("数量") }}</th>
+                    <th class="text-right p-2">{{ _("成交额") }}</th>
+                    <th class="text-left p-2">{{ _("方向") }}</th>
+                </tr>
+            </thead>
+            <tbody id="coin-trades-list">
+                <tr><td colspan="5" class="p-2 text-slate-500">{{ _("加载中") }}...</td></tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<script>
+/* =========================================================================
+ * /coin/{symbol} — 币种详情（契约 §1/§2）
+ * 接口: /api/coin/{symbol}, /api/kline/{symbol}, /api/market/depth, /api/market/trades
+ * ========================================================================= */
+var SYMBOL = {{ symbol | tojson }};
+
+/* ── 统一请求助手：非 200 / {"error":...} / 网络错误 → 交给 onErr ── */
+var INFLIGHT = {};
+function busy(u, on) { if (on) { INFLIGHT[u] = true; } else { delete INFLIGHT[u]; } }
+function isBusy(u) { return !!INFLIGHT[u]; }
+function apiGet(url, onOk, onErr) {
+    if (isBusy(url)) { return; }                 // 同一 URL 不并发重叠
+    busy(url, true);
+    fetch(url, { credentials: 'same-origin' }).then(function (r) {
+        return r.json().catch(function () { return null; }).then(function (j) {
+            busy(url, false);
+            if (!r.ok) { if (onErr) onErr(errText(j, r.status)); return; }
+            if (j && j.error) { if (onErr) onErr(String(j.error)); return; }
+            if (onOk) onOk(j);
+        });
+    }).catch(function (e) {
+        busy(url, false);
+        if (onErr) onErr('网络错误: ' + e.message);
+    });
+}
+function errText(j, status) {
+    if (j && j.detail) { return typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail); }
+    if (j && j.error) { return String(j.error); }
+    if (status === 401) { return '登录已过期，请重新登录'; }
+    if (status === 403) { return '无权访问 (需要 trader 权限)'; }
+    if (status === 404) { return '接口不存在 (404)'; }
+    if (status) { return 'HTTP ' + status; }
+    return '网络错误';
+}
+
+/* ── 格式化 ── */
+function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+}
+function num(v, dflt) { var n = parseFloat(v); return isFinite(n) ? n : (dflt === undefined ? NaN : dflt); }
+function fmtPrice(v) {
+    var n = num(v); if (!isFinite(n)) { return '--'; }
+    var a = Math.abs(n);
+    if (a >= 1000) { return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+    if (a >= 10) { return n.toFixed(2); }
+    if (a >= 1) { return n.toFixed(4); }
+    if (a >= 0.01) { return n.toFixed(6); }
+    return n.toFixed(8);
+}
+function fmtQty(v) { var n = num(v); if (!isFinite(n)) { return '--'; } var s = n.toFixed(8); return s.replace(/0+$/, '').replace(/\.$/, ''); }
+function bigQty(v) {
+    var n = num(v); if (!isFinite(n)) { return '--'; }
+    if (Math.abs(n) >= 1e9) { return (n / 1e9).toFixed(2) + 'B'; }
+    if (Math.abs(n) >= 1e6) { return (n / 1e6).toFixed(2) + 'M'; }
+    if (Math.abs(n) >= 1e3) { return (n / 1e3).toFixed(2) + 'K'; }
+    return n.toFixed(2);
+}
+function fmtPct(v, dp) {
+    var n = num(v);
+    if (!isFinite(n)) { return '--'; }
+    return (n >= 0 ? '+' : '') + n.toFixed(dp === undefined ? 2 : dp) + '%';
+}
+function pctClass(v) { var n = num(v, 0); return n > 0 ? 'text-green-400' : (n < 0 ? 'text-red-400' : 'text-slate-400'); }
+function intFmt(v) { var n = num(v); return isFinite(n) ? Math.round(n).toLocaleString('en-US') : '--'; }
+function localTime(ts) {
+    var n = num(ts);
+    if (!isFinite(n) || n <= 0) { return '--'; }
+    if (n < 1e11) { n = n * 1000; }                 // /api/market/trades 的 time 是秒
+    var d = new Date(n);
+    function p(x) { return (x < 10 ? '0' : '') + x; }
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
+        p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+function setText(id, text, cls) {
+    var el = document.getElementById(id);
+    if (!el) { return; }
+    el.textContent = text;
+    if (cls) { el.className = cls; }
+}
+function nullNote(v) { return (v === null || v === undefined || !isFinite(num(v))) ? '数据不足' : null; }
+
+/* ── 轮询（本页为快照型页面，仅 60s 轻量刷新，隐藏时暂停） ── */
+var TIMERS = [];
+function every(ms, fn) { TIMERS.push(setInterval(fn, ms)); }
+function clearTimers() { for (var i = 0; i < TIMERS.length; i++) { clearInterval(TIMERS[i]); } TIMERS = []; }
+document.addEventListener('visibilitychange', function () {
+    if (document.hidden) { clearTimers(); }
+    else { loadCoin(); loadDepth(); loadTrades(); startPolling(); }
+});
+function startPolling() {
+    clearTimers();
+    every(60000, function () { loadCoin(); });
+}
+
+/* =========================================================================
+ * 1. GET /api/coin/{symbol} — 基本信息 / 24h / 表现 / 风险
+ * ========================================================================= */
+function renderHeader(j) {
+    setText('coin-symbol', j.symbol || SYMBOL, 'text-slate-100');
+    setText('coin-base', j.base_asset || '--');
+    setText('coin-quote', j.quote_asset || '--');
+    var st = j.status || '--';
+    var stEl = document.getElementById('coin-status');
+    stEl.textContent = st;
+    stEl.className = 'badge text-[10px] ' + (st === 'TRADING' ? 'badge-green' : 'badge-yellow');
+    setText('coin-listing', j.listing_date || '--');
+    var f = j.filters || {};
+    setText('coin-tick', isFinite(num(f.tick_size)) ? String(f.tick_size) : '--');
+    setText('coin-step', isFinite(num(f.step_size)) ? String(f.step_size) : '--');
+    setText('coin-minnotional', isFinite(num(f.min_notional)) ? String(f.min_notional) : '--');
+    var corr = num(j.correlation_btc_30d);
+    setText('coin-corr', isFinite(corr) ? corr.toFixed(3) : '--（数据不足）');
+    var iv = j.cached_intervals || [];
+    var box = document.getElementById('coin-cached');
+    box.innerHTML = (iv && iv.length)
+        ? iv.map(function (s) { return '<span class="badge badge-blue text-[10px] mr-1">' + esc(s) + '</span>'; }).join('')
+        : '<span class="text-slate-500">无</span>';
+}
+
+function renderStats(t) {
+    t = t || {};
+    var chg = num(t.change_pct);
+    var last = document.getElementById('coin-last');
+    last.textContent = fmtPrice(t.last);
+    last.className = 'text-lg font-bold ' + (isFinite(chg) ? (chg >= 0 ? 'text-green-400' : 'text-red-400') : 'text-slate-200');
+    setText('coin-change', fmtPct(chg), 'text-lg font-bold ' + pctClass(chg));
+    setText('coin-high', fmtPrice(t.high), 'text-lg font-bold text-green-400');
+    setText('coin-low', fmtPrice(t.low), 'text-lg font-bold text-red-400');
+    setText('coin-vol', bigQty(t.volume), 'text-lg font-bold text-slate-200');
+    setText('coin-qvol', bigQty(t.quote_volume), 'text-lg font-bold text-sky-400');
+    setText('coin-count', intFmt(t.count), 'text-lg font-bold text-slate-200');
+}
+
+function renderPerf(p) {
+    p = p || {};
+    ['d1', 'd7', 'd30', 'd90'].forEach(function (k) {
+        var v = p[k];
+        var note = nullNote(v);
+        setText('coin-perf-' + k, note || fmtPct(v), 'font-bold ' + (note ? 'text-slate-500' : pctClass(v)));
+    });
+}
+
+function scoreColor(v) {
+    var n = num(v);
+    if (!isFinite(n)) { return '#64748b'; }
+    if (n >= 70) { return '#34d399'; }
+    if (n >= 40) { return '#fbbf24'; }
+    return '#f87171';
+}
+function bar(label, id, value) {
+    var n = num(value);
+    var width = isFinite(n) ? Math.max(0, Math.min(100, n)) : 0;
+    return '<div class="flex items-center gap-2 mb-1">' +
+        '<span class="text-[11px] text-slate-400 w-24 shrink-0">' + esc(label) + '</span>' +
+        '<div class="flex-1 h-2 bg-slate-800 rounded overflow-hidden">' +
+            '<div id="' + id + '" style="width:' + width.toFixed(1) + '%;background:' + scoreColor(n) + ';height:100%"></div>' +
+        '</div>' +
+        '<span class="text-[11px] ' + (isFinite(n) ? 'text-slate-200' : 'text-slate-500') + ' w-12 text-right">' +
+            (isFinite(n) ? n.toFixed(0) : '--') + '</span>' +
+        '</div>';
+}
+
+function renderRisk(r) {
+    r = r || {};
+    document.getElementById('coin-score-bars').innerHTML =
+        '<div class="text-xs text-slate-500 mb-1">评分维度（0-100，越高越好）</div>' +
+        bar('综合评分', 'bar-overall', r.overall_score) +
+        bar('流动性', 'bar-liquidity', r.liquidity_score) +
+        bar('价差质量', 'bar-spread', r.spread_score) +
+        bar('成交量', 'bar-volume', r.volume_score);
+    var vol = num(r.volatility_30d_annualized);
+    setText('coin-risk-vol', isFinite(vol) ? (vol * 100).toFixed(1) + '%' : '--（数据不足）');
+    var mdd = num(r.max_drawdown_90d);
+    setText('coin-risk-mdd', isFinite(mdd) ? mdd.toFixed(2) + '%' : '--（数据不足）');
+    var flags = r.flags || [];
+    document.getElementById('coin-risk-flags').innerHTML = flags.length
+        ? flags.map(function (f) { return '<span class="badge badge-yellow text-[10px]">' + esc(f) + '</span>'; }).join('')
+        : '<span class="text-[11px] text-green-400">无风险标记</span>';
+}
+
+function loadCoin() {
+    apiGet('/api/coin/' + encodeURIComponent(SYMBOL), function (j) {
+        renderHeader(j);
+        renderStats(j.ticker);
+        renderPerf(j.performance);
+        renderRisk(j.risk);
+        var msg = '';
+        if (!j.ticker) { msg = '该币种暂无 24h 行情（可能已下线）'; }
+        setText('coin-header-err', msg);
+        setText('coin-stats-err', j.ticker ? '' : '24h 行情不可用');
+        setText('coin-perf-err', '');
+        setText('coin-risk-err', '');
+        if (!j.risk) {
+            document.getElementById('coin-score-bars').innerHTML =
+                '<div class="text-[11px] text-slate-500">风险评分不可用（数据不足）</div>';
+            document.getElementById('coin-risk-flags').innerHTML =
+                '<span class="text-[11px] text-slate-500">无数据</span>';
+        }
+        // 盘口摘要：实时 /api/market/depth 为主（价差/总额），
+        // 契约 §2 的 /api/coin.depth_summary 提供更深的 ±1% 深度，二者互补
+        coinDepth = j.depth_summary || null;
+        applyDepth();
+    }, function (e) {
+        setText('coin-header-err', '币种接口不可用: ' + e + '（接口 /api/coin/' + SYMBOL + '）');
+        setText('coin-stats-err', '24h 行情不可用: ' + e);
+        setText('coin-perf-err', '多周期表现不可用: ' + e);
+        setText('coin-risk-err', '风险评分不可用: ' + e);
+        document.getElementById('coin-score-bars').innerHTML =
+            '<div class="text-[11px] text-amber-400">风险评分接口不可用: ' + esc(e) + '</div>';
+        document.getElementById('coin-risk-flags').innerHTML =
+            '<span class="text-[11px] text-amber-400">' + esc(e) + '</span>';
+    });
+}
+
+/* =========================================================================
+ * 2. K 线图（GET /api/kline/{symbol}?interval=1h&limit=200，time 为秒）
+ * ========================================================================= */
+var chart = null, klineRows = [], chartMsg = '', chartView = 'candle';
+
+function renderChart() {
+    var box = document.getElementById('coin-chart');
+    if (!chart) { chart = echarts.init(box); }
+    if (!klineRows.length) {
+        chart.clear();
+        chart.setOption({
+            backgroundColor: '#0f172a', animation: false,
+            title: {
+                text: chartMsg || '等待 K 线数据…', left: 'center', top: 'middle',
+                textStyle: { color: chartMsg ? '#fbbf24' : '#64748b', fontSize: 13, fontWeight: 'normal' }
+            }
+        }, true);
+        return;
+    }
+    var times = klineRows.map(function (d) { return d.time * 1000; });
+    var closes = klineRows.map(function (d) { return d.close; });
+    var volumes = klineRows.map(function (d) { return d.volume; });
+    var main = chartView === 'candle'
+        ? {
+            name: 'K线', type: 'candlestick', data: klineRows.map(function (d) {
+                return [d.time * 1000, d.open, d.close, d.low, d.high];
+            }),
+            itemStyle: { color: '#34d399', color0: '#f87171', borderColor: '#34d399', borderColor0: '#f87171' }
+        }
+        : {
+            name: '收盘价', type: 'line', data: closes, smooth: true, symbol: 'none',
+            lineStyle: { width: 1.5, color: '#38bdf8' },
+            areaStyle: { color: 'rgba(56,189,248,0.12)' }
+        };
+    chart.setOption({
+        backgroundColor: '#0f172a', animation: false,
+        tooltip: {
+            trigger: 'axis', axisPointer: { type: 'cross' },
+            backgroundColor: '#1e293b', borderColor: '#334155', textStyle: { color: '#e2e8f0', fontSize: 11 }
+        },
+        axisPointer: { link: [{ xAxisIndex: 'all' }] },
+        legend: { top: 0, right: 10, textStyle: { color: '#94a3b8', fontSize: 10 }, icon: 'roundRect', itemWidth: 10, itemHeight: 6 },
+        grid: [
+            { left: 62, right: 16, top: 22, height: '58%' },
+            { left: 62, right: 16, top: '84%', height: '12%' }
+        ],
+        xAxis: [
+            { type: 'category', data: times, gridIndex: 0, axisLine: { lineStyle: { color: '#334155' } }, axisLabel: { show: false }, axisTick: { show: false } },
+            { type: 'category', data: times, gridIndex: 1, axisLine: { lineStyle: { color: '#334155' } },
+              axisLabel: {
+                  color: '#94a3b8', fontSize: 10, formatter: function (v) {
+                      var d = new Date(v);
+                      function p(x) { return (x < 10 ? '0' : '') + x; }
+                      return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+                  }
+              } }
+        ],
+        yAxis: [
+            { gridIndex: 0, scale: true, splitLine: { lineStyle: { color: '#1e293b' } },
+              axisLabel: { color: '#94a3b8', fontSize: 10, formatter: function (v) { return fmtPrice(v); } } },
+            { gridIndex: 1, splitLine: { show: false }, splitNumber: 2,
+              axisLabel: { color: '#94a3b8', fontSize: 9, formatter: function (v) { return bigQty(v); } } }
+        ],
+        dataZoom: [
+            { type: 'inside', xAxisIndex: [0, 1], zoomOnMouseWheel: true, moveOnMouseMove: true },
+            { type: 'slider', xAxisIndex: [0, 1], bottom: 0, height: 14, borderColor: '#334155',
+              backgroundColor: '#1e293b', fillerColor: 'rgba(56,189,248,0.2)', handleStyle: { color: '#38bdf8' },
+              textStyle: { color: '#64748b', fontSize: 9 } }
+        ],
+        series: [
+            main,
+            {
+                name: '成交量', type: 'bar', xAxisIndex: 1, yAxisIndex: 1, data: volumes,
+                itemStyle: {
+                    color: function (pp) {
+                        var r = klineRows[pp.dataIndex];
+                        return (r && r.close >= r.open) ? '#34d399' : '#f87171';
+                    }
+                }
+            }
+        ]
+    }, true);
+}
+
+function setView(v) {
+    chartView = v;
+    document.getElementById('view-candle').className = 'px-2 py-0.5 rounded text-xs ' +
+        (v === 'candle' ? 'bg-sky-700 text-white' : 'bg-slate-700 text-slate-300');
+    document.getElementById('view-line').className = 'px-2 py-0.5 rounded text-xs ' +
+        (v === 'line' ? 'bg-sky-700 text-white' : 'bg-slate-700 text-slate-300');
+    renderChart();
+}
+
+function loadKline() {
+    var url = '/api/kline/' + encodeURIComponent(SYMBOL) + '?interval=1h&limit=200';
+    apiGet(url, function (j) {
+        if (!Array.isArray(j)) { klineRows = []; chartMsg = 'K线数据格式异常'; renderChart(); return; }
+        klineRows = j.filter(function (d) { return d && isFinite(num(d.close)); });
+        chartMsg = klineRows.length ? '' : '暂无 K 线数据';
+        setText('coin-chart-err', klineRows.length ? '' : '该交易对暂无 K 线');
+        renderChart();
+    }, function (e) {
+        klineRows = [];
+        chartMsg = 'K线获取失败: ' + e;
+        setText('coin-chart-err', e);
+        renderChart();
+    });
+}
+
+/* =========================================================================
+ * 3. 盘口摘要（GET /api/market/depth）
+ * ========================================================================= */
+var liveDepth = null, coinDepth = null;
+function depthDepth(levels, best, up) {
+    /* ±1% 名义金额深度，level = [price, qty]；只覆盖已取回的档位 */
+    var sum = 0;
+    for (var i = 0; i < levels.length; i++) {
+        var p = num(levels[i][0]), q = num(levels[i][1]);
+        if (!isFinite(p) || !isFinite(q) || !isFinite(best) || best <= 0) { continue; }
+        var dev = up ? (p - best) / best : (best - p) / best;
+        if (dev <= 0.01 && dev >= 0) { sum += p * q; }
+    }
+    return sum;
+}
+function applyDepth() {
+    var d = liveDepth || {}, s = coinDepth || {};
+    var spread = isFinite(num(d.spread)) ? d.spread : s.spread;
+    var spreadPct = isFinite(num(d.spread_pct)) ? d.spread_pct : s.spread_pct;
+    var bid1 = isFinite(num(s.bid_depth_1pct)) ? s.bid_depth_1pct : d.bid_depth_1pct;
+    var ask1 = isFinite(num(s.ask_depth_1pct)) ? s.ask_depth_1pct : d.ask_depth_1pct;
+    var bidTotal = isFinite(num(d.bid_total)) ? d.bid_total : s.bid_total;
+    var askTotal = isFinite(num(d.ask_total)) ? d.ask_total : s.ask_total;
+    setText('coin-spread', isFinite(num(spread)) ? fmtPrice(spread) : '--');
+    setText('coin-spread-pct', isFinite(num(spreadPct)) ? num(spreadPct).toFixed(4) + '%' : '--');
+    setText('coin-bid-1pct', isFinite(num(bid1)) ? bigQty(bid1) : '--');
+    setText('coin-ask-1pct', isFinite(num(ask1)) ? bigQty(ask1) : '--');
+    setText('coin-bid-total', isFinite(num(bidTotal)) ? bigQty(bidTotal) : '--');
+    setText('coin-ask-total', isFinite(num(askTotal)) ? bigQty(askTotal) : '--');
+    var src = '';
+    if (liveDepth) {
+        src = isFinite(num(s.bid_depth_1pct)) ? '实时盘口 + 服务端 ±1% 深度'
+                                              : '实时盘口（±1% 深度按前 100 档估算）';
+    } else if (coinDepth) { src = '/api/coin 摘要'; }
+    setText('coin-depth-src', src);
+}
+function loadDepth() {
+    var url = '/api/market/depth?symbol=' + encodeURIComponent(SYMBOL) + '&limit=100';
+    apiGet(url, function (j) {
+        var bids = j.bids || [], asks = j.asks || [];
+        var bestBid = bids.length ? num(bids[0][0]) : NaN;
+        var bestAsk = asks.length ? num(asks[0][0]) : NaN;
+        liveDepth = {
+            spread: num(j.spread, bestAsk - bestBid),
+            spread_pct: num(j.spread_pct, (bestAsk - bestBid) / bestAsk * 100),
+            bid_depth_1pct: depthDepth(bids, bestBid, false),
+            ask_depth_1pct: depthDepth(asks, bestAsk, true),
+            bid_total: num(j.bid_total, 0),
+            ask_total: num(j.ask_total, 0)
+        };
+        applyDepth();
+        setText('coin-depth-err', '');
+    }, function (e) {
+        setText('coin-depth-err', '盘口接口不可用: ' + e + (coinDepth ? '（已回退至 /api/coin 摘要）' : ''));
+        applyDepth();
+    });
+}
+
+/* =========================================================================
+ * 4. 最近成交（GET /api/market/trades）
+ * ========================================================================= */
+function loadTrades() {
+    var url = '/api/market/trades?symbol=' + encodeURIComponent(SYMBOL) + '&limit=30';
+    apiGet(url, function (j) {
+        var list = j.trades || [];
+        var tb = document.getElementById('coin-trades-list');
+        if (!list.length) {
+            tb.innerHTML = '<tr><td colspan="5" class="p-2 text-slate-500">暂无成交</td></tr>';
+            return;
+        }
+        tb.innerHTML = list.map(function (t) {
+            var cls = t.is_buyer_maker ? 'text-red-400' : 'text-green-400';
+            var side = t.is_buyer_maker ? '主动卖出' : '主动买入';
+            return '<tr class="border-b border-slate-800">' +
+                '<td class="p-2 text-slate-500">' + localTime(t.time) + '</td>' +
+                '<td class="p-2 text-right ' + cls + '">' + fmtPrice(t.price) + '</td>' +
+                '<td class="p-2 text-right text-slate-300">' + fmtQty(t.qty) + '</td>' +
+                '<td class="p-2 text-right text-slate-400">' + bigQty(t.quote_qty) + '</td>' +
+                '<td class="p-2 ' + cls + '">' + side + '</td>' +
+                '</tr>';
+        }).join('');
+        setText('coin-trades-err', '');
+    }, function (e) {
+        setText('coin-trades-err', e);
+        document.getElementById('coin-trades-list').innerHTML =
+            '<tr><td colspan="5" class="p-2 text-amber-400">成交数据不可用: ' + esc(e) + '</td></tr>';
+    });
+}
+
+/* =========================================================================
+ * 启动
+ * ========================================================================= */
+loadCoin(); loadKline(); loadDepth(); loadTrades();
+startPolling();
+</script>
+{% endblock %}

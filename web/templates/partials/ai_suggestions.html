@@ -1,0 +1,37 @@
+{#-
+  Shared AI-suggestion list.
+
+  Rendered by `GET /partials/ai-suggestions` AND by `pages.py::ai_page` for the
+  first paint, so the card looks identical before and after the HTMX refresh.
+  Fields shown: category, confidence, body summary, rationale, created_at.
+  `summary`/`confidence_pct` come from `web.routes.ai._suggestion_view`.
+-#}
+{% for s in suggestions %}
+<div class="py-2 border-b border-slate-800 text-sm" id="suggestion-{{ s.id }}">
+    <div class="flex justify-between items-start gap-2">
+        <div class="flex-1 min-w-0">
+            <span class="badge badge-blue text-xs mr-1">{{ s.category }}</span>
+            <span class="badge {{ 'badge-green' if s.status == 'applied' else 'badge-yellow' if s.status == 'approved' else 'badge-red' if s.status == 'rejected' else 'badge-blue' }} text-xs mr-1">{{ s.status }}</span>
+            <span class="text-xs text-slate-500">{{ _('置信') }}: {{ s.confidence_pct }}%</span>
+            <p class="mt-1 text-slate-200 whitespace-pre-wrap">{{ s.summary }}</p>
+            {% if s.rationale %}
+            <p class="mt-1 text-xs text-slate-500">{{ s.rationale }}</p>
+            {% endif %}
+            {% if s.created_at %}
+            <p class="mt-0.5 text-xs text-slate-600">{{ s.created_at | fmt_time }}</p>
+            {% endif %}
+        </div>
+        <div class="flex gap-1 shrink-0" id="btns-{{ s.id }}">
+            {% if s.status in ('pending',) %}
+            <button class="bg-green-700 hover:bg-green-600 text-white px-2 py-0.5 rounded text-xs"
+                    hx-post="/api/ai-suggestions/{{ s.id }}/approve" hx-target="#btns-{{ s.id }}" hx-swap="outerHTML">{{ _('批准') }}</button>
+            <button class="bg-red-700 hover:bg-red-600 text-white px-2 py-0.5 rounded text-xs"
+                    hx-post="/api/ai-suggestions/{{ s.id }}/reject" hx-target="#btns-{{ s.id }}" hx-swap="outerHTML">{{ _('拒绝') }}</button>
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endfor %}
+{% if not suggestions %}
+<div class="text-slate-500 text-sm py-4 text-center">{{ _('暂无待处理建议') }} — AI {{ _('后台循环运行中') }}（{{ _('市场评估每小时') }}、{{ _('币种选择每') }}4{{ _('小时') }}、{{ _('策略优化每日') }}、{{ _('风控调整每日') }}）</div>
+{% endif %}

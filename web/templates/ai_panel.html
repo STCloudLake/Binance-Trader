@@ -34,103 +34,22 @@
         <h3 class="text-lg mb-2">{{ _('最新市场评估') }}</h3>
         {% if last_assessment %}
         <div class="text-sm text-slate-200 leading-relaxed max-h-32 overflow-y-auto">{{ last_assessment }}</div>
+        {% if assessment_at %}<div class="text-xs text-slate-600 mt-1">{{ assessment_at }}</div>{% endif %}
         {% else %}
         <div class="text-sm text-slate-500">{{ _('等待') }} AI {{ _('首次市场评估') }}（{{ _('每小时自动运行') }}）</div>
         {% endif %}
     </div>
 </div>
 
-<!-- Strategy Monitor -->
-<div class="card mb-6" id="strategy-monitor">
-    <h3 class="text-lg mb-3">{{ _('策略引擎状态') }} <span class="text-xs text-slate-500">(15s)</span></h3>
-    <div class="text-sm text-slate-500">{{ _('加载中') }}...</div>
+<!-- Strategy engine: the full monitor lives on /trade; this page only links to it.
+     The duplicated fetch(/api/strategy-monitor) poller that used to live here
+     re-implemented trade.html's panel and double-polled the same endpoint. -->
+<div class="card mb-6" id="strategy-monitor-summary">
+    <div class="flex justify-between items-center text-sm">
+        <span class="text-slate-300">{{ _('策略引擎状态') }}</span>
+        <a href="/trade#strategy" class="text-sky-400 hover:underline">{{ _('在现货交易页查看完整策略监控') }} →</a>
+    </div>
 </div>
-
-<script>
-(function() {
-    var monitorEl = document.getElementById('strategy-monitor');
-    if (!monitorEl) return;
-    function renderMonitor(data) {
-        if (!data || !data.strategies) return;
-        var html = '<div class="text-sm mb-2"><span class="badge badge-green">' + data.active_count + ' {{ _("活跃") }}</span><span class="text-slate-400 ml-2">{{ _("共") }} ' + data.total_count + ' {{ _("个策略") }}</span></div>';
-        if (data.strategies.length === 0) {
-            html += '<div class="text-slate-500 text-sm py-2">{{ _("暂无策略配置") }}</div>';
-        } else {
-            html += '<div class="space-y-2">';
-            data.strategies.forEach(function(s) {
-                var badge = s.enabled ? 'badge-green' : 'badge-red';
-                var status = s.enabled ? '{{ _("启用") }}' : '{{ _("禁用") }}';
-                var sigCount = s.signal_count;
-                html += '<div class="bg-slate-800 rounded p-2 border border-slate-700">';
-                html += '<div class="flex justify-between items-center"><b class="text-sm">' + s.name + '</b><span class="badge ' + badge + ' text-xs">' + status + '</span></div>';
-                html += '<div class="text-xs text-slate-500 mt-0.5">' + s.mode + ' | ' + (s.timeframes||[]).join(',') + ' | {{ _("监控") }} ' + sigCount + ' {{ _("个交易对") }}</div>';
-                if (sigCount > 0 && s.signals) {
-                    Object.keys(s.signals).forEach(function(sym) {
-                        var sig = s.signals[sym];
-                        var score = sig.final_score;
-                        var scoreCls = score >= 0.5 ? 'text-green-400 font-bold' : score > 0.3 ? 'text-green-400' : score <= -0.5 ? 'text-red-400 font-bold' : score < -0.3 ? 'text-red-400' : 'text-slate-400';
-                        var exitBlocks = sig.exit_blocks_entry;
-                        var triggered = sig.threshold_met && !exitBlocks;
-                        var statusBadge = triggered ? '<span class=\"badge badge-green text-xs\">{{ _("可入场") }}</span>' : '<span class=\"badge badge-yellow text-xs\">{{ _("未触发") }}</span>';
-                        var exitL = sig.exit_signal_long ? 'L' : '';
-                        var exitS = sig.exit_signal_short ? 'S' : '';
-                        var exitInfo = (exitL || exitS) ? '<span class=\"text-xs text-slate-500 ml-1\">{{ _("出场") }}:' + [exitL, exitS].filter(Boolean).join('/') + '</span>' : '';
-
-                        html += '<div class=\"mt-1 p-1.5 bg-slate-900 rounded text-xs\">';
-                        html += '<div class=\"flex gap-2 items-center flex-wrap\"><span class=\"text-slate-300 font-mono font-bold\">' + sym + '</span>' + statusBadge + exitInfo + '</div>';
-                        html += '<div class=\"flex gap-2 mt-1 flex-wrap\"><span class=\"' + scoreCls + '\">{{ _("总分") }}:' + score.toFixed(4) + '</span>';
-                        html += '<span class=\"text-slate-500\">{{ _("指标") }}:' + sig.indicator.toFixed(2) + ' ML:' + sig.ml_confidence.toFixed(4) + ' {{ _("新闻") }}:' + sig.news_sentiment.toFixed(4) + '</span></div>';
-
-                        // Show why not triggered
-                        if (!triggered) {
-                            var reasons = [];
-                            if (exitBlocks) reasons.push('{{ _("同向出场信号满足") }}，{{ _("入场被抑制") }}（{{ _("无持仓时不抑制") }}）');
-                            if (!sig.threshold_met) reasons.push('{{ _("总分") }} |' + score.toFixed(4) + '| ≤ 0.5 {{ _("阈值") }}');
-                            if (sig.indicator === 0) reasons.push('{{ _("无入场条件被满足") }}（{{ _("查看下方条件详情") }}）');
-                            html += '<div class=\"text-orange-400 mt-0.5\">⛔ ' + reasons.join('；') + '</div>';
-                        }
-
-                        // Entry conditions detail
-                        ['long', 'short'].forEach(function(side) {
-                            var conds = (sig.entry_conditions || {})[side] || [];
-                            if (conds.length === 0) return;
-                            var sideLabel = side === 'long' ? '{{ _("做多条件") }}' : '{{ _("做空条件") }}';
-                            html += '<div class=\"mt-1\"><span class=\"text-slate-500\">' + sideLabel + ':</span>';
-                            conds.forEach(function(c) {
-                                var cls = c.met ? 'text-green-400' : 'text-red-400';
-                                var icon = c.met ? '✓' : '✗';
-                                html += '<div class=\"ml-2 ' + cls + '\">' + icon + ' ' + c.condition + '</div>';
-                            });
-                            html += '</div>';
-                        });
-
-                        // Key indicator values
-                        var inds = sig.indicators || {};
-                        var keys = Object.keys(inds).filter(function(k) { return inds[k] !== null && inds[k] !== undefined; });
-                        if (keys.length > 0) {
-                            html += '<div class=\"mt-1 text-slate-500\">{{ _("指标值") }}: ';
-                            var parts = keys.slice(0, 8).map(function(k) { return k + '=' + inds[k]; });
-                            html += parts.join(' ') + '</div>';
-                        }
-
-                        html += '</div>';
-                    });
-                } else {
-                    html += '<div class="text-xs text-slate-600 mt-1">{{ _("等待") }} K {{ _("线触发评估") }}...</div>';
-                }
-                html += '</div>';
-            });
-            html += '</div>';
-        }
-        monitorEl.innerHTML = '<h3 class="text-lg mb-3">{{ _("策略引擎状态") }} <span class="text-xs text-slate-500">(15s)</span></h3>' + html;
-    }
-    function fetchMonitor() {
-        fetch('/api/strategy-monitor').then(function(r){return r.json();}).then(renderMonitor).catch(function(){});
-    }
-    fetchMonitor();
-    setInterval(fetchMonitor, 15000);
-})();
-</script>
 
 <!-- AI Heartbeat -->
 <div class="card mb-6" id="ai-heartbeat" hx-get="/api/ai-heartbeat" hx-trigger="load, every 60s">
@@ -138,15 +57,34 @@
     <div class="text-sm text-slate-500">{{ _('加载中') }}...</div>
 </div>
 
+<!-- Strategy lifecycle: compact events list + manual optimization trigger.
+     Served by the existing /api/strategy-lifecycle/* endpoints, which do return
+     real data (the live DB holds 30 strategy_lifecycle_events rows). -->
+<div class="card mb-6" id="strategy-lifecycle-panel">
+    <div class="flex justify-between items-center mb-2">
+        <h3 class="text-lg">{{ _('策略生命周期') }} <span class="text-xs text-slate-500">(60s)</span></h3>
+        {% if can_trade %}
+        <button class="bg-sky-700 hover:bg-sky-600 text-white px-3 py-1 rounded text-xs"
+                hx-post="/api/strategy-lifecycle/optimize"
+                hx-target="#lifecycle-result" hx-swap="innerHTML"
+                hx-confirm="{{ _('立即运行一次策略矩阵优化？') }}">{{ _('运行优化') }}</button>
+        {% endif %}
+    </div>
+    <div id="lifecycle-result" class="text-xs mb-1"></div>
+    <div id="lifecycle-events" hx-get="/partials/strategy-lifecycle" hx-trigger="load, every 60s">
+        <p class="text-slate-500 text-sm">{{ _('加载中') }}...</p>
+    </div>
+</div>
+
+
 <!-- Consultation -->
 <div class="card mb-6">
     <h3 class="text-lg mb-3 text-sky-400">AI {{ _('即时交易咨询') }}</h3>
     <p class="text-sm text-slate-400 mb-3">{{ _('由') }} DeepSeek {{ _('分析当前') }} K {{ _('线数据') }}，{{ _('给出具体的交易方向') }}、{{ _('支撑阻力位和风险提示') }}</p>
     <div class="flex gap-2 mb-3 flex-wrap text-sm">
-        <select id="consult-symbol" class="bg-slate-800 border border-slate-600 rounded px-2 md:px-3 py-1.5 md:py-2 text-white text-xs md:text-sm" class="bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
-            <option value="BTCUSDT">BTC/USDT</option><option value="ETHUSDT">ETH/USDT</option>
-            <option value="BNBUSDT">BNB/USDT</option><option value="SOLUSDT">SOL/USDT</option>
-            <option value="XRPUSDT">XRP/USDT</option>
+        <select id="consult-symbol" class="bg-slate-800 border border-slate-600 rounded px-2 md:px-3 py-1.5 md:py-2 text-white text-xs md:text-sm">
+            {% for s in symbols|default([]) %}<option value="{{ s }}">{{ s.replace('USDT','/USDT') }}</option>
+            {% endfor %}
         </select>
         <select id="consult-tf" class="bg-slate-800 border border-slate-600 rounded px-2 md:px-3 py-1.5 md:py-2 text-white text-xs md:text-sm">
             <option value="5m">5{{ _('分') }} {{ _('超短线') }}</option>
@@ -165,27 +103,12 @@
 <!-- Suggestions -->
 <div class="card">
     <h3 class="text-lg mb-3">AI {{ _('自动建议') }} <span class="text-xs text-slate-500">({{ _('来自后台定时分析') }})</span></h3>
+    {# First paint and every HTMX refresh render the SAME partial through the same
+       `_suggestion_view` projection (category, status, confidence, body,
+       rationale, time) — the old pair disagreed and the poller silently dropped
+       confidence and cut the body to 100 chars. #}
     <div id="ai-pending" hx-get="/partials/ai-suggestions?status=pending&limit=10" hx-trigger="every 60s">
-        {% for s in pending_suggestions %}
-        <div class="py-2 border-b border-slate-800 text-sm">
-            <div class="flex justify-between items-start gap-2">
-                <div class="flex-1 min-w-0">
-                    <span class="badge badge-blue text-xs mr-1">{{ s.category }}</span>
-                    <span class="text-xs text-slate-500">{{ _('置信') }}: {{ "%.0f"|format(s.confidence|float * 100) }}%</span>
-                    <p class="mt-1 text-slate-200 truncate">{{ s.content[:200] }}</p>
-                </div>
-                <div class="flex gap-1 shrink-0" id="btns-{{ s.id }}">
-                    <button class="bg-green-700 hover:bg-green-600 text-white px-2 py-0.5 rounded text-xs"
-                            hx-post="/api/ai-suggestions/{{ s.id }}/approve" hx-target="#btns-{{ s.id }}" hx-swap="outerHTML">{{ _('批准') }}</button>
-                    <button class="bg-red-700 hover:bg-red-600 text-white px-2 py-0.5 rounded text-xs"
-                            hx-post="/api/ai-suggestions/{{ s.id }}/reject" hx-target="#btns-{{ s.id }}" hx-swap="outerHTML">{{ _('拒绝') }}</button>
-                </div>
-            </div>
-        </div>
-        {% endfor %}
-        {% if not pending_suggestions %}
-        <div class="text-slate-500 text-sm py-4 text-center">{{ _('暂无待处理建议') }} — AI {{ _('后台循环运行中') }}（{{ _('市场评估每小时') }}、{{ _('币种选择每') }}4{{ _('小时') }}、{{ _('策略优化每日') }}、{{ _('风控调整每日') }}）</div>
-        {% endif %}
+        {{ suggestions_html }}
     </div>
 </div>
 

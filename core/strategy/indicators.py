@@ -1,3 +1,6 @@
+import ast
+import operator
+
 import pandas as pd
 import numpy as np
 import talib
@@ -158,66 +161,230 @@ def compute_all(df: pd.DataFrame, indicator_configs: dict) -> pd.DataFrame:
 
 _COND_FAIL_LOG: set[str] = set()  # dedup failed conditions to avoid log spam
 
-# Whitelist of allowed names in condition expressions.
-# Only column names and a few safe helper functions are permitted.
-_ALLOWED_FUNCTIONS = frozenset({"abs", "round", "min", "max", "sma", "cross"})
-# Characters allowed in condition expressions beyond alphanumeric, whitespace, and operators
-_ALLOWED_EXTRA_CHARS = frozenset("_.()<>!=&|,[]:'\"/+-*")
+
+class UnsafeConditionError(ValueError):
+    """Raised when a condition string is not a permitted expression."""
 
 
-def _validate_condition(condition: str, allowed_columns: set[str]) -> bool:
-    """Validate that a condition expression only references allowed names.
+# ── Safe condition evaluator ─────────────────────────────────────────────
+#
+# SECURITY: strategy conditions are attacker-influenced input. They can come from
+# a YAML file saved by any `trader` account (POST /api/strategy), from the AI
+# strategy lifecycle, or from GA chromosomes. The previous implementation ran
+# `pd.eval(condition, engine="python")` after a regex *denylist* check; that check
+# was bypassable (identifier splitting like `'__cla'+'ss__'`, unrestricted
+# attribute/method calls) and allowed arbitrary method invocation such as
+# `close.to_csv(...)` — i.e. arbitrary file write from a trading strategy.
+#
+# The evaluator below is a strict *allowlist*: the expression is parsed with `ast`
+# and every node type is checked, attribute access/subscripts/lambdas/
+# comprehensions/dunder names are rejected outright, and column references are
+# resolved only against the DataFrame's own columns.
 
-    Returns True if the condition is safe to evaluate, False otherwise.
-    This prevents arbitrary code injection through strategy YAML files.
-    """
-    import re
-    import builtins
-    # Extract all identifiers (variable names, function names)
-    identifiers = set(re.findall(r'[a-zA-Z_]\w*', condition))
-    # Dangerous builtins that should never appear in conditions
-    _dangerous_builtins = {
-        "__import__", "eval", "exec", "compile", "open", "input",
-        "globals", "locals", "vars", "dir", "getattr", "setattr",
-        "delattr", "hasattr", "__class__", "__bases__", "__subclasses__",
-        "__builtins__", "__globals__", "__code__", "system", "popen",
-        "subprocess", "os", "sys", "shutil", "importlib",
-    }
-    dangerous = identifiers & _dangerous_builtins
-    if dangerous:
-        from loguru import logger
-        logger.warning(f"Condition contains dangerous identifiers: {dangerous}")
-        return False
-    # Note: identifier names that are not in allowed_columns may be valid
-    # (e.g., pd.eval builtins like 'abs', column names not yet computed).
-    # We only block explicitly dangerous patterns above.
-    return True
+#: Expressions may call ONLY these functions.
+_SAFE_FUNCTIONS: dict[str, object] = {}
+
+
+def _safe_abs(value):
+    return abs(value)
+
+
+def _safe_round(value, ndigits=0):
+    return round(value, ndigits)
+
+
+def _safe_min(*args):
+    if any(isinstance(a, pd.Series) for a in args):
+        return np.minimum.reduce([np.asarray(a) if not isinstance(a, pd.Series) else a for a in args]) \
+            if False else _elementwise_min(args)
+    return min(args)
+
+
+def _safe_max(*args):
+    if any(isinstance(a, pd.Series) for a in args):
+        return _elementwise_max(args)
+    return max(args)
+
+
+def _elementwise_min(args):
+    result = args[0]
+    for other in args[1:]:
+        result = np.minimum(result, other)
+    return result
+
+
+def _elementwise_max(args):
+    result = args[0]
+    for other in args[1:]:
+        result = np.maximum(result, other)
+    return result
+
+
+def _safe_sma(series, period):
+    if not isinstance(series, pd.Series):
+        raise UnsafeConditionError("sma() expects a column, e.g. sma(rsi, 14)")
+    period = int(period)
+    if not 1 <= period <= 1000:
+        raise UnsafeConditionError("sma() period out of range")
+    return series.rolling(period).mean()
+
+
+def _safe_cross(a, b):
+    if not isinstance(a, pd.Series) or not isinstance(b, pd.Series):
+        raise UnsafeConditionError("cross() expects two columns")
+    return (a > b) & (a.shift(1) <= b.shift(1))
+
+
+_SAFE_FUNCTIONS.update({
+    "abs": _safe_abs,
+    "round": _safe_round,
+    "min": _safe_min,
+    "max": _safe_max,
+    "sma": _safe_sma,
+    "cross": _safe_cross,
+})
+
+#: Node types that may appear in a condition expression.
+_ALLOWED_NODE_TYPES = (
+    ast.Expression, ast.BoolOp, ast.And, ast.Or,
+    ast.UnaryOp, ast.Not, ast.USub, ast.UAdd,
+    ast.BinOp, ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod,
+    ast.Compare, ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+    ast.Name, ast.Load, ast.Constant, ast.Call,
+)
+
+_BIN_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.Mod: operator.mod,
+}
+
+_CMP_OPS = {
+    ast.Eq: operator.eq,
+    ast.NotEq: operator.ne,
+    ast.Lt: operator.lt,
+    ast.LtE: operator.le,
+    ast.Gt: operator.gt,
+    ast.GtE: operator.ge,
+}
+
+
+def _check_condition_ast(tree: ast.AST) -> None:
+    """Reject any node/name that is not explicitly allowed."""
+    for node in ast.walk(tree):
+        if not isinstance(node, _ALLOWED_NODE_TYPES):
+            raise UnsafeConditionError(
+                f"disallowed syntax: {type(node).__name__}")
+        if isinstance(node, ast.Name):
+            if node.id.startswith("__") or node.id.endswith("__"):
+                raise UnsafeConditionError(f"dunder name not allowed: {node.id}")
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name):
+                raise UnsafeConditionError("only direct calls to whitelisted functions are allowed")
+            if node.func.id not in _SAFE_FUNCTIONS:
+                raise UnsafeConditionError(f"function not allowed: {node.func.id}")
+            if node.keywords:
+                raise UnsafeConditionError("keyword arguments are not allowed")
+        if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+            # String literals have no legitimate use in a numeric condition and
+            # they are the building block of identifier-splitting tricks.
+            raise UnsafeConditionError("string literals are not allowed in conditions")
+        if isinstance(node, ast.BinOp) and type(node.op) not in _BIN_OPS:
+            raise UnsafeConditionError(f"operator not allowed: {type(node.op).__name__}")
+
+
+def _eval_condition_ast(node: ast.AST, env: dict):
+    if isinstance(node, ast.Expression):
+        return _eval_condition_ast(node.body, env)
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name):
+        if node.id in env:
+            return env[node.id]
+        raise UnsafeConditionError(f"unknown column/identifier: {node.id}")
+    if isinstance(node, ast.UnaryOp):
+        operand = _eval_condition_ast(node.operand, env)
+        if isinstance(node.op, ast.Not):
+            return ~operand.astype(bool) if isinstance(operand, pd.Series) else (not operand)
+        if isinstance(node.op, ast.USub):
+            return -operand
+        return +operand
+    if isinstance(node, ast.BinOp):
+        left = _eval_condition_ast(node.left, env)
+        right = _eval_condition_ast(node.right, env)
+        return _BIN_OPS[type(node.op)](left, right)
+    if isinstance(node, ast.BoolOp):
+        values = [_eval_condition_ast(v, env) for v in node.values]
+        result = values[0]
+        for value in values[1:]:
+            if isinstance(node.op, ast.And):
+                result = result & value
+            else:
+                result = result | value
+        return result
+    if isinstance(node, ast.Compare):
+        left = _eval_condition_ast(node.left, env)
+        result = None
+        for op, comparator in zip(node.ops, node.comparators):
+            right = _eval_condition_ast(comparator, env)
+            comparison = _CMP_OPS[type(op)](left, right)
+            result = comparison if result is None else (result & comparison)
+            left = right
+        return result
+    if isinstance(node, ast.Call):
+        func = _SAFE_FUNCTIONS[node.func.id]
+        args = [_eval_condition_ast(a, env) for a in node.args]
+        return func(*args)
+    raise UnsafeConditionError(f"unsupported node: {type(node).__name__}")
 
 
 def evaluate_condition(df: pd.DataFrame, condition: str) -> pd.Series:
-    env = {col: df[col] for col in df.columns}
-    def _sma(series, period):
-        return series.rolling(period).mean()
-    # Avoid overwriting "sma" column with the helper function
-    if "sma" not in env:
-        env["sma"] = _sma
+    """Evaluate a strategy condition safely, returning a boolean Series.
 
-    # Validate condition safety before evaluation
-    allowed_columns = set(df.columns)
-    if not _validate_condition(condition, allowed_columns):
-        return pd.Series([False] * len(df), index=df.index)
+    Unknown columns, disallowed syntax or evaluation errors yield an all-False
+    Series (never an exception, never code execution).
+    """
+    false_series = pd.Series(False, index=df.index, dtype=bool)
+    if not isinstance(condition, str) or not condition.strip():
+        return false_series
+
+    env: dict = {}
+    for col in df.columns:
+        try:
+            env[str(col)] = df[col]
+        except Exception:
+            continue
 
     try:
-        result = pd.eval(condition, engine="python", local_dict=env)
-        return result
-    except Exception as e:
-        from loguru import logger
-        # Rate-limit: log each unique failed condition only once per process
+        tree = ast.parse(condition, mode="eval")
+        _check_condition_ast(tree)
+        result = _eval_condition_ast(tree, env)
+    except UnsafeConditionError as e:
         key = f"{condition}:{e}"
         if key not in _COND_FAIL_LOG:
             _COND_FAIL_LOG.add(key)
+            from loguru import logger
+            logger.warning(f"Condition rejected or unevaluable: '{condition}' — {e}")
+        return false_series
+    except Exception as e:
+        key = f"{condition}:{e}"
+        if key not in _COND_FAIL_LOG:
+            _COND_FAIL_LOG.add(key)
+            from loguru import logger
             logger.debug(f"Condition evaluation failed: '{condition}' — {e}")
-        return pd.Series([False] * len(df), index=df.index)
+        return false_series
+
+    if isinstance(result, pd.Series):
+        try:
+            if result.dtype == bool:
+                return result.fillna(False)
+            return result.fillna(False).astype(bool)
+        except Exception:
+            return false_series
+    # Scalar result (e.g. "1 > 0") — broadcast to the frame length.
+    return pd.Series(bool(result), index=df.index, dtype=bool)
 
 
 # ── Market structure helpers ──────────────────────────────────────────────
@@ -276,13 +443,17 @@ def _rs_hurst(returns: np.ndarray, max_lag: int = 20) -> float:
 def _detect_swing_points(high: np.ndarray, low: np.ndarray,
                          close: np.ndarray,
                          lookback: int = 5) -> tuple[np.ndarray, np.ndarray]:
-    """Detect swing highs and lows and forward-fill the most recent levels.
+    """Detect swing highs/lows and forward-fill the most recent CONFIRMED levels.
 
-    A swing high: high[t] > max(high[t-lookback : t+lookback+1])
-    A swing low:  low[t]  < min(low[t-lookback : t+lookback+1])
+    A swing high is ``high[t] > max(high[t-lookback : t+lookback+1])`` — a centred
+    window, so it can only be *confirmed* ``lookback`` bars later. The detection
+    index is therefore shifted forward by ``lookback`` before forward-filling:
+    without that shift, the value stored at bar t depended on bars up to
+    ``t + lookback`` (look-ahead bias — changing only bar T+1 altered the swing
+    level reported at T, which live trading could never have known).
 
-    Returns two same-length arrays where each bar carries the nearest
-    past swing high/low price (forward-filled from detection point).
+    Returns two same-length arrays where each bar carries the most recent
+    *already confirmed* swing high/low price.
     """
     n = len(high)
     swing_high = np.full(n, np.nan)
@@ -296,7 +467,12 @@ def _detect_swing_points(high: np.ndarray, low: np.ndarray,
         if low[i] == l_window.min():
             swing_low[i] = low[i]
 
-    # Forward-fill: each bar knows the most recent swing level
+    # Shift detections to the bar where they become knowable (t + lookback).
+    if lookback > 0:
+        swing_high = np.concatenate([np.full(lookback, np.nan), swing_high[:-lookback]])
+        swing_low = np.concatenate([np.full(lookback, np.nan), swing_low[:-lookback]])
+
+    # Forward-fill: each bar knows the most recent confirmed swing level
     last_high = np.nan
     last_low = np.nan
     for i in range(n):

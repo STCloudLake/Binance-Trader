@@ -1,0 +1,422 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="max-w-[1600px] mx-auto space-y-4">
+
+    {# ── header + HONESTY BANNER (contract §4: must be prominent) ─────────── #}
+    <div class="flex flex-wrap items-start justify-between gap-3">
+        <div>
+            <h2 class="text-xl font-bold text-slate-100">代币检测 <span class="text-sm font-normal text-slate-500">Token Screen</span></h2>
+            <p class="text-xs text-slate-400 mt-1">
+                基于币安现货<b>公开行情数据</b>的启发式筛查：流动性 / 波动性 / 价格质量 / 上市时间 / 集中度代理。
+            </p>
+        </div>
+        <div class="flex items-center gap-2">
+            <span id="audit-updated" class="text-xs text-slate-500">--</span>
+            <button id="btn-refresh" onclick="loadScreen(true)"
+                    class="text-sm px-3 py-1.5 rounded bg-sky-600 hover:bg-sky-500 text-white font-medium">重新检测</button>
+        </div>
+    </div>
+
+    <div class="rounded-lg border-2 border-amber-500/60 bg-amber-500/10 p-3">
+        <div class="flex items-start gap-2">
+            <span class="text-amber-400 text-lg leading-none mt-0.5">⚠</span>
+            <div class="text-xs text-amber-200/90 leading-relaxed">
+                <b class="text-amber-300">启发式筛查，非链上合约审计。</b>
+                <span id="disclaimer-text">本页只用交易所公开行情做统计推断，不读取链上合约、持仓分布、权限或资金池，
+                因此<b>无法识别蜜罐、貔貅盘、跑路、隐藏增发、黑名单</b>等链上风险。
+                分数低只代表"该交易所市场数据看起来异常"，分数高也<b>不代表</b>代币安全。</span>
+                <div id="method-note" class="mt-1 text-[11px] text-amber-200/70"></div>
+            </div>
+        </div>
+    </div>
+
+    {# ── controls ─────────────────────────────────────────────────────────── #}
+    <div class="card flex flex-wrap items-end gap-3">
+        <label class="text-xs text-slate-400">采样数量 (按 24h 成交额 Top N，≤200)
+            <select id="f-limit" class="block mt-1 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-sm text-slate-200">
+                <option value="10">10</option>
+                <option value="25">25</option>
+                <option value="50" selected>50</option>
+                <option value="100">100</option>
+                <option value="200">200</option>
+            </select>
+        </label>
+        <label class="text-xs text-slate-400">最低 24h 成交额 (USDT)
+            <input id="f-minqv" type="number" min="0" step="100000" value="100000"
+                   class="block mt-1 w-40 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-sm text-slate-200">
+        </label>
+        <label class="text-xs text-slate-400">排序
+            <select id="f-sort" class="block mt-1 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-sm text-slate-200">
+                <option value="score" selected>按分数 (低→高)</option>
+                <option value="volume">按成交额 (高→低)</option>
+            </select>
+        </label>
+        <label class="text-xs text-slate-400">波动率周期
+            <select id="f-interval" class="block mt-1 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-sm text-slate-200">
+                <option value="1h" selected>1h</option>
+                <option value="4h">4h</option>
+                <option value="1d">1d</option>
+            </select>
+        </label>
+        <button onclick="loadScreen(true)"
+                class="text-sm px-4 py-1.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-100">应用</button>
+        <div class="text-[11px] text-slate-500 ml-auto max-w-md">
+            首次检测需抓取每个币种的盘口 + K 线（并发 6、带超时），约 10–40 秒；结果缓存 5 分钟，重复加载很快。
+        </div>
+    </div>
+
+    {# ── states ───────────────────────────────────────────────────────────── #}
+    <div id="audit-loading" class="card hidden">
+        <div class="flex items-center gap-3 text-sm text-slate-300">
+            <span class="inline-block w-4 h-4 border-2 border-sky-400 border-t-transparent rounded-full animate-spin"></span>
+            <span id="audit-loading-text">正在检测…</span>
+        </div>
+    </div>
+    <div id="audit-error" class="hidden rounded-lg border border-red-500/60 bg-red-500/10 p-3 text-sm text-red-300">
+        <b>检测失败：</b><span id="audit-error-text"></span>
+        <div class="text-xs text-red-300/70 mt-1">可稍后点击"重新检测"重试；若行情主机不可达，接口会返回 <code>{"error": ...}</code>。</div>
+    </div>
+    <div id="audit-empty" class="hidden card text-sm text-slate-400">
+        没有符合条件的交易对（试试降低最低成交额，或减少采样数量的限制）。
+    </div>
+    <div id="audit-partial" class="hidden rounded-lg border border-amber-600/50 bg-amber-500/5 p-3 text-xs text-amber-300"></div>
+
+    {# ── results table ────────────────────────────────────────────────────── #}
+    <div id="audit-table-wrap" class="card hidden overflow-x-auto p-0">
+        <table class="w-full text-sm">
+            <thead class="text-xs text-slate-400 border-b border-slate-700">
+                <tr>
+                    <th class="text-left px-3 py-2">交易对</th>
+                    <th class="text-left px-3 py-2 w-40">评分 (0–100)</th>
+                    <th class="text-left px-3 py-2">等级</th>
+                    <th class="text-right px-3 py-2">24h 成交额</th>
+                    <th class="text-right px-3 py-2">±1% 深度</th>
+                    <th class="text-right px-3 py-2">价差%</th>
+                    <th class="text-right px-3 py-2">年化波动</th>
+                    <th class="text-right px-3 py-2">90d 回撤</th>
+                    <th class="text-right px-3 py-2">上市</th>
+                    <th class="text-left px-3 py-2">Flags</th>
+                </tr>
+            </thead>
+            <tbody id="audit-tbody"></tbody>
+        </table>
+    </div>
+    <p class="text-[11px] text-slate-500">点击任意行查看完整指标与每条 flag 的数值依据。</p>
+</div>
+
+{# ── detail drawer ────────────────────────────────────────────────────────── #}
+<div id="drawer-mask" class="hidden fixed inset-0 bg-black/50 z-40" onclick="closeDrawer()"></div>
+<aside id="drawer" class="hidden fixed top-0 right-0 h-full w-full md:w-[720px] bg-slate-900 border-l border-slate-700 z-50 overflow-y-auto">
+    <div class="sticky top-0 bg-slate-900 border-b border-slate-700 px-4 py-3 flex items-center justify-between">
+        <div>
+            <div id="drawer-title" class="text-lg font-bold text-slate-100">--</div>
+            <div id="drawer-sub" class="text-xs text-slate-500">--</div>
+        </div>
+        <button onclick="closeDrawer()" class="text-slate-400 hover:text-white text-xl leading-none px-2">×</button>
+    </div>
+    <div id="drawer-body" class="p-4 space-y-4"></div>
+</aside>
+
+<script>
+/* =========================================================================
+ * /audit — 代币检测.  Vanilla JS, no new CDN libraries.
+ * Endpoints: GET /api/audit/screen, GET /api/audit/{symbol}
+ * ========================================================================= */
+var DISCLAIMER_FALLBACK = '启发式筛查，非链上合约审计：仅基于币安公开行情数据，无法识别链上合约风险（蜜罐/貔貅/跑路等）。';
+var ROUTE_TIMEOUT_MS = 40000;   // > server-side 30s cap, so the server's reason wins
+var currentRows = [];
+var lastScreen = null;
+
+/* ── helpers (same conventions as trade.html) ────────────────────────────── */
+function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+}
+function num(v, dflt) {
+    var n = parseFloat(v);
+    return isFinite(n) ? n : (dflt === undefined ? NaN : dflt);
+}
+function fmtNum(v, digits) {
+    var n = num(v); if (!isFinite(n)) return '--';
+    return n.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+function bigUsdt(v) {
+    var n = num(v); if (!isFinite(n)) return '--';
+    var a = Math.abs(n);
+    if (a >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+    if (a >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+    if (a >= 1e3) return (n / 1e3).toFixed(2) + 'K';
+    return n.toFixed(2);
+}
+function pctText(v, digits) {
+    var n = num(v); if (!isFinite(n)) return '--';
+    return n.toFixed(digits === undefined ? 2 : digits) + '%';
+}
+function ratioText(v) {
+    var n = num(v); if (!isFinite(n)) return '--';
+    if (Math.abs(n) >= 1000) return n.toExponential(2);
+    return n.toFixed(4);
+}
+function riskBadge(level) {
+    var map = {
+        low:    ['badge-green',  '低风险'],
+        medium: ['badge-yellow', '中风险'],
+        high:   ['badge-red',    '高风险']
+    };
+    var m = map[level] || ['badge-blue', String(level || '未知')];
+    return '<span class="badge ' + m[0] + '">' + m[1] + '</span>';
+}
+function scoreClass(score) {
+    var n = num(score, 0);
+    return n >= 60 ? 'bg-green-400' : (n >= 35 ? 'bg-amber-400' : 'bg-red-400');
+}
+function sevBadge(sev) {
+    var map = { high: 'badge-red', warn: 'badge-yellow', info: 'badge-blue' };
+    return '<span class="badge ' + (map[sev] || 'badge-blue') + '">' + esc(sev || 'info') + '</span>';
+}
+function errText(j, status) {
+    if (j && j.error) return String(j.error);
+    if (j && j.detail) return String(j.detail);
+    if (status === 401) return '登录已过期，请重新登录';
+    if (status) return 'HTTP ' + status;
+    return '网络错误';
+}
+function setText(id, text) { var el = document.getElementById(id); if (el) el.textContent = text; }
+function show(id, on) { var el = document.getElementById(id); if (el) el.classList.toggle('hidden', !on); }
+
+/* Fetch with an explicit timeout so a stalled host cannot spin forever. */
+function getJSON(url) {
+    var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    var timer = ctrl ? setTimeout(function () { ctrl.abort(); }, ROUTE_TIMEOUT_MS) : null;
+    return fetch(url, { credentials: 'same-origin', signal: ctrl ? ctrl.signal : undefined })
+        .then(function (r) {
+            return r.text().then(function (t) {
+                var j = null;
+                try { j = JSON.parse(t); } catch (e) { j = null; }
+                if (!r.ok) throw new Error(errText(j, r.status));
+                if (j && j.error) throw new Error(String(j.error));
+                return j;
+            });
+        })
+        .finally(function () { if (timer) clearTimeout(timer); });
+}
+
+/* ── screen list ─────────────────────────────────────────────────────────── */
+function currentParams() {
+    return {
+        limit: document.getElementById('f-limit').value,
+        min_quote_volume: document.getElementById('f-minqv').value,
+        sort: document.getElementById('f-sort').value,
+        interval: document.getElementById('f-interval').value
+    };
+}
+
+function loadScreen(force) {
+    var p = currentParams();
+    var url = '/api/audit/screen?limit=' + encodeURIComponent(p.limit) +
+              '&min_quote_volume=' + encodeURIComponent(p.min_quote_volume) +
+              '&sort=' + encodeURIComponent(p.sort) +
+              '&interval=' + encodeURIComponent(p.interval);
+    show('audit-loading', true);
+    show('audit-error', false);
+    show('audit-empty', false);
+    show('audit-partial', false);
+    var t0 = Date.now();
+    setText('audit-loading-text', force === true
+        ? '正在重新检测（首次检测需要抓取每个币种的公开行情，请稍候）…'
+        : '正在检测…');
+
+    getJSON(url).then(function (j) {
+        show('audit-loading', false);
+        lastScreen = j;
+        if (j.disclaimer) setText('disclaimer-text', j.disclaimer);
+        if (j.method && j.method.dimensions) {
+            setText('method-note', '检测维度：' + j.method.dimensions.join('；') +
+                '。不覆盖：' + (j.method.not_covered || []).join('、') + '。');
+        }
+        var secs = ((Date.now() - t0) / 1000).toFixed(1);
+        setText('audit-updated', new Date().toLocaleTimeString() + ' · ' + secs + 's' +
+            (j.cached ? ' · 缓存命中' : '') + ' · 样本 ' + (j.sampled || 0) +
+            '/' + (j.universe_usdt || 0) + ' 个 USDT 交易对');
+        var rows = j.results || [];
+        currentRows = rows;
+        if (!rows.length) { show('audit-empty', true); show('audit-table-wrap', false); return; }
+        renderRows(rows);
+        show('audit-table-wrap', true);
+        var fails = j.failures || [];
+        if (fails.length) {
+            var el = document.getElementById('audit-partial');
+            el.innerHTML = '<b>' + fails.length + ' 个币种数据不完整</b>（其余结果仍然有效）：' +
+                fails.slice(0, 8).map(function (f) { return esc(f.symbol) + ' (' + esc(f.error || 'unknown') + ')'; }).join('、') +
+                (fails.length > 8 ? ' …' : '');
+            show('audit-partial', true);
+        }
+    }).catch(function (e) {
+        show('audit-loading', false);
+        setText('audit-error-text', e && e.name === 'AbortError'
+            ? ('请求超过 ' + (ROUTE_TIMEOUT_MS / 1000) + 's 未返回，已中止') : (e.message || String(e)));
+        show('audit-error', true);
+        show('audit-table-wrap', false);
+    });
+}
+
+function renderRows(rows) {
+    var html = rows.map(function (r, idx) {
+        var m = r.metrics || {};
+        var flags = (r.flags || []);
+        var flagHtml = flags.length
+            ? flags.slice(0, 3).map(function (f) {
+                  return '<div class="text-[11px] text-amber-300/90 truncate" title="' + esc(f) + '">• ' + esc(f) + '</div>';
+              }).join('') + (flags.length > 3 ? '<div class="text-[11px] text-slate-500">… 共 ' + flags.length + ' 条</div>' : '')
+            : '<span class="text-[11px] text-green-400">未触发规则</span>';
+        var pct = Math.max(0, Math.min(100, num(r.overall_score, 0)));
+        return '<tr class="border-b border-slate-800 hover:bg-slate-800/60 cursor-pointer" onclick="openDetail(\'' +
+                esc(r.symbol) + '\', ' + idx + ')">' +
+            '<td class="px-3 py-2"><a href="/coin/' + encodeURIComponent(r.symbol) + '" onclick="event.stopPropagation()" ' +
+                'class="text-sky-400 hover:underline font-medium">' + esc(r.symbol) + '</a>' +
+                '<div class="text-[11px] text-slate-500">' + esc(r.base_asset || '') + '</div></td>' +
+            '<td class="px-3 py-2"><div class="flex items-center gap-2">' +
+                '<span class="tabular-nums w-10 text-right ' + (pct >= 60 ? 'text-green-400' : pct >= 35 ? 'text-amber-300' : 'text-red-400') + '">' +
+                fmtNum(r.overall_score, 1) + '</span>' +
+                '<span class="flex-1 h-1.5 bg-slate-700 rounded overflow-hidden"><span class="block h-full ' +
+                scoreClass(pct) + '" style="width:' + pct + '%"></span></span></div></td>' +
+            '<td class="px-3 py-2">' + riskBadge(r.risk_level) + '</td>' +
+            '<td class="px-3 py-2 text-right tabular-nums">' + bigUsdt(m.quote_volume) + '</td>' +
+            '<td class="px-3 py-2 text-right tabular-nums">' + bigUsdt(m.depth_1pct_total) + '</td>' +
+            '<td class="px-3 py-2 text-right tabular-nums">' + (m.spread_pct == null ? '--' : num(m.spread_pct, 0).toFixed(4)) + '</td>' +
+            '<td class="px-3 py-2 text-right tabular-nums">' + (m.volatility_30d_annualized == null ? '--' : (num(m.volatility_30d_annualized, 0) * 100).toFixed(0) + '%') + '</td>' +
+            '<td class="px-3 py-2 text-right tabular-nums">' + (m.max_drawdown_90d == null ? '--' : pctText(m.max_drawdown_90d, 1)) + '</td>' +
+            '<td class="px-3 py-2 text-right tabular-nums text-slate-400">' + (m.age_days == null ? '--' : Math.round(num(m.age_days, 0)) + 'd') + '</td>' +
+            '<td class="px-3 py-2 max-w-[320px]">' + flagHtml + '</td>' +
+        '</tr>';
+    }).join('');
+    document.getElementById('audit-tbody').innerHTML = html;
+}
+
+/* ── detail drawer ───────────────────────────────────────────────────────── */
+function openDrawer() {
+    show('drawer', true); show('drawer-mask', true);
+    document.getElementById('drawer-body').innerHTML =
+        '<div class="flex items-center gap-3 text-sm text-slate-300"><span class="inline-block w-4 h-4 border-2 border-sky-400 border-t-transparent rounded-full animate-spin"></span>正在加载明细…</div>';
+}
+function closeDrawer() { show('drawer', false); show('drawer-mask', false); }
+document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeDrawer(); });
+
+function openDetail(symbol, idx) {
+    var row = (idx !== undefined && currentRows[idx]) ? currentRows[idx] : null;
+    setText('drawer-title', symbol);
+    setText('drawer-sub', row ? ('评分 ' + fmtNum(row.overall_score, 1) + ' · ' +
+        (row.risk_level === 'low' ? '低风险' : row.risk_level === 'medium' ? '中风险' : '高风险')) : '');
+    openDrawer();
+    getJSON('/api/audit/' + encodeURIComponent(symbol) +
+            '?interval=' + encodeURIComponent(document.getElementById('f-interval').value))
+        .then(function (j) { renderDetail(j); })
+        .catch(function (e) {
+            document.getElementById('drawer-body').innerHTML =
+                '<div class="rounded border border-red-500/50 bg-red-500/10 p-3 text-sm text-red-300">明细加载失败：' +
+                esc(e.message || String(e)) + '</div>';
+        });
+}
+
+function metricCard(label, value, hint) {
+    return '<div class="bg-slate-800/60 rounded p-2">' +
+        '<div class="text-[11px] text-slate-400">' + esc(label) + '</div>' +
+        '<div class="text-sm text-slate-100 tabular-nums">' + value + '</div>' +
+        (hint ? '<div class="text-[10px] text-slate-500">' + esc(hint) + '</div>' : '') +
+        '</div>';
+}
+
+function metricGrid(m) {
+    return '<div class="grid grid-cols-2 md:grid-cols-3 gap-2">' +
+        metricCard('最新价', fmtNum(m.last, m.last >= 1 ? 4 : 8), esc(m.base_asset || '') + '/USDT') +
+        metricCard('24h 涨跌', m.change_pct == null ? '--' : (num(m.change_pct, 0) >= 0 ? '+' : '') + pctText(m.change_pct), '') +
+        metricCard('24h 计价成交额', bigUsdt(m.quote_volume) + ' USDT', '流动性维度') +
+        metricCard('±1% 盘口深度', bigUsdt(m.depth_1pct_total) + ' USDT',
+            '买 ' + bigUsdt(m.bid_depth_1pct) + ' / 卖 ' + bigUsdt(m.ask_depth_1pct)) +
+        metricCard('价差', m.spread == null ? '--' : fmtNum(m.spread, 8),
+            m.spread_pct == null ? '' : num(m.spread_pct, 0).toFixed(5) + '%') +
+        metricCard('30d 年化波动率', m.volatility_30d_annualized == null ? '--' : (num(m.volatility_30d_annualized, 0) * 100).toFixed(1) + '%',
+            (m.volatility_bars || 0) + ' 根 K 线') +
+        metricCard('90d 最大回撤', m.max_drawdown_90d == null ? '--' : pctText(m.max_drawdown_90d, 2),
+            (m.drawdown_bars || 0) + ' 根日线') +
+        metricCard('单根 >15% 次数', m.spike_count_30d == null ? '--' : String(m.spike_count_30d),
+            '每 100 根 ' + (m.spikes_per_100_bars == null ? '--' : num(m.spikes_per_100_bars, 0).toFixed(2)) + ' 次') +
+        metricCard('影线占比(均)', m.avg_wick_ratio == null ? '--' : (num(m.avg_wick_ratio, 0) * 100).toFixed(1) + '%',
+            '最长 ' + (m.max_wick_ratio == null ? '--' : (num(m.max_wick_ratio, 0) * 100).toFixed(1) + '%') +
+            ' · 超70%占 ' + (m.wick_hot_bars_pct == null ? '--' : num(m.wick_hot_bars_pct, 0).toFixed(1) + '%')) +
+        metricCard('连续同向 K 线', m.gap_run_max == null ? '--' : String(m.gap_run_max), '最长连续同向根数') +
+        metricCard('平均单笔成交额', m.avg_trade_size == null ? '--' : fmtNum(m.avg_trade_size, 2) + ' USDT',
+            '笔数 ' + (m.trade_count == null ? '--' : fmtNum(m.trade_count, 0))) +
+        metricCard('成交额活跃度', ratioText(m.volume_ratio) + 'x', '近24h均 / 前30d中位') +
+        metricCard('上市日期', esc(m.listing_date || '--'), m.age_days == null ? '' : Math.round(num(m.age_days, 0)) + ' 天') +
+        metricCard('指标完整度', m.data_completeness == null ? '--' : (num(m.data_completeness, 0) * 100).toFixed(0) + '%',
+            (m.metrics_available || 0) + '/' + (m.metrics_total || 0) + ' 项可用') +
+        '</div>';
+}
+
+function flagTable(flags) {
+    if (!flags || !flags.length) {
+        return '<div class="text-xs text-green-400">未触发任何规则（阈值内的正常市场状态）。</div>';
+    }
+    return flags.map(function (f) {
+        var ev = f.evidence || {};
+        var rows = Object.keys(ev).map(function (k) {
+            var v = ev[k];
+            var shown = (v !== null && typeof v === 'object') ? JSON.stringify(v) : String(v);
+            return '<tr><td class="pr-3 text-slate-500 align-top whitespace-nowrap">' + esc(k) + '</td>' +
+                   '<td class="text-slate-200 break-all">' + esc(shown) + '</td></tr>';
+        }).join('');
+        return '<div class="rounded border border-slate-700 bg-slate-800/40 p-2 mb-2">' +
+            '<div class="flex items-center gap-2 mb-1">' + sevBadge(f.severity) +
+            '<span class="text-sm font-medium text-slate-100">' + esc(f.label || f.code) + '</span>' +
+            '<span class="text-[10px] text-slate-500">' + esc(f.code || '') + '</span></div>' +
+            '<div class="text-xs text-slate-300 mb-2">' + esc(f.message || '') + '</div>' +
+            '<div class="text-[11px] text-slate-400 mb-1">数值依据 (evidence)</div>' +
+            '<table class="text-[11px] w-full">' + rows + '</table></div>';
+    }).join('');
+}
+
+function breakdownTable(bd) {
+    if (!bd || !bd.terms) return '';
+    var rows = bd.terms.map(function (t) {
+        return '<tr><td class="pr-3 text-slate-400">' + esc(t.name) + '</td>' +
+            '<td class="text-right tabular-nums text-slate-200">' +
+            (t.penalty == null ? '<span class="text-slate-500">无数据/不适用</span>' : '-' + fmtNum(t.penalty, 1)) +
+            '</td><td class="text-right text-slate-500">/' + fmtNum(t.max_penalty, 0) + '</td></tr>';
+    }).join('');
+    return '<div class="text-xs text-slate-400 mb-1">评分构成：100 分起，按下表扣分（无数据的维度不扣分也不加分）</div>' +
+        '<table class="text-xs w-full">' + rows +
+        '<tr class="border-t border-slate-700"><td class="pt-1 text-slate-300">合计扣分</td>' +
+        '<td class="pt-1 text-right tabular-nums text-amber-300">-' + fmtNum(bd.total_penalty, 1) + '</td><td></td></tr>' +
+        '<tr><td class="text-slate-300">最终得分</td><td class="text-right tabular-nums text-slate-100 font-bold">' +
+        fmtNum(bd.score, 1) + '</td><td></td></tr></table>';
+}
+
+function renderDetail(j) {
+    setText('drawer-sub', '评分 ' + fmtNum(j.overall_score, 1) + ' · ' +
+        (j.risk_level === 'low' ? '低风险' : j.risk_level === 'medium' ? '中风险' : '高风险') +
+        ' · 数据 ' + (j.updated_at ? new Date(j.updated_at * 1000).toLocaleTimeString() : '--'));
+    var body =
+        '<div class="rounded border border-amber-500/50 bg-amber-500/10 p-2 text-[11px] text-amber-200/90">' +
+            esc(j.disclaimer || DISCLAIMER_FALLBACK) + '</div>' +
+        '<div class="mt-3">' + metricGrid(j.metrics || {}) + '</div>' +
+        '<div class="mt-4"><div class="text-sm font-medium text-slate-200 mb-2">Flags 与数值依据</div>' +
+            flagTable(j.flags) + '</div>' +
+        '<div class="mt-4"><div class="text-sm font-medium text-slate-200 mb-2">评分明细</div>' +
+            breakdownTable(j.score_breakdown) + '</div>' +
+        '<div class="mt-4 text-[11px] text-slate-500">原始数据：币安 ' + esc(j.host || '') +
+            ' 公开接口（ticker/24hr、depth?limit=100、klines）。本明细不包含任何链上数据。</div>';
+    document.getElementById('drawer-body').innerHTML = body;
+}
+
+/* ── boot: honour a ?symbol= deep link, else load the screen ─────────────── */
+document.addEventListener('DOMContentLoaded', function () {
+    show('audit-loading', true);
+    var deep = '';
+    try { deep = new URLSearchParams(window.location.search).get('symbol') || ''; } catch (e) { deep = ''; }
+    loadScreen(false);
+    if (deep) openDetail(String(deep).toUpperCase().replace(/[^A-Z0-9]/g, ''));
+});
+</script>
+{% endblock %}

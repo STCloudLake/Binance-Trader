@@ -17,63 +17,59 @@
             </div>
         </div>
 
-        <!-- Symbols — checkboxes -->
-        <div>
+        <!-- Symbols — searchable multi-select fed by GET /api/market/symbols -->
+        <div id="bt-symbol-selector" data-max-symbols="{{ max_fetch_symbols }}" data-max-intervals="{{ max_fetch_intervals }}">
             <label class="text-sm text-slate-400 mb-1 block">{{ _("Symbols") }}
-                <button type="button" class="text-xs text-sky-400 hover:underline ml-2" onclick="toggleAll('bt-symbols', true)">{{ _("Select All") }}</button>
-                <button type="button" class="text-xs text-slate-500 hover:underline ml-1" onclick="toggleAll('bt-symbols', false)">{{ _("Clear") }}</button>
+                <span class="text-xs text-slate-500 ml-2" id="bt-symbol-source">{{ _("本地已知列表") }}</span>
+                <button type="button" class="text-xs text-sky-400 hover:underline ml-2" onclick="btSelectAllKnown()">{{ _("Select All") }}</button>
+                <button type="button" class="text-xs text-slate-500 hover:underline ml-1" onclick="btClearSymbols()">{{ _("Clear") }}</button>
             </label>
-            <div id="bt-symbols" class="flex flex-wrap gap-2 bg-slate-800 rounded p-2 border border-slate-600">
-                {% for s in available_symbols %}
-                <label class="flex items-center gap-2 text-sm text-slate-300 hover:bg-slate-700 rounded px-3 py-1 cursor-pointer">
-                    <input type="checkbox" name="symbol" value="{{ s }}" checked class="accent-sky-500">
-                    {{ s.replace('USDT','/USDT') }}
-                </label>
-                {% endfor %}
+            <div class="relative">
+                <input id="bt-symbol-search" type="text" autocomplete="off"
+                       placeholder="{{ _('搜索任意 USDT 交易对（如 SOL 或 SOLUSDT）') }}"
+                       class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm"
+                       oninput="btOnSearchInput()" onfocus="btOpenDropdown()">
+                <div id="bt-symbol-dropdown"
+                     class="hidden absolute z-20 mt-1 w-full max-h-64 overflow-y-auto bg-slate-900 border border-slate-600 rounded shadow-lg"></div>
             </div>
+            <div id="bt-symbol-chips"
+                 class="flex flex-wrap gap-2 mt-2 bg-slate-800 rounded p-2 border border-slate-600 min-h-[3rem]"></div>
+            <div id="bt-symbol-warning" class="mt-2 text-xs"></div>
         </div>
+
+        <!-- Local parquet data: what is cached + one-click download -->
+        <details id="bt-data-panel" class="mb-1">
+            <summary class="text-sm text-slate-400 cursor-pointer hover:text-slate-300">
+                {{ _("本地数据") }} ⬇️ <span id="bt-data-summary" class="text-xs text-slate-500"></span>
+            </summary>
+            <div class="mt-2 p-3 bg-slate-800/50 rounded space-y-2">
+                <div class="flex flex-wrap items-center gap-2">
+                    <span class="text-xs text-slate-400">{{ _("下载周期") }} (≤ {{ max_fetch_intervals }})</span>
+                    <div id="bt-dl-intervals" class="flex flex-wrap gap-1"></div>
+                </div>
+                <div class="flex flex-wrap items-center gap-2">
+                    <button type="button" id="bt-download-btn"
+                            class="bg-emerald-700 hover:bg-emerald-600 text-white px-4 py-1.5 rounded text-xs font-bold"
+                            onclick="btDownloadSelected()">{{ _("下载所选数据") }}</button>
+                    <span class="text-xs text-slate-500">
+                        {{ _("仅下载缺少本地数据的交易对；单次最多") }} {{ max_fetch_symbols }} {{ _("个交易对") }}
+                    </span>
+                </div>
+                <div id="bt-download-msg" class="text-xs"></div>
+            </div>
+        </details>
 
         <!-- Strategy–Symbol Mapping Matrix (backtest-only, does NOT modify live strategies) -->
         {% if strategy_configs %}
-        <div>
+        <div id="bt-matrix-wrap">
             <label class="text-sm text-slate-400 mb-1 block">{{ _("Strategy–Symbol Mapping") }}
                 <span class="text-xs text-yellow-400 ml-2">({{ _("仅本次回测有效") }})</span>
+                <span class="text-xs text-slate-500 ml-2">({{ _("列 = 已选交易对") }})</span>
             </label>
             <div class="max-h-48 overflow-auto bg-slate-800 rounded p-2 border border-slate-600">
-                <table class="w-full text-xs border-collapse">
-                    <thead class="text-slate-400">
-                        <tr>
-                            <th class="text-left p-1 sticky left-0 bg-slate-800">{{ _("Strategy") }}</th>
-                            {% for sym in available_symbols %}
-                            <th class="text-center p-1 w-14">{{ sym.replace('USDT','') }}</th>
-                            {% endfor %}
-                            <th class="text-center p-1 w-10"><button type="button" class="text-sky-400 hover:underline" onclick="matrixAll(true)">{{ _("All") }}</button></th>
-                            <th class="text-center p-1 w-10"><button type="button" class="text-slate-500 hover:underline" onclick="matrixAll(false)">{{ _("Clear") }}</button></th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for s in strategy_configs %}
-                        <tr class="border-b border-slate-700 hover:bg-slate-750"
-                            data-strategy="{{ s.name }}">
-                            <td class="p-1 sticky left-0 bg-slate-800 font-bold text-slate-300">
-                                <span class="{{ 'text-green-400' if s.enabled else 'text-slate-600' }}">{{ s.name }}</span>
-                            </td>
-                            {% for sym in available_symbols %}
-                            {% set has_symbol = (not s.symbols) or (sym in (s.symbols or [])) %}
-                            <td class="text-center p-1">
-                                <input type="checkbox"
-                                       class="matrix-cb accent-sky-500"
-                                       data-strategy="{{ s.name }}"
-                                       data-symbol="{{ sym }}"
-                                       {% if has_symbol %}checked{% endif %}>
-                            </td>
-                            {% endfor %}
-                            <td></td><td></td>
-                        </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
+                <table class="w-full text-xs border-collapse" id="bt-matrix-table"></table>
             </div>
+            <div id="bt-matrix-hint" class="text-xs text-slate-500 mt-1"></div>
         </div>
         {% endif %}
 
@@ -124,7 +120,7 @@
         </div>
 
         <!-- Trading Cost Model -->
-        <details class="mb-3">
+        <details class="mb-3" open>
             <summary class="text-sm text-slate-400 cursor-pointer hover:text-slate-300">
                 {{ _("Trading Costs") }} ⚙️
             </summary>
@@ -138,32 +134,22 @@
                     <input type="number" name="taker_fee_pct" value="0.04" min="0" max="1" step="0.005"
                            class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1 text-white text-xs">
                 </div>
-                <div></div>
-                <div>
-                    <label class="text-xs text-slate-500">BTC Spread %</label>
-                    <input type="number" name="spread_btc" value="0.01" min="0" max="1" step="0.005"
-                           class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1 text-white text-xs">
+            </div>
+
+            <!-- Spread per selected symbol: derived, not hardcoded -->
+            <div class="mt-2 p-3 bg-slate-800/50 rounded">
+                <div class="flex items-center justify-between mb-1">
+                    <span class="text-xs text-slate-400 font-bold">{{ _("价差（按所选交易对实时解析）") }}</span>
+                    <span class="text-[11px] text-slate-500" id="bt-spread-source-note"></span>
                 </div>
-                <div>
-                    <label class="text-xs text-slate-500">ETH Spread %</label>
-                    <input type="number" name="spread_eth" value="0.02" min="0" max="1" step="0.005"
-                           class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1 text-white text-xs">
-                </div>
-                <div>
-                    <label class="text-xs text-slate-500">BNB Spread %</label>
-                    <input type="number" name="spread_bnb" value="0.03" min="0" max="1" step="0.005"
-                           class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1 text-white text-xs">
-                </div>
-                <div>
-                    <label class="text-xs text-slate-500">SOL Spread %</label>
-                    <input type="number" name="spread_sol" value="0.03" min="0" max="1" step="0.005"
-                           class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1 text-white text-xs">
-                </div>
-                <div>
-                    <label class="text-xs text-slate-500">XRP Spread %</label>
-                    <input type="number" name="spread_xrp" value="0.04" min="0" max="1" step="0.005"
-                           class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1 text-white text-xs">
-                </div>
+                <table class="w-full text-xs border-collapse" id="bt-spread-table"></table>
+                <p class="text-[11px] text-slate-500 mt-1">
+                    {{ _("解析顺序：手动覆盖 → 实时盘口推导（深度买一/卖一，缓存") }}
+                    <span id="bt-spread-ttl">{{ live_spread_ttl_seconds }}</span>
+                    {{ _("秒）→ 默认值") }} <span id="bt-spread-default">{{ default_spread_pct }}</span>%。
+                    {{ _("改动手动值即成为该交易对的覆盖值；未覆盖的交易对使用实时/默认值。") }}
+                </p>
+                <div id="bt-spread-msg" class="text-[11px] mt-1"></div>
             </div>
         </details>
 
@@ -175,77 +161,666 @@
 </div>
 
 <script>
+// Server-rendered fallback universe + local parquet cache map.  The live
+// universe comes from GET /api/market/symbols; these keep the selector usable
+// (and honest) when that endpoint fails.
+window.BT_FALLBACK_SYMBOLS = {{ available_symbols|tojson }};
+window.BT_CACHED_MAP = {{ cached_map|tojson }};
+window.BT_STRATEGY_SYMBOLS = {{ strategy_symbols|tojson }};
+window.BT_STRATEGY_TIMEFRAMES = {{ strategy_timeframes|tojson }};
+window.BT_ALLOWED_INTERVALS = {{ allowed_intervals|tojson }};
+window.BT_MAX_SYMBOLS = {{ max_fetch_symbols }};
+window.BT_MAX_INTERVALS = {{ max_fetch_intervals }};
+// Spread resolution (override → live depth-derived → default).  The per-symbol
+// table below is filled by GET /api/backtest/spreads so the user sees that the
+// number is dynamic rather than the old hardcoded five-pair list.
+window.BT_DEFAULT_SPREAD_PCT = {{ default_spread_pct }};
+window.BT_LIVE_SPREAD_ENABLED = {{ live_spread_enabled|tojson }};
+window.BT_SPREAD_TTL = {{ live_spread_ttl_seconds }};
+window.BT_SPREAD_OVERRIDES_CFG = {{ spread_overrides_cfg|tojson }};
+
+var BT_T = {
+    localList: {{ _("本地已知列表")|tojson }},
+    exchangeList: {{ _("交易所全量列表")|tojson }},
+    apiFailed: {{ _("全币种接口不可用")|tojson }},
+    searchHint: {{ _("搜索全部 USDT 交易对")|tojson }},
+    hasData: {{ _("有本地数据")|tojson }},
+    noData: {{ _("无本地数据")|tojson }},
+    noDataWarning: {{ _("以下所选交易对没有本地 parquet 数据，回测会跳过它们")|tojson }},
+    allHaveData: {{ _("所选交易对均已有本地数据")|tojson }},
+    noneSelected: {{ _("请先选择交易对")|tojson }},
+    downloading: {{ _("下载中，请稍候（最多 5 分钟）…")|tojson }},
+    downloadFailed: {{ _("下载失败")|tojson }},
+    downloadOk: {{ _("下载完成")|tojson }},
+    intervalCap: {{ _("最多选择")|tojson }},
+    intervalCapTail: {{ _("个周期")|tojson }},
+    rows: {{ _("行")|tojson }},
+    empty: {{ _("未选择交易对")|tojson }},
+    matrixAll: {{ _("全部")|tojson }},
+    spreadSymbol: {{ _("交易对")|tojson }},
+    spreadValue: {{ _("价差 %")|tojson }},
+    spreadSource: {{ _("来源")|tojson }},
+    srcOverride: {{ _("手动覆盖")|tojson }},
+    srcLive: {{ _("实时盘口")|tojson }},
+    srcDefault: {{ _("默认值")|tojson }},
+    srcPending: {{ _("解析中…")|tojson }},
+    srcHint: {{ _("覆盖 = 手动/配置表；实时 = 由深度买一卖一推导并缓存；默认 = 兜底值")|tojson }},
+    liveOn: {{ _("实时推导已启用")|tojson }},
+    liveOff: {{ _("实时推导已关闭（仅覆盖/默认）")|tojson }},
+    spreadFailed: {{ _("价差解析失败")|tojson }}
+};
+
+var btState = {
+    selected: [],
+    universe: {},          // symbol -> {symbol, baseAsset, last, change_pct, has_cached_data}
+    cached: {},            // symbol -> [intervals] (local, server-rendered + refreshed)
+    matrix: {},            // strategy -> {symbol: bool}
+    intervals: [],         // download intervals (max BT_MAX_INTERVALS)
+    apiError: '',
+    source: 'fallback',
+    spreads: {},           // symbol -> {symbol, spread_pct, source}
+    overrides: {},         // symbol -> spread % the user edited by hand
+    spreadError: ''
+};
+
+// ---------------------------------------------------------------------------
+// universe loading
+// ---------------------------------------------------------------------------
+function btApplyCached(symbol, intervals) {
+    if (intervals && intervals.length) btState.cached[symbol] = intervals;
+}
+
+function btRegisterSymbols(list) {
+    (list || []).forEach(function(item) {
+        var sym = typeof item === 'string' ? item : item.symbol;
+        if (!sym) return;
+        var prev = btState.universe[sym] || {symbol: sym};
+        if (typeof item === 'object') {
+            btState.universe[sym] = Object.assign(prev, item, {symbol: sym});
+        } else if (!btState.universe[sym]) {
+            btState.universe[sym] = {symbol: sym};
+        }
+        btState.universe[sym].has_cached_data = !!(btState.universe[sym].has_cached_data ||
+            (btState.cached[sym] && btState.cached[sym].length));
+    });
+}
+
+function btSetSource(text, warn) {
+    var el = document.getElementById('bt-symbol-source');
+    if (!el) return;
+    el.textContent = text;
+    el.className = 'text-xs ml-2 ' + (warn ? 'text-amber-400' : 'text-slate-500');
+}
+
+function btLoadUniverse() {
+    // Fallback first: the page is usable before (and without) the API call.
+    Object.keys(window.BT_CACHED_MAP || {}).forEach(function(sym) {
+        btApplyCached(sym, window.BT_CACHED_MAP[sym]);
+    });
+    btRegisterSymbols(window.BT_FALLBACK_SYMBOLS || []);
+    btState.selected = (window.BT_FALLBACK_SYMBOLS || []).slice();
+    btRenderAll();
+
+    fetch('/api/market/symbols?limit=200&sort=volume')
+        .then(function(r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.json();
+        })
+        .then(function(data) {
+            btState.apiError = '';
+            btState.source = 'api';
+            btRegisterSymbols(data.symbols || []);
+            btSetSource(BT_T.exchangeList + ' · ' + (data.total || (data.symbols || []).length) +
+                        ' USDT · ' + BT_T.searchHint, false);
+            var known = {};
+            (data.symbols || []).forEach(function(s) { known[s.symbol] = true; });
+            // The API page is volume-ranked and capped at 200: keep the local
+            // five selected so a fresh page never starts with nothing selected.
+            (window.BT_FALLBACK_SYMBOLS || []).forEach(function(sym) {
+                if (!known[sym] && btState.selected.indexOf(sym) < 0) btState.selected.push(sym);
+            });
+            btRenderAll();
+        })
+        .catch(function(e) {
+            btState.apiError = (e && e.message) ? e.message : String(e);
+            btSetSource(BT_T.localList + ' · ' + BT_T.apiFailed + ' (' + btState.apiError + ')', true);
+            btRenderAll();
+        });
+}
+
+var btSearchTimer = null;
+function btOnSearchInput() {
+    var q = (document.getElementById('bt-symbol-search').value || '').trim();
+    btOpenDropdown();
+    btRenderDropdown();
+    if (!q) return;
+    clearTimeout(btSearchTimer);
+    btSearchTimer = setTimeout(function() {
+        fetch('/api/market/symbols?limit=50&sort=volume&q=' + encodeURIComponent(q))
+            .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+            .then(function(data) {
+                btRegisterSymbols(data.symbols || []);
+                btRenderDropdown();
+            })
+            .catch(function(e) {
+                btState.apiError = (e && e.message) ? e.message : String(e);
+                btSetSource(BT_T.localList + ' · ' + BT_T.apiFailed + ' (' + btState.apiError + ')', true);
+                btRenderDropdown();
+            });
+    }, 250);
+}
+
+// ---------------------------------------------------------------------------
+// rendering
+// ---------------------------------------------------------------------------
+// Symbol names come from the exchange API *and* from strategy YAML / parquet
+// directory names, so they are escaped before being interpolated into HTML
+// (and never inlined into a JS string — click handlers read data-symbol).
+function btEsc(value) {
+    return String(value == null ? '' : value).replace(/[&<>"']/g, function(c) {
+        return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c];
+    });
+}
+
+function btHasData(sym) {
+    var entry = btState.universe[sym];
+    return !!(btState.cached[sym] && btState.cached[sym].length) ||
+           !!(entry && entry.has_cached_data);
+}
+
+function btDataBadge(sym) {
+    if (btHasData(sym)) {
+        var ivs = (btState.cached[sym] || []).join(',');
+        return '<span class="text-emerald-400" title="' +
+               btEsc(BT_T.hasData + (ivs ? ': ' + ivs : '')) + '">●</span>';
+    }
+    return '<span class="text-amber-500" title="' + btEsc(BT_T.noData) + '">○</span>';
+}
+
+function btRunMatrixSnapshot() {
+    document.querySelectorAll('.matrix-cb').forEach(function(cb) {
+        if (!btState.matrix[cb.dataset.strategy]) btState.matrix[cb.dataset.strategy] = {};
+        btState.matrix[cb.dataset.strategy][cb.dataset.symbol] = cb.checked;
+    });
+}
+
+function btRenderChips() {
+    var host = document.getElementById('bt-symbol-chips');
+    if (!host) return;
+    if (!btState.selected.length) {
+        host.innerHTML = '<span class="text-xs text-slate-500">' + BT_T.empty + '</span>';
+        return;
+    }
+    var html = '';
+    btState.selected.forEach(function(sym) {
+        html += '<span class="flex items-center gap-1 text-xs px-2 py-1 rounded border border-slate-600 ' +
+                (btHasData(sym) ? 'bg-slate-700 text-slate-200' : 'bg-amber-900/30 text-amber-200 border-amber-600') + '">' +
+                btDataBadge(sym) + '<span>' + btEsc(sym.replace('USDT', '/USDT')) + '</span>' +
+                '<button type="button" class="text-slate-400 hover:text-red-400" data-symbol="' + btEsc(sym) +
+                '" onclick="btToggleSymbol(this.dataset.symbol)">×</button></span>';
+    });
+    host.innerHTML = html;
+}
+
+function btRenderDropdown() {
+    var host = document.getElementById('bt-symbol-dropdown');
+    if (!host) return;
+    var q = (document.getElementById('bt-symbol-search').value || '').trim().toUpperCase();
+    var symbols = Object.keys(btState.universe).filter(function(sym) {
+        if (!q) return true;
+        var base = (btState.universe[sym].baseAsset || sym.replace('USDT', '')).toUpperCase();
+        return sym.indexOf(q) >= 0 || base.indexOf(q) >= 0;
+    });
+    symbols.sort(function(a, b) {
+        var va = (btState.universe[a].quote_volume || 0), vb = (btState.universe[b].quote_volume || 0);
+        if (va !== vb) return vb - va;
+        return a < b ? -1 : 1;
+    });
+    var html = '';
+    symbols.slice(0, 100).forEach(function(sym) {
+        var info = btState.universe[sym] || {};
+        var picked = btState.selected.indexOf(sym) >= 0;
+        var meta = [];
+        if (info.last != null) meta.push(Number(info.last).toPrecision(6));
+        if (info.change_pct != null) {
+            var ch = Number(info.change_pct);
+            meta.push('<span class="' + (ch >= 0 ? 'text-green-400' : 'text-red-400') + '">' +
+                      (ch >= 0 ? '+' : '') + ch.toFixed(2) + '%</span>');
+        }
+        if (btHasData(sym)) meta.push('<span class="text-emerald-400">' + BT_T.hasData + '</span>');
+        html += '<div class="flex items-center justify-between px-3 py-1.5 text-sm cursor-pointer hover:bg-slate-800 ' +
+                (picked ? 'text-sky-300' : 'text-slate-300') + '" data-symbol="' + btEsc(sym) +
+                '" onclick="btToggleSymbol(this.dataset.symbol)">' +
+                '<span>' + btDataBadge(sym) + ' ' + btEsc(sym) + '</span>' +
+                '<span class="text-xs text-slate-500">' + meta.join(' · ') + '</span></div>';
+    });
+    if (!symbols.length) {
+        html = '<div class="px-3 py-2 text-xs text-slate-500">' +
+               (btState.apiError ? BT_T.apiFailed + ': ' + btState.apiError : '—') + '</div>';
+    }
+    host.innerHTML = html;
+    host.classList.remove('hidden');
+}
+
+function btOpenDropdown() {
+    var host = document.getElementById('bt-symbol-dropdown');
+    if (host) host.classList.remove('hidden');
+}
+
+function btCloseDropdown() {
+    var host = document.getElementById('bt-symbol-dropdown');
+    if (host) host.classList.add('hidden');
+}
+
+document.addEventListener('click', function(e) {
+    var sel = document.getElementById('bt-symbol-selector');
+    if (sel && !sel.contains(e.target)) btCloseDropdown();
+});
+
+function btRenderIntervals() {
+    var host = document.getElementById('bt-dl-intervals');
+    if (!host) return;
+    var html = '';
+    (window.BT_ALLOWED_INTERVALS || []).forEach(function(iv) {
+        var on = btState.intervals.indexOf(iv) >= 0;
+        html += '<span onclick="btToggleInterval(\'' + iv + '\')" class="text-xs px-2 py-1 rounded border cursor-pointer ' +
+                (on ? 'bg-sky-900 border-sky-500 text-sky-200' : 'border-slate-600 text-slate-400') + '">' +
+                iv + '</span>';
+    });
+    host.innerHTML = html;
+}
+
+function btToggleInterval(iv) {
+    var idx = btState.intervals.indexOf(iv);
+    if (idx >= 0) {
+        btState.intervals.splice(idx, 1);
+    } else {
+        if (btState.intervals.length >= window.BT_MAX_INTERVALS) {
+            // Cap enforced in the UI to match the API contract (MAX 2).
+            var msg = document.getElementById('bt-download-msg');
+            if (msg) msg.innerHTML = '<span class="text-amber-400">' + BT_T.intervalCap + ' ' +
+                window.BT_MAX_INTERVALS + ' ' + BT_T.intervalCapTail + '</span>';
+            return;
+        }
+        btState.intervals.push(iv);
+    }
+    btRenderIntervals();
+    btUpdateWarnings();
+}
+
+function btDefaultIntervals() {
+    var tfs = [];
+    document.querySelectorAll('#bt-strategies input[type="checkbox"]:checked').forEach(function(cb) {
+        (window.BT_STRATEGY_TIMEFRAMES[cb.value] || []).forEach(function(tf) {
+            if (tfs.indexOf(tf) < 0) tfs.push(tf);
+        });
+    });
+    if (!tfs.length) tfs = ['1h'];
+    return tfs.slice(0, window.BT_MAX_INTERVALS);
+}
+
+function btRenderMatrix() {
+    var table = document.getElementById('bt-matrix-table');
+    if (!table) return;
+    var strategies = Object.keys(window.BT_STRATEGY_SYMBOLS || {});
+    var syms = btState.selected;
+    var html = '<thead class="text-slate-400"><tr>' +
+        '<th class="text-left p-1 sticky left-0 bg-slate-800">' + {{ _("Strategy")|tojson }} + '</th>';
+    syms.forEach(function(sym) {
+        html += '<th class="text-center p-1 w-14" title="' + btEsc(sym) + '">' +
+                btEsc(sym.replace('USDT', '')) + '</th>';
+    });
+    html += '<th class="text-center p-1 w-10"><button type="button" class="text-sky-400 hover:underline" onclick="matrixAll(true)">' +
+            BT_T.matrixAll + '</button></th>' +
+            '<th class="text-center p-1 w-10"><button type="button" class="text-slate-500 hover:underline" onclick="matrixAll(false)">' +
+            {{ _("Clear")|tojson }} + '</button></th></tr></thead><tbody>';
+    strategies.forEach(function(name) {
+        var rowMap = btState.matrix[name] || {};
+        html += '<tr class="border-b border-slate-700" data-strategy="' + btEsc(name) + '">' +
+                '<td class="p-1 sticky left-0 bg-slate-800 font-bold text-slate-300">' + btEsc(name) + '</td>';
+        syms.forEach(function(sym) {
+            var checked = rowMap.hasOwnProperty(sym) ? rowMap[sym] : true;
+            html += '<td class="text-center p-1"><input type="checkbox" class="matrix-cb accent-sky-500"' +
+                    ' data-strategy="' + btEsc(name) + '" data-symbol="' + btEsc(sym) + '"' +
+                    (checked ? ' checked' : '') + '></td>';
+        });
+        html += '<td></td><td></td></tr>';
+    });
+    html += '</tbody>';
+    table.innerHTML = html;
+    var hint = document.getElementById('bt-matrix-hint');
+    if (hint) {
+        hint.textContent = syms.length > 12
+            ? {{ _("已选交易对较多，矩阵可横向滚动；全部勾选 = 该策略适用于全部所选交易对")|tojson }}
+            : '';
+    }
+}
+
+function btRenderSummary() {
+    var summary = document.getElementById('bt-data-summary');
+    if (!summary) return;
+    var withData = btState.selected.filter(btHasData).length;
+    summary.textContent = btState.selected.length
+        ? withData + '/' + btState.selected.length + ' ' + BT_T.hasData
+        : '';
+}
+
+// ---------------------------------------------------------------------------
+// spread table — GET /api/backtest/spreads (override → live → default)
+// ---------------------------------------------------------------------------
+function btSpreadOverrides() {
+    // Only rows the user edited by hand travel as overrides; everything else is
+    // re-derived server-side (live order book, else default) on every run.
+    var out = {};
+    Object.keys(btState.overrides).forEach(function(sym) {
+        if (btState.selected.indexOf(sym) >= 0) out[sym] = btState.overrides[sym];
+    });
+    return out;
+}
+
+function btSpreadSourceLabel(source) {
+    if (source === 'override') return BT_T.srcOverride;
+    if (source === 'live') return BT_T.srcLive;
+    if (source === 'default') return BT_T.srcDefault;
+    return BT_T.srcPending;
+}
+
+function btSpreadSourceClass(source) {
+    if (source === 'override') return 'text-amber-400';
+    if (source === 'live') return 'text-emerald-400';
+    if (source === 'default') return 'text-slate-400';
+    return 'text-slate-500';
+}
+
+function btRenderSpreads() {
+    var table = document.getElementById('bt-spread-table');
+    if (!table) return;
+    var note = document.getElementById('bt-spread-source-note');
+    if (note) {
+        note.textContent = window.BT_LIVE_SPREAD_ENABLED ? BT_T.liveOn : BT_T.liveOff;
+        note.className = 'text-[11px] ' + (window.BT_LIVE_SPREAD_ENABLED ? 'text-emerald-400' : 'text-amber-400');
+    }
+    if (!btState.selected.length) {
+        table.innerHTML = '<tbody><tr><td class="p-1 text-slate-500">' + BT_T.empty + '</td></tr></tbody>';
+        return;
+    }
+    var html = '<thead class="text-slate-400"><tr>' +
+        '<th class="text-left p-1">' + BT_T.spreadSymbol + '</th>' +
+        '<th class="text-right p-1">' + BT_T.spreadValue + '</th>' +
+        '<th class="text-right p-1">' + BT_T.spreadSource + '</th>' +
+        '</tr></thead><tbody>';
+    btState.selected.forEach(function(sym) {
+        var row = btState.spreads[sym] || {};
+        var value = (row.spread_pct != null) ? row.spread_pct
+                                             : (btState.overrides[sym] != null ? btState.overrides[sym] : '');
+        var source = row.source || (btState.overrides[sym] != null ? 'override' : null);
+        html += '<tr class="border-t border-slate-700">' +
+            '<td class="p-1 text-slate-300">' + btEsc(sym) + '</td>' +
+            '<td class="p-1 text-right"><input type="number" min="0" max="1" step="0.005"' +
+            ' class="w-20 bg-slate-700 border border-slate-600 rounded px-1 py-0.5 text-white text-xs text-right"' +
+            ' data-symbol="' + btEsc(sym) + '" value="' + btEsc(value) + '"' +
+            ' title="' + btEsc(BT_T.srcHint) + '"' +
+            ' onchange="btSetSpreadOverride(this.dataset.symbol, this.value)"></td>' +
+            '<td class="p-1 text-right ' + btSpreadSourceClass(source) + '">' +
+            btSpreadSourceLabel(source) + '</td></tr>';
+    });
+    table.innerHTML = html + '</tbody>';
+}
+
+function btSetSpreadOverride(sym, value) {
+    var num = parseFloat(value);
+    if (isNaN(num) || num < 0) {
+        delete btState.overrides[sym];
+    } else {
+        btState.overrides[sym] = num;
+    }
+    btFetchSpreads();
+}
+
+var btSpreadTimer = null;
+function btScheduleSpreads() {
+    if (btSpreadTimer) clearTimeout(btSpreadTimer);
+    btSpreadTimer = setTimeout(btFetchSpreads, 300);
+}
+
+function btFetchSpreads() {
+    var host = document.getElementById('bt-spread-msg');
+    if (!btState.selected.length) {
+        btState.spreads = {};
+        btRenderSpreads();
+        return;
+    }
+    var url = '/api/backtest/spreads?symbols=' +
+        encodeURIComponent(btState.selected.join(',')) +
+        '&overrides=' + encodeURIComponent(JSON.stringify(btSpreadOverrides()));
+    fetch(url).then(function(r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+    }).then(function(data) {
+        var map = {};
+        (data.symbols || []).forEach(function(row) { map[row.symbol] = row; });
+        btState.spreads = map;
+        btState.spreadError = '';
+        if (host) host.innerHTML = '';
+        btRenderSpreads();
+    }).catch(function(e) {
+        btState.spreadError = (e && e.message) ? e.message : String(e);
+        if (host) host.innerHTML = '<span class="text-amber-400">' + BT_T.spreadFailed +
+            ': ' + btEsc(btState.spreadError) + '</span>';
+        btRenderSpreads();
+    });
+}
+
+function btUpdateWarnings() {
+    var host = document.getElementById('bt-symbol-warning');
+    if (!host) return;
+    var missing = btState.selected.filter(function(s) { return !btHasData(s); });
+    if (!missing.length) {
+        host.innerHTML = btState.selected.length
+            ? '<span class="text-emerald-400">✓ ' + BT_T.allHaveData + '</span>'
+            : '';
+        return;
+    }
+    host.innerHTML = '<span class="text-amber-400">⚠ ' + BT_T.noDataWarning + ': ' +
+        missing.map(btEsc).join(', ') + '</span>' +
+        '<button type="button" class="ml-2 text-emerald-400 hover:underline" onclick="btDownloadSelected()">' +
+        {{ _("下载所选数据")|tojson }} + '</button>';
+}
+
+function btRenderAll() {
+    btRunMatrixSnapshot();
+    btRenderChips();
+    btRenderDropdown();
+    btRenderMatrix();
+    btRenderSummary();
+    btUpdateWarnings();
+    btScheduleSpreads();
+}
+
+function btToggleSymbol(sym) {
+    var idx = btState.selected.indexOf(sym);
+    if (idx >= 0) btState.selected.splice(idx, 1);
+    else btState.selected.push(sym);
+    btRenderAll();
+}
+
+function btSelectAllKnown() {
+    var q = (document.getElementById('bt-symbol-search').value || '').trim().toUpperCase();
+    Object.keys(btState.universe).forEach(function(sym) {
+        var base = (btState.universe[sym].baseAsset || '').toUpperCase();
+        var match = !q || sym.indexOf(q) >= 0 || base.indexOf(q) >= 0;
+        if (match && btState.selected.indexOf(sym) < 0) btState.selected.push(sym);
+    });
+    btRenderAll();
+}
+
+function btClearSymbols() {
+    btState.selected = [];
+    btRenderAll();
+}
+
+// ---------------------------------------------------------------------------
+// data download — POST /api/backtest/fetch-data
+// ---------------------------------------------------------------------------
+async function btDownloadSelected() {
+    var msg = document.getElementById('bt-download-msg');
+    var missing = btState.selected.filter(function(s) { return !btHasData(s); });
+    if (!btState.selected.length) {
+        if (msg) msg.innerHTML = '<span class="text-amber-400">' + BT_T.noneSelected + '</span>';
+        return;
+    }
+    var targets = missing.length ? missing : btState.selected.slice();
+    if (!missing.length) {
+        if (msg) msg.innerHTML = '<span class="text-slate-400">' + BT_T.allHaveData + ' — ' +
+            {{ _("仍将重新下载以刷新数据")|tojson }} + '</span>';
+    }
+    var note = '';
+    if (targets.length > window.BT_MAX_SYMBOLS) {
+        note = '<span class="text-amber-400">' + BT_T.intervalCap + ' ' + window.BT_MAX_SYMBOLS + ' ' +
+               {{ _("个交易对/次，本次先下载前")|tojson }} + ' ' + window.BT_MAX_SYMBOLS + '</span> ';
+        targets = targets.slice(0, window.BT_MAX_SYMBOLS);
+    }
+    var intervals = btState.intervals.length ? btState.intervals : btDefaultIntervals();
+    var fd = new FormData();
+    fd.append('symbols', targets.join(','));
+    fd.append('intervals', intervals.join(','));
+    fd.append('date_start', btFieldValue('date_start', ''));
+    fd.append('date_end', btFieldValue('date_end', ''));
+
+    var btn = document.getElementById('bt-download-btn');
+    if (btn) btn.disabled = true;
+    if (msg) msg.innerHTML = note + '<span class="text-slate-400">' + BT_T.downloading + '</span>';
+    try {
+        var resp = await fetch('/api/backtest/fetch-data', {method: 'POST', body: fd});
+        var data = await resp.json();
+        var lines = [];
+        (data.results || []).forEach(function(r) {
+            if (r.ok) {
+                btApplyCached(r.symbol, [r.interval].concat(btState.cached[r.symbol] || [])
+                    .filter(function(v, i, a) { return a.indexOf(v) === i; }));
+                var entry = btState.universe[r.symbol] || {symbol: r.symbol};
+                entry.has_cached_data = true;
+                btState.universe[r.symbol] = entry;
+                lines.push('<div class="text-emerald-400">✓ ' + btEsc(r.symbol) + ' ' + btEsc(r.interval) + ': ' +
+                           btEsc(r.rows) + ' ' + BT_T.rows + ' · <span class="text-slate-500">' +
+                           btEsc(r.path) + '</span></div>');
+            } else {
+                lines.push('<div class="text-red-400">✗ ' + btEsc(r.symbol) + ' ' + btEsc(r.interval) + ': ' +
+                           btEsc(r.error || '') + '</div>');
+            }
+        });
+        var head = data.ok ? '<span class="text-emerald-400">' + BT_T.downloadOk + '</span>'
+                           : '<span class="text-amber-400">' + BT_T.downloadFailed + ': ' +
+                             btEsc(data.error || '') + '</span>';
+        if (msg) msg.innerHTML = note + head + lines.join('');
+        btRenderAll();
+        btFetchCachedRefresh();
+    } catch (e) {
+        if (msg) msg.innerHTML = note + '<span class="text-red-400">' + BT_T.downloadFailed + ': ' + btEsc(e) + '</span>';
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
+function btFetchCachedRefresh() {
+    // Re-read has_cached_data from the API so the badges reflect what is now on disk.
+    fetch('/api/market/symbols?limit=200&sort=volume')
+        .then(function(r) { return r.ok ? r.json() : null; })
+        .then(function(data) {
+            if (!data) return;
+            btRegisterSymbols(data.symbols || []);
+            btRenderAll();
+        })
+        .catch(function() { /* local cached map already updated */ });
+}
+
+// ---------------------------------------------------------------------------
+// backtest submission helpers (unchanged contract)
+// ---------------------------------------------------------------------------
 function toggleAll(containerId, checked) {
     var cbs = document.querySelectorAll('#' + containerId + ' input[type="checkbox"]');
     cbs.forEach(function(cb) { cb.checked = checked; });
 }
 
+// Named form-control lookup that works everywhere (`form.name` is a browser
+// legacy-named-property feature; `form.elements` is the spec path).
+function btField(name) {
+    var form = document.getElementById('bt-form');
+    if (!form) return null;
+    return form.elements ? form.elements.namedItem(name) : form[name];
+}
+
+function btFieldValue(name, fallback) {
+    var el = btField(name);
+    return el ? el.value : fallback;
+}
+
+function btFieldChecked(name) {
+    var el = btField(name);
+    return !!(el && el.checked);
+}
+
 function matrixAll(checked) {
-    document.querySelectorAll('.matrix-cb').forEach(function(cb) { cb.checked = checked; });
+    btRunMatrixSnapshot();
+    btState.selected.forEach(function(sym) {
+        Object.keys(btState.matrix).forEach(function(name) {
+            btState.matrix[name][sym] = checked;
+        });
+    });
+    btRenderMatrix();
 }
 
 // Collect the backtest-only matrix mapping and build FormData
 function getMatrixMapping() {
     var mapping = {};
-    document.querySelectorAll('.matrix-cb').forEach(function(cb) {
-        if (!mapping[cb.dataset.strategy]) mapping[cb.dataset.strategy] = [];
-        if (cb.checked) mapping[cb.dataset.strategy].push(cb.dataset.symbol);
+    btRunMatrixSnapshot();
+    Object.keys(btState.matrix).forEach(function(name) {
+        var row = btState.matrix[name] || {};
+        var picked = btState.selected.filter(function(sym) { return row[sym] !== false; });
+        // All selected symbols checked -> empty list (means "all")
+        mapping[name] = (picked.length === btState.selected.length) ? [] : picked;
     });
-    // If all symbols checked for a strategy -> empty list (means all)
-    var allSyms = [];
-    document.querySelectorAll('#bt-symbols input[type="checkbox"]').forEach(function(cb) {
-        allSyms.push(cb.value);
-    });
-    for (var s in mapping) {
-        if (mapping[s].length === allSyms.length) mapping[s] = [];
-    }
     return mapping;
 }
 
 async function runBacktest(e) {
     e.preventDefault();
     var status = document.getElementById('bt-status');
-    status.textContent = '{{ _("Starting...") }}';
+    status.textContent = {{ _("Starting...")|tojson }};
 
-    // Collect checked strategies and symbols
+    // Collect checked strategies and the selected symbols
     var strategies = [];
     document.querySelectorAll('#bt-strategies input[type="checkbox"]:checked').forEach(function(cb) {
         strategies.push(cb.value);
     });
-    var symbols = [];
-    document.querySelectorAll('#bt-symbols input[type="checkbox"]:checked').forEach(function(cb) {
-        symbols.push(cb.value);
-    });
+    var symbols = btState.selected.slice();
 
     if (strategies.length === 0 || symbols.length === 0) {
-        status.textContent = '{{ _("Please select at least one strategy and symbol") }}';
+        status.textContent = {{ _("Please select at least one strategy and symbol")|tojson }};
         return;
     }
 
-    var form = document.getElementById('bt-form');
     var fd = new FormData();
     fd.append('strategies', strategies.join(','));
     fd.append('symbols', symbols.join(','));
-    fd.append('date_start', form.date_start.value);
-    fd.append('date_end', form.date_end.value);
-    fd.append('mode', form.mode.value);
-    fd.append('initial_balance', form.initial_balance.value);
-    fd.append('simulate_ai_weights', form.simulate_ai_weights?.checked ? '1' : '0');
-    fd.append('ml_engine', form.ml_engine?.value || 'lightgbm');
-    fd.append('skip_ml_training', form.skip_ml_training?.checked ? '1' : '0');
-    // Cost model params
-    fd.append('cost_enabled', form.cost_enabled?.checked ? '1' : '0');
-    fd.append('taker_fee_pct', form.taker_fee_pct?.value || '0.04');
-    fd.append('spread_btc', form.spread_btc?.value || '0.01');
-    fd.append('spread_eth', form.spread_eth?.value || '0.02');
-    fd.append('spread_bnb', form.spread_bnb?.value || '0.03');
-    fd.append('spread_sol', form.spread_sol?.value || '0.03');
-    fd.append('spread_xrp', form.spread_xrp?.value || '0.04');
+    fd.append('date_start', btFieldValue('date_start', ''));
+    fd.append('date_end', btFieldValue('date_end', ''));
+    fd.append('mode', btFieldValue('mode', 'full'));
+    fd.append('initial_balance', btFieldValue('initial_balance', '10000'));
+    fd.append('simulate_ai_weights', btFieldChecked('simulate_ai_weights') ? '1' : '0');
+    fd.append('ml_engine', btFieldValue('ml_engine', 'lightgbm'));
+    fd.append('skip_ml_training', btFieldChecked('skip_ml_training') ? '1' : '0');
+    // Cost model params: taker fee + the per-symbol spread OVERRIDE map the user
+    // edited in the cost table.  Unchanged rows are not sent, so the engine
+    // re-derives them live (override → live depth → default) for this run.
+    fd.append('cost_enabled', btFieldChecked('cost_enabled') ? '1' : '0');
+    fd.append('taker_fee_pct', btFieldValue('taker_fee_pct', '0.04'));
+    fd.append('spread_overrides', JSON.stringify(btSpreadOverrides()));
     // Include the backtest-only matrix mapping
     fd.append('strategy_symbols', JSON.stringify(getMatrixMapping()));
 
     // Show progress bar immediately (static placeholder before real progress loads)
-    document.getElementById('backtest-results').innerHTML = '<div class="card mb-4"><div class="text-slate-400 text-sm">{{ _("Starting backtest...") }}</div><div class="w-full bg-slate-700 rounded-full h-3 mt-2"><div class="bg-sky-500 h-3 rounded-full animate-pulse" style="width:10%"></div></div></div>';
+    document.getElementById('backtest-results').innerHTML = '<div class="card mb-4"><div class="text-slate-400 text-sm">' + {{ _("Starting backtest...")|tojson }} + '</div><div class="w-full bg-slate-700 rounded-full h-3 mt-2"><div class="bg-sky-500 h-3 rounded-full animate-pulse" style="width:10%"></div></div></div>';
     switchToResults();
 
     var resp = await fetch('/api/backtest/run', { method: 'POST', body: fd });
@@ -263,4 +838,15 @@ async function runBacktest(e) {
 
     status.textContent = '';
 }
+
+// ---------------------------------------------------------------------------
+// boot
+// ---------------------------------------------------------------------------
+btState.intervals = btDefaultIntervals();
+document.querySelectorAll('#bt-strategies input[type="checkbox"]').forEach(function(cb) {
+    cb.addEventListener('change', function() { btRenderIntervals(); });
+});
+btRenderIntervals();
+btRenderSpreads();
+btLoadUniverse();
 </script>

@@ -37,6 +37,11 @@ env/
 **/*.parquet
 **/*.pkl
 
+# Coin-universe caches written by core/market_data/universe.py
+# (exchangeInfo snapshot + lazily discovered listing dates; refetched when stale)
+data/symbols.json
+data/listing_dates.json
+
 # Backtest result JSONs (large generated files)
 data/backtest/
 
@@ -67,9 +72,17 @@ data/ga_wf_state.json
 data/ga_checkpoint.pkl
 data/deepseek_models.json
 
-# Claude / AI agent plans (local only)
-docs/superpowers/
+# NOTE: docs/superpowers/ (design specs + implementation plans) is intentionally
+# NOT ignored any more — it is the only record of the project's design history and
+# was being lost on every fresh clone. Local agent tooling stays ignored above.
 
 # Project root
 run_logs/
 *.bat
+
+# Local DB/backup sidecars (never publish a real database)
+*.bak
+*.db.bak
+*.db.pre_restore
+*.db-wal
+*.db-journal

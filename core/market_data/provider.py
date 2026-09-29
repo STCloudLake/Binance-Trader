@@ -6,7 +6,99 @@ import pandas as pd
 
 from app.event_bus import EventBus, Event, EventType
 from app.config import Config
+from core.market_data.data_client import MarketDataClient, MarketDataError
 from core.market_data.ohlcv_cache import OHLVCache
+
+# ======================================================================
+# Interval registry — the single source of truth for kline intervals
+# ======================================================================
+#: ``interval → spec``.  Every interval handling decision in the system reads
+#: this table, so a new interval only has to be added **here**:
+#:
+#:   minutes      bar length in minutes (ordering / primary-timeframe choice)
+#:   min_candles  candles on disk that count as "enough" (prefetch skip test)
+#:   batches      upstream 1000-candle pages fetched per symbol/interval
+#:   poll_secs    staleness threshold for the REST polling fallback (seconds)
+#:   ml_enabled   the ML predictor consumes this interval's MARKET_KLINE events
+#:
+#: Consumers: :meth:`MarketDataProvider.start` / ``_prefetch_history`` (this
+#: module), ``core.ml.predictor`` (the ML gate), ``core.ga.genome`` (timeframe
+#: genes), ``core.backtest.signal_matrix`` (timeframe ordering) and
+#: ``app.main`` (poll cadence + ML training interval).
+INTERVAL_SPEC: dict[str, dict] = {
+    "1m":  {"minutes": 1,    "min_candles": 10000, "batches": 4, "poll_secs": 120,
+            "ml_enabled": False},
+    "3m":  {"minutes": 3,    "min_candles": 200,   "batches": 1, "poll_secs": 360,
+            "ml_enabled": False},
+    "5m":  {"minutes": 5,    "min_candles": 3000,  "batches": 2, "poll_secs": 300,
+            "ml_enabled": False},
+    "15m": {"minutes": 15,   "min_candles": 2000,  "batches": 1, "poll_secs": 900,
+            "ml_enabled": False},
+    "30m": {"minutes": 30,   "min_candles": 1000,  "batches": 1, "poll_secs": 1800,
+            "ml_enabled": False},
+    "1h":  {"minutes": 60,   "min_candles": 500,   "batches": 1, "poll_secs": 3600,
+            "ml_enabled": True},
+    "2h":  {"minutes": 120,  "min_candles": 300,   "batches": 1, "poll_secs": 7200,
+            "ml_enabled": False},
+    "4h":  {"minutes": 240,  "min_candles": 200,   "batches": 1, "poll_secs": 7200,
+            "ml_enabled": True},
+    "6h":  {"minutes": 360,  "min_candles": 200,   "batches": 1, "poll_secs": 7200,
+            "ml_enabled": False},
+    "8h":  {"minutes": 480,  "min_candles": 200,   "batches": 1, "poll_secs": 7200,
+            "ml_enabled": False},
+    "12h": {"minutes": 720,  "min_candles": 200,   "batches": 1, "poll_secs": 7200,
+            "ml_enabled": False},
+    "1d":  {"minutes": 1440, "min_candles": 200,   "batches": 1, "poll_secs": 7200,
+            "ml_enabled": False},
+    "3d":  {"minutes": 4320, "min_candles": 200,   "batches": 1, "poll_secs": 7200,
+            "ml_enabled": False},
+    "1w":  {"minutes": 10080, "min_candles": 200,  "batches": 1, "poll_secs": 7200,
+            "ml_enabled": False},
+}
+
+#: Intervals the provider streams and pre-fetches when the caller names none,
+#: and the timeframe universe the GA evolves over (all of them have data).
+DEFAULT_INTERVALS = ["1m", "5m", "15m", "1h", "4h"]
+
+#: Interval the ML models are trained on (the most reliable one for ML).
+DEFAULT_ML_INTERVAL = "1h"
+
+#: Interval used whenever a caller/strategy names none.
+DEFAULT_TIMEFRAME = "1h"
+
+#: Fallbacks for an interval that is not (or only partly) in INTERVAL_SPEC.
+_INTERVAL_DEFAULTS: dict = {"minutes": 60, "min_candles": 200, "batches": 1,
+                            "poll_secs": 300, "ml_enabled": False}
+
+
+def interval_spec(interval: str) -> dict:
+    """Registry entry for ``interval``, with documented defaults filled in.
+
+    Unknown/``None`` intervals get :data:`_INTERVAL_DEFAULTS` (the historical
+    hard-coded fallbacks), so callers never need their own ``.get(x, default)``.
+    """
+    spec = dict(_INTERVAL_DEFAULTS)
+    spec.update(INTERVAL_SPEC.get(str(interval or ""), {}) or {})
+    return spec
+
+
+def interval_minutes(interval: str, default: int = 60) -> int:
+    """Bar length in minutes (``default`` when the interval is blank)."""
+    if not interval:
+        return default
+    return int(interval_spec(interval)["minutes"])
+
+
+def poll_seconds(interval: str, default: int = 300) -> int:
+    """REST-poll staleness threshold for ``interval`` (seconds)."""
+    if not interval:
+        return default
+    return int(interval_spec(interval)["poll_secs"])
+
+
+def ml_intervals() -> list[str]:
+    """Intervals the ML predictor reacts to, in registry order."""
+    return [tf for tf, spec in INTERVAL_SPEC.items() if spec.get("ml_enabled")]
 
 
 class MarketDataProvider:
@@ -16,6 +108,7 @@ class MarketDataProvider:
         self.cache = OHLVCache(config.data_dir)
         self.client: Optional[AsyncClient] = None
         self.bsm: Optional[BinanceSocketManager] = None
+        self._data_client: Optional[MarketDataClient] = None
         self._running = False
         self._tasks: list[asyncio.Task] = []
         self._watched_symbols: list[str] = []
@@ -25,10 +118,47 @@ class MarketDataProvider:
         self._price_history: dict[str, list[tuple[float, float]]] = {}
 
     @property
+    def data_client(self) -> MarketDataClient:
+        """Public market-data client (``config.market_data_host``).
+
+        Every **kline read** goes here, never through the testnet trading client:
+        testnet lists a handful of pairs and its history is synthetic, which is
+        what left strategies and charts without data.  (contract §0)
+        """
+        if self._data_client is None:
+            self._data_client = MarketDataClient(
+                getattr(self.config, "market_data_host", "https://data-api.binance.vision"))
+        return self._data_client
+
+    @property
     def watched_symbols(self) -> list[str]:
         return list(self._watched_symbols)
 
-    async def start(self, symbols: list[str], intervals: list[str]):
+    async def start(self, symbols: list[str] | None = None, intervals: list[str] | None = None):
+        """Start streaming + prefetching for ``symbols``.
+
+        ``symbols=None`` (the production path from ``app/main.py``) means "watch
+        the persisted watchlist": the same `system_config.watchlist_symbols`
+        list that ``/api/market/watchlist`` writes, capped at
+        :data:`WATCHLIST_MAX`, with :data:`DEFAULT_WATCHLIST` as the fallback when
+        nothing has been persisted yet.  ``docs/overhaul/MARKET_PAGES_API.md`` §1.
+        """
+        from core.market_data.universe import (
+            DEFAULT_WATCHLIST, WATCHLIST_MAX, load_watchlist)
+
+        if symbols is None:
+            try:
+                symbols = await load_watchlist(self.config.db_path, DEFAULT_WATCHLIST)
+            except Exception as e:
+                from loguru import logger
+                logger.warning(f"Could not load watchlist ({e}); using defaults")
+                symbols = list(DEFAULT_WATCHLIST)
+            from loguru import logger
+            logger.info(
+                f"Watching persisted watchlist ({len(symbols)}/{WATCHLIST_MAX}): "
+                f"{', '.join(symbols)}")
+        symbols = list(symbols)[:WATCHLIST_MAX]
+        intervals = list(intervals or self._intervals or DEFAULT_INTERVALS)
         self._watched_symbols = symbols
         self._intervals = intervals
         try:
@@ -61,31 +191,26 @@ class MarketDataProvider:
         """
         from loguru import logger
 
-        # Minimum candles we consider "sufficient" per interval
-        MIN_CANDLES = {"1m": 10000, "5m": 3000, "15m": 2000, "30m": 1000,
-                       "1h": 500, "2h": 300, "4h": 200}
         LIMIT = 1000
-        BATCHES = {"1m": 4, "5m": 2, "15m": 1, "30m": 1, "1h": 1,
-                   "2h": 1, "4h": 1, "6h": 1, "8h": 1, "12h": 1, "1d": 1}
 
         for symbol in symbols:
             for interval in intervals:
+                # Per-interval specs come from the single registry above.
+                spec = interval_spec(interval)
                 # Check existing data
                 existing = self.cache.get(symbol, interval)
-                min_candles = MIN_CANDLES.get(interval, 200)
+                min_candles = spec["min_candles"]
                 if existing is not None and len(existing) >= min_candles:
                     continue  # already has enough data
 
-                batches = BATCHES.get(interval, 1)
+                batches = spec["batches"]
                 all_klines = []
                 end_time = None
 
                 for batch in range(batches):
                     try:
-                        params = {"symbol": symbol, "interval": interval, "limit": LIMIT}
-                        if end_time is not None:
-                            params["endTime"] = end_time
-                        klines = await self.client.get_klines(**params)
+                        klines = await self.data_client.klines(
+                            symbol, interval, limit=LIMIT, end_time=end_time)
                         if not klines or len(klines) <= 1:
                             break
                         all_klines = klines + all_klines
@@ -113,6 +238,14 @@ class MarketDataProvider:
 
     async def _run_websocket(self):
         self.bsm = BinanceSocketManager(self.client)
+        # python-binance defaults to `wss://stream.binance.com:9443/`, which is
+        # unreachable from this host; point its socket factory at the configured
+        # market-data stream host (`wss://data-stream.binance.vision`) instead.
+        stream_url = getattr(self.config, "binance_stream_url", None)
+        if not stream_url:
+            host = getattr(self.config, "market_stream_host", "wss://data-stream.binance.vision")
+            stream_url = str(host).rstrip("/") + "/"
+        self.bsm._get_stream_url = lambda explicit=None: explicit or stream_url
         streams = []
         for symbol in self._watched_symbols:
             sym_lower = symbol.lower()
@@ -222,11 +355,9 @@ class MarketDataProvider:
         if cached is not None and len(cached) >= limit:
             return cached.tail(limit)
 
-        if self.client is None:
-            return cached
-
         try:
-            klines = await self.client.get_klines(symbol=symbol, interval=interval, limit=limit)
+            # Public market data host, not the (testnet) trading client.
+            klines = await self.data_client.klines(symbol, interval, limit=limit)
             if not klines:
                 return cached
             df = pd.DataFrame(klines, columns=[
@@ -287,3 +418,6 @@ class MarketDataProvider:
             task.cancel()
         if self.client:
             await self.client.close_connection()
+        if self._data_client is not None:
+            await self._data_client.close()
+            self._data_client = None

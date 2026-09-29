@@ -39,10 +39,6 @@ class NewsAnalyzer:
         self._tasks.append(asyncio.create_task(self._periodic_fetch()))
         self._tasks.append(asyncio.create_task(self._anomaly_monitor()))
 
-    def set_symbols(self, core: list[str], satellite: list[str]):
-        self._core_symbols = core
-        self._satellite_symbols = satellite
-
     async def set_deepseek(self, api_key: str, base_url: str = "https://api.deepseek.com"):
         try:
             from openai import AsyncOpenAI
@@ -193,20 +189,12 @@ class NewsAnalyzer:
 
     async def _save_article(self, source_id: int, symbol: str,
                             article: dict, sentiment: float):
-        db = await get_db()
-        try:
-            await db.execute(
-                """INSERT INTO news_articles (source_id, symbol, title, url, content_summary, sentiment_score, published_at)
-                   VALUES (?,?,?,?,?,?,?)""",
-                (source_id, symbol, article.get("title", ""), article.get("url", ""),
-                 article.get("content_summary", ""), sentiment,
-                 article.get("published_at", datetime.now().isoformat()))
-            )
-            await db.commit()
-        except Exception as e:
-            logger.warning(f"Failed to save news article: {e}")
-        finally:
-            await db.close()
+        """Persist hook kept for the ingest path.
+
+        The `news_articles` table was dropped in schema v4 because nothing ever
+        read it, so there is no row to write. The per-symbol EMA aggregation
+        below still runs for every analysed article.
+        """
 
         # Aggregate sentiment per symbol using EMA
         old_ema = self._sentiment_ema.get(symbol, 0.0)

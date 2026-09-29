@@ -24,6 +24,13 @@ class PositionGuard:
         self._risk_manager = None
         self._task: asyncio.Task | None = None
         self._check_interval_sec = 15  # check every 15 seconds
+        # Shared trailing-distance helper (same semantics as the backtest engines)
+        from core.risk.position_sizer import PositionSizer
+        self._sizer = PositionSizer(
+            config.hard_limits, config.soft_params,
+            getattr(config, "core_capital_pct", 0.7),
+            getattr(config, "satellite_capital_pct", 0.3),
+        )
 
     def wire(self, executor, market_data, risk_manager=None):
         self._executor = executor
@@ -143,9 +150,18 @@ class PositionGuard:
         """Move stop_loss toward current price, but only in the favorable direction.
         Long: stop moves UP toward price.  Short: stop moves DOWN toward price."""
         entry = pos["entry_price"]
-        distance_pct = getattr(self.config.hard_limits, "trailing_stop_distance_pct", 2.0)
+        # Single source of truth for the trailing distance: a per-position override
+        # (from strategy.risk_exit) wins, otherwise the shared PositionSizer helper
+        # reads hard_limits.trailing_stop_distance_pct / trailing_stop_enabled. This
+        # keeps live trailing identical to what the backtest engines simulate.
+        override = pos.get("trailing_stop_pct")
+        if override is not None:
+            distance_pct = float(override)
+        else:
+            distance_pct = self._sizer.trailing_stop_distance_pct()
+        if distance_pct <= 0:
+            return
         current_sl = pos.get("stop_loss")
-        existing_entry_sl = pos.get("entry_stop_loss")
 
         # Calculate the trailing stop price
         if side == "long":
@@ -179,6 +195,15 @@ class PositionGuard:
 
         if should_update:
             pos["stop_loss"] = new_sl
+            # Persist the move: a trailing stop that lived only in memory was
+            # reset to the executor's 2% default by the next restart, i.e. a stop
+            # already trailed into profit silently went back to where it started.
+            persist = getattr(self._executor, "update_stop_loss", None)
+            if persist is not None:
+                try:
+                    await persist(symbol, new_sl)
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.warning(f"Could not persist trailing stop for {symbol}: {e}")
             old_sl_str = f"{current_sl:.2f}" if current_sl else "none"
             logger.debug(f"Trailing stop: {symbol} {side} SL {old_sl_str} → {new_sl:.2f} (price={price:.2f})")
 

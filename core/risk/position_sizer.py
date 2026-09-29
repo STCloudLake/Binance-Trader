@@ -61,6 +61,20 @@ class PositionSizer:
         else:
             return entry_price * (1 + sl_pct)
 
+    def trailing_stop_distance_pct(self, strategy_risk_exit=None) -> float:
+        """Trailing-stop distance in percent — single source of truth.
+
+        Live trading, the legacy backtest engine and the hybrid engine all call
+        this so a position is managed with identical trailing semantics.
+        Order of precedence: per-strategy ``risk_exit.trailing_stop_pct`` →
+        ``hard_limits.trailing_stop_distance_pct`` (when enabled) → disabled (0).
+        """
+        if strategy_risk_exit is not None:
+            return float(getattr(strategy_risk_exit, "trailing_stop_pct", 0.0) or 0.0)
+        if not getattr(self.hard, "trailing_stop_enabled", False):
+            return 0.0
+        return float(getattr(self.hard, "trailing_stop_distance_pct", 0.0) or 0.0)
+
     def calculate_take_profits(self, entry_price: float, side: str) -> list[tuple[float, float]]:
         levels = [
             self.soft.take_profit_1_pct / 100,

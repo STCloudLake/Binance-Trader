@@ -3,7 +3,7 @@ import pandas as pd
 
 from app.event_bus import EventBus, Event, EventType
 from app.config import Config
-from core.market_data.provider import MarketDataProvider
+from core.market_data.provider import MarketDataProvider, interval_minutes
 from core.strategy.loader import StrategyLoader, StrategyConfig
 from core.strategy.indicators import compute_all, evaluate_condition
 from core.strategy.evaluation_kernel import (
@@ -11,7 +11,6 @@ from core.strategy.evaluation_kernel import (
     evaluate_exit_conditions as eval_exit_conds,
     fuse_signals,
     check_higher_tf_trend,
-    resolve_entry_side,
 )
 
 
@@ -166,9 +165,11 @@ class StrategyEngine:
 
         # ── Shared Kernel: Higher-timeframe trend alignment ──
         if indicator_signal != 0.0 and len(strategy.timeframes) > 1:
-            _TF_MIN = {"1m":1,"3m":3,"5m":5,"15m":15,"30m":30,"1h":60,"2h":120,"4h":240,"6h":360,"8h":480,"12h":720,"1d":1440}
-            current_min = _TF_MIN.get(interval, 60)
-            higher_tfs = [tf for tf in strategy.timeframes if _TF_MIN.get(tf, 60) > current_min]
+            # Bar lengths come from the interval registry (INTERVAL_SPEC) — no
+            # local copy to drift when an interval is added there.
+            current_min = interval_minutes(interval)
+            higher_tfs = [tf for tf in strategy.timeframes
+                          if interval_minutes(tf) > current_min]
             tf_multiplier = 1.0
             for htf in higher_tfs:
                 try:
@@ -208,6 +209,17 @@ class StrategyEngine:
         # Aggregate exit_signal for monitor display (backwards-compat)
         exit_signal = exit_signal_long or exit_signal_short
 
+        # Effective ML weight actually used by fuse_signals — kept in sync so the
+        # dashboard reports the weight that produced this score (regression: the
+        # Shared Kernel refactor renamed ml_weight → strategy_ml_weight and this
+        # dict kept referencing the old name, raising NameError on every
+        # evaluation and silently killing the whole live signal path).
+        effective_ml_weight = (
+            strategy_ml_weight
+            if (ml_enabled and strategy_ml_weight is not None)
+            else w.ml
+        )
+
         key = f"{strategy.name}|{symbol}"
         self._signal_cache[key] = {
             "strategy": strategy.name,
@@ -224,7 +236,7 @@ class StrategyEngine:
             "exit_results": exit_results,
             "indicators": indicator_snapshots,
             "threshold_met": abs(final_score) >= 0.5,
-            "weights": {"indicator": w.indicator, "ml": ml_weight, "news": w.news},
+            "weights": {"indicator": w.indicator, "ml": effective_ml_weight, "news": w.news},
         }
 
         # Signal publishing — only when driven by real-time klines
@@ -307,57 +319,17 @@ class StrategyEngine:
                         if not price and df is not None and len(df) > 0:
                             price = float(df["close"].iloc[-1])
                         if price:
-                            reduce_key = f"reduce_count_{symbol}_{pos_side}"
+                            # Reset the reduce counter with the SAME key format used
+                            # when incrementing it (regression: the reset used to drop
+                            # a key without the strategy prefix, so counters never
+                            # cleared and reduce conditions stopped firing after 4 hits).
+                            reduce_key = f"reduce_count_{strategy.name}_{symbol}_{pos_side}"
                             self._signal_cache.pop(reduce_key, None)
                             await self.event_bus.publish(Event(EventType.POSITION_EXIT, {
                                 "symbol": symbol, "strategy": strategy.name,
                                 "price": price, "trader": "ai",
                                 "reason": f"Exit condition met ({pos_side}) on {interval}",
                             }))
-
-    def get_signal(self, symbol: str, strategy_name: str = None) -> dict | None:
-        """Get latest signal for a symbol. If strategy_name is given, match exactly; otherwise return any."""
-        if strategy_name:
-            return self._signal_cache.get(f"{strategy_name}|{symbol}")
-        # Return first matching signal for the symbol
-        for key, sig in self._signal_cache.items():
-            if key.endswith(f"|{symbol}"):
-                return sig
-        return None
-
-    def get_strategies(self) -> list[dict]:
-        return [s.model_dump() for s in self._strategies.values()]
-
-    def evaluate_sync(self, df: pd.DataFrame, strategy, symbol: str) -> dict | None:
-        """Synchronous strategy evaluation for backtesting. Returns signal dict or None."""
-        from core.strategy.indicators import compute_all
-
-        df = compute_all(df, strategy.indicators)
-
-        # ── Shared Kernel ──
-        long_active, short_active = evaluate_entry_conditions(
-            df, strategy.entry_conditions)
-
-        if long_active and short_active:
-            return None
-
-        side = "long" if long_active else "short" if short_active else None
-        if side is None:
-            return None
-
-        return {
-            "side": side,
-            "score": 1.0 if side == "long" else -1.0,
-            "symbol": symbol,
-            "strategy": strategy.name,
-            "strategy_name": strategy.name,
-            "price": float(df["close"].iloc[-1]),
-        }
-
-    def evaluate_exit_sync(self, df: pd.DataFrame, strategy, pos_side: str) -> bool:
-        """Check if exit conditions are met for an open position. Returns True if should exit."""
-        # ── Shared Kernel ──
-        return eval_exit_conds(df, strategy.exit_conditions, pos_side)
 
     async def evaluate_all_now(self, publish: bool = False):
         """Evaluate all strategies immediately.
@@ -373,7 +345,14 @@ class StrategyEngine:
                     try:
                         await self._evaluate(symbol, interval, strategy, publish=publish)
                     except Exception:
-                        pass
+                        # Never swallow silently: a failure here means signals stop
+                        # flowing entirely, which is indistinguishable from "no signal"
+                        # unless it is logged loudly.
+                        from loguru import logger
+                        logger.exception(
+                            f"Strategy evaluation FAILED: {strategy.name} {symbol} {interval} "
+                            f"(publish={publish}) — signals will not be produced for this pair"
+                        )
 
     @staticmethod
     def _sanitize(obj):
@@ -443,14 +422,6 @@ class StrategyEngine:
             "active_count": sum(1 for s in self._strategies.values() if s.enabled),
             "total_count": len(self._strategies),
         })
-
-    async def add_strategy(self, config: StrategyConfig):
-        self.loader.save(config)
-        self._strategies[config.name] = config
-
-    async def remove_strategy(self, name: str):
-        self.loader.delete(name)
-        self._strategies.pop(name, None)
 
     async def stop(self):
         self._running = False

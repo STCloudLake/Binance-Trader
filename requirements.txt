@@ -34,3 +34,6 @@ httpx>=0.24.0
 
 # Dev / Test
 pytest>=7.0.0
+pytest-asyncio>=0.23.0
+
+python-multipart>=0.0.18  # starlette imports it unconditionally; FastAPI will not import without it

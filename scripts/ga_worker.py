@@ -37,6 +37,50 @@ def write_result(job_file: str, data: dict):
     Path(tmp).replace(final)
 
 
+#: Last-resort symbols when a job carries none *and* the watchlist is unreadable.
+DEFAULT_FALLBACK_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]
+
+
+def _watchlist_fallback(config) -> list:
+    """The persisted watchlist (same source as ``GET /api/market/watchlist``)."""
+    try:
+        import asyncio
+
+        from core.market_data.universe import DEFAULT_WATCHLIST, load_watchlist
+
+        db_path = getattr(config, "db_path", "") if config is not None else ""
+        symbols = asyncio.run(load_watchlist(db_path, DEFAULT_WATCHLIST))
+    except Exception:
+        return []
+    out = []
+    for item in symbols or []:
+        symbol = str(item).strip().upper()
+        if symbol and symbol not in out:
+            out.append(symbol)
+    return out
+
+
+def job_symbols(job: dict, config=None) -> list:
+    """Symbols this job must run on — **from the payload**, never a literal list.
+
+    The job file is written by the GA routes after validating the user's
+    selection against the exchange universe, so it is authoritative.  A missing
+    / empty ``symbols`` key (e.g. an old checkpoint job file) falls back to the
+    persisted watchlist and finally to :data:`DEFAULT_FALLBACK_SYMBOLS`.
+    """
+    raw = job.get("symbols")
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    symbols: list = []
+    for item in raw or []:
+        symbol = str(item).strip().upper()
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+    if symbols:
+        return symbols
+    return _watchlist_fallback(config) or list(DEFAULT_FALLBACK_SYMBOLS)
+
+
 def run_ga(job: dict, job_file: str):
     """Run standard GA evolution."""
     from app.config import Config
@@ -51,7 +95,11 @@ def run_ga(job: dict, job_file: str):
     config = Config.load("sim")
     config.backtest_cost_enabled = job.get("cost_enabled", True)
     config.backtest_taker_fee_pct = job.get("taker_fee_pct", 0.04)
-    config.backtest_spread_pct = job.get("spread_pct", {})
+    # The job's spread map is an OVERRIDE table on top of the config's own
+    # overrides; symbols in neither are derived live / by default.
+    config.backtest_spread_pct = {
+        **(getattr(config, "backtest_spread_pct", None) or {}),
+        **(job.get("spread_pct") or {})}
     config.backtest_engine_mode = "legacy"  # subprocess doesn't have full engine stack
 
     event_bus = EventBus()
@@ -95,7 +143,9 @@ def run_ga(job: dict, job_file: str):
 
     evolver.set_progress_callback(on_progress)
 
-    symbols = job.get("symbols", ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"])
+    # Symbols come from the job payload (validated by the web route); the
+    # watchlist is only the fallback for a job file that carries none.
+    symbols = job_symbols(job, config)
     date_start = job.get("date_start", "2025-06-01")
     date_end = job.get("date_end", "2026-06-01")
     validation_start = job.get("validation_start") or None
@@ -124,7 +174,11 @@ def run_walkforward(job: dict, job_file: str):
     config = Config.load("sim")
     config.backtest_cost_enabled = job.get("cost_enabled", True)
     config.backtest_taker_fee_pct = job.get("taker_fee_pct", 0.04)
-    config.backtest_spread_pct = job.get("spread_pct", {})
+    # The job's spread map is an OVERRIDE table on top of the config's own
+    # overrides; symbols in neither are derived live / by default.
+    config.backtest_spread_pct = {
+        **(getattr(config, "backtest_spread_pct", None) or {}),
+        **(job.get("spread_pct") or {})}
     config.backtest_engine_mode = "legacy"  # subprocess doesn't have full engine stack
 
     event_bus = EventBus()
@@ -152,7 +206,9 @@ def run_walkforward(job: dict, job_file: str):
         step_months=job.get("step_months", 1),
     )
 
-    symbols = job.get("symbols", ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"])
+    # Symbols come from the job payload (validated by the web route); the
+    # watchlist is only the fallback for a job file that carries none.
+    symbols = job_symbols(job, config)
     date_start = job.get("date_start", "2025-06-01")
     date_end = job.get("date_end", "2026-06-01")
 

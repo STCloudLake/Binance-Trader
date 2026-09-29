@@ -3,6 +3,9 @@ import json
 import time
 from loguru import logger
 
+from core.market_data.provider import DEFAULT_INTERVALS, DEFAULT_TIMEFRAME
+from core.market_data.universe import DEFAULT_WATCHLIST, load_watchlist
+
 
 class StrategyLifecycleManager:
     """Coordinates the AI-driven strategy lifecycle.
@@ -28,6 +31,21 @@ class StrategyLifecycleManager:
         self._generation_interval: int = 86400   # 24h
         self._retirement_interval: int = 3600     # 1h
         self._optimization_interval: int = 43200  # 12h
+
+    async def _watchlist(self) -> list[str]:
+        """The persisted watchlist — the symbol set every matrix cell is derived from.
+
+        ``core.market_data.universe`` owns the list (``system_config`` row
+        ``watchlist_symbols``, written by ``POST /api/market/watchlist``); this
+        manager must never carry its own copy, otherwise the optimizer, the
+        "remove losing symbols" write and the gap detection silently disagree
+        with the symbols the engine actually trades.
+        """
+        try:
+            return await load_watchlist(self.db_path, DEFAULT_WATCHLIST)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(f"Lifecycle: watchlist unavailable ({e}); using defaults")
+            return list(DEFAULT_WATCHLIST)
 
     async def log_event(self, strategy_name: str, action: str, reason: str = "",
                         metrics_snapshot: dict = None, backtest_id: int = None):
@@ -76,8 +94,8 @@ class StrategyLifecycleManager:
             f"{symbol_hint}\n\n"
             f"REQUIRED fields:\n"
             f"- name: a descriptive English name (no spaces, use underscores)\n"
-            f"- timeframes: MUST be a non-empty list from [\"1m\",\"5m\",\"15m\",\"1h\",\"4h\"]. "
-            f"At minimum include \"1h\".\n"
+            f"- timeframes: MUST be a non-empty list from {json.dumps(DEFAULT_INTERVALS)}. "
+            f"At minimum include \"{DEFAULT_TIMEFRAME}\".\n"
             f"- mode: one of \"trend\", \"mean_reversion\", \"momentum\", \"breakout\"\n"
             f"- symbols: OPTIONAL list of symbols to restrict to (e.g. [\"BTCUSDT\",\"ETHUSDT\"]). "
             f"Omit or leave empty to apply to all symbols.\n"
@@ -86,7 +104,8 @@ class StrategyLifecycleManager:
             f"- exit_conditions: at least one condition each for \"long\" and \"short\"\n\n"
             f'Respond ONLY with valid JSON:\n'
             f'{{"name": "my_strategy", "enabled": true, "mode": "trend", '
-            f'"timeframes": ["1h"], "symbols": ["BTCUSDT"], '
+            f'"timeframes": {json.dumps([DEFAULT_TIMEFRAME])}, '
+            f'"symbols": {json.dumps(DEFAULT_WATCHLIST[:1])}, '
             f'"indicators": {{"rsi": {{"period": 14}}, "macd": {{"fast": 12, "slow": 26, "signal": 9}}}}, '
             f'"entry_conditions": {{"long": ["rsi < 30 and close > ema21"], '
             f'"short": ["rsi > 70 and close < ema21"]}}, '
@@ -95,10 +114,16 @@ class StrategyLifecycleManager:
             f'"reduce_conditions": {{}}, "ml_config": {{"enabled": false}}}}'
         )
 
-        result = await self.deepseek._call_deepseek(
-            "You are a quantitative trading strategist. Output only valid JSON.",
-            prompt
-        )
+        try:
+            result = await self.deepseek._call_deepseek(
+                "You are a quantitative trading strategist. Output only valid JSON.",
+                prompt
+            )
+        except Exception as e:
+            # An AI/transport failure must surface as a handled failure, not as an
+            # unhandled exception turning the API endpoint into a 500.
+            logger.warning(f"Lifecycle: AI generation call failed: {e}")
+            return None
 
         if not result:
             logger.warning("Lifecycle: AI generation returned no result")
@@ -113,8 +138,10 @@ class StrategyLifecycleManager:
 
         # Validate required fields
         if not strategy_config.get("timeframes"):
-            logger.warning(f"Lifecycle: AI generated strategy missing timeframes, defaulting to ['1h']")
-            strategy_config["timeframes"] = ["1h"]
+            logger.warning(
+                f"Lifecycle: AI generated strategy missing timeframes, "
+                f"defaulting to ['{DEFAULT_TIMEFRAME}']")
+            strategy_config["timeframes"] = [DEFAULT_TIMEFRAME]
         if not strategy_config.get("entry_conditions"):
             logger.warning("Lifecycle: AI generated strategy missing entry_conditions")
             return None
@@ -140,8 +167,9 @@ class StrategyLifecycleManager:
             logger.warning(f"Lifecycle: failed to save generated strategy {strategy_name}: {e}")
             return False
 
-        # Respect strategy's symbol restriction in backtest
-        symbols = strategy_config.get("symbols", []) or ["BTCUSDT", "ETHUSDT"]
+        # Respect strategy's symbol restriction in backtest; an unrestricted
+        # strategy is validated on the whole persisted watchlist.
+        symbols = strategy_config.get("symbols", []) or await self._watchlist()
 
         # Run backtest (in thread pool to avoid blocking event loop)
         import asyncio, concurrent.futures
@@ -212,7 +240,7 @@ class StrategyLifecycleManager:
         start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
 
         s = self.loader.load(name)
-        symbols = s.symbols if s.symbols else ["BTCUSDT", "ETHUSDT"]
+        symbols = s.symbols if s.symbols else await self._watchlist()
 
         loop = asyncio.get_event_loop()
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
@@ -269,7 +297,13 @@ class StrategyLifecycleManager:
         if not all_strategies:
             return {"skipped": True, "reason": "no strategies"}
 
-        all_symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]
+        # The strategy×symbol matrix, the per-cell "remove losing symbols" write
+        # and the coverage-gap detection all run over the persisted watchlist —
+        # not a hard-coded five.  (Fetched with the strategy list so the two are
+        # always consistent for one analysis pass.)
+        all_symbols = await self._watchlist()
+        if not all_symbols:
+            return {"skipped": True, "reason": "empty watchlist"}
 
         # Step 1: Run comprehensive backtest
         from datetime import datetime, timedelta
@@ -425,7 +459,7 @@ class StrategyLifecycleManager:
         from datetime import datetime, timedelta
         end = datetime.now().strftime("%Y-%m-%d")
         start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-        symbols = s.symbols if s.symbols else ["BTCUSDT", "ETHUSDT"]
+        symbols = s.symbols if s.symbols else await self._watchlist()
 
         # Summarize per-symbol performance for the AI
         perf_summary = "\n".join(

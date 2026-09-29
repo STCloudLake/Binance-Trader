@@ -14,6 +14,8 @@ import random
 import itertools
 from dataclasses import dataclass, field
 from core.strategy.loader import StrategyConfig, MLConfig
+from core.market_data.provider import (
+    DEFAULT_INTERVALS, DEFAULT_TIMEFRAME, interval_minutes)
 
 
 # ── Gene definitions ──────────────────────────────────────────────────
@@ -156,7 +158,9 @@ EXIT_CONDITION_POOL = {
 }
 
 MODE_OPTIONS = ["trend", "range", "scalp", "momentum"]
-TIMEFRAME_OPTIONS = ["1m", "5m", "15m", "1h", "4h"]
+#: Timeframes the GA evolves over — the intervals INTERVAL_SPEC declares as the
+#: streamed/pre-fetched set, so a new interval added there joins the genes too.
+TIMEFRAME_OPTIONS = list(DEFAULT_INTERVALS)
 
 INDICATOR_NAMES = ["rsi", "macd", "bollinger", "adx", "ema", "atr", "stoch", "cci", "obv", "sma", "hurst", "swing_points", "frac_diff"]
 
@@ -397,7 +401,7 @@ def chromosome_to_strategy(chromosome: dict) -> StrategyConfig:
         confidence_threshold=round(cont.get("ml_threshold", 0.6), 2),
     )
 
-    timeframes = cat.get("timeframes", "1h").split(",")
+    timeframes = cat.get("timeframes", DEFAULT_TIMEFRAME).split(",")
 
     # ── Condition sanitization: remove conditions referencing disabled indicators ──
     enabled_set = {name for name, enabled in ind_genes.items() if enabled}
@@ -430,7 +434,9 @@ def random_chromosome(name: str = "ga_strategy") -> dict:
     """Create a random strategy chromosome with diverse indicator selection."""
     mode = random.choice(MODE_OPTIONS)
     tfs = random.sample(TIMEFRAME_OPTIONS, k=random.choice([1, 2]))
-    tfs.sort(key=lambda t: {"1m":1,"5m":5,"15m":15,"1h":60,"4h":240}[t])
+    # Shortest first, using the shared interval registry: an unknown timeframe
+    # must not raise a KeyError here.
+    tfs.sort(key=interval_minutes)
 
     indicators = _random_indicators()
 

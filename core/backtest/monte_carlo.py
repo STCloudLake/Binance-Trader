@@ -116,36 +116,3 @@ def monte_carlo_simulation(
         "mc_simulations": n_simulations,
     }
 
-
-def monte_carlo_equity_curve(
-    trades: list[dict],
-    n_simulations: int = 200,
-    seed: int | None = 42,
-) -> list[dict]:
-    """Generate Monte Carlo equity-curve envelopes for plotting.
-
-    Returns a list of percentile curves: median, 5th, 25th, 75th, 95th.
-
-    Each curve is a dict with ``"label"`` and ``"values"`` (list of
-    equity floats, same length as the number of trades).
-    """
-    pnl_values = np.array([t.get("pnl", 0.0) for t in trades if t.get("pnl") is not None])
-    n_trades = len(pnl_values)
-
-    if n_trades < 5:
-        return []
-
-    rng = np.random.RandomState(seed)
-    all_curves = np.empty((n_simulations, n_trades))
-
-    for i in range(n_simulations):
-        perm = rng.permutation(pnl_values)
-        all_curves[i] = 10000 + np.cumsum(perm)
-
-    percentiles = [5, 25, 50, 75, 95]
-    curves = []
-    for p in percentiles:
-        curve = np.percentile(all_curves, p, axis=0)
-        curves.append({"label": f"P{p}", "values": [round(float(v), 2) for v in curve]})
-
-    return curves

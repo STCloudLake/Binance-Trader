@@ -1,5 +1,13 @@
 # Binance Trader
 
+> **STALE ENGLISH SNAPSHOT — not maintained.** This document predates the current
+> code and still shows the old `binance_trader/…` layout and the pre-split
+> architecture. It is **not** updated with the 2.0.0 revisions (test counts, route
+> inventory, line references, the "no strategy YAML is tracked" caveat, …).
+> The maintained, current document is the Chinese [`README.md`](README.md);
+> where the two disagree, **the code and `README.md` win**.
+> Regenerating this translation is an open task (see `README.md` §13).
+
 ![Binance Trader](social-preview.png)
 
 An automated cryptocurrency trading system built in Python, integrating multi-strategy engine, genetic algorithm optimization, ML prediction, AI decision-making, three-tier risk control, and a real-time web management panel.

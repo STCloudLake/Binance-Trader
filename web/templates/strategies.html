@@ -1,5 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
+{% set _sym_ns = namespace(syms=[]) %}
+{% for _s in strategies %}{% for _sym in (_s.symbols or []) %}{% if _sym not in _sym_ns.syms %}{% set _sym_ns.syms = _sym_ns.syms + [_sym] %}{% endif %}{% endfor %}{% endfor %}
 <h2 class="text-xl mb-4">{{ _('策略管理') }}</h2>
 
 <div class="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-6">
@@ -34,6 +36,16 @@
 
     <div class="card col-span-2" id="strategy-editor">
         <h3 class="text-lg mb-3">{{ _('策略编辑器') }} <span class="text-sm text-slate-500" id="editor-title"></span></h3>
+
+        <!-- Symbol universe used by the editor's searchable symbol multi-select.
+             Hydrated from GET /api/market/symbols (all USDT pairs); the
+             server-rendered fallback — pairs already referenced by the saved
+             strategies plus the built-in five — is kept when that fails. -->
+        <div id="sg-symbol-selector-host" class="text-xs text-slate-500 mb-2" data-source="fallback">
+            {{ _('交易对候选') }}:
+            <span id="sg-symbol-status">{{ _('本地已知列表') }}</span>
+            <span id="sg-symbol-error" class="text-amber-400 ml-1"></span>
+        </div>
 
         <div id="editor-form" class="text-sm">
             <div class="text-slate-500 py-8 text-center">{{ _('请从左侧选择一个策略进行编辑') }}，{{ _('或点击') }}"{{ _('新建策略') }}"</div>
@@ -76,7 +88,199 @@ var availableIndicators = [
 ];
 var allTimeframes = ['1m','5m','15m','1h','4h','1d'];
 var allModes = ['trend','grid','momentum','scalp'];
-var allSymbols = ['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT'];
+
+// ---------------------------------------------------------------------------
+// Symbol universe — searchable multi-select over all Binance USDT pairs.
+// Empty selection keeps its existing meaning: "all watched symbols".
+// ---------------------------------------------------------------------------
+window.SG_FALLBACK_SYMBOLS = {{ ((symbols|default([])) + _sym_ns.syms)|tojson }};
+var sgUniverse = {};          // symbol -> {symbol, baseAsset, last, change_pct, has_cached_data}
+var sgSelected = [];          // symbols attached to the strategy being edited
+var sgApiError = '';
+
+var SG_T = {
+    localList: {{ _("本地已知列表")|tojson }},
+    exchangeList: {{ _("交易所全量列表")|tojson }},
+    apiFailed: {{ _("全币种接口不可用")|tojson }},
+    searchAll: {{ _("搜索全部 USDT 交易对")|tojson }},
+    emptyMeansAll: {{ _("空=全部自选交易对")|tojson }},
+    empty: {{ _("未限制（适用于全部自选交易对）")|tojson }},
+    noMatch: {{ _("无匹配交易对")|tojson }},
+    all: {{ _("全选")|tojson }},
+    clear: {{ _("清空")|tojson }},
+    hasData: {{ _("有本地数据")|tojson }},
+    noData: {{ _("无本地数据")|tojson }}
+};
+
+function sgRegister(list) {
+    (list || []).forEach(function(item) {
+        var sym = typeof item === 'string' ? item : item.symbol;
+        if (!sym) return;
+        var prev = sgUniverse[sym] || {symbol: sym};
+        if (typeof item === 'object') sgUniverse[sym] = Object.assign(prev, item, {symbol: sym});
+        else sgUniverse[sym] = prev;
+    });
+}
+
+function sgSetStatus(text, warn, error) {
+    var host = document.getElementById('sg-symbol-selector-host');
+    var el = document.getElementById('sg-symbol-status');
+    var err = document.getElementById('sg-symbol-error');
+    if (host) host.dataset.source = warn ? 'fallback' : 'api';
+    if (el) {
+        el.textContent = text;
+        el.className = warn ? 'text-amber-400' : 'text-slate-500';
+    }
+    if (err) err.textContent = error || '';
+}
+
+function sgLoadUniverse() {
+    sgRegister(window.SG_FALLBACK_SYMBOLS || []);
+    sgSetStatus(SG_T.localList + ' · ' + Object.keys(sgUniverse).length, true, '');
+    fetch('/api/market/symbols?limit=200&sort=volume')
+        .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+        .then(function(data) {
+            sgApiError = '';
+            sgRegister(data.symbols || []);
+            sgSetStatus(SG_T.exchangeList + ' · ' + (data.total || Object.keys(sgUniverse).length) +
+                        ' USDT · ' + SG_T.searchAll, false, '');
+            sgRenderSymbols();
+        })
+        .catch(function(e) {
+            sgApiError = (e && e.message) ? e.message : String(e);
+            sgSetStatus(SG_T.localList + ' · ' + Object.keys(sgUniverse).length, true,
+                        SG_T.apiFailed + ' (' + sgApiError + ')');
+            sgRenderSymbols();
+        });
+}
+
+var sgSearchTimer = null;
+function sgOnSearch() {
+    sgRenderDropdown();
+    var q = (document.getElementById('sg-symbol-search') || {}).value || '';
+    q = q.trim();
+    if (!q) return;
+    clearTimeout(sgSearchTimer);
+    sgSearchTimer = setTimeout(function() {
+        fetch('/api/market/symbols?limit=50&sort=volume&q=' + encodeURIComponent(q))
+            .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+            .then(function(data) { sgRegister(data.symbols || []); sgRenderDropdown(); })
+            .catch(function(e) {
+                sgApiError = (e && e.message) ? e.message : String(e);
+                sgSetStatus(SG_T.localList + ' · ' + Object.keys(sgUniverse).length, true,
+                            SG_T.apiFailed + ' (' + sgApiError + ')');
+                sgRenderDropdown();
+            });
+    }, 250);
+}
+
+function sgHasData(sym) {
+    var e = sgUniverse[sym];
+    return !!(e && e.has_cached_data);
+}
+
+// Symbols come from the exchange API *and* from saved strategy YAML, so they
+// are escaped before interpolation and never inlined into a JS string
+// (click handlers read data-symbol instead).
+function sgEsc(value) {
+    return String(value == null ? '' : value).replace(/[&<>"']/g, function(c) {
+        return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c];
+    });
+}
+
+function sgRenderSymbols() {
+    sgRenderChips();
+    sgRenderDropdown();
+}
+
+function sgRenderChips() {
+    var host = document.getElementById('sg-symbol-chips');
+    if (!host) return;
+    if (!sgSelected.length) {
+        host.innerHTML = '<span class="text-xs text-slate-500">' + SG_T.empty + '</span>';
+        return;
+    }
+    var html = '';
+    sgSelected.forEach(function(sym) {
+        html += '<span class="text-xs px-2 py-1 rounded border border-emerald-600 bg-emerald-900/40 text-emerald-200 flex items-center gap-1">' +
+                '<span class="' + (sgHasData(sym) ? 'text-emerald-400' : 'text-amber-500') + '" title="' +
+                sgEsc(sgHasData(sym) ? SG_T.hasData : SG_T.noData) + '">●</span>' +
+                sgEsc(sym.replace('USDT', '/USDT')) +
+                '<button type="button" class="text-emerald-300 hover:text-red-400" data-symbol="' + sgEsc(sym) +
+                '" onclick="sgToggleSymbol(this.dataset.symbol)">×</button></span>';
+    });
+    host.innerHTML = html;
+}
+
+function sgRenderDropdown() {
+    var host = document.getElementById('sg-symbol-dropdown');
+    if (!host) return;
+    var q = ((document.getElementById('sg-symbol-search') || {}).value || '').trim().toUpperCase();
+    var syms = Object.keys(sgUniverse).filter(function(sym) {
+        if (!q) return true;
+        var base = (sgUniverse[sym].baseAsset || sym.replace('USDT', '')).toUpperCase();
+        return sym.indexOf(q) >= 0 || base.indexOf(q) >= 0;
+    });
+    syms.sort(function(a, b) {
+        var va = sgUniverse[a].quote_volume || 0, vb = sgUniverse[b].quote_volume || 0;
+        if (va !== vb) return vb - va;
+        return a < b ? -1 : 1;
+    });
+    var html = '';
+    syms.slice(0, 100).forEach(function(sym) {
+        var info = sgUniverse[sym] || {};
+        var picked = sgSelected.indexOf(sym) >= 0;
+        var meta = [];
+        if (info.last != null) meta.push(Number(info.last).toPrecision(6));
+        if (info.change_pct != null) {
+            var ch = Number(info.change_pct);
+            meta.push('<span class="' + (ch >= 0 ? 'text-green-400' : 'text-red-400') + '">' +
+                      (ch >= 0 ? '+' : '') + ch.toFixed(2) + '%</span>');
+        }
+        if (info.has_cached_data) meta.push('<span class="text-emerald-400">' + SG_T.hasData + '</span>');
+        html += '<div class="flex items-center justify-between px-3 py-1.5 text-sm cursor-pointer hover:bg-slate-800 ' +
+                (picked ? 'text-emerald-300' : 'text-slate-300') + '" data-symbol="' + sgEsc(sym) +
+                '" onclick="sgToggleSymbol(this.dataset.symbol)">' +
+                '<span>' + (picked ? '✓ ' : '') + sgEsc(sym) + '</span>' +
+                '<span class="text-xs text-slate-500">' + meta.join(' · ') + '</span></div>';
+    });
+    if (!syms.length) {
+        html = '<div class="px-3 py-2 text-xs text-slate-500">' +
+               (sgApiError ? SG_T.apiFailed + ': ' + sgApiError : SG_T.noMatch) + '</div>';
+    }
+    host.innerHTML = html;
+    host.classList.remove('hidden');
+}
+
+function sgToggleSymbol(sym) {
+    var idx = sgSelected.indexOf(sym);
+    if (idx >= 0) sgSelected.splice(idx, 1);
+    else sgSelected.push(sym);
+    sgRenderSymbols();
+}
+
+function sgSelectAllVisible() {
+    var q = ((document.getElementById('sg-symbol-search') || {}).value || '').trim().toUpperCase();
+    Object.keys(sgUniverse).forEach(function(sym) {
+        var base = (sgUniverse[sym].baseAsset || '').toUpperCase();
+        if ((!q || sym.indexOf(q) >= 0 || base.indexOf(q) >= 0) && sgSelected.indexOf(sym) < 0) {
+            sgSelected.push(sym);
+        }
+    });
+    sgRenderSymbols();
+}
+
+function sgClearSymbols() {
+    sgSelected = [];
+    sgRenderSymbols();
+}
+
+document.addEventListener('click', function(e) {
+    var host = document.getElementById('sg-symbol-selector');
+    var dd = document.getElementById('sg-symbol-dropdown');
+    if (host && dd && !host.contains(e.target)) dd.classList.add('hidden');
+});
+
 
 function newStrategy() {
     currentStrategy = null;
@@ -130,13 +334,15 @@ function renderEditor(s) {
     });
     h += '</div></div>';
 
-    // Symbols (strategy-symbol mapping)
-    h += '<div class="mb-4"><label class="text-slate-400">{{ _("交易对") }} <span class="text-xs text-slate-600">({{ _("空=全部交易对") }})</span></label><div class="flex gap-2 mt-1" id="sym-checkboxes">';
-    allSymbols.forEach(function(sym) {
-        var checked = (s.symbols || []).indexOf(sym) >= 0;
-        h += '<label class="text-xs px-2 py-1 rounded border border-slate-600 ' + (checked ? 'bg-emerald-900 border-emerald-500 text-emerald-300' : 'text-slate-400') + '"><input type="checkbox" value="' + sym + '" ' + (checked ? 'checked' : '') + ' onchange="this.parentElement.classList.toggle(\'bg-emerald-900\');this.parentElement.classList.toggle(\'border-emerald-500\');this.parentElement.classList.toggle(\'text-emerald-300\')"> ' + sym.replace('USDT','/USDT') + '</label>';
-    });
-    h += '</div></div>';
+    // Symbols — searchable multi-select over the full USDT universe
+    h += '<div class="mb-4" id="sg-symbol-selector">';
+    h += '<label class="text-slate-400">{{ _("交易对") }} <span class="text-xs text-slate-600">(' + SG_T.emptyMeansAll + ')</span>';
+    h += '<button type="button" class="text-xs text-sky-400 hover:underline ml-2" onclick="sgSelectAllVisible()">' + SG_T.all + '</button>';
+    h += '<button type="button" class="text-xs text-slate-500 hover:underline ml-1" onclick="sgClearSymbols()">' + SG_T.clear + '</button></label>';
+    h += '<div class="relative mt-1"><input id="sg-symbol-search" type="text" autocomplete="off" placeholder="' + SG_T.searchAll + '" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm" oninput="sgOnSearch()" onfocus="sgRenderDropdown()">';
+    h += '<div id="sg-symbol-dropdown" class="hidden absolute z-20 mt-1 w-full max-h-56 overflow-y-auto bg-slate-900 border border-slate-600 rounded shadow-lg"></div></div>';
+    h += '<div id="sg-symbol-chips" class="flex flex-wrap gap-2 mt-2 bg-slate-800 rounded p-2 border border-slate-600 min-h-[2.5rem]"></div>';
+    h += '</div>';
 
     // Indicators
     h += '<div class="mb-4"><label class="text-slate-400">{{ _("技术指标") }} <span class="text-xs text-slate-600">({{ _("勾选启用") }}，{{ _("可调参数") }})</span></label><div class="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-1">';
@@ -219,6 +425,14 @@ function renderEditor(s) {
     h += '<button class="w-full bg-sky-600 hover:bg-sky-500 text-white px-4 py-2 rounded text-sm font-bold" onclick="saveStrategy()">💾 {{ _("保存策略") }}</button>';
     h += '<div id="save-msg" class="mt-2 text-sm"></div>';
     document.getElementById('editor-form').innerHTML = h;
+
+    // Bind this strategy's symbols to the shared universe selector. Saved
+    // symbols are registered even when the API has not listed them (e.g. the
+    // endpoint is down, or the pair is no longer TRADING) so saving never
+    // silently drops them.
+    sgSelected = (s.symbols || []).slice();
+    sgRegister(sgSelected);
+    sgRenderSymbols();
 }
 
 function toggleIndicator(cb) {
@@ -277,9 +491,8 @@ function saveStrategy() {
     var tfs = [];
     document.querySelectorAll('#tf-checkboxes input[type=checkbox]:checked').forEach(function(cb) { tfs.push(cb.value); });
 
-    // Gather symbols (strategy-symbol mapping)
-    var syms = [];
-    document.querySelectorAll('#sym-checkboxes input[type=checkbox]:checked').forEach(function(cb) { syms.push(cb.value); });
+    // Gather symbols (strategy-symbol mapping); empty = all watched symbols
+    var syms = sgSelected.slice();
 
     // Gather indicators
     var indicators = {};
@@ -374,5 +587,8 @@ function loadGAPanel() {
         });
     });
 }
+
+// Boot: hydrate the symbol universe (falls back to the server-rendered list).
+sgLoadUniverse();
 </script>
 {% endblock %}
