@@ -38,6 +38,10 @@ class EventBus:
     def __init__(self):
         self._subscribers: dict[EventType, list[Callable[[Event], Awaitable[None]]]] = defaultdict(list)
         self._queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=10000)
+        #: The loop the queue is bound to.  An ``asyncio.Queue`` binds to the loop
+        #: of its first *waiter*: once a second loop touches a queue that still has
+        #: a waiter parked on the first, every ``get()`` raises ``RuntimeError``.
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._running = False
         self._task: asyncio.Task | None = None
 
@@ -56,7 +60,36 @@ class EventBus:
     async def publish(self, event: Event):
         await self._queue.put(event)
 
+    def _bind_to_running_loop(self, force: bool = False) -> None:
+        """Make sure ``_queue`` is usable from the loop running ``_process``.
+
+        An ``asyncio.Queue`` must not be used from two loops.  Once a second loop
+        touches a queue that still has a waiter parked on the first, *every*
+        ``get()`` raises ``RuntimeError`` — including for the loop that ran first.
+        Callers therefore pass ``force=True`` after a failed ``get()``.
+
+        Rather than fight the stale queue, its pending events are carried over to
+        a fresh one: the bus keeps its contract (no event silently dropped) and
+        the new loop starts from a clean binding.  A waiter still parked on the
+        old queue belongs to a loop that no longer drives this bus, so letting go
+        of the old object is safe.
+        """
+        loop = asyncio.get_running_loop()
+        if self._loop is loop and not force:
+            return
+        old = self._queue
+        self._queue = asyncio.Queue(maxsize=10000)
+        self._loop = loop
+        while True:
+            try:
+                self._queue.put_nowait(old.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+            except Exception:  # noqa: BLE001 - a stale queue must never stop the bus
+                break
+
     async def start(self):
+        self._bind_to_running_loop()
         self._running = True
         self._task = asyncio.create_task(self._process())
 
@@ -80,8 +113,19 @@ class EventBus:
                             )
             except asyncio.TimeoutError:
                 continue
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
+                # The queue can be bound to another loop (a second loop touching
+                # one bus), and a bare retry would then raise again immediately:
+                # the branch turned into a 100% CPU log flood (200KB in ~15s).
+                # Rebind to a clean queue and back off before retrying.
                 logger.warning(f"EventBus _process error: {e}")
+                try:
+                    self._bind_to_running_loop(force=True)
+                except Exception:  # noqa: BLE001 - never let recovery spin either
+                    pass
+                await asyncio.sleep(0.1)
 
     async def shutdown(self):
         self._running = False

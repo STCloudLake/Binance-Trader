@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import threading
 import time
 import uuid
 from decimal import ROUND_DOWN, Decimal
@@ -44,6 +46,103 @@ class OrderExecutor:
         #: resolve a symbol's LOT_SIZE / NOTIONAL rules. Injected, never imported
         #: as a global: without it the executor keeps its 1e-5 fallback.
         self._universe = None
+        #: Trade gate — see :meth:`reset_barrier`.  Deliberately built from
+        #: ``threading`` primitives, not ``asyncio`` ones: an ``asyncio.Lock`` is
+        #: bound to the loop that first waited on it, so a reset served by the web
+        #: loop could not serialise an open running on another loop (the test
+        #: suite's per-test ``asyncio.run`` loops, and this app's own startup
+        #: thread).  A per-loop gate looked serialised in one loop and was no
+        #: protection at all across two — the reset erased the row while the open
+        #: still owed the cash (Δ −100.160030).
+        self._gate_lock = threading.Lock()
+        self._gate_idle = threading.Event()
+        self._gate_idle.set()
+        self._gate_closed = False
+        self._gate_active = 0
+        #: Diagnostic only: which loops currently have a mutation registered.
+        self._active_loops: dict[int, int] = {}
+
+    # ---- trade gate ------------------------------------------------------
+    def _enter_mutation(self) -> None:
+        """Register one in-flight cash movement (its ``finally`` must release)."""
+        while True:
+            if not self._gate_closed:
+                # Atomic enough under the GIL **and** free of ``await``: no other
+                # task in this loop can interleave between the check and the
+                # increment, and a reset is what flips ``_gate_closed``.
+                self._gate_active += 1
+                self._gate_idle.clear()
+                return
+            self._gate_idle.wait()
+
+    def _leave_mutation(self) -> None:
+        self._gate_active -= 1
+        if self._gate_active <= 0:
+            self._gate_active = 0
+            self._gate_idle.set()
+
+    @contextlib.asynccontextmanager
+    async def _mutation_slot(self):
+        """Register one in-flight cash movement, waiting out any pending reset."""
+        self._enter_mutation()
+        loop_id = id(asyncio.get_running_loop())
+        self._active_loops[loop_id] = self._active_loops.get(loop_id, 0) + 1
+        try:
+            yield
+        finally:
+            remaining = self._active_loops.get(loop_id, 1) - 1
+            if remaining > 0:
+                self._active_loops[loop_id] = remaining
+            else:
+                self._active_loops.pop(loop_id, None)
+            self._leave_mutation()
+
+    @contextlib.asynccontextmanager
+    async def reset_barrier(self):
+        """Exclusive window for an admin reset: no in-flight cash movement survives it.
+
+        ``/api/settings/reset-sim`` used to erase ``trades``/``positions`` and then
+        restore the balance to 10000 while an open was still in flight: the open
+        committed its row *before* the erase and deducted its cash *after* the
+        restore, leaving the ledger identity broken (measured Δ −100.160030) with
+        a cash movement no row explains.
+
+        Every cash-moving mutation registers through :meth:`_mutation_slot`, and
+        this context manager closes the gate, waits for the in-flight book to
+        drain, then holds it closed until the reset is done.  New opens/closes wait
+        for the reset instead of running through it.  A close that already read a
+        position is refused by the revision check in :meth:`close_position`, which
+        the caller bumps while still inside this window.
+        """
+        self._gate_lock.acquire()
+        self._gate_closed = True
+        self._gate_lock.release()
+        # Wait for the in-flight book to drain.  ``Event.wait`` blocks only this
+        # thread's loop while the reset runs elsewhere; it is set again by the
+        # last mutation to leave, and by the release below.
+        while self._gate_active > 0:
+            self._gate_idle.wait(0.05)
+            await asyncio.sleep(0)      # let this loop's own tasks settle
+        self._active_loops.clear()
+        try:
+            yield
+        finally:
+            self._gate_closed = False
+            self._gate_idle.set()
+
+    def check_no_mutations(self) -> None:
+        """Assert the trade gate is quiet (call while holding :meth:`reset_barrier`).
+
+        A reset is only meaningful if *nothing* is mid-mutation while it erases the
+        ledger.  This makes a future caller that forgets to wrap itself in
+        :meth:`_mutation_slot` fail loudly here instead of silently corrupting the
+        balance.
+        """
+        if self._gate_active != 0:
+            raise RuntimeError(
+                f"a cash-moving mutation is in flight during a reset "
+                f"(active={self._gate_active}); it must register through "
+                f"OrderExecutor._mutation_slot (see reset_barrier)")
 
     def _symbol_lock(self, symbol: str) -> asyncio.Lock:
         """The per-symbol mutation lock, created on first use.
@@ -392,7 +491,11 @@ class OrderExecutor:
         was stranded for ever (S6).
         """
         async with self._symbol_lock(str(data.get("symbol", ""))):
-            return await self._execute_sim_locked(data)
+            # Registered with the trade gate for the whole critical section: an
+            # admin reset waits for this open (and this open waits for a reset in
+            # progress) so the erase and the cash movement can never interleave.
+            async with self._mutation_slot():
+                return await self._execute_sim_locked(data)
 
     async def _execute_sim_locked(self, data: dict):
         order_id = f"sim_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
@@ -746,18 +849,24 @@ class OrderExecutor:
             return {"ok": False, "error": f"No position for {symbol}"}
         observed = self._position_rev.get(symbol, 0)
         async with self._symbol_lock(symbol):
-            if self._position_rev.get(symbol, 0) != observed:
-                message = (f"{symbol} position changed while this reduce waited for "
-                           f"the lock; refusing to apply a stale basis")
-                logger.warning(f"Concurrent close/reduce refused: {message}")
-                await self.event_bus.publish(Event(EventType.ALERT_TRIGGER, {
-                    "level": "warning", "type": "concurrent_close_rejected",
-                    "message": f"{symbol} 并发平仓/减仓已拒绝（避免重复计算资金）",
-                    "symbol": symbol,
-                }))
-                return {"ok": False, "error": message}
-            return await self._close_position_locked(symbol, reduce_pct,
-                                                     current_price, reason)
+            # Same gate as `_execute_sim`: a reset cannot erase the ledger in the
+            # middle of this close's row-insert + cash movement, and this close
+            # cannot run against a ledger that is being reset.  The revision check
+            # below is the second line of defence when a reset was already waiting
+            # for this symbol's lock.
+            async with self._mutation_slot():
+                if self._position_rev.get(symbol, 0) != observed:
+                    message = (f"{symbol} position changed while this reduce waited for "
+                               f"the lock; refusing to apply a stale basis")
+                    logger.warning(f"Concurrent close/reduce refused: {message}")
+                    await self.event_bus.publish(Event(EventType.ALERT_TRIGGER, {
+                        "level": "warning", "type": "concurrent_close_rejected",
+                        "message": f"{symbol} 并发平仓/减仓已拒绝（避免重复计算资金）",
+                        "symbol": symbol,
+                    }))
+                    return {"ok": False, "error": message}
+                return await self._close_position_locked(symbol, reduce_pct,
+                                                         current_price, reason)
 
     async def _close_position_locked(self, symbol: str, reduce_pct: float,
                                      current_price: float, reason: str) -> dict:

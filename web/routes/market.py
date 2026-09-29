@@ -47,6 +47,10 @@ from core.market_data.data_client import MarketDataClient, MarketDataError
 #: Signal attribution default: sourced from the interval registry so the web
 #: layer does not hard-code a timeframe the registry may change.
 from core.market_data.provider import DEFAULT_TIMEFRAME
+#: Shared symbol-shape validator: both market-data key spaces (this module's coin
+#: cache and the audit screener) must reject a malformed symbol *before* it
+#: reaches the network or the cache, and they must agree on what "malformed" is.
+from core.market_data.screener import valid_symbol
 from core.market_data.ttl_cache import (
     COIN_TTL,
     DEPTH_TTL,
@@ -351,7 +355,7 @@ def register(app: FastAPI, ctx) -> None:
     # ==================================================================
     @app.get("/api/market/ticker")
     async def market_ticker(request: Request, symbol: str = "BTCUSDT"):
-        if err := check_rate_limit(request, "market"):
+        if err := check_rate_limit(request, "ticker"):
             return err
         data, err = await _cached("ticker", symbol, lambda: _fetch_ticker(symbol))
         if err:
@@ -360,7 +364,7 @@ def register(app: FastAPI, ctx) -> None:
 
     @app.get("/api/market/depth")
     async def market_depth(request: Request, symbol: str = "BTCUSDT", limit: int = 20):
-        if err := check_rate_limit(request, "market"):
+        if err := check_rate_limit(request, "depth"):
             return err
         limit = max(1, min(int(limit), 100))
         key = f"{symbol}|{limit}"
@@ -372,7 +376,7 @@ def register(app: FastAPI, ctx) -> None:
 
     @app.get("/api/market/trades")
     async def market_trades(request: Request, symbol: str = "BTCUSDT", limit: int = 30):
-        if err := check_rate_limit(request, "market"):
+        if err := check_rate_limit(request, "trades"):
             return err
         limit = max(1, min(int(limit), 100))
         key = f"{symbol}|{limit}"
@@ -390,7 +394,7 @@ def register(app: FastAPI, ctx) -> None:
         watches (``core.market_data.universe``), not a hard-coded five pairs, so
         the overview follows a watchlist change instead of drifting from it.
         """
-        if err := check_rate_limit(request, "market"):
+        if err := check_rate_limit(request, "overview"):
             return err
         tickers, err = await _ticker_snapshot()
         try:
@@ -414,7 +418,7 @@ def register(app: FastAPI, ctx) -> None:
     @app.get("/api/market/ticker24h")
     async def market_ticker24h(request: Request):
         """Every symbol's 24h stats — cached 60s (upstream costs ~10s)."""
-        if err := check_rate_limit(request, "market"):
+        if err := check_rate_limit(request, "ticker"):
             return err
         tickers, err = await _ticker_snapshot()
         if err:
@@ -437,7 +441,7 @@ def register(app: FastAPI, ctx) -> None:
     async def market_symbols(request: Request, q: str = "", quote: str = "USDT", limit: int = 50,
                              offset: int = 0, sort: str = "volume"):
         """Searchable / sortable / pageable view of the whole USDT universe."""
-        if err := check_rate_limit(request, "market"):
+        if err := check_rate_limit(request, "overview"):
             return err
         try:
             limit = max(1, min(int(limit), 200))
@@ -644,9 +648,17 @@ def register(app: FastAPI, ctx) -> None:
 
     @app.get("/api/coin/{symbol}")
     async def coin_detail(request: Request, symbol: str):
-        if err := check_rate_limit(request, "market"):
+        # Shape first, and *before* any upstream call or cache entry: the symbol is
+        # a path component and a cache key, and it used to reach the network
+        # unvalidated here while `/api/audit/{symbol}` validated it — so the coin
+        # cache was keyed by whatever the caller sent.
+        canonical = valid_symbol(symbol)
+        if canonical is None:
+            return JSONResponse({"error": f"invalid symbol '{symbol}'"},
+                                status_code=400)
+        if err := check_rate_limit(request, "coin"):
             return err
-        key = symbol.upper()
+        key = canonical
 
         async def _fetch():
             try:
@@ -754,7 +766,7 @@ def register(app: FastAPI, ctx) -> None:
     @app.get("/api/data/overview")
     async def data_overview(request: Request):
         # One minute of cache on purpose: this fans out over ~120 upstream calls.
-        if err := check_rate_limit(request, "market"):
+        if err := check_rate_limit(request, "overview"):
             return err
         data, err = await _cache().get("data_overview", TICKER24H_TTL, _data_overview)
         if err:
@@ -779,7 +791,7 @@ def register(app: FastAPI, ctx) -> None:
         and no new connection per chart refresh); falls back to a REST call
         against ``config.market_data_host``.
         """
-        if err := check_rate_limit(request, "market"):
+        if err := check_rate_limit(request, "klines"):
             return err
         limit = max(1, min(int(limit), 1000))
 

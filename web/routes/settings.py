@@ -1,5 +1,6 @@
 """Settings write endpoints (DeepSeek, AI/news, risk, Binance) plus
 circuit-breaker reset and server restart."""
+import contextlib
 from pathlib import Path
 
 import yaml
@@ -215,42 +216,58 @@ def register(app: FastAPI, ctx) -> None:
         if err := _require_admin(request): return err
         """Clear all sim trading records and reset balance to 10000."""
         cancelled = 0
-        try:
-            db = await get_db()
-            try:
-                # One transaction: the reset is a single state change.  Open limit
-                # orders must go with it — they used to survive, and the running
-                # matcher then filled a stale order against the FRESH 10000,
-                # opening a position whose ledger row had just been erased (and
-                # whose cash the reset had already restored).  Cancelled, never
-                # deleted: the record of what was withdrawn is kept, and
-                # `frozen` (the sum over status='open') is released at once.
-                await db.execute("BEGIN IMMEDIATE")
-                await db.execute("DELETE FROM trades")
-                await db.execute("DELETE FROM positions")
-                cursor = await db.execute(
-                    "UPDATE pending_orders SET status='cancelled',"
-                    " reason=COALESCE(NULLIF(reason, ''), 'sim reset')"
-                    " WHERE status='open'")
-                cancelled = cursor.rowcount
-                await db.commit()
-            finally:
-                await db.close()
-            if cancelled:
-                ctx.logger.info(f"reset-sim: cancelled {cancelled} open limit order(s)")
-        except Exception as e:
-            ctx.logger.warning(f"reset-sim could not clear the sim state: {e}")
-
         executor = getattr(app.state, "executor", None)
-        if executor:
-            executor._positions.clear()
-            # Keep the per-symbol revisions monotonic: a reduce that read a
-            # position before the reset must not be applied to the fresh state.
-            for _sym in list(getattr(executor, "_position_rev", {})):
-                executor._bump_revision(_sym)
+        # The whole reset runs inside the executor's trade gate when one exists:
+        # an open/close that is already moving cash finishes first, and new ones
+        # wait for the reset.  Without it the erase and the in-flight deduction
+        # interleaved and left the balance below the identity by the open's whole
+        # notional with no row to explain it (measured Δ −100.160030).
+        barrier = (executor.reset_barrier() if hasattr(executor, "reset_barrier")
+                   else contextlib.nullcontext())
+        async with barrier:
+            if executor is not None and hasattr(executor, "check_no_mutations"):
+                # Inside the barrier nothing is in flight; a violation means a
+                # future mutation path skipped the gate, which must be loud rather
+                # than silently break the ledger identity.
+                executor.check_no_mutations()
+            try:
+                db = await get_db()
+                try:
+                    # One transaction: the reset is a single state change.  Open limit
+                    # orders must go with it — they used to survive, and the running
+                    # matcher then filled a stale order against the FRESH 10000,
+                    # opening a position whose ledger row had just been erased (and
+                    # whose cash the reset had already restored).  Cancelled, never
+                    # deleted: the record of what was withdrawn is kept, and
+                    # `frozen` (the sum over status='open') is released at once.
+                    await db.execute("BEGIN IMMEDIATE")
+                    await db.execute("DELETE FROM trades")
+                    await db.execute("DELETE FROM positions")
+                    cursor = await db.execute(
+                        "UPDATE pending_orders SET status='cancelled',"
+                        " reason=COALESCE(NULLIF(reason, ''), 'sim reset')"
+                        " WHERE status='open'")
+                    cancelled = cursor.rowcount
+                    await db.commit()
+                finally:
+                    await db.close()
+                if cancelled:
+                    ctx.logger.info(f"reset-sim: cancelled {cancelled} open limit order(s)")
+            except Exception as e:
+                ctx.logger.warning(f"reset-sim could not clear the sim state: {e}")
 
-        app.state.balance = DEFAULT_BALANCE
-        await _save_balance(ctx)
+            if executor:
+                executor._positions.clear()
+                # Keep the per-symbol revisions monotonic: a reduce that read a
+                # position before the reset must not be applied to the fresh state.
+                # Bumped inside the barrier, so no mutation can slip in between.
+                for _sym in list(getattr(executor, "_position_rev", {})):
+                    executor._bump_revision(_sym)
+
+            # Written inside the barrier as well: the restore can no longer land
+            # after an open's deduction (or before its row) — the identity holds.
+            app.state.balance = DEFAULT_BALANCE
+            await _save_balance(ctx)
 
         resp = HTMLResponse(f'<span class="text-green-400 text-sm">✓ 模拟交易已重置 — 所有记录已清除，余额恢复至 {DEFAULT_BALANCE:.2f} USDT</span>')
         resp.headers["HX-Trigger"] = "tradeUpdated"

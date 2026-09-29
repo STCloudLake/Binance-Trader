@@ -17,6 +17,7 @@ contract audit.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 
 from fastapi import FastAPI, Request
@@ -27,6 +28,7 @@ from core.market_data.screener import (
     UpstreamError,
     get_screener,
     normalize_min_quote_volume,
+    valid_symbol,
 )
 
 #: Hard ceiling for one request so a stalled host can never pin a worker.
@@ -41,11 +43,75 @@ ROUTE_TIMEOUT = 30.0
 #: crawler of the public exchange (one screen = ticker + depth + klines for up
 #: to 200 symbols).  The budgets are deliberately generous — the UI polls a
 #: couple of endpoints every few seconds — but a tight loop gets a 429.
-RATE_LIMITS = {"audit": 30, "market": 300}
-#: Sliding window for the limits above.
+#:
+#: They are **per endpoint family**, not one shared "market" pot.  One bucket for
+#: ticker+depth+trades+kline meant a single trade page (~82 req/min at the
+#: documented cadence: depth/trades every 2s, account/orders every 3s, klines
+#: every 5s) put four tabs at 328/min against a 300/min ceiling, so ordinary
+#: polling got 429s (measured: 28) while the page did nothing wrong.  A family's
+#: budget now only has to cover its own traffic (4 tabs ≈ 120/min for the
+#: busiest family), and every family is additionally capped in aggregate so the
+#: process-wide fan-out to the exchange is still bounded.  An operator can still
+#: tighten or widen any of them without a redeploy via ``BT_RATE_LIMIT_<NAME>``.
 RATE_WINDOW_SEC = 60.0
 #: Soft cap on tracked callers before stale buckets are pruned.
 RATE_MAX_CALLERS = 512
+
+#: ``group -> (family bucket, aggregate bucket)``.  The aggregate is an extra,
+#: coarser ceiling: it is never the reason legitimate polling fails, it is the
+#: reason a *loop hammering every family at once* still stops.
+RATE_FAMILY = {
+    "audit": "audit",
+    "audit_detail": "audit_detail",
+    "market": "market",
+    "ticker": "ticker",
+    "overview": "overview",
+    "depth": "depth",
+    "trades": "trades",
+    "klines": "klines",
+    "coin": "coin",
+}
+#: The aggregate bucket each family also charges.
+RATE_AGGREGATE = {
+    "audit": "audit",
+    "audit_detail": "audit",
+    "market": "market",
+    "ticker": "market",
+    "overview": "market",
+    "depth": "market",
+    "trades": "market",
+    "klines": "market",
+    "coin": "market",
+}
+
+#: Family budgets (requests per :data:`RATE_WINDOW_SEC` per caller).
+RATE_LIMITS = {
+    "audit": 30,             # one screen/one detail per 2s
+    "audit_detail": 60,
+    "market": 900,           # aggregate ceiling over every cheap read
+    "ticker": 300,
+    "overview": 240,
+    "depth": 300,
+    "trades": 300,
+    "klines": 240,
+    "coin": 240,
+}
+
+
+def _env_limit(name: str, default: int) -> int:
+    """Per-family override (``BT_RATE_LIMIT_DEPTH=120``); 0/negative means the
+    built-in default, and a malformed value is ignored rather than fatal."""
+    raw = os.environ.get(f"BT_RATE_LIMIT_{name.upper()}")
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+RATE_LIMITS = {name: _env_limit(name, limit) for name, limit in RATE_LIMITS.items()}
 
 #: (group, caller) -> list of request timestamps inside the window.
 _rate_hits: dict[tuple[str, str], list[float]] = {}
@@ -77,25 +143,49 @@ def _prune_rate_hits(now: float) -> None:
         _rate_hits.pop(key, None)
 
 
+def _rate_key(request: Request, bucket: str) -> tuple[str, str]:
+    return (bucket, _rate_caller(request))
+
+
+def _spend_bucket(request: Request, bucket: str, limit: int, now: float,
+                  window: float) -> bool:
+    """Charge one request to ``bucket``; True when the caller is over budget."""
+    key = _rate_key(request, bucket)
+    hits = [t for t in _rate_hits.get(key, []) if now - t < window]
+    if len(hits) >= limit:
+        _rate_hits[key] = hits
+        return True
+    hits.append(now)
+    _rate_hits[key] = hits
+    return False
+
+
 def check_rate_limit(request: Request, group: str, limit: int = None,
                      window: float = None):
     """Record one hit; return a 429 ``JSONResponse`` once the budget is spent.
 
     Returns ``None`` when the caller is still inside its budget, so handlers can
     keep the ``if err := ...: return err`` shape used by the auth helpers.
+
+    Two buckets are charged: the endpoint's own family (see :data:`RATE_FAMILY`)
+    and that family's aggregate.  An explicit ``limit`` keeps the old single-bucket
+    behaviour for direct callers.
     """
+    group = group if group in RATE_LIMITS or limit is not None else "market"
     limit = RATE_LIMITS.get(group, 60) if limit is None else limit
     window = RATE_WINDOW_SEC if window is None else window
     now = time.time()
-    key = (group, _rate_caller(request))
-    hits = [t for t in _rate_hits.get(key, []) if now - t < window]
-    if len(hits) >= limit:
-        _rate_hits[key] = hits
+    if _spend_bucket(request, group, limit, now, window):
         return JSONResponse(
             {"error": f"Too many requests for '{group}', retry in a minute"},
             status_code=429)
-    hits.append(now)
-    _rate_hits[key] = hits
+    aggregate = RATE_AGGREGATE.get(group)
+    if aggregate and aggregate != group:
+        budget = RATE_LIMITS.get(aggregate, 60)
+        if _spend_bucket(request, aggregate, budget, now, window):
+            return JSONResponse(
+                {"error": f"Too many requests for '{group}', retry in a minute"},
+                status_code=429)
     _prune_rate_hits(now)
     return None
 
@@ -202,16 +292,24 @@ def register(app: FastAPI, ctx) -> None:
         call costs five upstream requests, so repeating it in a loop used to be
         an uncached fan-out.
         """
-        if err := check_rate_limit(request, "audit"):
-            return err
         symbol = (symbol or "").strip().upper()
         if symbol == "SCREEN":
             # Defensive: /api/audit/screen is registered first, but this route
             # must never be able to interpret the literal path as a token.
             return JSONResponse({"error": "invalid symbol 'SCREEN'"}, status_code=400)
-        if not symbol or not symbol.replace("-", "").isalnum() or len(symbol) > 24:
+        canonical = valid_symbol(symbol)
+        if canonical is None:
+            # Shape first, *before* the rate budget and before any upstream call:
+            # a malformed symbol used to cost the caller budget and (for a lucky
+            # shape) an upstream crawl, and it still keyed a cache entry.
             return JSONResponse({"error": f"invalid symbol '{symbol}'"},
                                 status_code=400)
+        symbol = canonical
+        # The detail read is one symbol (a cached, bounded fan-out), so it gets a
+        # slightly larger family budget than the whole-market screen while still
+        # charging the same aggregate.
+        if err := check_rate_limit(request, "audit_detail"):
+            return err
         interval = (interval or "1h").strip()
         if interval not in ("1h", "4h", "1d"):
             return JSONResponse(

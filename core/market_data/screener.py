@@ -42,6 +42,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time
+from collections import OrderedDict
 from statistics import median
 from typing import Any, Awaitable, Callable, Iterable, Optional
 
@@ -72,6 +73,14 @@ RETRY_DELAY = 0.4
 #: Sampling bounds for the screen endpoint.
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 200
+
+#: Bounds on the screen/detail caches.  The detail key carries a caller-supplied
+#: symbol, so without an eviction policy 50 distinct `/api/audit/{symbol}` calls
+#: left 52 entries for ever and the map was caller-controlled.  The working set is
+#: ``ladder × limits × sorts × intervals`` for the screen plus the symbols an
+#: operator actually looked at, so these are far above any legitimate use.
+MAX_CACHE_ENTRIES = 256
+MAX_CACHE_LOCKS = 128
 
 #: Neutral defaults for optional inputs.
 DEFAULT_MIN_QUOTE_VOLUME = 100_000.0
@@ -677,8 +686,11 @@ class TokenScreener:
         self.concurrency = max(1, int(concurrency))
         self._now = now
         self._fetch_impl = fetch or self._default_fetch
-        self._cache: dict[tuple, tuple[float, dict]] = {}
-        self._locks: dict[tuple, asyncio.Lock] = {}
+        #: LRU-ordered so a caller-supplied key space cannot grow them for ever.
+        self._cache: "OrderedDict[tuple, tuple[float, dict]]" = OrderedDict()
+        self._locks: "OrderedDict[tuple, asyncio.Lock]" = OrderedDict()
+        self.max_cache_entries = MAX_CACHE_ENTRIES
+        self.max_cache_locks = MAX_CACHE_LOCKS
         #: diagnostics for tests / operators (cache hits, upstream calls)
         self.stats = {"upstream_calls": 0, "cache_hits": 0, "cache_misses": 0,
                       "screens": 0, "errors": 0, "retries": 0}
@@ -708,6 +720,53 @@ class TokenScreener:
                   interval: str) -> tuple:
         return (int(limit), float(min_quote_volume), str(sort), str(interval))
 
+    def _cache_read(self, key: tuple) -> Optional[dict]:
+        """Return a still-fresh cached payload (marking it as such), else None."""
+        cached = self._cache.get(key)
+        if cached is None or (self._now() - cached[0]) >= self.cache_ttl:
+            return None
+        self._cache.move_to_end(key)      # LRU: a read is a use
+        payload = dict(cached[1])
+        payload["cached"] = True
+        return payload
+
+    def _cache_write(self, key: tuple, payload: dict) -> None:
+        """Store a payload and keep the map bounded (oldest entry out)."""
+        self._cache[key] = (self._now(), payload)
+        self._cache.move_to_end(key)
+        while len(self._cache) > self.max_cache_entries:
+            self._cache.popitem(last=False)
+
+    def _cache_lock(self, key: tuple) -> asyncio.Lock:
+        """The lock de-duplicating one key's in-flight upstream crawl.
+
+        Cached here only for the duration of that crawl, so it is dropped again in
+        the ``finally`` of the callers: 50 distinct detail keys used to leave 50
+        locks behind whether or not the fetch succeeded.
+        """
+        lock = self._locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[key] = lock
+            self._locks.move_to_end(key)
+            self._prune_cache_locks()
+        return lock
+
+    def _prune_cache_locks(self) -> None:
+        if len(self._locks) <= self.max_cache_locks:
+            return
+        for stale in [k for k, lock in self._locks.items() if not lock.locked()]:
+            self._locks.pop(stale, None)
+            if len(self._locks) <= self.max_cache_locks:
+                return
+        while len(self._locks) > self.max_cache_locks:
+            self._locks.popitem(last=False)
+
+    def _drop_cache_lock(self, key: tuple) -> None:
+        lock = self._locks.get(key)
+        if lock is not None and not lock.locked():
+            self._locks.pop(key, None)
+
     # ---- public surface --------------------------------------------------
     async def screen(self, limit: int = DEFAULT_LIMIT,
                      min_quote_volume: float = DEFAULT_MIN_QUOTE_VOLUME,
@@ -720,30 +779,29 @@ class TokenScreener:
         interval = interval or "1h"
 
         key = self.cache_key(limit, min_quote_volume, sort, interval)
-        cached = self._cache.get(key)
-        if cached is not None and (self._now() - cached[0]) < self.cache_ttl:
+        cached = self._cache_read(key)
+        if cached is not None:
             self.stats["cache_hits"] += 1
-            payload = dict(cached[1])
-            payload["cached"] = True
-            return payload
+            return cached
         self.stats["cache_misses"] += 1
 
-        lock = self._locks.setdefault(key, asyncio.Lock())
-        async with lock:
-            # Another request may have filled the cache while we waited.
-            cached = self._cache.get(key)
-            if cached is not None and (self._now() - cached[0]) < self.cache_ttl:
-                self.stats["cache_hits"] += 1
-                payload = dict(cached[1])
-                payload["cached"] = True
-                return payload
+        lock = self._cache_lock(key)
+        try:
+            async with lock:
+                # Another request may have filled the cache while we waited.
+                cached = self._cache_read(key)
+                if cached is not None:
+                    self.stats["cache_hits"] += 1
+                    return cached
 
-            payload = await self._run_screen(limit, min_quote_volume, sort, interval)
-            self._cache[key] = (self._now(), payload)
-            self.stats["screens"] += 1
-            out = dict(payload)
-            out["cached"] = False
-            return out
+                payload = await self._run_screen(limit, min_quote_volume, sort, interval)
+                self._cache_write(key, payload)
+                self.stats["screens"] += 1
+                out = dict(payload)
+                out["cached"] = False
+                return out
+        finally:
+            self._drop_cache_lock(key)
 
     async def detail(self, symbol: str, interval: str = "1h") -> dict:
         """Full audit detail for one symbol (cached ~5min, like the screen).
@@ -754,29 +812,28 @@ class TokenScreener:
         discipline as :meth:`screen` now applies, keyed by ``(symbol, interval)``.
         """
         key = ("detail", str(symbol), str(interval or "1h"))
-        cached = self._cache.get(key)
-        if cached is not None and (self._now() - cached[0]) < self.cache_ttl:
+        cached = self._cache_read(key)
+        if cached is not None:
             self.stats["cache_hits"] += 1
-            payload = dict(cached[1])
-            payload["cached"] = True
-            return payload
+            return cached
         self.stats["cache_misses"] += 1
 
-        lock = self._locks.setdefault(key, asyncio.Lock())
-        async with lock:
-            # Another request may have filled the cache while we waited.
-            cached = self._cache.get(key)
-            if cached is not None and (self._now() - cached[0]) < self.cache_ttl:
-                self.stats["cache_hits"] += 1
-                payload = dict(cached[1])
-                payload["cached"] = True
-                return payload
+        lock = self._cache_lock(key)
+        try:
+            async with lock:
+                # Another request may have filled the cache while we waited.
+                cached = self._cache_read(key)
+                if cached is not None:
+                    self.stats["cache_hits"] += 1
+                    return cached
 
-            payload = await self._enrich(symbol, interval)
-            self._cache[key] = (self._now(), payload)
-            out = dict(payload)
-            out["cached"] = False
-            return out
+                payload = await self._enrich(symbol, interval)
+                self._cache_write(key, payload)
+                out = dict(payload)
+                out["cached"] = False
+                return out
+        finally:
+            self._drop_cache_lock(key)
 
     # ---- internals -------------------------------------------------------
     async def _run_screen(self, limit: int, min_quote_volume: float, sort: str,
@@ -939,6 +996,41 @@ def normalize_min_quote_volume(value: Any) -> float:
         else:
             break
     return bucket
+
+
+#: A USDT spot pair: letters/digits, optionally hyphenated, ending in the quote.
+SYMBOL_MIN_LEN = 4
+SYMBOL_MAX_LEN = 24
+
+
+def valid_symbol(symbol: Any) -> Optional[str]:
+    """Return the canonical ``SYMBOL`` when the shape is a USDT pair, else ``None``.
+
+    The symbol is part of a cache key (``/api/audit/{symbol}``, ``/api/coin/{symbol}``)
+    and of every upstream path, so an unvalidated value is a caller-controlled key
+    space *and* an SSRF-ish path component.  The shape checked here is the one the
+    contract documents — uppercase letters/digits, an optional hyphen (Binance
+    tolerates ``BTC-USDT``), 4..24 characters, quoted in USDT, non-empty base.
+    Membership of the exchange universe is checked separately (it needs a fetch).
+    """
+    text = str(symbol or "").strip().upper()
+    if not (SYMBOL_MIN_LEN <= len(text) <= SYMBOL_MAX_LEN):
+        return None
+    if not (text.replace("-", "").isalnum() and text.replace("-", "").isascii()):
+        return None
+    if "-" in text:
+        base, _, quote = text.partition("-")
+        if not base or not base.isalnum():
+            return None
+        if quote != USDT:
+            return None
+    else:
+        base = text[: -len(USDT)]
+        if not base:
+            return None
+        if not text.endswith(USDT):
+            return None
+    return text
 
 
 def _base_metrics(symbol: str, ticker: dict) -> dict:

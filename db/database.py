@@ -862,33 +862,72 @@ async def load_sim_balance(db_path: str = None) -> float:
             await db.close()
 
 
-async def save_sim_balance(balance: float, db_path: str = None):
-    """Persist sim balance to ``system_config`` atomically.
+async def save_sim_balance(balance: float, db_path: str = None,
+                           expected: float = None) -> float:
+    """Persist the sim balance to ``system_config`` atomically.
 
-    Uses the same ``BEGIN IMMEDIATE`` + shared-lock path as
-    :func:`atomic_adjust_balance`: the previous bare ``INSERT OR REPLACE``
-    autocommitted on its own, so a concurrent ``atomic_adjust_balance`` (an
-    engine open/close) could interleave with it and the *stale* absolute value
-    won — silently reverting a real fill's cash movement.
+    Two contracts, one writer:
+
+    * **Reset** (``expected is None``) — the absolute value IS the state change.
+      This is what ``/api/settings/reset-sim`` means by "restore 10000": it runs
+      inside the executor's trade gate, so nothing is in flight to overwrite.
+    * **Guarded write** (``expected`` given) — compare-and-set on the value the
+      caller last read.  The lock alone fixed *interleaving* but not *staleness*:
+      a caller that read the balance before a fill could hand the lock back an
+      older absolute number and silently revert that fill's cash movement.  With
+      ``expected`` the write only lands when the stored value is still the one
+      the caller based its number on; otherwise the current value is returned
+      unchanged and the caller must re-read.  ``expected=None`` therefore means
+      "unconditional, reset use only" — use :func:`save_sim_balance_guarded`
+      (or pass ``expected``) for anything derived from a previous read.
+
+    Returns the value now stored (which differs from ``balance`` when a guarded
+    write lost the race).
     """
     path = db_path or DB_PATH
     if not path:
-        return
+        return balance
     async with balance_lock():
         db = await aiosqlite.connect(path)
         try:
+            db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT value FROM system_config WHERE key='sim_balance'")
+            row = await cursor.fetchone()
+            current = float(row["value"]) if row else DEFAULT_BALANCE
+            if expected is not None and abs(current - float(expected)) > 1e-9:
+                # Someone moved the balance after this caller read it: refuse to
+                # revert them and report what is really stored.
+                await db.rollback()
+                logger.warning(
+                    f"save_sim_balance refused a stale write: expected "
+                    f"{float(expected)!r}, stored {current!r} — keeping {current!r}")
+                return current
             await db.execute(
                 "INSERT OR REPLACE INTO system_config (key, value, category) "
                 "VALUES ('sim_balance', ?, 'trading')",
                 (str(balance),))
             await db.commit()
+            return float(balance)
         except Exception as e:
             await db.rollback()
             logger.warning(f"Failed to save sim balance: {e}")
             raise
         finally:
             await db.close()
+
+
+async def save_sim_balance_guarded(balance: float, previous: float,
+                                   db_path: str = None) -> float:
+    """Compare-and-set variant: write ``balance`` only while the stored value is
+    still ``previous`` (the value the caller read before computing it).
+
+    Use this for anything derived from a previous read (a startup repair, an
+    admin form posting a new balance); callers that mean "this absolute value IS
+    the new state" (a full reset) use :func:`save_sim_balance` instead.
+    """
+    return await save_sim_balance(balance, db_path, expected=previous)
 
 
 async def atomic_adjust_balance(delta: float, db_path: str = None) -> float:
