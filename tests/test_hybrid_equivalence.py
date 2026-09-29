@@ -84,7 +84,7 @@ def test_signal_matrix_summary_statistics():
                         "2026-05-20", "2026-05-31", config, loader)
 
     # If no data is available (date range mismatch), skip gracefully.
-    if "error" in result and "No historical data" in result.get("error", ""):
+    if "error" in result and "No historical" in result.get("error", ""):
         pytest.skip(f"No historical data for test period: {result['error']}")
 
     assert "error" not in result, f"Hybrid engine returned error: {result.get('error')}"

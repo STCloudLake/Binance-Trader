@@ -148,9 +148,6 @@ def register(app: FastAPI, ctx) -> None:
                 "live_price": live_price, "pnl": pnl,
                 "position_type": pos.get("position_type", "satellite"),
             })
-        if rest_client:
-            try: await rest_client.close_connection()
-            except Exception: pass
         return _render("partials/positions_table.html", {"request": None, "positions": pos_list})
 
     @app.post("/api/trade/close/{symbol}")
