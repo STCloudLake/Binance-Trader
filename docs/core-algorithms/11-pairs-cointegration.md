@@ -210,7 +210,7 @@ Kalman β 的漂移（首尾各 10% 均值之差 / 平均 |β|）为 0.061–0.3
 
 ### 盘口/微观结构（Tsay 第 5 章）
 
-`core/market_data/microstructure.py`，测试 `tests/test_microstructure.py`（19 条）。
+`core/market_data/microstructure.py`，测试 `tests/test_microstructure.py`（20 条）。
 特征：`ofi_depth`（盘口买卖量不平衡）、`ofi_depth_weighted`（按距离衰减，半衰点 5 bp）、
 `ofi_trades`（主动方成交量不平衡）、`microprice` / `microprice_dev_bps`、`spread_bps`、
 `book_slope_ratio`、成交笔/量/大单占比、`rv_trade`（按成交价、每 10 笔采样）、

@@ -12,6 +12,14 @@ from core.risk.position_sizer import PositionSizer
 #: Bars kept per ``(symbol, interval)`` from live ``MARKET_KLINE`` events.  The
 #: estimator's own default window is 500 (``risk.vol_targeting.window``); 600
 #: leaves headroom without keeping a second history in memory.
+#:
+#: Coverage limit (stated, not fixed): the live forecast path only ever sees the
+#: **last 600 bars**, so its splice guard can only refuse a hole inside that
+#: window — a hole or splice further back in the parquet is invisible to it.  A
+#: hole at −100 or −300 *is* refused (it lands in the tail); one at −900 is not.
+#: The whole-file check is ``scripts/check_data_integrity.py``; the reconstructed
+#: whole-file form is asserted in
+#: ``tests/test_residual_closure.py::test_live_file_bar_key_shape_matches_the_reporter``.
 _VOL_HISTORY_BARS = 600
 #: How long a resolved forecast is reused (seconds).  A signal arrives many times
 #: per bar (every tick rebuilds the frame), so the estimate must not be recomputed
@@ -20,12 +28,21 @@ _VOL_CACHE_TTL_SEC = 300.0
 #: Interval used when a signal records no timeframe (matches PositionGuard).
 _DEFAULT_VOL_INTERVAL = "1h"
 #: A series is refused as *spliced* when a calendar gap exceeds this many bar
-#: lengths (see ``scripts/check_data_integrity.py``).  Measured reason: the
-#: shipped ``BTCUSDT/1h`` cache jumps 2026-07-29 → 2026-09-29 inside one "bar"
-#: (+27.63 % log return), and an un-clipped RiskMetrics recursion then reports
-#: 5.31 %/bar instead of 0.52 %/bar — a 10.1x overstatement that would shrink
-#: every vol-targeted position by that factor.  Refusing the forecast falls back
-#: to the fixed fraction, which is the pre-P3 behaviour.
+#: lengths (see ``scripts/check_data_integrity.py``).
+#:
+#: **Historical (no longer present in the live file).**  This bound was chosen
+#: because the shipped ``BTCUSDT/1h`` cache then jumped 2026-07-29 → 2026-09-29
+#: inside one "bar" (+27.63 % log return): an un-clipped RiskMetrics recursion
+#: reported 5.31 %/bar instead of 0.52 %/bar, a 10.1x overstatement that would
+#: have shrunk every vol-targeted position by that factor.  Re-measured at
+#: ``1a452ce`` the live ``BTCUSDT/1h.parquet`` has **no such splice**: raw max
+#: adjacent step is 1.0 h and the clipped figure equals the unclipped one
+#: (0.3003 %/bar, 1.00x) because the file's close-convention tail row is gone.
+#: The +27.63 % / 5.31 % / 10.1x numbers, and the 1.99997 h close-convention tail
+#: step, are properties of the *old* file contents; the guard and the 10.1x
+#: overstatement mechanism remain real, and are pinned on reconstructed frames
+#: (``tests/test_gap_fixes.py``, ``tests/test_residual_closure.py``).  Refusing
+#: the forecast falls back to the fixed fraction, which is the pre-P3 behaviour.
 _VOL_MAX_GAP_BARS = 1.5
 
 #: Bar length in hours, for the splice guard only (unknown interval → no guard).

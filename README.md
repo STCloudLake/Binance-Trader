@@ -2,7 +2,7 @@
 
 面向币安现货的 Python 3.12 自动化交易系统。以 asyncio 事件总线为骨架，把**行情 → 策略信号 → 风控 → 下单 → 持仓守护**串成一条可观测的流水线；行情来自币安主网公开镜像、下单走 testnet；配套一个 FastAPI + aiosqlite + ECharts 的 Web 控制台（现货交易页、全币种行情、币种信息、市场数据总览、代币启发式筛查、策略监控、回测/GA、AI 面板、预警中心、设置、DB 管理）。模拟盘带真实成本模型（手续费分档 + 盘口半价差 + 滑点），账本恒等式有专门的回归测试守护；回测有 legacy 与 hybrid 两套引擎，共用同一个评估内核，并有逐笔等价门禁。
 
-> **状态**: `VERSION` **2.0.1** · 本 README 核对于 **2026-09-30** · 测试 **1067 passed, 0 failed**（`221s`，详见 [§10 测试](#10-测试与质量)；干净克隆另见 §10.1 的前提说明）
+> **状态**: `VERSION` **2.0.1** · 本 README 核对于 **2026-09-30** · 测试 **1070 passed, 0 failed**（见 [§10 测试](#10-测试与质量)；干净克隆另见 §10.1 的前提说明）
 > **文档索引**：详细变更史见 [`docs/overhaul/CHANGELOG.md`](docs/overhaul/CHANGELOG.md)；本 README 只陈述**当前代码事实**，与陈旧描述冲突时**以代码为准**（见 [§11.3](#113-残余耦合与陈旧之处当前审计清单)）
 > **运行环境**: Python 3.12 · Windows / Linux · 默认只监听 `127.0.0.1:8899`
 > **一句话前提**: 本机 **无法访问 `api.binance.com`**，因此**行情**走 `data-api.binance.vision`（主网公开镜像），**下单**走 `testnet.binance.vision`。见 [§3](#3-关键环境约束必读)。
@@ -787,11 +787,13 @@ python -m pytest tests/ -q -m "not slow"
 
 `pytest.ini`：`testpaths=tests`、`asyncio_mode=strict`、`markers=slow`、忽略 DeprecationWarning。**没有安装 `pytest-timeout`**，所以 `--timeout=` 会直接报参数错误。
 
-**收集数：1067 项**（核验时快照），**一次完整运行的结果**：
+**收集数：1070 项**（`python -m pytest tests/ --collect-only -q -p no:cacheprovider` 末行，本轮核验快照），**一次完整运行的结果**：
 
 ```
-1067 passed, 4 warnings in 220.71s (0:03:40)
+1070 passed, 4 warnings in 221.15s (0:03:41)
 ```
+
+本轮连续跑了 **3** 次全绿（`221.15 s` / `220.94 s` / `218.41 s`，退出码均 0），其中最后一次是在**运行中的实盘进程重写了 `data/market/XRPUSDT/1m.parquet` 之后**（该文件 18:16:08 被改写，其 20 根 1m 窗口的成交额从 2 395 029.65 变为 **227.03** USDT —— 参与度上限从 23 950 掉到 2.27），套件仍为 `1070 passed`。
 
 全部通过（0 failed）。`tests/` 里 68 个 `.py`（含 `__init__.py` 与 `conftest.py`，即 66 个 `test_*.py`）。核验期间仓库仍在被并行改动（本 README 只保证数字来自核验当次运行），但**没有任何已知失败用例**：曾经的 `tests/test_database.py::test_init_database_creates_tables`（它要求 v4 迁移**已经故意删除**的 `orders` 表存在）断言已修正，现在校验 `pending_orders`/`positions` 等真实表；`orders` 表在全仓库（代码、允许表清单、`reset-sim` 语句）里已无残留引用。曾被记录为"跟随 `test_ledger_invariant.py` 之后会失败"的 `test_money_concurrency.py::test_concurrent_opens_of_different_symbols_still_run_in_parallel` **在完整串行运行里通过**（`tests/conftest.py` 的 autouse fixture 在每个用例后还原进程级 `db.database.DB_PATH`，消除了跨文件状态污染）。
 
@@ -801,21 +803,23 @@ python -m pytest tests/ -q -m "not slow"
 
 | 副本状态 | 实测结果 | 失败集合 |
 |---|---|---|
-| **完全无 `data/`**（真·干净克隆） | `7 failed, 1016 passed, 44 skipped in 199.13s` | 全部 7 个都是 `tests/test_engine_parity_variants.py` 的真实数据变体 |
-| 有 `data/`（models/backtest 等）但**无 `data/market/`** | `8 failed, 1016 passed, 43 skipped in 198.55s` | 上述 7 个 + `tests/test_microstructure.py::test_live_snapshot_is_optional_and_correct_when_available`（**该用例单独运行时通过**，本轮只在整跑中出现，属顺序相关，不计入"无数据必然失败"集合） |
+| **完全无 `data/`**（真·干净克隆，本轮复测于当前 revision） | `7 failed, 1018 passed, 44 skipped in 203.54s` | 全部 7 个都是 `tests/test_engine_parity_variants.py` 的真实数据变体 |
+| 有 `data/`（models/backtest 等）但**无 `data/market/`** | 同上 7 个（此前该行记的 `8 failed` 含下面那个已消失的用例） | 上述 7 个。**该行曾把 `tests/test_microstructure.py::test_live_snapshot_is_optional_and_correct_when_available` 列为第 8 个失败**：那是旧版本在整跑里**真实抓取**币安盘口/成交时才会遇到的**实时行情时序**抖动（同文件的 docstring 记录：40 次单独实时抓取中有 3 次 `arrival_rate_hz == 0.0`，样例丢弃 3/90/100 笔；与执行顺序无关，README 此处原写的"顺序相关"是错的），不是"无数据"造成的。该用例现已改为**只用测试内构造的 Binance 形状快照**（不碰网络，`test_microstructure.py` 的 20 项全部如此）；本轮实测：把该文件单独放进一个**没有 `data/`** 的副本里运行 → `20 passed in 0.14s`，不再出现在任何无数据失败集合中 |
+
+> 上表两次测量的确切口径：本轮把源码树整份复制到一个**没有 `data/`、也没有 `.git`** 的临时目录（`PYTHONPATH` 指向源码树），全量一次得到 `7 failed, 1018 passed, 44 skipped in 203.54s`；7 个失败与历史记录完全一致。该副本里另有一次失败 `tests/test_reaudit_fixes.py::test_evidence_index_is_repinned_to_the_current_revision`，它是**环境产物**（该用例 `subprocess.run(["git", "rev-parse", "HEAD"])`，而副本没有 `.git`），在仓库内单跑为 `1 passed in 0.58s`，故不计入。"有 `data/` 但无 `data/market/`"一列未在本轮重跑，沿用同一失败集合（多出的 `data/models` 等不改变这 7 个用例的输入）。
 
 失败全部是"没有缓存历史"这一类，错误文本是那段唯一的 canonical 文案 `NO_MARKET_DATA_MESSAGE`（`core/backtest/signal_matrix.py:22-26`，legacy / hybrid / signal-matrix 三条路径共用同一句）：`No historical market data found for the selected symbols and date range. Download candles first with ...`；底层也会出现 `No timestamps found in data feeder`（见 `core/backtest/signal_matrix.py` 里对它的注释）：
 
 - `tests/test_engine_parity_variants.py` 的 **7** 个真实数据变体：`test_parity_multi_timeframe_strategies`、`test_parity_multi_timeframe_single_strategy`、`test_parity_multi_timeframe_with_isolation`、`test_parity_shared_indicator_config_different_timeframes`、`test_parity_risk_exit_overrides`、`test_parity_risk_only_exits`、`test_parity_per_strategy_isolation`——它们用 `DATE_START/DATE_END = 2026-05-25/2026-05-31` 与 `SYMBOLS = ["BTCUSDT", "ETHUSDT"]`；
 - `tests/test_hybrid_equivalence.py::test_signal_matrix_summary_statistics` 在无缓存时走 **skip** 路径（`tests/test_hybrid_equivalence.py:88`，同一句 `NO_MARKET_DATA_MESSAGE`），因此它在上面两次整跑里都不是失败；另 1 个 skipped 是 `tests/test_hybrid_equivalence.py:179`（"No trades in either engine -- not enough data variation"）。
 
-同一文件里不受影响的用例：`test_engine_parity_variants.py::test_parity_uses_synthetic_market_without_cached_data`（自己往临时目录写合成 parquet）与 `::test_reduce_conditions_route_to_legacy`，以及 `test_hybrid_equivalence.py::test_no_lookahead_bias`。下好历史后重跑即全绿（**1067 passed**）：
+同一文件里不受影响的用例：`test_engine_parity_variants.py::test_parity_uses_synthetic_market_without_cached_data`（自己往临时目录写合成 parquet）与 `::test_reduce_conditions_route_to_legacy`，以及 `test_hybrid_equivalence.py::test_no_lookahead_bias`。下好历史后重跑即全绿（**1070 passed**）：
 
 ```bash
 python scripts/download_history.py --symbols BTCUSDT,ETHUSDT --intervals 1h --start 2026-05-25 --end 2026-05-31
 ```
 
-> 因此：**上面的"全绿"数字都附带隐含前提——本机 `data/market/` 里已经有对应区间的缓存**。CI 或新机器上请在跑测试前先下历史，或接受那 7 个（真·干净克隆）/ 8 个（有 `data/` 但无 `data/market/`）失败。
+> 因此：**上面的"全绿"数字都附带隐含前提——本机 `data/market/` 里已经有对应区间的缓存**。CI 或新机器上请在跑测试前先下历史，或接受那 7 个（真·干净克隆）/ 7 个（有 `data/` 但无 `data/market/`，本轮起不再有第 8 个）失败。
 
 ### 10.2 重点回归套件
 
@@ -886,7 +890,7 @@ python -m compileall -q app core web db scripts alerts     # 语法完整性
 - 没有 CSRF token；没有 HTTPS；没有**谁改了什么**这类操作审计日志（`ledger_reconciliation` 只记录账本修复，见 [§9.4.1](#941-ledger_reconciliation-审计表)）；没有自动对账任务；没有多用户级别的自选列表（自选是全局的）；派生的交互式 OpenAPI 文档页被显式关掉（`docs_url=None, redoc_url=None`，所以 `/docs`、`/redoc` 是 404——但 `/openapi.json` 仍然可访问）。
 - **干净克隆里没有历史数据，也没有策略。** `data/` 与 `strategies/` 的全部内容都在 `.gitignore` 里，`git ls-files strategies/` 输出为空：
   - **策略数为 0**：`GET /api/strategy-monitor` → `{"strategies": [], "active_count": 0, "total_count": 0}`；`POST /api/backtest/run` 用任何内置名字（如 `rsi_reversal`）都会在引擎层返回 `Strategy 'rsi_reversal' not found: Strategy file not found: …`。必须先自己写 `strategies/*.yaml`（schema 见 `core/strategy/loader.py::StrategyConfig`）。仓库**不附带示例策略**。
-  - **回测/等价性测试无数据可用**：干净克隆跑全量测试会得到 `7 failed, 1016 passed, 44 skipped`（详见 [§10.1](#101-怎么跑)），历史要自己用 `scripts/download_history.py` 下。
+  - **回测/等价性测试无数据可用**：干净克隆跑全量测试会得到 `7 failed, 1018 passed, 44 skipped`（详见 [§10.1](#101-怎么跑)），历史要自己用 `scripts/download_history.py` 下。
 
 ---
 
@@ -966,7 +970,7 @@ python -m app.main --mode sim --port 8900
 
 ### 下一步（按价值排序）
 
-1. **配置/审计卫生**：~~清掉 `db_manager.py`、`pages.py`、`settings.py` 里对已删除 `orders` 表的引用；修 `tests/test_database.py` 的陈旧断言。~~ **已完成**：三处 `orders` 引用与陈旧断言均已清理，套件 **1067 passed / 0 failed**（见 [§10.1](#101-怎么跑)）。
+1. **配置/审计卫生**：~~清掉 `db_manager.py`、`pages.py`、`settings.py` 里对已删除 `orders` 表的引用；修 `tests/test_database.py` 的陈旧断言。~~ **已完成**：三处 `orders` 引用与陈旧断言均已清理，套件 **1070 passed / 0 failed**（见 [§10.1](#101-怎么跑)）。
 2. **统一价差兜底**：让回测的 `default_spread_pct`（0.03）与 sim 盘的 `default`（0.02）取同一个常量，消除口径分歧。
 3. **拆掉 hybrid 的价差临时改写**：给 `run_hybrid` 传一个显式的 `spread_pct` 参数，不再副作用式改 `config`。
 4. **授权依赖化**：把 `_require_trader` / `_require_admin` 从 handler 内联改成 FastAPI 依赖（`HTTPException(403)`），并补 CSRF token。

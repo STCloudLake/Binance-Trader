@@ -51,6 +51,11 @@ def _read(path: Path):
     return pd.read_parquet(path)
 
 
+def _frame(volumes, closes):
+    """A minimal synthetic frame: the only columns the capacity helpers read."""
+    return pd.DataFrame({"volume": volumes, "close": closes})
+
+
 # ── 1. the helper module ────────────────────────────────────────────────
 
 def test_recent_quote_volume_uses_tail_window_and_real_prices():
@@ -222,14 +227,19 @@ def test_helper_call_cost_is_bounded():
 
 
 def test_real_data_capacity_table():
-    """Measured participation/cap on the shipped cache — the doc's §3 table.
+    """The cap rule on the shipped cache — derived, branch-complete, the doc's §3.
 
     Every expectation is **derived from the same frame the test just read**, so a
     cache repair or a new bar cannot fail the test while the code is correct (the
     policy in ``tests/test_measured_threshold_policy.py``).  BTC 1h is deep: even
-    50 000 USDT is far under a 1 % ceiling.  XRP 1m is the capacity-limited case:
-    each order's share of the window is derived below.  The doc quotes one
-    measured snapshot together with the command that printed it.
+    50 000 USDT is far under a 1 % ceiling.  XRP 1m is the capacity-limited case
+    *when the window is shallow enough* — that premise is a mutable fact of the
+    live file, so it is not pinned: the measured window picks the branch and the
+    binding branch is asserted from the very numbers in hand
+    (``cap_notional`` returns ``notional`` iff ``notional <= window * pct/100``).
+    Both branches are pinned on synthetic frames with a **fixed** window in
+    :func:`test_cap_rule_holds_for_a_shallow_and_a_deep_window`.  The doc quotes
+    one measured snapshot together with the command that printed it.
     """
     from core.risk.liquidity import (cap_notional, impact_pct,
                                      participation_pct, recent_quote_volume)
@@ -256,14 +266,49 @@ def test_real_data_capacity_table():
     allowed_50k, reason_50k = cap_notional(50_000.0, xrp_vol, 1.0)
     if participation_pct(500.0, xrp_vol) <= 1.0:
         assert allowed_500 == 500.0 and reason_500.startswith("ok:")
-    # 50 000 USDT is > 1 % of this minute window on the shipped cache → shrunk
-    # to exactly the ceiling, so the capped participation lands ON the ceiling.
-    assert 50_000.0 > xrp_vol / 100.0, (
-        "cache changed: 50 000 USDT is now under 1 % of the XRP 1m window — "
-        "the 'capped' half of this test no longer has an input")
-    assert allowed_50k == pytest.approx(xrp_vol / 100.0)
-    assert allowed_50k < 50_000.0 and reason_50k.startswith("capped:")
-    assert participation_pct(allowed_50k, xrp_vol) == pytest.approx(1.0, rel=1e-9)
+    # Which branch 50 000 USDT falls in is a property of *this* window, not of
+    # the code: a live app rewrite can flip it (measured 1.88 M → 6.30 M → 2.80 M
+    # USDT across one audit), so the assertion is the rule evaluated on the
+    # window just read.  Both branches are exercised deterministically below.
+    ceiling = xrp_vol * 1.0 / 100.0
+    if 50_000.0 > ceiling:
+        # Capped: exactly the ceiling, and participation lands ON the cap.
+        assert allowed_50k == pytest.approx(ceiling)
+        assert allowed_50k < 50_000.0 and reason_50k.startswith("capped:")
+        assert participation_pct(allowed_50k, xrp_vol) == pytest.approx(1.0, rel=1e-9)
+    else:
+        # Deep enough to absorb it: passed through bit-identically.
+        assert allowed_50k == 50_000.0 and reason_50k.startswith("ok:")
+        assert participation_pct(allowed_50k, xrp_vol) <= 1.0
+
+
+def test_cap_rule_holds_for_a_shallow_and_a_deep_window():
+    """The 50 000 USDT input, pinned on **two fixed synthetic windows**.
+
+    The branch a live window falls in moves whenever the running app rewrites
+    ``data/market/**`` (the XRP 1m 20-bar window measured 1 878 291 → 6 298 710.92
+    → 2 801 364.26 USDT inside one audit), so both branches are pinned here on
+    frames the test builds: a 1 000 USDT window where the order is 50× the 1 %
+    ceiling, and a 10 000 000 USDT window where it is 0.5 % of it.  The
+    expectation is the code's own rule — ``cap_notional`` returns the notional
+    unchanged iff ``notional <= window * pct/100`` — so this is a unit test of the
+    rule, not a measurement of a cache.
+    """
+    from core.risk.liquidity import cap_notional, participation_pct
+
+    shallow = _frame([1.0] * 20, [50.0] * 20)      # window = 1 000 USDT
+    deep = _frame([10.0] * 20, [500_000.0] * 20)   # window = 10 000 000 USDT
+    for frame, capped in ((shallow, True), (deep, False)):
+        window = float((frame["close"].tail(20) * frame["volume"].tail(20)).sum())
+        allowed, reason = cap_notional(50_000.0, window, 1.0)
+        if capped:
+            assert 50_000.0 > window / 100.0, (window, reason)
+            assert allowed == pytest.approx(window / 100.0)
+            assert allowed < 50_000.0 and reason.startswith("capped:")
+            assert participation_pct(allowed, window) == pytest.approx(1.0, rel=1e-9)
+        else:
+            assert 50_000.0 <= window / 100.0, (window, reason)
+            assert allowed == 50_000.0 and reason.startswith("ok:")
 
 
 # ── 2. PositionSizer: opt-in, shrink-only, hard caps still authoritative ──

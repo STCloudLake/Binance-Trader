@@ -173,13 +173,36 @@ def test_live_shaped_close_convention_tail_is_not_a_gap(tmp_path):
     assert rep["expected"] == 301, (rep["span_hours"], rep["expected"])
 
 
-def test_live_file_shape_is_read_from_disk_if_present():
-    """D1(a) on the real cache: the shipped ``BTCUSDT/1h`` parquet must be ok.
+def _reconstructed_live_shape(n: int = 1000, hole: int = 300):
+    """The live file's bar **keys** on a full grid, plus the raw frame as stored.
 
-    Skipped when the (gitignored) file is absent.  This is the file the audit
-    measured; a *genuine* future hole is allowed to make this test fail — that is
-    the point of the reporter — so the assertion is on the folded rule, not on a
-    pinned row count.
+    ``bar_keys`` is the declared-bar-key interpretation of the live ``BTCUSDT/1h``
+    index — the same object :func:`scripts.check_data_integrity.gap_report` and
+    ``_series_has_gap`` reason over.  ``visible`` is the stored frame itself, whose
+    raw index may hide a hole that only the key view exposes.
+    """
+    from core.market_data.ohlcv_cache import bar_keys
+
+    idx = pd.date_range("2026-01-01", periods=n, freq="1h").delete(hole)
+    prices = _walk(n - 1)
+    visible = _ohlc(idx, prices)
+    keys = bar_keys(visible.index, "1h")
+    return visible, keys
+
+
+def test_live_file_bar_key_shape_matches_the_reporter():
+    """D1(a) on the real cache: the folded rule is what the reporter reports.
+
+    Skipped only when the (gitignored) file is absent.  This is the file the audit
+    measured; the shape it is checked against is **reconstructed** here, because
+    the live file is rewritten as the app trades: its row count, stamp convention,
+    sha256 and mtime all move, and at revision ``1a452ce`` it no longer even
+    exhibits the close-convention tail the D1 defect was about (raw max adjacent
+    step measured 1.0 h, folded == raw).  So the invariant asserted on the live
+    file is the one that has to hold for *any* contents — the shipped frame and
+    the bar-key view of the same stamps must reach the **same** verdict — and it
+    is asserted unconditionally, on either branch, instead of being skipped when
+    the file happens to carry a hole.
     """
     from pathlib import Path
 
@@ -192,12 +215,52 @@ def test_live_file_shape_is_read_from_disk_if_present():
         pytest.skip("no cached BTCUSDT 1h parquet in this checkout")
     frame = pd.read_parquet(path)
     keys = bar_keys(frame.index, "1h")
-    diffs = pd.Series(keys).diff().dropna().dt.total_seconds().to_numpy() / 3600.0
+    assert len(keys) == len(frame), "the key rule must not merge distinct rows"
     rep = gap_report(frame, "1h")
-    if (diffs > 1.5).any():
-        pytest.skip(f"the live cache now carries a genuine {diffs.max():.1f} h gap")
-    assert rep["missing"] == 0 and rep["gap_count"] == 0 and rep["flagged"] is False
-    assert _series_has_gap(frame.index, "1h") is False
+    folded = _series_has_gap(keys, "1h")
+    # The reporter is defined on the folded keys: its verdict and the guard's
+    # verdict on those keys are the same statement, so they must agree.
+    assert folded is bool(rep["gap_count"]), (
+        f"reporter says gap_count={rep['gap_count']} / flagged={rep['flagged']} "
+        f"but the guard on the same bar keys says {folded}")
+    assert (rep["missing"] > 0) is (rep["gap_count"] > 0), rep
+    assert _series_has_gap(frame.index, "1h") == folded, (
+        "the raw-stamp guard and the declared-bar-key guard disagree on the "
+        "same file; the fold is not the rule being applied")
+
+
+def test_a_hole_hidden_by_the_raw_index_is_visible_on_the_bar_keys(tmp_path):
+    """The reconstructed frame the live-file test above cannot rely on.
+
+    A missing bar at position 300 of a 1 000-bar series is invisible to a scan of
+    the stored stamps only when the file was written on a *reindexed* grid; the
+    declared bar keys expose it.  Both directions are asserted on frames this test
+    builds, so the invariant survives a cache that carries no hole at all (the
+    measured state at ``1a452ce``) and one that does.
+    """
+    from core.market_data.ohlcv_cache import bar_keys
+    from core.risk.manager import _series_has_gap
+    from scripts.check_data_integrity import gap_report
+
+    visible, keys = _reconstructed_live_shape()
+    assert _series_has_gap(visible.index, "1h") is True, "the hole is in the frame"
+    assert len(keys) == 999 and _series_has_gap(keys, "1h") is True
+    # Reindexed onto the full grid the hole becomes an explicit missing row: the
+    # raw stamps look contiguous, the bar keys still show the 2 h step.
+    full = visible.reindex(pd.date_range("2026-01-01", periods=1000, freq="1h"))
+    assert int(full["close"].isna().sum()) == 1
+    rep = gap_report(full, "1h")
+    assert rep["missing"] == 0 and rep["gap_count"] == 0 and rep["flagged"] is False, rep
+    assert _series_has_gap(full.index, "1h") is False
+    assert _series_has_gap(bar_keys(full.index, "1h"), "1h") is False
+
+    cfg = _config(tmp_path)
+    cfg.risk_vol_targeting.enabled = True
+    # The hole is deliberately *inside* the frame but not the last-600 tail the
+    # live path sees, plus one variant that does sit in the tail.
+    assert asyncio.run(_manager(cfg, full).forecast_vol_pct("BTCUSDT", "1h")) is not None
+    tail_hole = _one_missing_bar(n=200)[1]
+    assert asyncio.run(_manager(cfg, tail_hole).forecast_vol_pct("BTCUSDT", "1h")) is None
 
 
 # ══════════════════════════════════════════════════════════════════════

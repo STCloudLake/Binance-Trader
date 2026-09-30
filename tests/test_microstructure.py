@@ -17,7 +17,9 @@ Claims under test:
 driven by a Binance-shaped snapshot built inside the test, so the suite cannot
 depend on connectivity, on the live tape's trade rate, or on the host's clock —
 the three things that used to make this file's last test fail in a full run and
-pass standalone (see that test's docstring).
+pass standalone (see that test's docstring).  The cost of that choice is stated
+there too: the real ``MarketDataClient`` is never exercised end to end by this
+file.
 """
 from __future__ import annotations
 
@@ -343,6 +345,16 @@ async def test_live_snapshot_is_optional_and_correct_when_available():
     to run first, so this was a live-timing dependence, not an ordering one.  The
     absent/degenerate branches are asserted in the next test; here the provider
     answers, so every feature must satisfy the documented contract.
+
+    **Stated limitation: nothing here exercises the real provider end to end.**
+    The whole module is offline by design (see the module docstring) and this
+    rewritten test only feeds the stub client a stored Binance-shaped payload, so
+    the wiring from ``MarketDataClient.get_depth``/``get_recent_trades`` into
+    ``fetch_features`` -- URL, parsing, authentication-free public endpoints -- is
+    not covered by any test in this suite.  That coverage was traded away
+    deliberately: the live-fetch version failed on the host's tape timing, not on
+    the code, and a flaky gate is worse than a documented gap.  Verify that wiring
+    manually (or in a network-enabled check) before trusting a provider change.
     """
     client = _StubClient(_snapshot_book(), _snapshot_trades())
     feats = await fetch_features(client, "BTCUSDT")          # the live-now shape

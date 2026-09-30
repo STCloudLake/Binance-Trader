@@ -19,11 +19,14 @@ flush put the duplicate rows back after a repair had removed them.
 
 A *proximity* rule ("stamps closer than a fraction of the interval are the same
 bar") fixes nothing here and destroys data: the 54 one-millisecond-adjacent pairs
-in that same file are the close of hour ``H-1`` beside the open of hour ``H`` —
-two *different* bars.  A 1 s tolerance would collapse all 54 of those real hours
-while leaving all 55 genuine duplicates in place.  The declared bar length is the
-only sound basis, so :func:`bar_keys` folds on it (the same rule
-``scripts/download_history.py`` already applies on the download path).
+in that same file (a **historical** measurement of revision ``0542e02``) are the
+close of hour ``H-1`` beside the open of hour ``H`` — two *different* bars.  A 1 s
+tolerance would collapse all 54 of those real hours while leaving all 55 genuine
+duplicates in place.  The declared bar length is the only sound basis, so
+:func:`bar_keys` folds on it (the same rule ``scripts/download_history.py``
+already applies on the download path).  Re-measured at ``1a452ce`` the live file
+no longer holds the close-convention rows at all: every adjacent step is exactly
+3 600.0 s, in the raw stamps and in the bar keys alike.
 """
 from __future__ import annotations
 
@@ -275,9 +278,9 @@ def merge_history(existing: pd.DataFrame | None,
     exactly what ``scripts/download_history.py`` promises — and a genuine second
     bar is never collapsed, however close its stamp is (at revision ``0542e02`` the
     live ``1h`` cache held 54 one-millisecond-neighbour pairs, the close of hour
-    ``H-1`` beside the open of hour ``H``: 55 distinct hours; measured at revision
-    ``09125bd`` the file holds **0** such pairs, its closest pair being exactly
-    1 h / 3 600 s apart).
+    ``H-1`` beside the open of hour ``H``: 55 distinct hours; re-measured at
+    revision ``1a452ce`` the file holds **0** such pairs, its closest pair being
+    exactly 1 h / 3 600 s apart and its raw stamps already contiguous).
 
     ``interval=None`` (and labels with no usable grid, e.g. an unknown timeframe)
     keeps the historical exact-timestamp union; :meth:`OHLVCache.save` always

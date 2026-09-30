@@ -111,12 +111,15 @@ def gap_report(df: pd.DataFrame, interval: str,
 
     The timeline is the **declared bar key** (:func:`bar_keys`), not the raw
     stamp: the two timestamp conventions this cache can hold are ``bar_length −``
-    1 ms apart, so differencing raw stamps measured the live
+    1 ms apart, so differencing raw stamps once measured the
     ``data/market/BTCUSDT/1h.parquet`` tail (``…06:00:00`` →
     ``…07:59:59.999``) as a **1.99997 h gap with 1 missing bar** for a series that
     is contiguous on the bar grid (folded: max step 1.0 h, 0 gaps, 0 missing).
-    A genuinely missing bar is a 2.0 h step on the folded keys and is still
-    flagged.
+    That close-convention tail row is **historical**: re-measured at ``1a452ce``
+    the live file's raw max adjacent step is already 1.0 h, so folded and raw
+    agree.  The rule is still the right one for any file that holds both
+    conventions.  A genuinely missing bar is a 2.0 h step on the folded keys and
+    is still flagged.
     """
     out = {
         "bars": int(len(df)), "first": None, "last": None, "span_hours": 0.0,
