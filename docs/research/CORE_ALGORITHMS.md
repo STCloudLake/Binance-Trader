@@ -2,6 +2,7 @@
 
 **Repository**：`E:\Codes\Binance Trader` · **Revision**：`c703b8b`（`git rev-parse HEAD` = `c703b8ba485a5410dba72ea5e0659aade0268276`，测量时刻工作树干净）
 **性质**：研究级公式/算法参考，为个人精读《金融时间序列分析》（Tsay）与 López de Prado 系列而写。
+**P6 补充**：§1–§11 的测量 revision 仍是 `c703b8b`（正文不改）；**§12（量能/资金流, P6-B/C/D）在 `b81094b` 上重测**，两段不混用数字。
 **纪律**：本文每一个数字都来自仓库里的文件或我在本 revision 上跑过的命令，并给出 `file:line`。凡无法验证者一律写 **未验证**，不含任何盈利性声明。
 
 > **写作时的工作树状态（重要）**
@@ -61,6 +62,14 @@
 9. [数据完整性（横切）](#9-数据完整性横切-data-integrity)
 10. [什么没有实现 / 什么被证伪](#10-什么没有实现--什么被证伪-what-is-not-implemented--what-is-falsified)
 11. [文档 ↔ 代码矛盾清单](#11-文档--代码矛盾清单-discrepancies)（D-1 … D-31）
+12. [量能 / 资金流（P6-B / P6-C / P6-D）](#12-量能--资金流p6-b--p6-c--p6-d)
+    - 12.1 [特征契约 v2：量能 / 资金流 15 列](#121-特征契约-v2量能--资金流-15-列)
+    - 12.2 [缓存列 `quote_volume` / `trade_count`](#122-缓存列-quote_volume--trade_count)
+    - 12.3 [P6-B 接缝：实盘风控与回测成本](#123-p6-b-接缝实盘风控与回测成本)
+    - 12.4 [P6-C 量钟：美元棒与量棒](#124-p6-c-量钟美元棒与量棒)
+    - 12.5 [P6-C 广度：市场级量能](#125-p6-c-广度市场级量能)
+    - 12.6 [P6-D：GA 量能模板、基因与可执行性模型](#126-p6-dga-量能模板基因与可执行性模型)
+    - 12.7 [P6 没有做到的事](#127-p6-没有做到的事)
 
 ---
 
@@ -613,6 +622,8 @@ def feature_schema_hash(feature_names=None) -> str:            # core/ml/feature
 2. hash 只覆盖**列名列表**：列的顺序/类型/单位都不在哈希里（名字相同但语义改变不会被发现）。
 3. 契约演进要求把旧 hash 当**字面量**保存（工作树注释 `:106-110` 自述），因此 v1→v2→v3 会线性堆积常量，且不能自动验证"这个字面量真的是当年的列表"——我这次是手工复算才确认 `335e63360104` 对应 39 列（不含 `hurst`）。
 4. **未验证**：工作树的 v2 契约在写作时**无法导入**（见 §2.9），因此 v2 的 52/54 列数、hash、以及"v1 模型被拒"的行为我都没能实测。
+
+> **P6 更新（`cc63efd` / `117e5ea`）**：v2 契约已落地并可复现 —— 54 列、`1f30fded996d`，v1 字面量改为**可复算**的 `FEATURE_V1_NAMES`，两处加载路径共用 `feature_schema_mismatch_reason`。实测见 **§12.1**；上文第 1 点的"40 项 / `70899cff156d`"仍然成立，但只在 `hurst` 位于**第 31 位**时成立（顺序敏感），复算细节见 §12.1。
 
 ### 2.9 本 revision 上无法复现的部分（已实测记录）
 
@@ -1357,7 +1368,7 @@ $$\text{allowed}=\min\Big(\text{notional},\ \frac{\texttt{max\_participation\_pc
 **已知局限.**
 1. 参与率针对**已成交**量度量，不是**挂单**流动性；看不到薄簿、假档，或穿价时变宽的价差（`docs/core-algorithms/13-volume-liquidity-costs.md:253-255`）。
 2. 窗口是 **bar 聚合**，不是逐笔 tape：1h 的 20 根平滑掉突发——20 bar 均值不是下一分钟的样子（`:256-258`）。
-3. 缓存**没有** `quote_volume` 列，所以跨币种可比量能只能靠 `volume×close` 代理（`docs/overhaul/P6_VOLUME_PLAN.md:41`, `:48`）。P6-B 的第一项任务就是补该列。
+3. 缓存**没有** `quote_volume` 列，所以跨币种可比量能只能靠 `volume×close` 代理（`docs/overhaul/P6_VOLUME_PLAN.md:41`, `:48`）。P6-B 的第一项任务就是补该列。→ **已补**（`cc63efd`）：列已存在于写入 schema，但**本机 live 文件至今仍是 5 列**，所以本文 §12.3 的容量表仍是**代理**读数，见 §12.2。
 4. **实盘定仓路径当时未接线**：`RiskManager` 不传 `recent_quote_volume`，所以参与率上限只被 sizer API 与测试触发（`docs/core-algorithms/13-volume-liquidity-costs.md:260-265`）。
 5. `per_symbol` 覆盖是**部分** dict 合并（`liquidity_for_symbol`，`:185-220`），一个写错键名的覆盖会被静默忽略（不在 `LiquidityConfig.__slots__` 的键被跳过，`:217-219`）。
 
@@ -1425,8 +1436,8 @@ $$\text{legacy}=\underbrace{f\cdot \text{entry}+\underbrace{f\cdot\text{exit}}_{
 
 1. **系数未标定**：$k=0.1$ 是"为了让算术可读"的文档化例子；shipped 默认是 $0.0$。真实标定需要 trade-and-quote 数据（实现滑点 vs 参与率），本次部署**没有**（`docs/core-algorithms/13-volume-liquidity-costs.md:245-250`）。
 2. **没有订单簿深度模型**：参与率对着**成交量**度量，不是挂单量（同上 `:251-255`）。
-3. **回测本身还没有把逐 bar 成交量喂给 `apply_trading_costs`**——缝只差一个关键字参数，但没接（`:260-265`）。
-4. 实盘 `RiskManager` 未传 `recent_quote_volume`（同一条）。
+3. **回测本身还没有把逐 bar 成交量喂给 `apply_trading_costs`**——缝只差一个关键字参数，但没接（`:260-265`）。→ **已接**（`cc63efd`）：`BacktestEngine._recent_quote_volume_for`（`core/backtest/engine.py:1640-1684`），默认 `impact_k=0` 时 `_impact_bars()` 立即返回 0 且**不切片**，见 §12.3。
+4. 实盘 `RiskManager` 未传 `recent_quote_volume`（同一条）。→ **已接**（`cc63efd`）：`RiskManager.resolve_recent_quote_volume`（`core/risk/manager.py:396-…`）→ `PositionSizer.calculate_position_size(recent_quote_volume=…)`（`:583-588`）；关闭时**零 I/O**，见 §12.3。
 5. `impact_pct` 的 `floor`/`cap` 参数在 `apply_trading_costs` 路径上**没有被传入**（`cost_model.py:401-403` 只传 volume 与 $k$），因此 `risk.liquidity` 里没有 floor/cap 的配置项——这是一个未暴露的能力。
 
 ---
@@ -1556,6 +1567,7 @@ RESULT: 25/29 file(s) carry a gap beyond 1.5 x bar length.
 
 ### 10.2 明写的"被证伪"（falsified）
 
+> **P6 更新（`cc63efd` / `117e5ea` / `4a7aaed`）**：§10.1 的第 6、8、9、18 条已过期——缓存列已扩（§12.2）、两条缝已接（§12.3）、P6-B/C/D 已落地（§12.1/§12.4/§12.5/§12.6）、`tests/test_ml_credibility.py:381` 现在断言 **54** 而不是 39。**新证伪**：量能特征族 v2 重跑 1h 门**仍被拒**（§12.1）、美元棒**没有**改善门（§12.4）、广度**未接线**（§12.5）。其余条目（1–5、7、10–17）逐条保留。
 | # | 被证伪的主张 | 实测反证 | 出处 |
 |---|---|---|---|
 | F1 | "方向可预测" | BTC OOS AUC **0.5207**、ETH **0.5342**（门槛 0.55）；净期望 **−0.2494 % / −0.1822 %**；$t$ **−4.46 / −2.28**。**ML 保持关闭是实测结论，不是默认值** | `docs/overhaul/ALGO_UPGRADE_EVIDENCE.md:69`, `:73` |
@@ -1594,17 +1606,19 @@ RESULT: 25/29 file(s) carry a gap beyond 1.5 x bar length.
 
 > **状态跟踪（2026-09-30 更新，本表是这份清单的活口）**。标记含义：
 > **fixed here** = 本轮由文档清扫代理在其写范围内修好；**fixed by the code agent** = Lead
-> 分派给代码侧兄弟代理（D-4/D-16/D-19/死 GA 键/DSR 试验计数）；**fixed earlier** =
+> 分派给代码侧兄弟代理（D-4/D-13/D-14/D-16/D-18/D-19/死 GA 键；`117e5ea` 与 `363b4c0`）；**fixed earlier** =
 > 前一轮已修，本轮复核仍成立；**report-only (lead)** = 不在本轮任何写范围（`config/`、
 > `docs/overhaul/ALGO_UPGRADE_EVIDENCE.md`、doc 06/07），只报告不修改；**open** = 仍然存在、
 > 本轮无人认领（含本轮清单未列的 doc 侧条目）。
+>
+> **P6 复核（`b81094b`，见 §12）**：代码侧已了结的六项我在 `b81094b` 上**逐项复核并复算**（D-4 的三值哈希、D-16 的 alpha、D-18 的试验计数、D-19 的 timeout 归属、D-26 的 GA 键）；**D-13 是 `363b4c0` 新修的**（旧表原记为 report-only）。其余条目保持 open / report-only，位置不动。
 >
 > | # | 主题 | 状态 | 本轮记录 |
 > |---|---|---|---|
 > | D-1 | `ewma` 成本三值 | **fixed here** | `docs/core-algorithms/10-volatility-targeting.md` §3.2 按**形状**标注：实时 ≤600 根 `forecast_vol` 0.20 ms / 数组 0.16 ms；全历史 1.72 ms / 1.64 ms；`volatility.py` 的 ≈0.14 ms = 500 根数组；表的 ≈1.5 ms/bar = 全历史形状（本文 §3.9 的 0.2248/0.3093/0.2806 是同一批形状在负载下的读数） |
 > | D-2 | 裁剪倍数四值 | **fixed here** | doc 10 §2 新增"D-2 口径对照"表：10.12×/10.1×/9.81× = 历史真实接缝的三种读数；12.3× = 合成注入；当前缓存 1.000000×（全历史）/1.0365×（尾窗 500） |
 > | D-3 | legacy ML 准确率 | open | `ALGO_UPGRADE_EVIDENCE.md:66,:69` vs `docs/core-algorithms/08-ml-triple-barrier.md:154-155`，两侧都不在本轮写范围 |
-> | D-4 | 特征契约 hash | **fixed by the code agent** | `core/ml/features.py` + `tests/test_feature_schema_v1.py` |
+> | D-4 | 特征契约 hash | **fixed by the code agent**（`117e5ea`） | v1 不再是字面量：`FEATURE_V1_NAMES` 由**排除法**从 `DEFAULT_FEATURES` 减去 `VOLUME_FLOW_FEATURES` 得到（`core/ml/features.py:136-137`），`FEATURE_SCHEMA_V1_HASH = _schema_hash(FEATURE_V1_NAMES)`（`:145`）；我在 HEAD 上复算得 39 列 → `335e63360104`、54 列 → `1f30fded996d`（§12.1）。`tests/test_feature_schema_v1.py`（5 项）钉死三值 |
 > | D-5 | 实盘波动率定仓接线 | open | doc 10:357-364 已过期（`core/risk/manager.py:577` 现调用 `resolve_forecast_vol_pct`）；本轮清单未列 |
 > | D-6 | doc 12 测试数 20 | **fixed here** | doc 12:61 → **24**（`--collect-only` 实测） |
 > | D-7 | 归档 "≥95 %" | report-only (lead) | `ALGO_UPGRADE_EVIDENCE.md:14,:81`；doc 11 本轮已把同一张表标注 in-sample（见 D-11） |
@@ -1613,25 +1627,28 @@ RESULT: 25/29 file(s) carry a gap beyond 1.5 x bar length.
 > | D-10 | 流动性测试数 24/25/26 | **fixed here** | doc 13:291 → **26**；P6 计划:58 → **26**（`--collect-only` 实测 26） |
 > | D-11 | "三 regime"/≥95 % | **fixed here** | doc 11 表头 + ⚠️：0.9987/0.9993/0.9987 是 **in-sample**，可交易口径 **0.758/0.759/0.815**；归档两处表述待 lead |
 > | D-12 | doc 12 门写 OR | **fixed here** | doc 12:44 → **AND**（`core/ml/credibility.py:865`） |
-> | D-13 | config GARCH 成本注释 | report-only (lead) | `config/config.yaml:164`（HEAD 为 **:159**）"~12 ms/bar" vs 实测 ≈0.13 s/call / doc 10 ≈0.18–0.19 s |
+> | D-13 | config GARCH 成本注释 | **fixed by the code agent**（`363b4c0`） | `config/config.yaml:164-166` 现在是"cheap methods ≤1 ms/bar（实测 ewma 0.14–0.20 ms）；garch11 ≈0.13–0.16 s/call（window=500）/≈3.7 s（window=0）"——旧注释的 "~12 ms/bar" 与实测差一个数量级，已替换为实测区间 |
 > | D-14 | alpha 漏 √365 | **fixed by the code agent** | doc 06 + `core/ga/fitness.py` |
 > | D-15 | T<20 时 alpha 记 0 | open | `docs/core-algorithms/07-deflated-sharpe-ratio.md:62-63` |
-> | D-16 | fitness 减买入持有 | **fixed by the code agent** | doc 06 + `core/ga/fitness.py` |
+> | D-16 | fitness 减买入持有 | **fixed by the code agent**（`117e5ea`） | 决定是**改声明而不是加项**：`buy_hold_pct` 在默认引擎路径上非 None，减掉它会改变每一个默认 GA fitness。代码侧现在明写"基准被报告与门消费，不参与重新打分"（`core/ga/fitness.py:24-27`、`:928-932` 只写 `alpha_vs_buy_hold_pct`），测试改为断言**不变性**（fitness 22.9878 在 `buy_hold_pct` 为 None 与 25.0 时相同；alpha 0.0 → −14.7391） |
 > | D-17 | doc 07 门槛常数不自洽 | open | doc 07:36-37 与同页 :41 不自洽；docstring 在 `tests/test_ga_credibility.py` |
-> | D-18 | DSR 的两个 $N$ | **fixed by the code agent** | DSR 试验计数 |
-> | D-19 | `timeout_label` 自相矛盾 | **fixed by the code agent** | `core/ml/labels.py` |
+> | D-18 | DSR 的两个 $N$ | **fixed by the code agent**（`117e5ea`） | 试验计数只剩**一个公式**：`core/ga/evolver.py:67-93` 的 `dsr_trial_counts(prior_trials, ledger_total, population, …)`；冠军复用本代的 prior，不再额外加一个 population（`:376-380`、`:433-434` 的 `n_trials`）。端到端 stub `evolve()` 钉死 prior_trials 0/4/8 → provenance `n_trials = 12`（`tests/test_ga_dsr_trial_counts.py`，7 项） |
+> | D-19 | `timeout_label` 自相矛盾 | **fixed by the code agent**（`117e5ea`） | 真缺陷：波动率缩放屏障路径现在把**完整前向窗口内未触障**的 bar 填成 timeout 类（`core/ml/labels.py:287-300`），持久化分布只有一处（`core/ml/predictor.py`），`timeout_share` 不再是硬编码 0（`labels.py:306-315`）。测试覆盖全平序列（share 1.0）、`timeout_label=None`（无 NA）、`max_rows` 前缀 |
 > | D-20 | doc 06 hybrid"残留"过期 | report-only (lead) | doc 06:50,:68（该文件在兄弟代理写范围，但不在其清单） |
 > | D-21 | doc 06 交叉引用失效 | report-only (lead) | doc 06:5,:210 引用不存在的"效用分析"节 |
 > | D-22 | `FEATURE_KEYS` 19 vs 20 | **fixed here** | P6 计划:17,:40 → **20**（`core/market_data/microstructure.py:125-131`） |
 > | D-23 | 配对成本两路径 | open | doc 11:95-99 只写 0.25 %/腿；`config=None` 的 0.14 %/腿 未写 |
 > | D-24 | 测试计数汇总 | **fixed here + fixed earlier** | doc 12/13、P6 计划本轮修；doc 11:111 的 **28**（25 def + 3 async）在前轮已修并本轮复核；`tests/test_condition_logic.py` 的 9 vs 10 仍 open |
 > | D-25 | 因果解码数字一处四值 | **fixed here（HMM 部分）** | doc 11 已标注 in-sample/causal（0.758–0.815）；Kalman 半衰期 `doc 11:145` 1.2 vs 代码 2.1、匹配零分布 `doc 11:33-35` −3.3015/−3.3098 vs 代码 −3.363/−3.370、`tests/test_pairs.py:203,:213` 的 `var(y)/R ≈ 100`（应为 4.3）仍 open |
-> | D-26 | 死代码与导出面 | **fixed by the code agent（部分）** | 死 GA 配置键由兄弟代理处理；`_hmm_forward_last`、`HMM_MIN_SIGMA_RATIO`、`DEPTH_DECAY_BP`、`_GARCH_MLE_X0` 仍未处理 |
+> | D-26 | 死代码与导出面 | **fixed by the code agent（部分，`117e5ea`）** | 七个无读取者的 GA 配置键已了结：`ga.alpha_weight`、`_GARCH_MLE_X0`（现被 `core/ml/volatility.py:721` 读取）、`total_trials` 接线，`PF_SHRINK`/`WEIGHT_GRID`/`overfit_penalty`/`ga.evaluation_leverage` **删除**——`ga:` 块现在只有 3 个键（`config/config.yaml:45` 起：`:50` `use_live_spread`、`:53` `min_champion_trades`、`:61` `alpha_weight`），并有"每个键都有生产读者"的守卫测试（`tests/test_final_audit_fixes.py:447`）。**仍未处理**：`_hmm_forward_last`、`HMM_MIN_SIGMA_RATIO`、`DEPTH_DECAY_BP` |
 > | D-27 | garch 网格复杂度注释 | open | `core/ml/volatility.py:713` 写 O(20×8)，实际 4×8=32 |
 > | D-28 | OHLC 估计量根本不裁剪 | open | doc 10:113 的"所有估计量"对 parkinson/garman（`volatility.py:472,:494`）与 GARCH 拟合（σ=8，`:815`）不成立 |
 > | D-29 | `stop_distance_pct` 硬下限被省略 | open | doc 10:51；`core/risk/position_sizer.py:144` 是 `max(stop_min_pct, hard.min_stop_loss_distance_pct)` |
 > | D-30 | 裁剪锚点函数名/窗口计数 | open | doc 10:119-122 应写 `series_anchor`；"8 343/8 344" vs 代码 ":226-231" 的 11 176/11 176 |
 > | D-31 | `window` 语义 | open | doc 10:141-145 与 `_as_returns`（`core/ml/volatility.py:1214-1216`）显式忽略 window 冲突 |
+> | D-32 | `volume_bars.print_gap_times` 的洞计数 | open（**P6 新增，本轮发现**） | 代码 docstring 写 **23** 个洞 / 166 476 分钟 / 24 %（`core/strategy/volume_bars.py:672-674`），而同一模块的实验与 doc 15 写 **27** 个 / 23.9 %；我在 `b81094b` 实测 **27 / 166 489 / 23.86 %**（§12.4） |
+> | D-33 | P6-D 测试的窗口 bar 数 | open（**P6 新增**） | `tests/test_ga_volume_genes.py:262` 的 docstring 写"pinned window 的 587 根中的 139 根"，同一测试运行时打印 `bars=337`（2026-02-01…15 = 337 根 1h）；§12.6 记的是实测的 337 |
+> | D-34 | doc 15 的"美元棒净成本略优" | open（**P6 新增，数字随 revision 移动**） | `docs/core-algorithms/15-volume-bars-breadth.md:262-263` 写 dollar 净期望"marginally better net of cost (+0.0103 pp)"；我在 `b81094b` 的同一协议下重跑得 **−0.1012 pp**（美元棒更差），两次都拒绝两种采样（§12.4） |
 
 ### D-1 `ewma` 的单次成本：文档 vs 代码注释 vs 我的实测（三值）
 
@@ -1868,6 +1885,12 @@ RESULT: 25/29 file(s) carry a gap beyond 1.5 x bar length.
 
 判定：doc 的"都生效"只在估计量层成立；`_as_returns` 这一层是显式忽略。历史差异（frame 33.6 ms / 0.003860 vs returns 2.2 ms / 0.003745，≈15.3×）记录在 `:1225-1227`，与 doc 的"慢 15×"一致。
 
+### D-32 / D-33 / D-34 P6 新增条目（本轮发现）
+
+* **D-32** `core/strategy/volume_bars.py:672-674`：`Measured on ``BTCUSDT/1m``: 23 such holes, 166 476 missing minutes = 24 % of the 697 719-minute span, the two largest 61.8 and 41.6 days.` 对照：`docs/core-algorithms/15-volume-bars-breadth.md:21-23` 与 `:120-122` 写 **27 holes / 166 476 missing minutes / 23.9 % / 697 719 span**；我实测 `print_holes = {n: 27, missing_minutes: 166 489, span_minutes: 697 776, largest_seconds: 5 338 560}`（§12.4）。判定：代码注释里的 **23** 与同一提交的实验记录 **27** 不一致；缺分钟数差 13 是缓存增长，洞计数差 4 不是。**未验证**：哪个 revision 上真有过 23 个洞。
+* **D-33** `tests/test_ga_volume_genes.py:262`：`which overlap on 139 of the 587 bars of the pinned window`。同一测试的运行输出是 `[or] bars=337 active=85 mismatches=0`（`:335`），而 feeder 的窗口是 2026-02-01…2026-02-15（337 根 1h）。判定：注释的 587 是旧窗口的残留，实际 337；不影响断言（断言只用 `active > 0` 与 `mismatches == []`）。
+* **D-34** `docs/core-algorithms/15-volume-bars-breadth.md:262-263`：`Dollar bars are **worse on the calibration-independent AUC (−0.0527)** and marginally better net of cost (+0.0103 pp)`。对照：我在 `b81094b` 用同一协议同一契约重跑 `gate`，得 time AUC 0.5361 / dollar 0.4679（$\Delta=-0.0682$）与 net $\Delta=$ **−0.1012 pp**。判定：doc 15 自己声明"这个测量随缓存移动"，所以两条都成立；但"净成本略优"**不是**可引用的稳定结论，能引用的只有"两种采样都被拒、美元棒没有改善"。
+
 ### D-24 测试计数（汇总）
 
 | 文件 | 文档记载 | 我在 `c703b8b` 实测 `def test` 计数 | 判定 |
@@ -1885,6 +1908,366 @@ RESULT: 25/29 file(s) carry a gap beyond 1.5 x bar length.
 
 **测试文件行数（子代理核对，与任务书的数字不符）**：`core/strategy/pairs.py` **1127** 行（任务书写 990）、`core/strategy/regime.py` **893**（写 793）、`core/market_data/microstructure.py` **611**（写 520）、`core/ml/volatility.py` **1434**（写 1241）。
 
+
+---
+
+## 12. 量能 / 资金流（P6-B / P6-C / P6-D）
+
+> **证据主文件**：`docs/core-algorithms/14-volume-features.md`（P6-B，220 行）、`docs/core-algorithms/15-volume-bars-breadth.md`（P6-C，419 行）、`docs/overhaul/P6_VOLUME_PLAN.md` §3（P6-B/C/D 任务与验收）。
+> **代码**：`core/ml/features.py`、`core/market_data/ohlcv_cache.py`、`core/market_data/provider.py`、`scripts/download_history.py`、`core/backtest/cost_model.py`、`core/backtest/engine.py`、`core/risk/{liquidity,manager,position_guard}.py`、`core/strategy/{volume_bars,indicators}.py`、`core/market_data/breadth.py`、`core/ga/{genome,fitness,evolver}.py`。
+> **落地 revision**：`cc63efd`（P6-B/C/D 主体）→ `4a7aaed`（P6-C 实验归档）→ `117e5ea`（D 清单代码侧收口）→ `363b4c0`（D-13）；本节写作于 **`b81094b`**，测量时刻 **2026-09-30 21:50–22:15**。
+> **写作期的工作树状态**：干净（`git status --porcelain` 为空；兄弟代理只改 `README.md`）。与前文 §0 的"编辑中"警告相反，本节引用的 P6 文件**已提交且可导入**，所以这一节的哈希/列数/成本都是**我本机实测**，不是工作树中间态。
+> **live 缓存会边读边长**：`data/market/**` 由运行中的服务追加，所以"行数 + 时间戳"是测量的一部分；凡涉及 `data/` 的数字都写成"读数 + 时刻"。
+
+### 12.1 特征契约 v2：量能 / 资金流 15 列
+
+**算法.** `DEFAULT_FEATURES` 从 39 列扩到 **54** 列（`core/ml/features.py:61-107`），新增的 15 列由 `VOLUME_FLOW_FEATURES`（`:112-120`）**单独命名**，`FEATURE_SCHEMA_VERSION = 2`（`:127`）。关键设计：v1 契约不再是一个字面量，而是**排除法**的重算结果
+
+$$\text{FEATURE\_V1\_NAMES} = \big[\,n \in \text{DEFAULT\_FEATURES}\ \big|\ n \notin \text{VOLUME\_FLOW\_FEATURES}\,\big]$$
+
+（`:136-137`），`FEATURE_SCHEMA_V1_HASH = _schema_hash(FEATURE_V1_NAMES)`（`:145`），而唯一的哈希规则是
+
+$$H(\text{names}) = \mathrm{sha1}\big(\mathrm{json}([\text{names}])\big)[:12]\qquad(\texttt{core/ml/features.py:49-56})$$
+
+**为什么需要（以及为什么字面量会漂移）.** 旧写法把 `"335e63360104"` 当字面量保存：它能被引用、不能被**复算**，因此没人能证明"发出去的列表"和"发出去的哈希"是同一份（D-4 的根因）。排除法把 v1 变成 v2 的一个**函数**：若将来有人往 `DEFAULT_FEATURES` 加列却忘了加进 `VOLUME_FLOW_FEATURES`，`FEATURE_V1_NAMES` 会长大、`FEATURE_SCHEMA_V1_HASH` 会变，`tests/test_feature_schema_v1.py`（5 项）**响亮地失败**，而不是悄悄重新定义"v1"。
+
+**我在 HEAD 上的独立复算（A）.**
+
+| 列表 | 长度 | `sha1(json)[:12]` |
+|---|---|---|
+| `FEATURE_V1_NAMES`（v1，无 `hurst`） | **39** | **`335e63360104`** |
+| `FEATURE_NAMES`（v2，39 + 15） | **54** | **`1f30fded996d`** |
+| v1 列表在**第 31 位**插回 `"hurst"` | **40** | **`70899cff156d`** |
+| v1 列表在**末尾**追加 `"hurst"` | 40 | `306754631305` |
+
+**顺序敏感**：`70899cff156d` 只在 `hurst` 位于历史位置（`hurst_signal` 之前）时成立；把 `hurst` 追加到末尾是**另一个列表**、另一个哈希。§2.8 记的 40 项哈希因此需要这一条限定语。
+
+**15 列的精确定义**（全部在 `_volume_flow_features`，`core/ml/features.py:594-706`；$\{x\}_w$ 表示"含 $t$ 的 $w$ 根尾窗"，$10^{-12}$ 是处处出现的除零守卫，$v_t$ 是 `volume`，$Q_t$ 是 `quote_volume` 或代理）：
+
+1. **多窗口 RVOL**（`:507-509`, `:655-656`，$w\in\{5,10,20,60\}$，`:216`）
+
+$$\text{volr}_w(t)=\frac{v_t}{\frac{1}{w}\sum_{i=0}^{w-1}v_{t-i}+10^{-12}}$$
+
+2. **因果闭块成交量 z 分数**（`:512-516`, `:659`；窗口 `VOLZ_WINDOW=60`、块长 `VOLZ_ANCHOR_STRIDE=20`，`:221-222`；锚定器 `:265-315`）
+
+$$x_t=\ln\big(\max(v_t,10^{-12})\big),\qquad b(t)=\Big\lfloor \frac{t}{20}\Big\rfloor\cdot 20$$
+$$\mu_t=\mathrm{median}\{x_s:\ s<b(t)\},\qquad \sigma_t=1.4826\cdot\mathrm{median}\{|x_s-\mu_t|:\ s<b(t)\},\qquad \text{volz}_{60}(t)=\frac{x_t-\mu_t}{\sigma_t+10^{-12}}$$
+
+3. **VWAP 偏离（滚动 20）**（`_vwap_level` `:519-523`、`:662-665`），$p^{typ}_t=(h_t+l_t+c_t)/3$（`:502-504`）
+
+$$\mathrm{VWAP}^{20}_t=\frac{\sum_{i=0}^{19}p^{typ}_{t-i}\,v_{t-i}}{\sum_{i=0}^{19}v_{t-i}+10^{-12}},\qquad \text{vwap\_dev\_20}(t)=\frac{c_t}{\mathrm{VWAP}^{20}_t+10^{-12}}-1$$
+
+4. **VWAP 偏离（因果扩张 / "session"）**（`:666-669`）
+
+$$\mathrm{VWAP}^{\text{ses}}_t=\frac{\sum_{s\le t}p^{typ}_s v_s}{\sum_{s\le t}v_s+10^{-12}},\qquad \text{vwap\_dev\_session}(t)=\frac{c_t}{\mathrm{VWAP}^{\text{ses}}_t+10^{-12}}-1$$
+
+5. **成交量重心**（`:699-700`）与 **收盘位置加权的量能**（`:702-704`）
+
+$$\text{centroid}_{20}(t)=\frac{v_t}{\sum_{i=0}^{19}v_{t-i}+10^{-12}},\qquad \text{flow\_close\_position\_weighted}(t)=\mathrm{clip}\Big(\frac{c_t-l_t}{h_t-l_t+10^{-12}},0,1\Big)\cdot\text{centroid}_{20}(t)$$
+
+6. **OBV / A-D 斜率**（`_obv_line` `:526-529`、`_ad_line` `:532-538`、`_rolling_slope` `:242-262`、`:672-677`），$w=10$、归一化用 $\bar v_{20}$
+
+$$\mathrm{OBV}_t=\sum_{s\le t}\mathrm{sign}(c_s-c_{s-1})\,v_s,\qquad \mathrm{AD}_t=\sum_{s\le t}\mathrm{CLV}_s\,v_s,\qquad \mathrm{CLV}_s=\frac{(c_s-l_s)-(h_s-c_s)}{h_s-l_s+10^{-12}}$$
+$$\mathrm{slope}_w(x)_t=\frac{\sum_{j=0}^{w-1}(j-\bar j)\,(x_{t-w+1+j}-\bar x)}{\sum_{j=0}^{w-1}(j-\bar j)^2},\qquad \text{obv\_slope\_10}(t)=\frac{\mathrm{slope}_{10}(\mathrm{OBV})_t}{\bar v_{20}(t)+10^{-12}}$$
+
+$\text{ad\_slope\_10}$ 同式，只把 $\mathrm{OBV}$ 换成 $\mathrm{AD}$。
+
+7. **Chaikin 资金流**（`:680-683`）
+
+$$\mathrm{MFV}_t=\mathrm{CLV}_t\,v_t,\qquad \text{flow\_cmf\_20}(t)=\frac{\sum_{i=0}^{19}\mathrm{MFV}_{t-i}}{\sum_{i=0}^{19}v_{t-i}+10^{-12}}$$
+
+8. **MFI(14)**（`_mfi` `:541-550`、`:686`），$F_t=p^{typ}_t v_t$，$F^{+}_t=F_t\mathbf 1[\Delta p^{typ}_t>0]$、$F^{-}_t=F_t\mathbf 1[\Delta p^{typ}_t<0]$
+
+$$M=\frac{\sum_{i=0}^{13}F^{+}_{t-i}}{\sum_{i=0}^{13}F^{-}_{t-i}+10^{-12}},\qquad \text{flow\_mfi\_14}(t)=100-\frac{100}{1+M}$$
+
+9. **Amihud 非流动性**（`:689-691`）
+
+$$r_t=\frac{c_t}{c_{t-1}}-1,\qquad \text{flow\_amihud\_20}(t)=10^{6}\cdot\frac{1}{20}\sum_{i=0}^{19}\frac{|r_{t-i}|}{|Q_{t-i}|+10^{-12}}$$
+
+（**注意口径**：这里的 $r_t$ 是契约列 `ret_1` 的**算术**收益 `close.pct_change(1)`（`:783`, `:689`），**不是** §0 记号表里波动率用的对数收益 $\ln(P_t/P_{t-1})$；doc 14 写的"$|ret\_1|$"与代码一致。）
+
+10. **量价相关**（`:694-696`）
+
+$$\text{flow\_vol\_price\_corr\_20}(t)=\rho_{20}\big(|r|,\ \Delta\ln v\big)\ \text{（窗口内 NaN 结果填空为 0）}$$
+
+**零成交量约定**：$v_t=0$ 在 VWAP/MFI/A-D/OBV 系列里先被换成 NaN（`_nonzero_volume` `:497-499`，与 GA 指标列**同一实现**，`:564-591`），随后在这些函数的求和里按 0 计（`.fillna(0.0)`）；`volr_*`/`volz_60` 则用**原始** `volume` 列。`vol_5`/`vol_10`/`vol_20` 是**收益率波动率**、`volr_*` 是**相对成交量**——这一对命名由 `test_volume_columns_are_not_aliases_of_the_return_volatility_columns` 钉住（常量成交量下 `vol_5` 仍变、`volr_5 ≡ 1`）。
+
+**为什么是"闭块"锚定，而不是整段 MAD.** 计划要求"仿 P3 `AnchorMAD`"；P3 的字面配方是**整段序列**一个锚，它"在单次调用内稳定"但**不因果**：追加 bar 会改写每一条历史 z 分数。测试 `test_the_volume_family_is_the_part_that_would_break` 显式构造了这个反例，并证明闭块形式的锚在追加 200 根后**逐位不变**。代价是**有界陈旧**：$t$ 时刻的锚最多用 $\mathrm{stride}-1=19$ 根之前的数据；`stride=1` 给出逐 bar 精确扩张中位数（也因果），代价按代码 docstring 自述是"在 11 600 根真实 bar 上约为整条特征管线预算的 **40×**"（**B**：`:289-295` 的注释，我未实测）。
+
+**为什么 VWAP 用扩张而不是日历 session.** 日历日 session VWAP 同样因果，但它在每个 UTC 午夜**重新锚定**，因此**不满足"追加 500 根 ⇒ 0 变化"**这条验收标准；扩张 VWAP 是单次遍历、时间可加，是唯一同时满足因果与追加不变性的写法（`:613-621`, `docs/core-algorithms/14-volume-features.md:216-220`）。
+
+**已实测（A，我本机在 `b81094b`）.**
+
+| 判据 | 读数 |
+|---|---|
+| 无前视（live BTCUSDT 1h，取尾部 6 000 根，去掉最后 500 根再比） | **54 列全部 0 变化**（总变化数 `0`） |
+| 非退化 | `near_constant_columns = []`：BTCUSDT 11 628 行 / ETHUSDT 8 855 行，均 54 列 |
+| 列数 | `DEFAULT_FEATURES` = `FEATURE_NAMES` = **54**；新族 = **15**；v1 = **39** |
+| 契约版本 | `FEATURE_SCHEMA_VERSION = 2`；`feature_schema_hash()` = `1f30fded996d`；v1 = `335e63360104` |
+| 确定性 | `tests/test_volume_features_v2.py::test_two_runs_of_the_same_inputs_are_bit_identical` 通过（本族 15 列逐位一致） |
+| 族成本（**按需**） | `compute_all` 默认 **不产出**这 6 个可读列（`tests/test_volume_flow_indicator_columns.py::test_the_family_is_opt_in_so_the_default_path_pays_nothing` 通过，成本 = 0）；开启 `{"volume_flow": {}}` 后本机 8 844 根读数见下 |
+| 管线成本（live frame） | 见下方"成本口径警告" |
+
+**成本口径警告（我要如实标注）.** 文档 14 与 P6 计划记的是 8 844 根整族 **95.7 ms**、`compute_all` **56 ms → 152 ms（2.7×）**、live 11 627 根管线 **0.688 s**（indicators 0.081 + features 0.608，上界 3.0 s）。我在**七个并发 Python 进程、CPU 100 %** 的机器上**复现不出这些绝对值**：
+
+| 口径 | 归档值（B） | 我的读数（A，负载下） |
+|---|---|---|
+| `compute_all` 默认 / 8 844 根 | 56 ms | wall 552.9 ms / cpu 343.8 ms |
+| `compute_all` + `volume_flow` | 152 ms | wall 1658.4 ms / cpu 1062.5 ms |
+| 整族增量 | 95.7 ms | wall 1105.5 ms / cpu 718.8 ms |
+| 开关比 | 2.7× | **3.00×** |
+| live 管线 total | 0.688 s | wall 7.415 s / cpu 5.250 s |
+
+两个成本上界测试在当前负载下**双双失败**（synthetic 11 627 根 3.47–4.60 s > 3.0 s）。结论：**绝对成本 = 未验证**（需要一台空闲机器重测）；**可复现的是形状**——族是**按需**的、默认路径**零成本**、开启后约为 `compute_all` 的 **3×**。归档的 95.7 ms / 0.688 s **不得**当作当前机器上的保证。
+
+**GA 侧对同一批列的读取（`core/strategy/indicators.py`，`:16`, `:43-53`）.** 六个可读名 `rvol`/`rvol_z`/`vwap`/`mfi`/`ad_line`/`obv_slope` = `volr_20`/`volz_60`/滚动 VWAP 水平/`flow_mfi_14`/A-D 累计线/`obv_slope_10`，**同一实现**（复用 `_rvol`/`_volz`/`_vwap_level`/`_mfi`/`_ad_line`），逐值相等由 `test_the_six_columns_are_exactly_the_p6b_family_series` 断言。它们是**按需列**而非 GA 基因：`VOLUME_FLOW_INDICATOR` 不在 `INDICATOR_NAMES`/`INDICATOR_INIT_PROB` 里（`core/ga/genome.py:275-292`），`chromosome_to_strategy` 对任何**读取这些列的条件**自动打开该键（`:1009-1012`），从而"条件引用某列"与"列被产出"是同一个不变量。
+
+**局限.**
+1. **门仍然被拒**：v2 契约重跑 1h 方向门，BTCUSDT AUC **0.5228**、0 笔（过少）；ETHUSDT AUC **0.5324**、净期望 **−0.4132 %**、889 笔、$t=-3.67$、PSR ≈ 1.9e-12 —— 两者都 **REFUSED**（B：`docs/core-algorithms/14-volume-features.md:191-198`；我**没有**重跑 `scripts/ml_credibility_measure.py`，故记为 B）。
+2. 成本绝对值未验证（上表）。
+3. `trade_count` 已持久化但**没有任何特征消费它**（doc 14:209-212）。
+4. 本族是**状态描述量**，不按构造带方向性：Amihud、相关、斜率都不含符号先验，方向性正是 §12.1 门测过并拒绝的东西。
+5. `volz_60` 的闭块锚是**近似**（最多 19 根陈旧），不是逐 bar 精确扩张中位数——测试证明的是"两者都因果"，不是"两者相等"。
+
+### 12.2 缓存列 `quote_volume` / `trade_count`
+
+**算法.** 缓存 schema 从 5 列扩到 7 列，顺序由**唯一一处**定义（`core/market_data/ohlcv_cache.py`）：
+
+$$\text{CACHE\_COLUMNS} = \underbrace{(\text{open},\text{high},\text{low},\text{close},\text{volume})}_{\text{PRICE\_VOLUME\_COLUMNS}\ (:63)} \| \underbrace{(\text{quote\_volume},\text{trade\_count})}_{\text{EXTENDED\_COLUMNS}\ (:67)}$$
+
+（`:70`）。三个写入者写同一形状、同一个 `canonical_columns`（`:73-114`）：
+
+| 写入者 | 位置 | 取值 |
+|---|---|---|
+| REST 预取（`fetch_historical`/批拉） | `core/market_data/provider.py:264-271` | kline **字段 7** = `quote_volume`、**字段 8** = `trade_count`；短/异形载荷 → `NaN` |
+| WebSocket 收盘 candle | `core/market_data/provider.py:352-364` | `kline["q"]` → `quote_volume`、`kline["n"]` → `trade_count` |
+| 历史回填（`--backfill`） | `scripts/download_history.py:549-660` | 只取这两列，锚定在**磁盘已有**的 bar 上 |
+
+**缺失 vs NaN 的约定（两种"没有值"必须可区分）.**
+
+| 情形 | 文档化行为 |
+|---|---|
+| **列不存在**（pre-P6-B 文件） | 读者不得崩溃；特征层回落到 $\text{volume}\times\text{close}$ **代理**（`core/ml/features.py:649-652`），流动性层同（`core/risk/liquidity.py:259-269`） |
+| 列存在、某行为 `NaN` | `NaN` = "未测量"。`recent_quote_volume` **丢掉**非有限 bar（`:355-357`，"窗口更小"而不是"用相似值填洞"）；特征层**不逐行**替换代理（`features.py:649-652` 只看列是否存在） |
+| 列存在但**整列**非有限 | `recent_quote_volume` **回落代理**而不是报 `0.0`——`0.0` 会被读成"没成交"并拒绝一笔本该能定仓的订单（`liquidity.py:310-315`） |
+| 两个写入者不一致 | `merge_history` 按**索引**求并集，`pandas.concat` 把缺的一侧填 `NaN`；`incoming-wins` 是**逐行**而非逐列（`ohlcv_cache.py:38-44`） |
+
+**bar 键合并规则.** 并集按**声明的 bar 长度折叠的 bar 键**（不是精确时间戳），因此同一根 bar 的 bar-open 戳与 Binance `close_time` 戳是**一行**（§9.1–9.3；`ohlcv_cache.py:26-29`）。`canonical_columns` 的写路径用 `reorder=False`：`_frame_hash` 按**列顺序**哈希，重排一个已经去重的旧文件会让每次 flush 都重写一个没人追加过的文件（`:86-93`, `:608-615`）。
+
+**回填（`--backfill`）的规则与它能证明的东西.** `backfill_plan`（`download_history.py:370-416`）返回"`quote_volume` 缺失的连续区段"（间隔 > 4 根 bar 长度就断开），最旧优先，**纯函数、零网络**；每段落成一个请求窗口（`:419-439`），窗口的"开"由 `_bar_starts`（`:451-481`）从**存盘戳**解出，所以两种时间戳口径得到同一个窗口（把 `close_time` 当 open 会让第一次回填**少一根**——实测并因此才有 `_bar_starts`）。取回后只拿这两列、按 bar open 匹配到**存盘的**时间戳上（`:484-499`）；**可续跑**（第二次 `missing == 0`、零请求）；若请求在飞时文件被运行中的服务追加了行，抛 `CacheMovedError` 且**什么都不写**（`:339-347`, `:651-…`）。
+
+**已实测.**
+* **(A)** live 文件**仍是 5 列**：`data/market/BTCUSDT/1h.parquet` 11 628 行（2025-06-03 00:00 → 2026-09-30 12:00）、`sha256_16 = 799a2bc888e18dac`，`quote_volume`/`trade_count` **列为 ABSENT**；ETHUSDT 8 855 行、`1c4b56adcd999047`。**回填从未在 live 缓存上跑过**——P6-B 只是让写入者开始写这两列。
+* **(B)** 归档：200 根 1h bar 从 `data-api.binance.vision` 重取，`quote_volume` 最大绝对差 `0.000000`、**200/200 精确**；`trade_count` 200/200 相等；临时副本回填后 `check_data_integrity` 不变（11 627 根、twin 0），11 627/11 627 个 `quote_volume` 单元被填（`docs/core-algorithms/14-volume-features.md:181-183`）。
+* **(A)** 单元测试：`test_backfill_fills_a_legacy_file_and_is_resumable`（missing 24 → filled 24、pages 1；第二次 done/0 请求）、`test_backfill_refuses_to_rewrite_a_file_the_live_process_moved`、`test_kline_payload_maps_quote_volume_and_trade_count`、`test_flush_of_an_already_deduped_legacy_file_still_writes_nothing`（字节不变）均通过。
+
+**局限.** 缓存**只在回填过的区段**有真值；未经回填的文件里 `flow_amihud_20` 与容量判断仍走代理，而代理与源字段在同一根 bar 上**不相等**（只有相关性 > 0.5，`tests/test_volume_features_v2.py:250-251` 断言）。`trade_count` 无消费者。
+
+### 12.3 P6-B 接缝：实盘风控与回测成本
+
+**算法（实盘）.** `RiskManager.resolve_recent_quote_volume(signal)`（`core/risk/manager.py:396-…`）在 `risk.liquidity.enabled` 为假时**直接返回 `None` 且不碰行情**（`:405-412`）；为真时按 symbol 解析 `per_symbol` 覆盖，再调 `core.risk.liquidity.recent_quote_volume`，把结果传给定仓器（`:583-588`）。`PositionGuard` 镜像同一开关（`core/risk/position_guard.py:164-176`, `:178-…`）。
+
+**算法（回测）.** 平仓时把逐 bar 窗口喂给成本模型：
+
+$$\texttt{recent\_quote\_volume} = \text{recent\_quote\_volume\_from\_bars}\big(\text{frame}[:t],\ \texttt{lookback\_bars}\big)$$
+
+（`core/backtest/engine.py:1619-1631`, `:1640-1684`；`core/backtest/cost_model.py:443-462`）。`_impact_bars()`（`:1686-1702`）每次运行只算一次：`impact_k <= 0` → **0**，于是 `_recent_quote_volume_for` **连一帧都不切**就返回。
+
+**成本分解（`apply_trading_costs`，`core/backtest/cost_model.py:310-404`）.** 设 $f$ = taker 费率、$s$ = **全额**报价价差（%）、$n_e,n_x$ = 入场/出场名义：
+
+$$\text{legacy} = \underbrace{f\,n_e + f\,n_x}_{\text{手续费}} + \underbrace{\frac{s}{2}n_e + \frac{s}{2}n_x}_{\text{半价差}},\qquad \text{total} = \text{legacy} + \text{impact\_usdt}$$
+
+$$\text{impact\_usdt}=\sum_{\text{side}\in\{e,x\}}\frac{\mathrm{clip}\big(k\,p_{\text{side}}^{\,e}\big)}{100}\,n_{\text{side}},\qquad p_{\text{side}}=\frac{n_{\text{side}}}{Q},\qquad e=\texttt{impact\_exponent}=0.5$$
+
+（`:369-403`；$Q$ = 上式的 20-bar 窗口）。$k\le0$ 或窗口未知 → **短路到 legacy**（`:394-396`）。`total_costs_with_impact`（`:486-524`）把三项**分开**报告：`fees_usdt`/`spread_usdt`/`impact_usdt`/`total_usdt`/`impact_pct`。
+
+**我在本机重测的容量阶梯（A）.** 窗口 = BTCUSDT 1h 最后 20 根、**ends 2026-09-30 12:00**、price **85 290.32**、$Q=$ **1 004 445 350.77 USDT**；⚠️ 因为 live 文件没有 `quote_volume` 列（§12.2），这个 $Q$ 是 $\sum \text{volume}\times\text{close}$ **代理**：
+
+| 规模 | 参与率 | $k=0.1$ Δ | $k=0.5$ Δ | cap@1 % |
+|---|---|---|---|---|
+| 0.01 BTC（852.90 USDT） | 0.000085 % | +0.0016 | +0.0079 | 852.90（不缩） |
+| 1.0 BTC（85 290.32） | 0.008491 % | +1.5719 | +7.8593 | 85 290.32（不缩） |
+| 10 BTC（852 903.20） | 0.084913 % | +49.7069 | +248.5344 | 不缩 |
+| 100 BTC（8 529 032.00） | 0.849129 % | +1 571.8694 | +7 859.3469 | 不缩 |
+
+$k=0$ 与 pre-P6 **逐位相同**：`77.52890088000001 == 77.52890088000001`（`apply_trading_costs(..., recent_quote_volume=Q)` 与不传参对比，`==` 而非 `approx`）。**形状验证**：$k=0.1$ 的 Δ 从 0.01 → 1.0 BTC（规模 ×100）涨 **982×**，即 $\text{size}^{1.5}$（$100^{1.5}=1000$），与平方根律一致。**同一窗口下的分解**（0.6 BTC 往返 @83 384 → 85 000，$k=0.1$）：fees **40.41216**、spread **5.05152**、impact **0.71650**、total **46.18018**、legacy **45.46368**。
+
+**与 doc 13 归档值的对照（可验证的部分）.**
+
+| 量 | doc 13（B，窗口 751 885 467.06 / price 83 043.14） | 我的重测（A，窗口 1 004 445 350.77 / price 85 290.32） |
+|---|---|---|
+| fees（0.6 BTC 往返） | 40.4122 | **40.41216** ✅ 与成交量无关，逐位一致 |
+| spread | 5.0515 | **5.05152** ✅ 同上 |
+| impact（$k=0.1$） | 0.8281 | **0.71650**（随窗口移动） |
+| 1.0 BTC $k=0.1$ Δ | +1.7455 | **+1.5719** |
+| 100 BTC $k=0.1$ Δ | +1 745.4596 | **+1 571.8694** |
+| XRP 1m 50 000 USDT 被缩到 26 575.74 | 是（窗口 2 657 574.07） | **否**：当前 XRP 1m 窗口 **13 434 193.51**（ends 2026-09-30 13:49:59.999），参与率 0.372185 %，cap@1 % = 50 000（不缩） |
+
+**读法**：fees/spread 两行**逐位复现**，证明成本分解式与 doc 13 一致；impact 与容量行**随窗口移动**（运行中的服务一直在追加 bar），所以"26 575.74 被缩"是**那个窗口的**读数，不是当前行为。
+
+**已实测的不变量.**
+* **(A)** 关闭路径：默认 `risk.liquidity.enabled: false` 时实盘查询**零行情调用**且定仓逐位相同（`test_risk_manager_quote_volume_is_none_and_io_free_by_default`：`market.calls == 0`）、`PositionGuard` 镜像（`test_position_guard_quote_volume_mirrors_the_switch`）。
+* **(A)** 回测 $k=0$ 整轮**逐位一致**：`test_engine_impact_seam_is_bit_identical_at_k_zero` 比较两次 $k=0$ 运行与一次"成本函数根本看不到 volume"的运行，trade 列表/total PnL/笔数相等；$k=0.5$ 严格更贵。
+* **(A)** 量级：`test_cost_model_charges_more_with_impact_enabled` 断言增量**恰等于** `total_impact_usdt(e, x, Q, 0.5, 0.5)`。
+
+**局限.**
+1. $k$ **未标定**（shipped `0.0`）；没有 L2 历史，参与率度量的是**已成交量**而不是挂单量（§8.5、doc 13 §4）。
+2. `impact_pct` 的 `floor`/`cap` 在 `apply_trading_costs` 路径上**没有传入**（`cost_model.py:401-403` 只传 volume 与 $k$）——§8.5 第 5 条的缝隙仍在。
+3. 实盘窗口来自**已写入**的缓存；live 文件没有 `quote_volume` 列时是代理，且代理与真值不相等（§12.2）。
+4. 窗口是 **bar 聚合**（默认 20 根），1h 的 20 根会平滑突发（§8.1 局限 2）。
+
+### 12.4 P6-C 量钟：美元棒与量棒
+
+**算法.** `core/strategy/volume_bars.py`。逐 print 权重 $w_i$（`:108-113`）：
+
+$$w_i=\begin{cases}c_i v_i & \text{美元棒（notional）}\\ v_i & \text{量棒（base volume）}\end{cases}$$
+
+一根 bar 在**累计权重自上一根收盘起**首次达到阈值 $\theta$ 的那个 print 上收盘；**超出部分丢弃**，下一根从下一个 print 开始（`_clock_groups` `:154-187`，与 `VolumeClockBuilder` 的逐 print 规则逐位一致）。于是
+
+$$\text{bar}_j=\{i:\ i_{j-1}<i\le i^{*}_j\},\qquad i^{*}_j=\min\Big\{i:\ \sum_{s=i_{j-1}+1}^{i}w_s\ \ge\ \theta\Big\},\qquad i_{-1}=-1$$
+
+bar 的时间戳是**组内最后一个 print 的时间**（`:122-127`），与缓存口径一致。尾部未达阈值的 bar 是**暂定**的、默认丢弃（`drop_partial=True`，`:190-215`）。`time_bars` 的对照用 `label="right"`/`closed="right"`、`origin="start_day"`（固定网格边缘，追加数据不能移动它）、并丢掉最后一个 bin（`:244-272`）。
+
+**因果阈值估计.** `notional_threshold`/`volume_threshold` 只用**前 `calibrate_on = 0.2`** 的 print（`_threshold_from_warmup` `:277-300`）：
+
+$$\theta=\frac{\sum_{i\in\text{warmup}}w_i}{\texttt{target\_bars}\times\texttt{calibrate\_on}}$$
+
+用全样本均值会让**评估窗口之后**的 print 决定采样网格——那是**采样层**的前视，即使特征干净。对照组的区间由 `match_time_interval`（`:340-378`）解出，使两组 bar 数相当（4 000 目标 ⇒ 137 min/BTCUSDT、179/ETHUSDT、154/SOLUSDT——我用 A 读数复现了这三个值）。
+
+**因果性实测（A）.** 每个构造器都是**前缀函数**：`as_of_consistency` 用 8 个增长前缀重建，数出较短构建被完整构建改写的历史 bar 数。我在当前缓存上重跑 `tools/p6_volume_bars_experiment.py bars`：
+
+| 符号 | prints | time | dollar | volume | 改写的历史 bar |
+|---|---|---|---|---|---|
+| BTCUSDT | 531 288 | 3 890 | 3 889 | 4 731 | **0** |
+| ETHUSDT | 531 291 | 2 983 | 2 987 | 3 079 | **0** |
+| SOLUSDT | 531 291 | 3 463 | 3 475 | 3 980 | **0** |
+
+（归档读数 531 248 prints、3 888/3 887/4 728 等见 `docs/core-algorithms/15-volume-bars-breadth.md:95-102`；缓存边读边长，行数是记录的一部分。）流式与批式在**边界与四个价格**上逐位一致，只有 `volume` 列因求和顺序差 ≤2.5e-15 相对（B，doc 15:104-110）。
+
+**分布实验的诚实结果（A，我本机重跑）.**
+
+| BTCUSDT，4 000 目标 | as-is 超额峰度 | 剔除跨洞收益后 | 被标记 |
+|---|---|---|---|
+| time | 354.3932 | **6.8568**（JB 7 601.89） | 19 |
+| dollar | 335.8498 | **1.3084**（JB 277.33） | 5 |
+| volume | 331.5972 | **1.0469**（JB 217.54） | 6 |
+
+* **原样（as-is）**：$\Delta$超额峰度的 bootstrap 区间**跨 0**，符号逐符号翻转（BTC dollar 点估计 −18.54、95 % CI **[−441.54, +419.48]**，`excludes_zero = false`）；计划写死的判据（JB **且**峰度同降、区间不含 0）在 4 000 根上**一个都没过**。
+* **剔除跨洞收益后**：$\Delta$ 在 4 000 根分辨率的**全部 6 个 cell** 上为负、bootstrap **6/6 支持**（`claim_supported_excluding_gaps = true`）；BTC dollar 点估计 **−5.5484**、95 % CI **[−7.3802, −3.7279]**（`excludes_zero = true`）。doc 15 把 4 000 与 500 两个分辨率合起来记为 **12/12 为负、10/12 支持**（**B**，doc 15:209-232）——合并口径我只重跑了 4 000 那一半。
+* **这一点也不构成换钟的理由**：它来自**这个缓存的洞**——BTCUSDT/1m 有 **27 个洞、166 489 个缺失分钟 = 697 776 分钟跨度的 23.86 %、最大 5 338 560 s ≈ 61.79 天**（A；归档 166 476 / 697 719 / 23.9 % / 61.8 天见 doc 15:21-23 与 `volume_bars.py:668-684`）。时间棒横跨这种洞时会**给一个从未成交的跳空定价**，少数极端收益主导峰度。剔除规则锚在**共同的 print 帧**上、对两侧施加同一条（`gap_spanning_returns` `:687-711`），倾斜（时间棒丢 19 个收益、活动棒丢 5–6 个）**如实标注**。
+
+**决定性实验：同一套可信度协议跑两种采样（A，本机重跑 `gate`）.**
+
+同符号 BTCUSDT、同窗口、同 54 列 v2 契约（`1f30fded996d`）、同成本 0.2500 %、同标签（±0.5 %、4 根前向）、同 purged/embargo K 折、同嵌套阈值选择：
+
+| 采样 | bars | OOS | AUC | 净期望 | 笔数 | $t$ | PSR | 门 |
+|---|---|---|---|---|---|---|---|---|
+| time | 3 890 | 2 236 | **0.5361** | −0.3276 % | 1 790 | −7.6002 | 1.094e-14 | **FAIL** |
+| dollar | 3 889 | 2 662 | **0.4679** | −0.4289 % | 1 521 | −7.4231 | 0.0000 | **FAIL** |
+
+裁决（工具自己的输出）：**"dollar bars did NOT improve the gate verdict (AUC delta −0.0682, net delta −0.1012 pp)"**。归档读数（B，doc 15:254-265）是 time AUC 0.5350 / 净 −0.3281 % / 1 796 笔 / $t=-7.635$ 与 dollar AUC 0.4823 / 净 −0.3178 % / 1 235 笔 / $t=-4.999$，$\Delta$AUC **−0.0527**。**两次都拒绝两种采样**；我这一次比归档更**不利**于美元棒（净期望也是负的）。doc 15 自己写了"数字随缓存移动"，而这次移动的方向正好说明**别引用单次读数**：稳定的只有"两种采样都被拒、美元棒没有改善"。
+
+**结论（必须这样写）.** 美元棒/量棒的因果构造**成立**（0 改写的实测），但 (a) 原样比较不支持计划判据，(b) 剔除跨洞收益后的改善是**这个缓存 27 个洞的产物**，(c) 决定性门测**两种采样都拒绝、美元棒更差**。因此这**不是**"换时钟更好"的证据；`ml.enabled` 保持 `false`，美元棒/量棒**没有**接进特征契约、回测喂价或任何门。
+
+**局限.** (1) 洞是 `data/market/**` 的**数据缺陷**（运行中的服务写的），修它属 `download_history.py --merge` 的范畴，不是 P6-C 的；(2) 时间对照的区间是对**全窗口** print 密度解出的**规格**，与"仅 warm-up"的阈值不是同一类量（doc 15:400-404）；(3) block bootstrap 对两条采样**独立**抽样，是"差的抽样不确定性"而不是配对检验；(4) 缓存一旦重下，本节所有分布数字都要重测。
+
+### 12.5 P6-C 广度：市场级量能
+
+**算法.** `core/market_data/breadth.py`，只用标准库，唯一数据源 `GET https://data-api.binance.vision/api/v3/ticker/24hr`（`:99-105`）。对通过 USDT 过滤（剔除 `UP/DOWN/BULL/BEAR` 杠杆代币，`:112`）且 $v_i>0$ 的交易对集合 $\mathcal U$：
+
+$$\text{total\_quote\_volume}=\sum_{i\in\mathcal U}v_i,\qquad \text{up\_share}=\frac{|\{i\in\mathcal U:\ \Delta p_i>0\}|}{|\mathcal U|},\qquad \text{HHI}=\sum_{i\in\mathcal U}\Big(\frac{v_i}{\sum_j v_j}\Big)^{2},\qquad \text{effective\_pairs}=\frac{1}{\text{HHI}}$$
+
+（`herfindahl` `:240-247`、`aggregate_breadth` `:325-399`）。$\sum v=0$ 或空全域 → **返回 `None`**，绝不用 `0.0` 冒充（`:366-367`）。计数口径写死以免"覆盖率"两读：`symbol_count` = 端点返回的全部条目；`pair_count` = 通过 USDT 过滤的条目；`usable_count` = $v_i>0$ 的条目；`coverage = usable/expected`（给了 documented universe 时）否则 `usable/pair`，且**不裁剪**（>1 是信息而非错误，`:341-357`）。
+
+**TTL / 陈旧策略（全在一处，`:54-79`, `:124-137`）.**
+
+| 常数 | 值 | 含义 |
+|---|---|---|
+| `TICKER24H_TTL_S` | 300 s | 观测"新鲜"5 分钟；全宇宙载荷 ≈1.9 MB（本机实测拉取 **116.0 s** 墙钟） |
+| `MAX_STALE_MS` | 1 800 000（30 min） | 超过后仍可返回缓存值，但**只带 `is_stale=True`**；需要新鲜数的调用者必须当成"不可用" |
+| `FETCH_TIMEOUT_S` | 45 s | 单请求 socket 超时（实测墙钟 55–98 s，所以调用者还要自己限循环） |
+| `REQUEST_ATTEMPTS` | 2 | 一次重试；错误**永不入缓存** |
+| `MAX_CACHE_LINES` | 20 000 | append-only JSONL `data/breadth/breadth.jsonl`（刻意**不**在 `data/market/**`），超限原子压缩 |
+
+**因果标注，以及"能验证的只有标注".** `is_causal`（`:693-715`）检查 `as_of_ms` 非降、且没有任何观测的 `request_started_ms` 晚于它自己的标签。端点**没有历史**，所以过去的广度**无法重建**：缓存是**向前记录**，`replay(upto_ms)`（`:718-721`）只是按标签过滤行。不可达时 `fetch_breadth` 返回 `None`（`:445-476`），`BreadthCache.refresh` 返回 `("unavailable", None)` 且不写任何东西。
+
+**已实测.** **(A) 我在 2026-09-30 22:0x 单次实时拉取**：端点返回 **3 723** 个条目 → plain USDT 交易对 **705** → 非零 24h 成交额 **676**；`coverage = 676/705 = 0.9589`（**95.89 %**，满足"≥ 95 %"），相对计划里过期的 496 是 **136.3 %**。这与 `P6_VOLUME_PLAN.md:108-113` 记的"2026-09-30 13:25：705 报告 / 676 可用 / 95.9 %"**逐个数字一致**（A 复现了 B）。**(B)** 归档的广度序列统计：6 次观测、447 s 墙钟、fetch 延迟 55.5/57.8/60.5/76.0/89.0/97.5 s；`acf1` = **0.9713**（total_quote_volume）/ **0.4858**（up_share）/ **0.6608**（hhi），三个都 `< 0.99` 且方差 > 0（doc 15:306-313）。**(A)** 同一次拉取的单点聚合（`as_of_ms = 1790777014266`）：`total_quote_volume` **8 654 915 396**、`up_share` **0.4645**、`hhi` **0.1184058**（`effective_pairs` **8.4**）、`top_share` **0.2742**、Top3 = USDCUSDT / BTCUSDT / ETHUSDT，`is_causal = {n: 1, causal: True, problems: []}`。注意这个 `up_share 0.4645` **落在**归档 6 样本区间 0.4749–0.5429 **之外**、`hhi 0.1184` 也略低于归档的 0.1242–0.1253——同一个量在几小时内会移动，这既支持"序列非退化"，也说明**单次**读数不能当水平。**n = 6 的告诫**：每个 `acf1` 的标准误 ≈0.4，而结构性预期相反——24 h 滚动量在相隔一分钟的两个样本间**重叠 ~99.9 %**，更长的样本应当**更接近 1**。所以"非退化"只能读作"**本次样本上通过**"，不是序列的性质。**(A)** `tests/test_breadth.py` 收集 **24** 项、`tests/test_volume_bars.py` **48** 项（doc 15:49 的 "48 tests" 与收集数一致；43 个 `def test` + 参数化）。
+
+**局限.** 广度**没有接进任何门**：无生产调用者、不是 ML 特征、没有配置开关（`:22-38`）——它是一库 + 一份证据。HHI 只在 USDT 子集上算，拥有 `exchangeInfo` 的调用者应传自己的 `symbol_filter` 把宇宙钉死（`:413-415`）。**历史无法回填**，所以任何"广度 → regime"的声明都必须先用**向前采集**积累样本。
+
+### 12.6 P6-D：GA 量能模板、基因与可执行性模型
+
+**（a）新条件模板，以及为什么**不**把它们改写成可读列.**
+
+`CONDITION_POOL`（`core/ga/genome.py:176-237`）与 `EXIT_CONDITION_POOL`（`:239-268`）新增 6 族共 14 个模板，每个都是对**已有列**的精确代数展开：
+
+| 模板 | 字符串（`core/ga/genome.py`） | 展开 |
+|---|---|---|
+| RVOL z 尖峰/枯竭 | `:124-136` | 语言里没有 `sqrt`/幂，所以 $\lvert z\rvert>k$ 写成 $z^2>k^2$，方差展开为 $E[x^2]-E[x]^2$；高位阈值 $k=2$、低位 $k=1$（低侧阈值是**实测可达性**选出来的，见下） |
+| VWAP 收复/失守/上下 | `:108-111`, `:138-141` | $\text{sma}(c\cdot v,20)/\text{sma}(v,20)$——两个滚动均值的比**就是**成交量加权均价 |
+| OBV 斜率 | `:143-146` | `sma(obv,5) > sma(obv,20)`（方向而非水平） |
+| A/D 斜率 | `:148-154` | $\mathrm{CLV}\cdot v$ 的 20 根均值与 0 比较（`CLV` 由原始列直接展开，无需累计列） |
+| MFI 超买/超卖 | `:156-165` | $F=p^{typ}v$、$d=p^{typ}-\text{sma}(p^{typ},2)$、$\mathrm{mfd}=F d$；$\mathrm{MFI}>80\iff \text{sma}(\mathrm{mfd})>0.6\,\text{sma}(\lvert\mathrm{mfd}\rvert)$（0.6 是**精确**代数，不是拟合） |
+| 量价背离 | `:167-173` | $x-\text{sma}(x,2)=\Delta x/2$，所以比较是真正的**单根变化** |
+
+**低侧阈值的可达性（A）.** `volume_ratio` 是**右偏**的，所以对称的 $\pm2$ 会让"量能枯竭"模板**永不触发**（计划明写"永不触发的模板要回退"）。我在 live BTCUSDT 1h（11 628 行，其中 11 550 行能算出 z）上独立复算 $z=(\text{volume\_ratio}-\text{sma}_{60})/\sqrt{E[x^2]-E[x]^2}$：$P(z<-1)=$ **4.7879 %**、$P(z<-1.5)=$ **0.0260 %**、$P(z<-2)=$ **0.0000 %**；同一组数在正侧是 $P(z>+1)=13.08\%$、$P(z>+2)=5.45\%$。这与代码注释记的 4.79 % / 0.026 % / 0.000 % **逐个数字一致**（`core/ga/genome.py:119-123`；注释说 11 549 根，我读到 11 550 根——缓存长了一根）。
+
+**为什么不改写成 §12.1 的可读列（estimator-expansion 论证）.** 每个模板都是对**另一个估计量**的精确展开，改写成新列会**改变哪些 bar 触发**，而不只是拼写：模板 VWAP 用 $\sum(c\,v)/\sum v$（close 基），P6-B 的 `vwap` 用典型价 + $10^{-12}$ 守卫；模板 RVOL z 是 `volume_ratio` 的滚动 mean/σ（ddof=0），`rvol_z` 是对数成交量的**锚定** median/MAD z；模板 A/D 斜率读的是**增量**序列，`ad_line` 是**累计**线。`test_p6d_templates_are_left_unchanged`（`tests/test_volume_flow_indicator_columns.py:234-253`）把字符串钉死，让未来的改写必须是**故意的**。六个可读列仍然存在、且**按需**（§12.1），并被**归属审计**覆盖。
+
+**（b）模板归属 / 清洗审计.** 三张表 + 一个审计器，让"无孤儿模板"是可以**失败**的性质而不是承诺：`RAW_ALWAYS_AVAILABLE_COLUMNS`（`:388-390`）、`COLUMN_INDICATOR_OWNER`（`:401-418`）、`TEMPLATE_REQUIRED_COLUMNS`（`:442-481`）、`audit_template_ownership`（`:513-591`）。它逐模板检查：有声明、声明里每列都可产出、声明与**从字符串解析出的标识符**一致、且清洗器在且仅在 owner 打开时保留该模板。`tests/test_ga_volume_genes.py::test_no_orphan_templates_in_any_pool` 对**所有池**运行审计并要求 `problems == []`（A：通过）；`test_broken_templates_fail_the_guard` 注入一个坏模板并证明审计会**报错**（非空集），使守卫非空洞。
+
+**（c）量能过滤基因.** `volume_filter_rvol ∈ [0,3]`、步长 0.1、默认 **0.0 = 关**（`:330`, `:614-617`）。它被**渲染进每一条**入场条件（`:1022-1032`）：
+
+$$c \mapsto (c)\ \wedge\ (\text{volume\_ratio} > r)$$
+
+因为 $\bigvee_i(c_i\wedge f)=(\bigvee_i c_i)\wedge f$、$\bigwedge_i(c_i\wedge f)=(\bigwedge_i c_i)\wedge f$，所以过滤在 `or` 与 `and` 两种结构下都是**真过滤**，且走**同一个** `evaluate_condition` 内核（`:629-642`）。编码时再**解包**（`:870-877`），于是 `encode(decode(x))` 恒等、基因不会被重复施加。
+
+**（d）可执行性模型（P6-D 实际交付的东西）.** 先说清交付边界：**这是"按可执行性重算 P&L 的评分模型"，不是引擎级定仓基因**——我按仓库全域 grep 复核：`volume_scale_k` 在 `core/ga/**` 之外 **0 命中**（`core/backtest`、`core/risk`、`app`、`web`、`scripts`、`tools` 都没有），`apply_executability_model`/`volume_size_factor` 在 `core/backtest/**` **0 命中**；`StrategyConfig` 实测 **12** 个字段（`name`/`enabled`/`mode`/`timeframes`/`symbols`/`indicators`/`entry_conditions`/`condition_logic`/`exit_conditions`/`reduce_conditions`/`ml_config`/`risk_exit`）、**没有任何定仓字段**，两个量能基因因此停在 `indicators` 的自由字典键 `_ga_volume_genes` 里（`core/ga/genome.py:602-611`），而 `compute_all` 的 elif 链对未知键**惰性**（所以该键在评估期无害）。
+
+模型（`core/ga/fitness.py:481-597`）：
+
+$$f_{\text{vol}}=\mathrm{clip}\big(1+k_v(\mathrm{RVOL}-1),\ 0.25,\ 1.0\big)\qquad(\texttt{:307-325})$$
+
+$k_v=$ `volume_scale_k`（0 = 关）；**只缩不放**。再经 P6-A 参与率上限（`:541-544`，`cap_notional`）：
+
+$$n'_e=\min\big(n_e f_{\text{vol}},\ \tfrac{p_{\max}}{100}Q\big),\qquad f=\frac{n'_e}{n_e}\in[0,1]$$
+
+成本**替换而非叠加**（`:550-564`；$c$ = 引擎写下的 `trade["cost"]`，$\ell$ = 同参数下的 pre-P6 费+半价差）：
+
+$$\hat I_{\text{eng}}=\max\big(0,\ c-\ell\big),\qquad c_{\text{base}}=c-\mathbf 1[\text{窗口已测}]\cdot\hat I_{\text{eng}}$$
+$$I'=\mathbf 1[k>0\ \wedge\ \text{窗口已测}]\cdot\sum_{\text{side}}\frac{\mathrm{clip}\big(k p_{\text{side}}^{\,e}\big)}{100}n'_{\text{side}},\qquad c'=c_{\text{base}}f+I'$$
+$$\pi'=(c+\pi)f-c'\qquad(\text{gross}=c+\pi\ \text{不变，只按规模缩放})$$
+
+净值点由 `_adjust_equity_curve`（`:600-…`）把逐笔 $\Delta$ **叠加在引擎自己的曲线上**，之后才交给 `stats_from_trades`/`score_stats`；冠军 provenance 带 `executability` 摘要（`:944-985`, `:1120-1122`）。
+
+**已实测（A，本机）.**
+
+| 判据 | 读数 |
+|---|---|
+| 关闭即不变 | `apply_executability_model` 在 `k=0` 且 `volume_scale_k=0` 时返回**同一个对象**（`out["trades"] is trades`）；强行走 ON 分支、中性基因 + 未测窗口时逐字段逐位一致、`exec_scale == 1.0`、`exec_impact_usdt == 0.0`、equity 曲线相等 |
+| pre-P6 基因组 | 冻结染色体解码得 `_config_hash == "809ddf7ba45af011"`，`_ga_volume_genes` 不出现，回编 `volume_filter_rvol = volume_scale_k = 0.0` |
+| 基因可达 | 固定种子下 `crossover`/`mutation` 按**名**处理新基因（`test_crossover_and_mutation_handle_the_new_genes_by_name`）；14 个新模板在真实缓存（2026-02-01…15、**337** 根）上**全部触发**，命中数 29/15/31/31/185/383/241/327/56/168/145/161/301/267（**无 0**） |
+| 标量 vs 向量化 | `or`：bars 337、active 85、**mismatches 0**；`and`：bars 337、active 257、**mismatches 0** |
+| **不重复收费** | 用**真**成本模型（$k=0.5$、带窗口）定价两笔成交：引擎 cost = 1.8396 / 0.8418，其中 impact = 0.7231 / 0.2671（合计 **0.9901**）；模型重测得 impact **0.9902**，输出的 cost/pnl **逐位等于输入**（`cost identical: True`，逐笔 $\Delta$pnl = 0.0）。若为叠加式重复收费，总成本应≈1.98 |
+| 冲击进入适应度 | 2 笔成交、impact **0.8920 USDT**：fitness **−14.2334 → −14.2379**（`test_impact_term_lowers_the_scored_pnl_and_fitness`） |
+| 参与率上限 | 窗口 200 000 USDT、`max_participation_pct=1 %` ⇒ 上限 2 000 USDT；`notional_after ≤ notional_before`、`trades_scaled == len(trades)`；把窗口放大到 $10^9$ 后 `trades_capped == 0` 而基因仍缩 |
+| 尺寸因子边界 | `volume_size_factor(1.0,0.5)=1.0`、`(3.0,0.5)=1.0`（cap）、`(0.2,1.0)=0.25`（floor）、`(rvol<=0 或 None, ·)=1.0`（未测量 ⇒ 不发明规模） |
+
+**局限.**
+1. **模型只在评分层**：引擎/`PositionSizer` 看不到这个规模，所以冠军的"量能感知定仓"**不会**在实盘或回测下单价量上出现（`docs/overhaul/P6_VOLUME_PLAN.md:156-174`）。
+2. $k_v$ 的上限在基因里是 1.0（`VOLUME_SCALE_MAX_K`），但 `chromosome_volume_scale_k` 只 clamp 到 2.0（`fitness.py:291-296`）——两个边界不一致，手写 YAML 可达 2.0 而 GA 不会生成。
+3. "不重复收费"的替换逻辑依赖 $\ell$ 与引擎口径**一致**；若引擎的成本函数被改（不同费率/价差），$\hat I_{\text{eng}}$ 会把差额当冲击（`:557-560` 的注释正是为此）。
+4. 模板可达性是**一个 337 根窗口**上的读数，不是对所有市场状态的保证；计划里的回退条件是"命中率为 0 就回退"，本次没有触发。
+
+### 12.7 P6 没有做到的事
+
+1. **门还是拒绝的，两个符号都是，而且是在 v2 契约下。** BTCUSDT 1h AUC 0.5228 / 0 笔，ETHUSDT 1h AUC 0.5324 / 净 −0.4132 % / 889 笔 / $t=-3.67$（B，doc 14 §5.1）。`ml.enabled` 保持 `false`；**没有**为了改变这个结果调参。
+2. **美元棒不是更好的采样。** 同协议同契约：time AUC 0.5361 vs dollar 0.4679（A，$\Delta=-0.0682$，两者都被拒）；"剔除跨洞收益后峰度更低"是**这个缓存 27 个洞**的产物（§12.4），不是换时钟的许可。
+3. **广度没有接线。** 库 + 证据而已：无生产调用者、无 ML 特征、无开关；而且因为端点没有历史，过去的值**无法回填**（§12.5）。
+4. **量能缩放基因是评分层产物。** 回测引擎看不到规模、`StrategyConfig` 没有定仓字段（§12.6）；它改变的是 fitness 与冠军 provenance，不是成交。
+5. **冲击系数未标定。** shipped `impact_k = 0.0`；没有 L2 历史可用于标定，"$k=0.1$ 的阶梯"是**为了让算术可读**的例子，不是校准结果（§12.3）。
+6. **live 缓存没有回填。** `data/market/BTCUSDT/1h.parquet` 至今仍是 5 列（A，§12.2），所以实盘路径与容量表仍在 $\text{volume}\times\text{close}$ 代理上，代理与 kline 字段 7 并不相等。
+7. **P6 的成本数字不能跨机器引用。** 本机在 7 个并发 Python 进程 / CPU 100 % 下测得整族 718.8 ms（cpu）、live 管线 5.250 s（cpu），而归档是 95.7 ms / 0.688 s（§12.1）——**归档值未验证**。
 
 ---
 
@@ -1929,6 +2312,50 @@ Select-String -Path tests\test_*.py -Pattern '^\s*(async )?def test' | Measure-O
 #     test_residual_closure 10
 ```
 
+**附录 A2：§12（P6）实际运行的命令（`b81094b`，2026-09-30 21:50–22:15）**
+
+```powershell
+# 1) P6 契约（导入工作树，非 commit 文本）
+python -c "import core.ml.features as F; print(len(F.DEFAULT_FEATURES), len(F.VOLUME_FLOW_FEATURES),
+  len(F.FEATURE_V1_NAMES), F.FEATURE_SCHEMA_VERSION, F.feature_schema_hash(), F.FEATURE_SCHEMA_V1_HASH)"
+#   → 54 15 39 2 1f30fded996d 335e63360104
+#   → v1 列表在第 31 位插回 "hurst"（40 项）→ 70899cff156d；追加到末尾 → 306754631305
+
+# 2) 无前视 + 非退化（live 帧，只读）
+#   特征：compute_features(compute_all(raw, REQUIRED_INDICATORS))
+#   → BTCUSDT 11 628 行 / ETHUSDT 8 855 行，near_constant = []；尾部 6 000 根去掉最后 500 根 → 54 列 0 变化
+#   → live 缓存列 = [open, high, low, close, volume]，sha256_16 BTC 799a2bc888e18dac / ETH 1c4b56adcd999047
+
+# 3) P6-B/D 测试
+python -m pytest tests/test_volume_features_v2.py tests/test_volume_seams.py `
+  tests/test_ga_volume_genes.py tests/test_volume_flow_indicator_columns.py -q
+#   → 56 passed, 1 failed（唯一失败是成本上界：本机 7 个并发 Python 进程、CPU 100 %）
+python -m pytest tests/test_volume_bars.py tests/test_breadth.py --collect-only -q
+#   → 72 tests collected（48 + 24，与 doc 15 一致）
+
+# 4) 容量阶梯 / k=0 逐位一致（复跑 doc 13 §3 的命令，见 §12.3 的表）
+#   → window 1,004,445,350.77 ends 2026-09-30 12:00 price 85 290.32
+#   → k=0 identical: True 77.52890088000001 77.52890088000001
+#   → {'fees_usdt': 40.41216, 'spread_usdt': 5.05152, 'impact_usdt': 0.71649795..., 'total_usdt': 46.1801...}
+
+# 5) 可执行性模型是否会重复收费（§12.6）
+python $env:TEMP\p6_double.py
+#   → engine costs [1.8396, 0.8418] (impact 0.9901) ; model impact 0.9902 ;
+#     cost identical: True ; d(pnl) per trade: [0.0, 0.0]
+
+# 6) P6-C 实验（§12.4）
+python tools/p6_volume_bars_experiment.py bars --symbols BTCUSDT ETHUSDT SOLUSDT `
+  --target-bars 4000 --n-boot 400 --out $env:TEMP\p6c_verify
+python tools/p6_volume_bars_experiment.py gate --symbol BTCUSDT --target-bars 4000 --out $env:TEMP\p6c_verify
+#   → 27 holes / 166 489 missing minutes / 697 776 span / largest 5 338 560 s
+#   → time AUC 0.5361 vs dollar 0.4679, both FAIL, AUC delta -0.0682
+
+# 7) 广度（§12.5，单次实时拉取；随后 --from-cache 可重放）
+#   → 3 723 entries / 705 plain USDT pairs / 676 usable / coverage 0.958865
+#   → up_share 0.4645, hhi 0.1184058, effective_pairs 8.4, is_causal n=1 True
+```
+
+
 ## 附录 B：本文**未验证**的清单
 
 1. 任何 GA 实测数字（`tools/ga_real_data_curve.py` 未重跑：>400 s 墙钟 + 子进程）。**例外**：`data/ga_jobs/**` 里的 job 日志/结果我在仓库内直接读到（§1.9 的 B 级表）。
@@ -1938,10 +2365,18 @@ Select-String -Path tests\test_*.py -Pattern '^\s*(async )?def test' | Measure-O
 5. `garch11_params` 的实际成本、`garch_backend()` 的返回值、`arch` 是否可导入。
 6. `core/ml/calibration.py` 的 `to_dict` → `from_dict` 逐位往返。
 7. `core/ga/genome.py` 的 `mutate()` 逐类细节（文件正被兄弟代理编辑；子代理读过头，见 §1.10 局限 13）。
-8. 工作树 v2 特征契约的列数、hash 与"v1 模型被拒"的行为（52 与 54 都是编辑中间态）。
+8. 工作树 v2 特征契约的列数、hash 与"v1 模型被拒"的行为（52 与 54 都是编辑中间态）。→ **已由 §12.1 结清**：54 列 / `1f30fded996d` / v1 = `335e63360104` 已在 `b81094b` 实测；"v1 模型被拒"的行为仍只有测试与 doc 14 的归档证据（我**没有**重跑侧车拒载的端到端场景）。
 9. `core/market_data/ohlcv_cache.py` 全部 525 行的逐行核对（只读了 `:1-145` 与 `:192-350` 的关键段；`merge_history`/`dedupe` 的完整实现未逐行读）。
 10. `data/ga_trials.json` 的内容（当前不存在；§1.6 的跨窗口累计只有文档依据）。
 11. `docs/core-algorithms/00-ERRATA.md` 的内容（我未读该文件）。
 12. doc 10 的 `≈1.5 ms/bar` 是在哪个 revision/何种窗口上量的（§11 D-1）。
 13. `fetch_features` 的 `trades_limit=100` 与 `trade_arrival_intensity` 内部 `MAX_TRADES=1000` 是否实际造成特征间样本不一致（§6.4 局限 10）。
 14. `core/backtest/signal_matrix.py` 的 hybrid 路径我只读了子代理引用的 `:15-16`/`:303-304`，没有通读全文件。
+
+**§12（P6）新增的未验证项（`b81094b`）**
+
+15. P6 的**绝对**成本数字：8 844 根整族 95.7 ms、`compute_all` 56→152 ms、live 管线 0.688 s。本机在 7 个并发 Python 进程 / CPU 100 % 下测得 718.8 ms（cpu）/ 3.00× / 5.250 s（cpu），两个成本上界测试**失败**；归档值需要一台空闲机器才能复现（§12.1）。
+16. `scripts/ml_credibility_measure.py` 在 v2 契约下的两次门判定（BTC 0.5228 / ETH 0.5324）我没有重跑，是 **B 级**归档（§12.1 局限 1）。
+17. 200 根 1h bar 的 `quote_volume` 源字段抽样比对（200/200 精确）与临时副本回填后的完整性检查是 **B 级**归档；我**没有**向 `data-api.binance.vision` 请求 kline（§12.2）。
+18. 广度序列的 `acf1`（0.9713 / 0.4858 / 0.6608）与其 \(n=6\) 区间是 **B 级**归档；我只做了**单次**实时拉取（覆盖 676/705 与单点聚合，§12.5），没有重放那 6 个样本。
+19. P6-C 的流式 vs 批式 `volume` 列 ≤2.5e-15 的相对差、以及 `--from-cache` 的字节级确定性，我读了归档与测试，**没有**在两个缓存 revision 间重跑对照（§12.4）。
