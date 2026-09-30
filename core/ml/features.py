@@ -1,20 +1,41 @@
 """Feature engineering for ML models.
 
-Provides a 30-dimensional feature set designed for financial time series:
+The canonical feature set is :data:`FEATURE_NAMES` — a single list shared by the
+live predictor, the trainers and the backtest path.  Phase P2 removed the
+"live trains on 40, backtest uses 47" fork (the deployed pkl even carried
+``n_features_in_=40`` while the backtest matrix had 47 columns) by making this
+module the only place a feature list is defined, and by having
+:func:`compute_features` refuse to return a short matrix.
+
+Feature groups:
 - Price momentum (6): multi-period returns + acceleration
 - Volatility (4): rolling std + volatility regime
 - Volume (4): volume changes + trend
 - Price position (5): distance from EMAs, BB position, BB width trend
 - Trend/indicator (6): RSI, MACD, ADX + their changes
-- Microstructure (3): intra-bar position, high-low range
+- Microstructure (2): intra-bar position, high-low range
 - Sequence (3): consecutive direction, return distribution shape
+- Market structure (5): rolling Hurst, swing distances, swing range, reversals
+- Fractional memory (3): fractional-differenced returns + their volatility
+
+Phase P2 audit finding (item 5): **10 of the old 40 columns were literal
+constants on the production path** because ``REQUIRED_INDICATORS`` only computed
+rsi/macd/bollinger/adx, so ``hurst``/``hurst_signal``/``roll_hurst_20`` fell back
+to 0.5, the swing features to 0.0 and the fractional ones to 0.0 while the model
+happily assigned them importance.  The indicator config below now computes every
+input these features need (``core.strategy.indicators.compute_all`` supports
+``atr``/``hurst``/``swing_points``/``frac_diff``), and
+:func:`assert_no_constant_columns` turns a regression into a test failure.
 """
+
+import hashlib
+import json
 
 import pandas as pd
 import numpy as np
 
 
-# ── Default feature list (30 features) ──────────────────────────────────
+# ── Canonical feature list (39 features) ────────────────────────────────
 
 DEFAULT_FEATURES: list[str] = [
     # Price momentum
@@ -35,31 +56,216 @@ DEFAULT_FEATURES: list[str] = [
     # Sequence / distribution
     "consecutive_dir", "ret_skew_20", "ret_kurt_20",
     # ── Market structure (Phase 4c) ──
-    "hurst", "hurst_signal",
+    # NOTE: bare "hurst" was dropped — it is perfectly collinear with
+    # `roll_hurst_20` (its own 20-bar mean), so keeping both added a duplicate
+    # column without adding information.
+    "hurst_signal",
     "dist_to_swing_high", "dist_to_swing_low",
     "swing_range_pct",
-    "frac_ret_5", "frac_ret_10", "frac_vol_10",
-    "roll_hurst_20",
     "swing_reversal_count_50",
+    "roll_hurst_20",
+    # ── Fractional memory ──
+    "frac_ret_5", "frac_ret_10", "frac_vol_10",
 ]
 
-# Extended features with cross-sectional and temporal signals
-EXTENDED_FEATURES: list[str] = DEFAULT_FEATURES + [
-    # Temporal (cyclical encoding — captures intraday/weekly patterns)
+#: The one and only feature contract.  Trainers persist this list in the model
+#: metadata and refuse to score a matrix whose columns differ (item 5).
+FEATURE_NAMES: tuple[str, ...] = tuple(DEFAULT_FEATURES)
+
+#: Columns ``compute_features`` always produces even when not selected — they are
+#: cheap, genuinely varying extras, deliberately NOT part of the contract.
+OPTIONAL_FEATURES: tuple[str, ...] = (
     "hour_sin", "hour_cos", "day_of_week_sin", "day_of_week_cos",
-    # Volume-quality
-    "volume_price_corr_20",
-    # Trend quality (how clean is the trend?)
-    "adx_trend_strength", "ema_slope_20",
-]
+    "volume_price_corr_20", "adx_trend_strength", "ema_slope_20",
+)
 
-# Indicator configs needed to compute the indicator-derived features above
+# Indicator configs needed to compute the indicator-derived features above.
+# `swing_points`/`frac_diff` are what make the market-structure block
+# non-constant; `atr` feeds the volatility-scaled triple barrier.
+#
+# `hurst` is deliberately NOT in this dict (audit P2 #7): the legacy indicator
+# (`core.strategy.indicators._compute_hurst_indicator`) costs O(n · lookback²)
+# with a 10-lag R/S regression per bar — measured 2.096 s for 8 844 bars against
+# 0.0029 s before it was added to the set (730×) — and `hurst_signal` was just
+# its own rolling mean, i.e. the same number twice.  The features below compute a
+# **bounded** R/S Hurst instead: a 60-bar window on a 4-lag grid, refreshed every
+# `_HURST_STRIDE` bars and forward-filled (see `_rolling_hurst_bounded`).
 REQUIRED_INDICATORS: dict[str, dict] = {
     "rsi": {"period": 14, "source": "close"},
     "macd": {"fast": 12, "slow": 26, "signal": 9},
     "bollinger": {"period": 20, "stddev": 2},
     "adx": {"period": 14},
+    "atr": {"period": 14},
+    "swing_points": {"lookback": 5},
+    "frac_diff": {"d": 0.4, "threshold": 0.001},
 }
+
+#: Rolling-Hurst budget: window length, lags used per window and the refresh
+#: stride.  ``60``-bar windows on ``4`` lags is the cheapest setting that still
+#: yields a varying series on 8 800 real 1h bars (measured std ≈ 0.076).
+HURST_LOOKBACK = 60
+HURST_LAGS = (4, 6, 9, 12)
+_HURST_STRIDE = 4
+
+
+#: Which DataFrame columns each entry of :data:`REQUIRED_INDICATORS` produces.
+#: Used by :func:`compute_features` to refuse a raw-OHLCV input instead of
+#: silently emitting constant columns.
+INDICATOR_COLUMNS: dict[str, tuple[str, ...]] = {
+    "rsi": ("rsi",),
+    "macd": ("macd_histogram",),
+    "bollinger": ("bollinger_upper", "bollinger_lower"),
+    "adx": ("adx",),
+    "atr": ("atr",),
+    "swing_points": ("swing_high", "swing_low"),
+    "frac_diff": ("frac_close",),
+}
+
+
+def _indicator_presence(df: pd.DataFrame, name: str) -> list[str]:
+    """The columns of indicator *name* that are actually present in *df*."""
+    return [c for c in INDICATOR_COLUMNS.get(name, ()) if c in df.columns]
+
+
+#: Rows required before an indicator-derived feature matrix is meaningful.
+#: ``compute_features`` raises below this and the live predictor
+#: (``MLPredictor._on_kline``) refuses to score below it — before P2 the
+#: predictor guarded at 100 rows while the feature code needed 200, so the
+#: 100–199-row band produced an all-zero/ffilled matrix (audit P2 #10).
+MIN_FEATURE_ROWS = HURST_LOOKBACK + 140
+
+
+class FeatureContractError(RuntimeError):
+    """Raised when a feature matrix violates the canonical contract."""
+
+
+def feature_schema_hash(feature_names: list[str] | tuple[str, ...] | None = None) -> str:
+    """Stable hash of a feature list — stored in model metadata."""
+    names = list(FEATURE_NAMES if feature_names is None else feature_names)
+    return hashlib.sha1(json.dumps(names).encode("utf-8")).hexdigest()[:12]
+
+
+def missing_feature_columns(result: pd.DataFrame,
+                            feature_list: list[str] | tuple[str, ...] | None = None
+                            ) -> list[str]:
+    """Canonical (or requested) features absent from *result*."""
+    wanted = list(FEATURE_NAMES if feature_list is None else feature_list)
+    return [f for f in wanted if f not in result.columns]
+
+
+def validate_feature_matrix(
+    result: pd.DataFrame,
+    feature_list: list[str] | tuple[str, ...] | None = None,
+    *,
+    require_exact: bool = False,
+    near_constant: bool = False,
+    tolerance: float = 1e-9,
+) -> None:
+    """Fail loudly when a feature matrix does not match the contract.
+
+    ``require_exact`` additionally rejects extra columns (the live/backtest
+    parity assertion).  ``near_constant`` rejects columns whose standard
+    deviation (or whole range) is below *tolerance* — the test that would have
+    caught the 10 constant columns.
+    """
+    wanted = list(FEATURE_NAMES if feature_list is None else feature_list)
+    missing = [f for f in wanted if f not in result.columns]
+    if missing:
+        raise FeatureContractError(
+            f"feature matrix is missing {len(missing)} required column(s): "
+            f"{missing[:8]}{'...' if len(missing) > 8 else ''} "
+            f"(have {len(result.columns)}, expected {len(wanted)})")
+    if require_exact:
+        extra = [c for c in result.columns if c not in wanted]
+        if extra:
+            raise FeatureContractError(f"feature matrix has unexpected column(s): {extra[:8]}")
+        if list(result.columns) != wanted:
+            raise FeatureContractError(
+                "feature matrix column ORDER differs from the contract "
+                "(a LightGBM/XGBoost model scores positionally)")
+    if near_constant:
+        bad = near_constant_columns(result[wanted], tolerance=tolerance)
+        if bad:
+            raise FeatureContractError(f"near-constant feature column(s): {bad}")
+
+
+def near_constant_columns(
+    result: pd.DataFrame,
+    tolerance: float = 1e-9,
+    min_unique: int = 2,
+) -> list[str]:
+    """Columns that are constant (or effectively constant) across all rows."""
+    bad: list[str] = []
+    for col in result.columns:
+        series = pd.to_numeric(result[col], errors="coerce")
+        finite = series.replace([np.inf, -np.inf], np.nan).dropna()
+        if len(finite) == 0:
+            bad.append(str(col))
+            continue
+        if finite.nunique(dropna=True) < int(min_unique):
+            bad.append(str(col))
+            continue
+        if float(finite.std(ddof=0)) <= float(tolerance):
+            bad.append(str(col))
+            continue
+        if float(finite.max() - finite.min()) <= float(tolerance):
+            bad.append(str(col))
+    return bad
+
+
+def _rs_hurst_lags(returns: np.ndarray, lags: tuple[int, ...] = HURST_LAGS) -> float:
+    """R/S Hurst exponent for one window of log-returns on a fixed lag grid."""
+    n = len(returns)
+    if n < 20:
+        return 0.5
+    usable = [lag for lag in lags if 4 <= lag <= n // 2]
+    if len(usable) < 2:
+        return 0.5
+    rs_values: list[float] = []
+    used: list[int] = []
+    for lag in usable:
+        n_chunks = n // lag
+        if n_chunks < 2:
+            continue
+        chunks = returns[: n_chunks * lag].reshape(n_chunks, lag).astype(np.float64)
+        mean = chunks.mean(axis=1, keepdims=True)
+        cum_dev = (chunks - mean).cumsum(axis=1)
+        rng = cum_dev.max(axis=1) - cum_dev.min(axis=1)
+        scale = chunks.std(axis=1, ddof=1) + 1e-12
+        rs_values.append(float((rng / scale).mean()))
+        used.append(lag)
+    if len(rs_values) < 2:
+        return 0.5
+    slope = float(np.polyfit(np.log(used), np.log(rs_values), 1)[0])
+    return max(0.0, min(1.0, slope))
+
+
+def _rolling_hurst_bounded(
+    close: pd.Series,
+    *,
+    lookback: int = HURST_LOOKBACK,
+    stride: int = _HURST_STRIDE,
+) -> pd.Series:
+    """Bounded rolling R/S Hurst of log-returns (audit P2 #7).
+
+    Same estimator as ``core.strategy.indicators._compute_hurst_indicator`` but
+    with a bounded window/lag grid and refreshed every ``stride`` bars, then
+    forward-filled: live inference cannot afford a 10-lag regression per bar
+    (measured 2.096 s per call on 8 844 bars).  Bars before the first full window
+    are NaN; the caller fills them like every other feature.
+    """
+    prices = close.to_numpy(dtype=float)
+    n = len(prices)
+    out = np.full(n, np.nan)
+    if n <= lookback + 1:
+        return pd.Series(out, index=close.index)
+    log_prices = np.log(np.maximum(prices, 1e-12))
+    step = max(int(stride), 1)
+    for i in range(lookback, n, step):
+        out[i] = _rs_hurst_lags(np.diff(log_prices[i - lookback: i + 1]))
+    series = pd.Series(out, index=close.index)
+    # Forward-fill the stride gaps (each value is a stale-but-knowable window).
+    return series.ffill()
 
 
 def build_features(df: pd.DataFrame, feature_list: list[str] | None = None) -> pd.DataFrame:
@@ -79,26 +285,58 @@ def build_features(df: pd.DataFrame, feature_list: list[str] | None = None) -> p
 
 
 def compute_features(df: pd.DataFrame,
-                     feature_list: list[str] | None = None) -> pd.DataFrame:
-    """Compute the full 30-dim feature set from OHLCV data.
-
-    Assumes *df* already has technical indicators attached (RSI, MACD,
-    Bollinger Bands, ADX).  Use :func:`add_engineered_features` if you
-    need to compute everything from raw OHLCV + indicators in one pass.
+                     feature_list: list[str] | None = None,
+                     *,
+                     validate: bool = True) -> pd.DataFrame:
+    """Compute the canonical feature set from an indicator-bearing DataFrame.
 
     Parameters
     ----------
     df : pd.DataFrame
-        Must contain at least 'open','high','low','close','volume' plus the
-        indicator columns listed in REQUIRED_INDICATORS.
+        Must contain at least 'open','high','low','close','volume' plus every
+        indicator column produced by
+        ``core.strategy.indicators.compute_all(df, REQUIRED_INDICATORS)``.
+        Passing a subset silently produced 10 constant columns before P2, so a
+        missing indicator input now raises :class:`FeatureContractError`.
     feature_list : list[str] | None
-        Subset of DEFAULT_FEATURES to return; None = all.
+        Subset of :data:`FEATURE_NAMES` to return; ``None`` = the full contract.
+        ``[]`` is treated as ``None`` for backward compatibility with callers
+        that pass an empty list meaning "everything".
+    validate : bool
+        Assert the resulting matrix matches the requested contract and has no
+        near-constant column (default True — this is the fail-loudly path).
 
     Returns
     -------
     pd.DataFrame
         Feature matrix with the same index as *df*.
     """
+    if feature_list is not None and len(feature_list) == 0:
+        feature_list = None
+    # The documented data requirement: below this every rolling window (and the
+    # 60-bar Hurst) is NaN→ffill→0, i.e. a matrix of constants.  The live
+    # predictor guards on the same constant so the two cannot disagree.
+    if len(df) < MIN_FEATURE_ROWS:
+        raise FeatureContractError(
+            f"compute_features needs at least {MIN_FEATURE_ROWS} rows "
+            f"(got {len(df)}); shorter windows make every rolling feature "
+            f"constant (audit P2 #10)")
+    # None → the canonical contract (NOT "every column computed"): the old
+    # `feature_list=None ⇒ all computed columns` behaviour is exactly how the
+    # live path (40) and the backtest path (47) drifted apart (item 5).
+    effective_list = list(FEATURE_NAMES if feature_list is None else feature_list)
+
+    required_inputs = [
+        col for name in REQUIRED_INDICATORS for col in INDICATOR_COLUMNS.get(name, ())
+    ]
+    missing_inputs = [c for c in required_inputs if c not in df.columns]
+    if missing_inputs:
+        raise FeatureContractError(
+            "compute_features needs the indicator columns produced by "
+            f"compute_all(df, REQUIRED_INDICATORS); missing: {missing_inputs}. "
+            "Feeding it raw OHLCV silently yields constant features "
+            "(this was audit finding P2-5).")
+
     result = pd.DataFrame(index=df.index)
     close = df["close"].astype(float)
     vol = df.get("volume", pd.Series(0, index=df.index)).astype(float)
@@ -210,47 +448,54 @@ def compute_features(df: pd.DataFrame,
     result["ema_slope_20"] = (ema20 - ema20.shift(5)) / (ema20.shift(5) + 1e-9)
 
     # ── Market structure (Phase 4c) ──────────────────────────────────
-    # Hurst (requires hurst indicator pre-computed)
-    result["hurst"] = df.get("hurst", pd.Series(0.5, index=df.index))
-    result["hurst_signal"] = df.get("hurst_signal", pd.Series(0.5, index=df.index))
-    result["roll_hurst_20"] = result["hurst"].rolling(20).mean().fillna(0.5)
+    # The raw `hurst` level is computed here with the bounded estimator (audit
+    # P2 #7); `roll_hurst_20` is its own 20-bar mean, which is why the bare
+    # `hurst` column is not part of the shipped contract.
+    result["hurst"] = _rolling_hurst_bounded(close)
+    result["roll_hurst_20"] = result["hurst"].rolling(20).mean()
+    # `hurst_signal` is the *regime change* — short-term Hurst minus its 60-bar
+    # mean — not a second copy of the same rolling mean.  Before P2 it was
+    # `hurst.rolling(lookback).mean()`, i.e. perfectly collinear with the
+    # 100-bar mean of the series it shipped next to.  Both come from the same
+    # bounded series, so the extra column costs nothing.
+    result["hurst_signal"] = result["hurst"] - result["hurst"].rolling(
+        HURST_LOOKBACK).mean()
 
     # Swing point distances (requires swing_points indicator)
-    if "dist_to_high_pct" in df.columns:
-        result["dist_to_swing_high"] = df["dist_to_high_pct"].fillna(0.0)
-        result["dist_to_swing_low"] = df["dist_to_low_pct"].fillna(0.0)
-        result["swing_range_pct"] = df.get("swing_range_pct",
-            pd.Series(0.0, index=df.index)).fillna(0.0)
-        # Count reversals: number of swing direction changes in last 50 bars
-        result["swing_reversal_count_50"] = (
-            (df["swing_high"].diff() != 0).astype(int)
-            .rolling(50).sum().fillna(0)
-        )
-    else:
-        result["dist_to_swing_high"] = 0.0
-        result["dist_to_swing_low"] = 0.0
-        result["swing_range_pct"] = 0.0
-        result["swing_reversal_count_50"] = 0.0
+    result["dist_to_swing_high"] = pd.to_numeric(df["dist_to_high_pct"], errors="coerce")
+    result["dist_to_swing_low"] = pd.to_numeric(df["dist_to_low_pct"], errors="coerce")
+    result["swing_range_pct"] = pd.to_numeric(df["swing_range_pct"], errors="coerce")
+    # Reversal activity: bars where the confirmed swing HIGH moved in the last
+    # 50 bars (the old expression re-added the swing type regardless of change,
+    # so it was indistinguishable from a 50-period count).
+    result["swing_reversal_count_50"] = (
+        df["swing_high"].diff().fillna(0.0).ne(0.0).astype(float)
+        .rolling(50).sum())
 
-    # Fractional-differenced returns (requires frac_diff indicator)
-    if "frac_close" in df.columns:
-        fd = df["frac_close"]
-        result["frac_ret_5"] = fd.pct_change(5).fillna(0.0).clip(-0.5, 0.5)
-        result["frac_ret_10"] = fd.pct_change(10).fillna(0.0).clip(-0.5, 0.5)
-        result["frac_vol_10"] = result["frac_ret_5"].rolling(10).std().fillna(0.0)
-    else:
-        result["frac_ret_5"] = 0.0
-        result["frac_ret_10"] = 0.0
-        result["frac_vol_10"] = 0.0
+    # Fractional-differenced returns (requires frac_diff indicator).  The
+    # fractional series is a *level* built from long-memory weights, whose
+    # magnitude depends on the price scale; pct_change of a small residual is
+    # numerically unstable, so the contract uses the fractional change
+    # normalised by entry price (a stationarised, scale-free measure).
+    fd = pd.to_numeric(df["frac_close"], errors="coerce")
+    for horizon in (5, 10):
+        change = (fd - fd.shift(horizon)) / (close.abs() + 1e-12)
+        result[f"frac_ret_{horizon}"] = change.clip(-0.5, 0.5)
+    result["frac_vol_10"] = result["frac_ret_5"].rolling(10).std()
 
     # ── Cleanup ─────────────────────────────────────────────────────
     result = result.replace([np.inf, -np.inf], np.nan)
     result = result.ffill().fillna(0)
 
-    # Subset if a specific list was requested
-    if feature_list is not None:
-        available = [f for f in feature_list if f in result.columns]
-        result = result[available]
+    # Subset to the contract (or the caller's explicit subset).  `effective_list`
+    # is used instead of `feature_list` so the None case is the contract too.
+    available = [f for f in effective_list if f in result.columns]
+    result = result[available]
+
+    if validate:
+        validate_feature_matrix(result, effective_list,
+                                require_exact=(feature_list is None),
+                                near_constant=True)
 
     return result
 
@@ -264,6 +509,15 @@ def create_binary_label(df: pd.DataFrame, forward_periods: int = 4,
 
     Returns 1 if price rises >= threshold, 0 if falls >= threshold,
     NaN for insignificant (noise) moves.
+
+    .. deprecated:: P2
+        This target **drops the no-move regime** (BTCUSDT 1h: 59.5 % of bars;
+        1m: 84.7 %), which is exactly why the live model could not beat the
+        majority class on the bars it was asked to decide.  New code should use
+        :func:`core.ml.labels.create_three_class_label` (keeps ``flat`` as a
+        class and abstains on it) or
+        :func:`core.ml.labels.create_triple_barrier_label_vol`.  Kept only for
+        the backtest engine, which is out of this phase's write scope.
     """
     future_close = df["close"].shift(-forward_periods)
     return_pct = (future_close - df["close"]) / df["close"]
@@ -288,6 +542,13 @@ def create_triple_barrier_label(
     upper_pct: float = 0.02,
     lower_pct: float = 0.02,
     timeout_label: float | None = None,
+    *,
+    vol_scaled: bool = True,
+    atr_period: int = 14,
+    atr_multiple: float = 1.5,
+    min_pct: float = 0.004,
+    max_pct: float = 0.06,
+    max_rows: int | None = None,
 ) -> pd.Series:
     """Path-aware label using the Triple Barrier Method.
 
@@ -298,18 +559,30 @@ def create_triple_barrier_label(
     5% hits the upper barrier first (label=1), even though the endpoint
     return is negative. Binary labels would incorrectly label this 0.
 
+    Phase P2: barriers are **volatility-scaled by default** (``vol_scaled=True``
+    → :func:`core.ml.labels.create_triple_barrier_label_vol`, width
+    ``atr_multiple × ATR / close`` clamped to ``[min_pct, max_pct]``).  The
+    fixed ``24 × 2 %`` version made 44.9 % of all labels timeouts on real data,
+    which is a class, not a signal.  Pass ``vol_scaled=False`` for the legacy
+    fixed-width behaviour.
+
     Parameters
     ----------
     df : pd.DataFrame
         Must have 'high', 'low', 'close' columns.
     forward_periods : int
-        Maximum number of periods to look forward.
-    upper_pct : float
-        Upper barrier as fraction above entry (e.g. 0.02 = +2%).
-    lower_pct : float
-        Lower barrier as fraction below entry (e.g. 0.02 = -2%).
+        Maximum number of periods to look forward — the time barrier.  Set it
+        to the strategy's real maximum holding period (bar count).
+    upper_pct, lower_pct : float
+        Fixed barriers (used only when ``vol_scaled=False``).
     timeout_label : float | None
         Value for samples where no barrier is hit (NaN = filtered out).
+    vol_scaled : bool
+        Use ATR-scaled barriers (default True).
+    atr_multiple, min_pct, max_pct : float
+        Barrier width controls for the volatility-scaled mode.
+    max_rows : int | None
+        Label only the most recent ``max_rows`` bars (research convenience).
 
     Returns
     -------
@@ -318,6 +591,13 @@ def create_triple_barrier_label(
         0  = lower barrier hit first (bearish)
         NaN or timeout_label = neither barrier hit within window
     """
+    if vol_scaled:
+        from core.ml.labels import create_triple_barrier_label_vol
+        return create_triple_barrier_label_vol(
+            df, forward_periods=forward_periods, atr_period=atr_period,
+            atr_multiple=atr_multiple, min_pct=min_pct, max_pct=max_pct,
+            timeout_label=timeout_label, max_rows=max_rows)
+
     n = len(df)
     high = df["high"].values.astype(np.float64)
     low = df["low"].values.astype(np.float64)
@@ -345,7 +625,11 @@ def create_triple_barrier_label(
 
     result = pd.Series(labels, index=df.index)
     if timeout_label is not None:
+        # Genuine timeouts inside the sample become the timeout class; the last
+        # `forward_periods` rows have no full window and stay NaN (audit P2 #6).
+        tail = result.iloc[n - forward_periods:] if forward_periods < n else result
         result = result.fillna(timeout_label)
+        result.loc[tail.index] = np.nan
     return result
 
 

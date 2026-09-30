@@ -7,7 +7,6 @@ from core.market_data.provider import MarketDataProvider, interval_minutes
 from core.strategy.loader import StrategyLoader, StrategyConfig
 from core.strategy.indicators import compute_all, evaluate_condition
 from core.strategy.evaluation_kernel import (
-    evaluate_entry_conditions,
     evaluate_exit_conditions as eval_exit_conds,
     fuse_signals,
     check_higher_tf_trend,
@@ -25,6 +24,13 @@ class StrategyEngine:
         self._strategies: dict[str, StrategyConfig] = {}
         self._signal_cache: dict[str, dict] = {}
         self._ml_confidence: dict[str, float] = {}
+        #: symbol → the ML predictor's full verdict
+        #: ``{"confidence", "base_rate", "score", "abstained"}``.  `engine.py`
+        #: used to keep only `confidence` and call `fuse_signals` without
+        #: `ml_base_rate`/`ml_score`, so an abstention published as
+        #: ``confidence = base_rate`` scored as a small **bearish** vote
+        #: (audit P2 #5).
+        self._ml_prediction: dict[str, dict] = {}
         self._news_sentiment: dict[str, float] = {}
 
     def wire_executor(self, executor):
@@ -92,6 +98,41 @@ class StrategyEngine:
     async def _on_ml_prediction(self, event: Event):
         symbol = event.data.get("symbol", "")
         self._ml_confidence[symbol] = event.data.get("confidence", 0.5)
+        payload = {"confidence": event.data.get("confidence", 0.5)}
+        if "ml_base_rate" in event.data or "base_rate" in event.data:
+            payload["base_rate"] = event.data.get("ml_base_rate",
+                                                  event.data.get("base_rate"))
+        if "ml_score" in event.data or "score" in event.data:
+            payload["score"] = event.data.get("ml_score", event.data.get("score"))
+        if "ml_abstained" in event.data or "abstained" in event.data:
+            payload["abstained"] = event.data.get("ml_abstained",
+                                                  event.data.get("abstained"))
+        self._ml_prediction[symbol] = payload
+
+    def _ml_fusion_inputs(self, symbol: str) -> dict:
+        """``fuse_signals`` kwargs for *symbol*'s latest ML prediction.
+
+        Audit P2 #5: the live path kept only ``confidence``.  With no base rate
+        the kernel defaults to 0.5, so an abstention published as
+        ``confidence = base_rate`` (e.g. 0.40) became a **bearish** vote of
+        ``(0.40 − 0.5) × 2 = −0.20``.  The verdict now carries the model's own
+        base rate and its signed score; an abstention contributes exactly 0.
+
+        Callers that only have a plain confidence (older tests, an external
+        event producer) keep the historical behaviour: no ``base_rate``/``score``
+        keys → the kernel's 0.5 default reproduces ``(conf − 0.5) × 2``.
+        """
+        stored = self._ml_prediction.get(symbol)
+        if stored is None:
+            return {"ml_confidence": float(self._ml_confidence.get(symbol, 0.5))}
+        kwargs: dict = {"ml_confidence": float(stored.get("confidence", 0.5))}
+        score = stored.get("score")
+        base_rate = stored.get("base_rate")
+        if base_rate is not None:
+            kwargs["ml_base_rate"] = float(base_rate)
+        if score is not None or base_rate is not None:
+            kwargs["ml_score"] = 0.0 if stored.get("abstained") else score
+        return kwargs
 
     async def _on_news_update(self, event: Event):
         symbol = event.data.get("symbol", "")
@@ -105,8 +146,12 @@ class StrategyEngine:
         df = compute_all(df, strategy.indicators)
 
         # ── Shared Kernel: Entry condition evaluation ──
-        long_active, short_active = evaluate_entry_conditions(
-            df, strategy.entry_conditions)
+        # ``StrategyConfig.entry_sides`` is the ONE entry-structure evaluator:
+        # it honours the persisted ``condition_logic`` gene ("or" → the shared
+        # OR kernel below, "and" → every condition must hold) exactly as the
+        # GA/backtest entry path does, so post-load trading cannot diverge from
+        # the structure the genome was scored under.
+        long_active, short_active = strategy.entry_sides(df)
 
         # Build per-condition diagnostic results (kernel only returns active flags)
         entry_results = {"long": [], "short": []}
@@ -149,15 +194,19 @@ class StrategyEngine:
         ml_enabled = bool(strategy.ml_config and strategy.ml_config.enabled)
         strategy_ml_weight = strategy.ml_config.weight if ml_enabled else None
 
+        # Full ML verdict (base rate + signed score + abstention), not just the
+        # scalar confidence — see `_ml_fusion_inputs` (audit P2 #5).  The helper
+        # returns `ml_confidence` itself, so it is not also passed explicitly.
+        ml_inputs = self._ml_fusion_inputs(symbol)
         final_score = fuse_signals(
             indicator_signal=indicator_signal,
-            ml_confidence=ml_conf,
             news_sentiment=news_sent,  # live mode — news is available
             w_indicator=w.indicator,
             w_ml=w.ml,
             w_news=w.news,
             ml_enabled=ml_enabled,
             strategy_ml_weight=strategy_ml_weight,
+            **ml_inputs,
         )
 
         # Determine entry side from the signal
@@ -226,6 +275,11 @@ class StrategyEngine:
             "symbol": symbol,
             "indicator_signal": indicator_signal,
             "ml_confidence": ml_conf,
+            # The full ML verdict that produced this score (audit P2 #5) — the
+            # dashboard can now show the base rate and the signed contribution
+            # instead of a bare probability.
+            "ml_base_rate": ml_inputs.get("ml_base_rate"),
+            "ml_score": ml_inputs.get("ml_score"),
             "news_sentiment": news_sent,
             "final_score": final_score,
             "exit_signal": exit_signal,
@@ -384,6 +438,10 @@ class StrategyEngine:
                 strat_signals[sym] = {
                     "indicator": round(sig["indicator_signal"], 2),
                     "ml_confidence": round(sig["ml_confidence"], 2),
+                    "ml_base_rate": (None if sig.get("ml_base_rate") is None
+                                     else round(sig["ml_base_rate"], 4)),
+                    "ml_score": (None if sig.get("ml_score") is None
+                                 else round(sig["ml_score"], 4)),
                     "news_sentiment": round(sig["news_sentiment"], 2),
                     "final_score": round(sig["final_score"], 3),
                     "exit_signal": sig["exit_signal"],

@@ -27,6 +27,14 @@ def generate_report(backtest_result: dict) -> dict:
         "avg_pnl": metrics.get("avg_pnl", 0),
         "avg_hold_minutes": metrics.get("avg_hold_minutes", 0),
         "ml_accuracy_pct": metrics.get("ml_accuracy_pct", 0),
+        # P2 item 1 — honesty about what ml_accuracy_pct is measured over:
+        # neutral (abstaining) predictions are excluded from accuracy, so the
+        # coverage and neutral shares are surfaced next to it.
+        "ml_coverage_pct": metrics.get("ml_coverage_pct", 0),
+        "ml_neutral_pct": metrics.get("ml_neutral_pct", 0),
+        "ml_predictions": metrics.get("ml_predictions", 0),
+        "ml_scored": metrics.get("ml_scored", 0),
+        "ml_abstained": metrics.get("ml_abstained", 0),
     }
 
     # ── Risk analysis (new — Sortino, Calmar, VaR, CVaR, etc.) ──

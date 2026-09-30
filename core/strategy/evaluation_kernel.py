@@ -23,11 +23,17 @@ import numpy as np
 import pandas as pd
 
 from core.strategy.indicators import evaluate_condition
+from core.ml.calibration import signed_score
 
 # ── Entry thresholds (single source of truth for live + backtest) ───────
 ENTRY_THRESHOLD = 0.5
 #: Counter-trend entries require a stronger signal (regime-aware gate).
 COUNTER_TREND_THRESHOLD = 0.65
+
+#: Base rate used to centre the ML score when the caller does not supply the
+#: model's own training base rate.  0.5 reproduces the historical
+#: ``(p − 0.5) × 2`` transform exactly (see :func:`core.ml.calibration.signed_score`).
+DEFAULT_ML_BASE_RATE = 0.5
 
 
 
@@ -99,19 +105,42 @@ def fuse_signals(*,
                  w_news: float = 0.1,
                  ml_enabled: bool = True,
                  strategy_ml_weight: float | None = None,
+                 ml_base_rate: float = DEFAULT_ML_BASE_RATE,
+                 ml_score: float | None = None,
                  ) -> float:
     """Weighted fusion of indicator, ML, and news signals.
 
+    ML term (Phase P2 item 4) — a **signed score centred on the model's own
+    base rate**::
+
+        edge           = ml_confidence / ml_base_rate - 1
+        scale          = max(1/ml_base_rate - 1, 1/(1 - ml_base_rate) - 1)
+        ml_directional = clip(edge / scale, -1, +1)
+
+    (audit P2 #10: this is **not** ``2·ml_confidence/base_rate − 1``.  The two
+    differ by up to 1.0 at base rate 0.2/0.8 and the real formula is
+    **asymmetric** — at ``base_rate = 0.2`` a maximal bullish call ``p = 1.0``
+    scores ``+1.0`` while ``p = 0.0`` scores ``−0.25``.  The implemented formula
+    is what :func:`core.ml.calibration.signed_score` computes and what the tests
+    assert.)
+
+    ``ml_confidence`` is ``P(up)`` — *not* a generic "confidence".  Centring on
+    the base rate fixes the audit's sign inversion: with the hard-coded 0.5 a
+    bullish call at ``P(up) = 0.35`` scored **bearish** even though 0.35 is above
+    the base rate of a filtered (±0.5 %) sample.  ``ml_base_rate = 0.5`` (the
+    default, so callers that cannot be edited keep their exact old behaviour)
+    reproduces the historical ``(p - 0.5) * 2``.
+
     Formula::
 
-        ml_directional = (ml_confidence - 0.5) * 2   # 0→1  maps to  -1→+1
         total_weight   = w_indicator + effective_ml_weight + w_news
-        final_score    = (indicator*w_ind + ml_dir*effective_ml + news*w_news)
+        final_score    = (indicator*w_ind + ml_directional*effective_ml + news*w_news)
                          / total_weight
 
     Args:
         indicator_signal: -1 (short), 0 (neutral), or +1 (long) from indicators.
-        ml_confidence:   ML model confidence in [0, 1].  0.5 = neutral.
+        ml_confidence:   ML ``P(up)`` in [0, 1].  0.5 = neutral only when the
+                         base rate is 0.5.
         news_sentiment:  News sentiment in [-1, +1].  Pass **None** to exclude
                          from numerator (backtest mode — no historical news).
         w_indicator:     Weight for indicator signal (default 0.6).
@@ -120,14 +149,25 @@ def fuse_signals(*,
         ml_enabled:      Whether ML is enabled for this strategy.
         strategy_ml_weight: Per-strategy ML weight override.  If *None*,
                          falls back to *w_ml*.
+        ml_base_rate:    The model's own base rate (persisted in the model
+                         metadata).  Default 0.5 = legacy behaviour.
+        ml_score:        Optional pre-computed signed score in [-1, +1]
+                         (e.g. ``signed_score(p_up, base_rate)`` from a
+                         calibrated model, or ``p_up - p_down`` from PatchTST).
+                         When given it wins over ``ml_confidence``.
 
     Returns:
         Fused final score in [-1, +1].  |score| ≥ 0.5 is the standard
         entry threshold.
     """
-    # ML directional transform: confidence ∈ [0,1] → signal ∈ [-1, +1]
+    # ML directional transform: P(up) ∈ [0,1] → signal ∈ [-1, +1].
     # When ML is disabled, ignore any stale confidence values (defense in depth)
-    ml_directional = 0.0 if not ml_enabled else (ml_confidence - 0.5) * 2.0
+    if not ml_enabled:
+        ml_directional = 0.0
+    elif ml_score is not None:
+        ml_directional = float(max(-1.0, min(1.0, float(ml_score))))
+    else:
+        ml_directional = float(signed_score(ml_confidence, ml_base_rate))
 
     # Effective ML weight:
     # - Per-strategy override takes priority (when ml_enabled and configured)
@@ -270,9 +310,24 @@ def fuse_signals_series(indicator: pd.Series, *,
                         ml_enabled: bool = True,
                         strategy_ml_weight: float | None = None,
                         ml_confidence: float = 0.5,
+                        ml_base_rate: float = DEFAULT_ML_BASE_RATE,
+                        ml_score: float | pd.Series | None = None,
                         news_sentiment: float | None = None) -> pd.Series:
-    """Vectorized :func:`fuse_signals` (same formula, same divisor rules)."""
-    ml_directional = 0.0 if not ml_enabled else (ml_confidence - 0.5) * 2.0
+    """Vectorized :func:`fuse_signals` (same formula, same divisor rules).
+
+    ``ml_base_rate`` / ``ml_score`` mirror the scalar signature so the vectorized
+    hybrid engine can use a model's real base rate instead of the 0.5 default.
+    """
+    if not ml_enabled:
+        ml_directional: float | pd.Series = 0.0
+    elif ml_score is not None:
+        if isinstance(ml_score, pd.Series):
+            ml_directional = ml_score.reindex(indicator.index).fillna(0.0)\
+                .astype("float64").clip(-1.0, 1.0)
+        else:
+            ml_directional = float(max(-1.0, min(1.0, float(ml_score))))
+    else:
+        ml_directional = float(signed_score(ml_confidence, ml_base_rate))
     if ml_enabled and strategy_ml_weight is not None:
         effective_ml_weight = strategy_ml_weight
     else:
@@ -296,7 +351,10 @@ def build_entry_signals(long_active: pd.Series | None,
                         ml_enabled: bool = False,
                         strategy_ml_weight: float | None = None,
                         htf_frames: list[pd.DataFrame] | None = None,
-                        regime: str | None = "range") -> pd.Series:
+                        regime: str | None = "range",
+                        ml_base_rate: float = DEFAULT_ML_BASE_RATE,
+                        ml_confidence: float = 0.5,
+                        ml_score: float | pd.Series | None = None) -> pd.Series:
     """Vectorized equivalent of the live entry pipeline.
 
     Reproduces, in order:
@@ -321,6 +379,8 @@ def build_entry_signals(long_active: pd.Series | None,
         indicator,
         w_indicator=w_indicator, w_ml=w_ml, w_news=w_news,
         ml_enabled=ml_enabled, strategy_ml_weight=strategy_ml_weight,
+        ml_confidence=ml_confidence, ml_base_rate=ml_base_rate,
+        ml_score=ml_score,
     )
 
     if htf_frames:

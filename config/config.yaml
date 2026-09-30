@@ -37,6 +37,25 @@ backtest:
     taker_fee_pct: 0.04
   engine_mode: auto
   ml_enabled: false
+# Genetic-algorithm evaluation settings (P1 — GA credibility).  These control how
+# a genome is SCORED; they never change live trading.
+ga:
+  # Historical fills are never priced from TODAY's order book: an unmapped symbol
+  # resolves to `backtest.cost_model.default_spread_pct` and the resolved source
+  # ("override"/"default") is recorded in the run metrics and champion provenance.
+  # true only for a deliberate "what would today's book cost" experiment.
+  use_live_spread: false
+  # A champion with fewer completed trades than this is written with
+  # `enabled: false` and a `rejection_reasons` list in its provenance block.
+  min_champion_trades: 30
+  # Weight of the risk-adjusted term in the fitness formula:
+  # DSR-deflated Sharpe * min(1, trades/30) - max drawdown; the run's return is
+  # scored against the equal-weighted buy & hold of the same window/symbols.
+  alpha_weight: 1.0
+  # Cash-only evaluation (1.0) — GA scores the artefact as it will be evaluated;
+  # live 2-4x leverage (risk_params.yaml) still scales live PnL/drawdown, and that
+  # mismatch is stated in the champion provenance instead of being hidden.
+  evaluation_leverage: 1.0
 binance:
   # Trading/account client (orders, balances). testnet.binance.vision is reachable.
   testnet: true
@@ -48,6 +67,68 @@ core_position:
   capital_pct: 0.7
   max_symbols: 5
 language: zh
+ml:
+  # ── ML credibility gate (docs/overhaul/ALGO_UPGRADE_PLAN.md §二 P2) ──
+  # SAFE DEFAULT: enabled=false.  The measured live model is worse than the
+  # majority class (accuracy 0.41–0.47 vs 0.54–0.67; OOS AUC 0.396–0.447) and
+  # anti-calibrated (predicted 0.91 → realised 0.22), so turning ML on is a
+  # measured negative contribution.  A model may only be used when the
+  # purged/embargoed out-of-sample evaluation passes BOTH gate conditions.
+  enabled: false
+  # 'lightgbm' (tabular, default) or 'tft' (sequence).
+  model_type: lightgbm
+  # 'isotonic' or 'platt' — fitted on a held-out slice, persisted with the model.
+  calibration: isotonic
+  # Hard thresholds (plan §二 P2.1 / §三.2), all consumed by
+  # `credibility_gate` via `MLPredictor._gate_config()`.
+  gate_auc_min: 0.55
+  gate_net_expectancy_min: 0.0
+  # Significance floor (audit P2 #3): a candidate must show at least this many
+  # OUTER trades AND either t > gate_min_t_stat or PSR >= gate_min_psr.  The
+  # audited "best" candidates had 27 trades / t=1.28 (BTC) and 77 / t=0.30
+  # (ETH), so both are refused on this alone.
+  gate_min_trades: 100
+  gate_min_t_stat: 2.0
+  gate_min_psr: 0.95
+  # Enough out-of-sample rows for the AUC to mean anything.
+  min_oos_rows: 100
+  # feature_list: null → the canonical contract in core/ml/features.py
+  # (FEATURE_NAMES).  Setting it replaces the contract everywhere (live AND
+  # backtest); a column outside the contract is a hard error.
+  feature_list: null
+  # Per-interval label horizon/threshold: `label_params.<interval>` wins, then
+  # these documented defaults.
+  forward_periods: 4
+  label_threshold: 0.005
+  # Effective label threshold = max(label_threshold, k * round-trip cost).
+  # 0.0 = the audited ±0.5 % threshold (40.5 % of BTC 1h bars tradeable, 59.5 %
+  # flat/abstain).  Raise it so the target must clear a multiple of its cost.
+  label_cost_multiple: 0.0
+  # Strategy max holding period in bars — the triple-barrier TIME barrier must
+  # match it (the old fixed 24×2% made 44.9% of labels timeouts).
+  max_hold_bars: 24
+  # Embargo for the purged K-fold split; default = label horizon.
+  embargo_bars: 4
+  # Volatility-scaled barrier width (ATR multiple, clamped).
+  barrier_atr_period: 14
+  barrier_atr_multiple: 1.5
+  barrier_min_pct: 0.004
+  barrier_max_pct: 0.06
+  # Decision threshold on the calibrated P(up).  null → use the cost-aware
+  # threshold selected by the gate (maximises net expectancy, not accuracy).
+  # `confidence_threshold` used to be evolved by the GA and never read.
+  confidence_threshold: null
+  default_confidence_threshold: 0.55
+  # Cost model: null → the `sim.cost_model` numbers (the same source real fills
+  # use via app.config.sim_cost_quote).  Do not set a fee here unless you intend
+  # the gate to use a cost the fills do not pay.
+  taker_fee_pct: null
+  half_spread_pct: null
+  slippage_bps: null
+  # null → follow `sim.cost_model.use_bnb_discount`.
+  use_bnb_discount: null
+  # Periodic retrain cadence used by MLPredictor._retrain_loop.
+  retrain_interval_hours: 24
 news:
   anomaly_threshold_pct: 3.0
   fetch_interval_minutes: 30

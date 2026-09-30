@@ -47,6 +47,18 @@
                 </span>
             </div>
         </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">
+            <div>
+                <label class="text-sm text-slate-400">{{ _("Seed (0 = random)") }}</label>
+                <input type="number" id="ga-seed" value="0" min="0" step="1"
+                       class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-white text-sm">
+            </div>
+            <div class="flex items-end">
+                <span class="text-xs text-slate-500">
+                    {{ _("Same seed + same data = identical champions (reproducible)") }}
+                </span>
+            </div>
+        </div>
 
         <!-- Symbols — searchable multi-select fed by GET /api/market/symbols.
              Defaults to the persisted watchlist (GET /api/market/watchlist);
@@ -573,6 +585,7 @@ function startGA() {
         seed_strategies: ['mean_reversion_rsi_bollinger_bands'],
         cost_enabled: true,
         taker_fee_pct: parseFloat(document.getElementById('ga-cost-fee').value) || 0.04,
+        seed: parseInt(document.getElementById('ga-seed').value) || 0,
         spread_pct: {
             BTCUSDT: parseFloat(document.getElementById('ga-spread-btc').value) || 0.01,
             ETHUSDT: parseFloat(document.getElementById('ga-spread-eth').value) || 0.02,
@@ -627,7 +640,7 @@ function toggleWFConfig() {
 
 // ── Lock/unlock all GA inputs when job is running ──
 var _gaInputIds = ['ga-pop-size', 'ga-generations', 'ga-workers', 'ga-date-start', 'ga-date-end',
-    'ga-val-start', 'ga-wf-enabled', 'ga-wf-train-mo', 'ga-wf-val-mo', 'ga-wf-step-mo',
+    'ga-val-start', 'ga-seed', 'ga-wf-enabled', 'ga-wf-train-mo', 'ga-wf-val-mo', 'ga-wf-step-mo',
     'ga-cost-fee', 'ga-spread-btc', 'ga-spread-eth', 'ga-spread-bnb', 'ga-spread-sol', 'ga-spread-xrp',
     'ga-symbol-search'];
 
@@ -647,6 +660,7 @@ function restoreParams(params) {
     if (params.population_size) document.getElementById('ga-pop-size').value = params.population_size;
     if (params.generations) document.getElementById('ga-generations').value = params.generations;
     if (params.max_workers) document.getElementById('ga-workers').value = params.max_workers;
+    if (params.seed) document.getElementById('ga-seed').value = params.seed;
     if (params.symbols && params.symbols.length) {
         gaState.selected = params.symbols.slice();
         gaRegisterSymbols(params.symbols);
@@ -813,6 +827,21 @@ function pollGAStatus() {
             info += '<div class=\'grid grid-cols-1 sm:grid-cols-2 gap-2 mt-1\'>';
             info += '<div><span class=\'text-slate-400\'>Train Sharpe:</span> ' + (s.best_sharpe || 0).toFixed(2) + '</div>';
             info += '<div><span class=\'text-slate-400\'>Train Win Rate:</span> ' + (s.best_win_rate || 0).toFixed(1) + '%</div>';
+            info += '<div><span class=\'text-slate-400\'>Trades:</span> ' + (s.best_trades || 0) + '</div>';
+            if (s.seed) {
+                info += '<div><span class=\'text-slate-400\'>Seed:</span> ' + s.seed + '</div>';
+            }
+
+            // ── Publication gate (P1): a champion is only enabled when it
+            // passed the trades/PnL/PF/DSR/validation gate ──
+            if (s.published === false) {
+                var reasons = (s.rejection_reasons || []).join('; ') || 'gate failed';
+                info += '<div class=\'col-span-2 mt-1 text-red-400\'>' +
+                    '{{ _("Not published") }} (enabled: false): ' + reasons + '</div>';
+            } else if (s.published === true) {
+                info += '<div class=\'col-span-2 mt-1 text-emerald-400\'>' +
+                    '{{ _("Published") }} (enabled: true)</div>';
+            }
 
             if (s.validation) {
                 var v = s.validation;
@@ -822,13 +851,15 @@ function pollGAStatus() {
                 var color = drop < 20 ? 'text-emerald-400' : (drop < 50 ? 'text-yellow-400' : 'text-red-400');
                 info += '<div><span class=\'text-slate-400\'>Val Sharpe:</span> <span class=\'' + color + '\'>' + valSharpe.toFixed(2) + '</span></div>';
                 info += '<div><span class=\'text-slate-400\'>Val Win Rate:</span> ' + (v.win_rate || 0).toFixed(1) + '%</div>';
+                info += '<div><span class=\'text-slate-400\'>Val Trades:</span> ' + (v.trade_count || 0) + '</div>';
+                info += '<div><span class=\'text-slate-400\'>Val Window:</span> ' + (v.start || '?') + ' ~ ' + (v.end || '?') + '</div>';
 
                 if (s.dsr) {
                     var dsr = s.dsr;
-                    var sigColor = dsr.significant ? 'text-emerald-400' : 'text-red-400';
+                    var sigColor = dsr.dsr > 0 ? 'text-emerald-400' : 'text-red-400';
                     info += '<div class=\'col-span-2 mt-1\'>';
-                    info += '<span class=\'text-slate-400\'>DSR:</span> <span class=\'' + sigColor + '\'>' + (dsr.dsr || 0).toFixed(3) + '</span>';
-                    info += ' <span class=\'text-xs text-slate-500\'>(' + (dsr.significant ? 'significant' : 'NOT significant') + ', p=' + (dsr.p_value || 1).toFixed(3) + ')</span>';
+                    info += '<span class=\'text-slate-400\'>DSR (deflated Sharpe):</span> <span class=\'' + sigColor + '\'>' + (dsr.dsr || 0).toFixed(3) + '</span>';
+                    info += ' <span class=\'text-xs text-slate-500\'>(' + (dsr.dsr > 0 ? 'beats data mining' : 'NOT significant') + ', p=' + (dsr.p_value || 1).toFixed(3) + ', T=' + (dsr.observation_periods || 0) + ', N=' + (dsr.n_trials || 0) + ')</span>';
                     info += '</div>';
                 }
             }
@@ -886,11 +917,21 @@ function loadStrategyFromGA() {
             // Show previous champion
             if (gaState.champion_name) {
                 document.getElementById('ga-champion').classList.remove('hidden');
-                document.getElementById('ga-champion-info').innerHTML =
-                    '<strong>' + gaState.champion_name + '</strong><br>' +
+                var prev = '<strong>' + gaState.champion_name + '</strong><br>' +
                     'Fitness: ' + (gaState.best_fitness || 0).toFixed(2) +
                     ' | Sharpe: ' + (gaState.best_sharpe || 0).toFixed(2) +
-                    ' | Win Rate: ' + (gaState.best_win_rate || 0).toFixed(1) + '%';
+                    ' | Win Rate: ' + (gaState.best_win_rate || 0).toFixed(1) + '%' +
+                    ' | Trades: ' + (gaState.best_trades || 0);
+                if (gaState.published === false) {
+                    prev += '<br><span class="text-red-400">' +
+                        '{{ _("Not published") }} (enabled: false): ' +
+                        ((gaState.rejection_reasons || []).join('; ') || 'gate failed') +
+                        '</span>';
+                } else if (gaState.published === true) {
+                    prev += '<br><span class="text-emerald-400">' +
+                        '{{ _("Published") }} (enabled: true)</span>';
+                }
+                document.getElementById('ga-champion-info').innerHTML = prev;
             }
 
             if (gaState.running) {

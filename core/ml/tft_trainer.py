@@ -35,6 +35,8 @@ class TFTTrainer:
         self.num_heads = num_heads
         self.lstm_layers = lstm_layers
         self.dropout = dropout
+        #: Train-time scaler (set by :meth:`train` / :meth:`load`).
+        self.scaler = None
 
         if device is None:
             if torch.cuda.is_available():
@@ -54,16 +56,25 @@ class TFTTrainer:
 
     def prepare_sequences(self, df: pd.DataFrame,
                           feature_cols: list[str] | None = None,
-                          label_col: str = "label") -> tuple[torch.Tensor, torch.Tensor]:
+                          label_col: str = "label",
+                          scaler=None) -> tuple[torch.Tensor, torch.Tensor]:
         """Convert a flat feature DataFrame into (X_seq, y) tensors.
 
         Each sample: features from t-seq_len+1 to t, label at t.
+
+        Normalisation (Phase P2 item 8): training used *expanding-window* stats
+        while inference used the global mean/std — a genuine train/serve skew.
+        Both now use the supplied :class:`core.ml.scalers.TrainTimeScaler`
+        (``scaler=None`` keeps the raw values, i.e. no silent third transform).
 
         Parameters
         ----------
         df : pd.DataFrame
             Must have all feature columns + a 'label' column.
             We drop the last few rows to avoid NaN labels.
+        scaler : TrainTimeScaler | None
+            Fitted once on the TRAINING rows by :meth:`train` and reused at
+            inference; persisted in the checkpoint.
 
         Returns
         -------
@@ -102,21 +113,9 @@ class TFTTrainer:
         X = np.stack(X_list, axis=0)
         y = np.array(y_list)
 
-        # Standardize with expanding-window stats (walk-forward safe).
-        # For each window at position i, use mean/std of all data [0 : i+seq_len].
-        # This preserves trend info — model can see if current value is high/low
-        # relative to history, not just relative to the last 100 bars.
-        for feat in range(X.shape[2]):
-            feat_data = data[:num_samples + self.seq_len, feat]
-            cumsum = np.cumsum(feat_data)
-            cumsum2 = np.cumsum(feat_data ** 2)
-            for i in range(num_samples):
-                end = i + self.seq_len  # last index in this window
-                n = end + 1
-                f_mean = cumsum[end] / n
-                f_var = cumsum2[end] / n - f_mean ** 2
-                f_std = np.sqrt(max(f_var, 1e-10)) + 1e-8
-                X[i, :, feat] = (X[i, :, feat] - f_mean) / f_std
+        # Train-time normalisation — the SAME transform is applied at inference.
+        if scaler is not None:
+            X = scaler.transform(X.reshape(-1, X.shape[-1])).reshape(X.shape)
 
         return torch.tensor(X), torch.tensor(y)
 
@@ -134,7 +133,9 @@ class TFTTrainer:
 
         Returns (model, metrics_dict).
         """
-        X, y = self.prepare_sequences(df, feature_cols, label_col)
+        from core.ml.scalers import TrainTimeScaler
+
+        X, y = self.prepare_sequences(df, feature_cols, label_col, scaler=None)
         if len(X) < 60:
             return None, {"error": f"Insufficient sequences: {len(X)}"}
 
@@ -142,6 +143,15 @@ class TFTTrainer:
         split_idx = int(len(X) * (1 - validation_split))
         X_train, X_val = X[:split_idx], X[split_idx:]
         y_train, y_val = y[:split_idx], y[split_idx:]
+
+        # Fit the scaler on the TRAINING rows only (after the split, so the
+        # validation block cannot influence the transform) and apply it to both.
+        scaler = TrainTimeScaler.fit(X_train.reshape(-1, X_train.shape[-1]).numpy())
+        self.scaler = scaler
+        X_train = torch.tensor(scaler.transform(
+            X_train.reshape(-1, X_train.shape[-1]).numpy()).reshape(X_train.shape))
+        X_val = torch.tensor(scaler.transform(
+            X_val.reshape(-1, X_val.shape[-1]).numpy()).reshape(X_val.shape))
 
         num_features = X.shape[2]
         model = TFTModel(
@@ -240,6 +250,7 @@ class TFTTrainer:
             "num_sequences": len(X),
             "num_features": num_features,
             "device": self.device,
+            "scaler": scaler.to_dict(),
         }
         return model, metrics
 
@@ -247,7 +258,8 @@ class TFTTrainer:
 
     def predict(self, model: TFTModel,
                 df: pd.DataFrame,
-                feature_cols: list[str] | None = None) -> dict | None:
+                feature_cols: list[str] | None = None,
+                scaler=None) -> dict | None:
         """Make a single prediction from the latest sequence window.
 
         Parameters
@@ -258,6 +270,11 @@ class TFTTrainer:
             Feature DataFrame (must have ≥ seq_len rows).
         feature_cols : list[str] | None
             Feature columns to use.
+        scaler : TrainTimeScaler | None
+            The **train-time** scaler persisted with the checkpoint.  When
+            omitted, ``self.scaler`` (set by :meth:`train`/:meth:`load`) is used;
+            only if neither exists do we fall back to the legacy global-stats
+            normalisation.
 
         Returns
         -------
@@ -275,13 +292,18 @@ class TFTTrainer:
 
         data = recent[feature_cols].values.astype(np.float32)
 
-        # Standardize using expanding-window statistics from ALL available history
-        # (consistent with training normalization in prepare_sequences)
-        full_data = df[feature_cols].values.astype(np.float32)
-        for feat in range(data.shape[1]):
-            f_mean = full_data[:, feat].mean()
-            f_std = full_data[:, feat].std() + 1e-8
-            data[:, feat] = (data[:, feat] - f_mean) / f_std
+        scaler = scaler if scaler is not None else getattr(self, "scaler", None)
+        if scaler is not None and getattr(scaler, "fitted", False):
+            data = scaler.transform(data)
+        else:
+            # Legacy checkpoints (saved before the scaler was persisted) used the
+            # global mean/std here while training used expanding windows — the
+            # very skew this phase fixes.  Kept only so old artefacts still load.
+            full_data = df[feature_cols].values.astype(np.float32)
+            for feat in range(data.shape[1]):
+                f_mean = full_data[:, feat].mean()
+                f_std = full_data[:, feat].std() + 1e-8
+                data[:, feat] = (data[:, feat] - f_mean) / f_std
 
         X = torch.tensor(data).unsqueeze(0).to(self.device)  # (1, seq, features)
 
@@ -291,7 +313,10 @@ class TFTTrainer:
 
         return {
             "direction": int(out["direction"].item()),
+            # `confidence` is a heuristic score, NOT a probability (P2 item 8) —
+            # kept by name for existing callers, exposed as `score` too.
             "confidence": round(float(out["confidence"].item()), 4),
+            "score": round(float(out["confidence"].item()), 4),
             "uncertainty": round(float(out["uncertainty"].item()), 6),
             "p50": round(float(out["p50"].item()), 6),
             "quantiles": [round(float(q), 6) for q in out["quantiles"][0].tolist()],
@@ -312,6 +337,9 @@ class TFTTrainer:
                 "dropout": model.dropout,
                 "quantiles": model.quantiles,
             },
+            # Persisted train-time scaler (P2 item 8: fixes train/serve skew).
+            "scaler": getattr(self, "scaler", None).to_dict()
+            if getattr(self, "scaler", None) is not None else None,
         }, path)
         return str(path)
 
@@ -320,6 +348,8 @@ class TFTTrainer:
         if not path.exists():
             return None
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        from core.ml.scalers import TrainTimeScaler
+        self.scaler = TrainTimeScaler.from_dict(checkpoint.get("scaler"))
         cfg = checkpoint["config"]
         model = TFTModel(
             num_features=cfg["num_features"],

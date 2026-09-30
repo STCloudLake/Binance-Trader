@@ -19,6 +19,7 @@ from core.strategy.evaluation_kernel import (
     detect_market_regime,
 )
 from core.market_data.provider import INTERVAL_SPEC, interval_minutes
+from core.ml.features import FEATURE_NAMES, REQUIRED_INDICATORS
 
 
 def _tf_minutes(tf: str) -> int:
@@ -50,6 +51,120 @@ def _resolve_regime_proxy(config, symbols, market_regime) -> str | None:
     return proxy
 
 
+# ── ML prediction contract helpers (Phase P2 item 4, consumed here by P1.5) ──
+#
+# The engine's ML path used to carry a bare ``confidence`` float.  Phase P2
+# added the richer prediction contract (``p_up`` — a real probability — plus the
+# model's own ``base_rate``, the signed ``score`` and an ``abstained`` flag) and
+# published it from the live path (``core.ml.predictor``: on abstention
+# ``confidence`` becomes the base rate so a consumer that only reads
+# ``confidence`` fuses a zero vote).
+#
+# The legacy neutral band (``0.38 ≤ confidence ≤ 0.62`` → 0.5), which only made
+# sense while the engines could not tell "P(up) = 0.6 against a 0.5 base rate"
+# from "P(up) = 0.6 against a 0.62 base rate", is kept for the legacy contract
+# (a bare float, no ``base_rate``/``score``) so those callers stay
+# bit-identical.  Callers that DO supply the model's base rate get the signed
+# score (``core.ml.calibration.signed_score``): a bullish ``p_up`` above the
+# model's own base rate is a positive contribution, and an exact
+# ``p_up == base_rate`` is a neutral one.
+
+#: Confidence band treated as "no call" for the legacy bare-float contract.
+_ML_NEUTRAL_BAND = (0.38, 0.62)
+
+
+def _normalise_ml_prediction(raw) -> dict:
+    """Normalise an ML model output to the P2 prediction contract.
+
+    Accepts what the engine's ML paths emit:
+
+    * a bare ``float`` — legacy ``confidence`` (no ``p_up``/``base_rate``), the
+      neutral band above is applied and ``base_rate``/``score`` stay ``None`` so
+      ``fuse_signals`` reproduces its historical ``(conf − 0.5) × 2`` term;
+    * ``(direction, confidence)`` — the PatchTST/TFT tri-class contract, where
+      ``confidence`` is a magnitude: ``p_up`` is derived by sign;
+    * a ``dict`` — ``p_up`` (or ``confidence``/``direction``), ``base_rate``,
+      ``score``, ``abstained``.  The signed score is preferred when supplied.
+
+    Returns ``{p_up, base_rate, score, abstained}``; ``base_rate``/``score`` are
+    ``None`` when the caller did not supply them.
+    """
+    out = {"p_up": 0.5, "base_rate": None, "score": None, "abstained": False}
+
+    if isinstance(raw, dict):
+        base_rate = raw.get("base_rate")
+        base_rate = None if base_rate is None else float(base_rate)
+        if not (base_rate and 0.0 < base_rate < 1.0):
+            base_rate = None
+        if "p_up" in raw and raw["p_up"] is not None:
+            p_up = float(raw["p_up"])
+        else:
+            conf = float(raw.get("confidence", 0.5))
+            direction = raw.get("direction")
+            if direction is None:
+                p_up = conf
+            else:
+                direction = float(direction)
+                p_up = conf if direction > 0 else (1.0 - conf if direction < 0 else 0.5)
+        if base_rate is not None and p_up == 0.5:
+            # P2 publishes ``confidence = base_rate`` on abstention; the same
+            # neutral vote appears as a bare 0.5 in the legacy tri-class path.
+            p_up = base_rate
+        score = raw.get("score")
+        out.update({
+            "p_up": float(min(1.0, max(0.0, p_up))),
+            "base_rate": base_rate,
+            "score": None if score is None else float(score),
+            "abstained": bool(raw.get("abstained", False)),
+        })
+        return out
+
+    if isinstance(raw, (tuple, list)) and len(raw) == 2:
+        direction, conf = float(raw[0]), float(raw[1])
+        out["p_up"] = conf if direction > 0 else (1.0 - conf if direction < 0 else 0.5)
+        return out
+
+    conf = float(raw)
+    if _ML_NEUTRAL_BAND[0] <= conf <= _ML_NEUTRAL_BAND[1]:
+        conf = 0.5  # neutral — model doesn't know (legacy band)
+    out["p_up"] = conf
+    return out
+
+
+def _ml_fusion_inputs(pred: dict) -> dict:
+    """``fuse_signals`` keyword arguments for a normalised ML prediction.
+
+    ``ml_score`` is passed **only** when the caller supplied a base rate or a
+    signed score; without either, ``ml_base_rate`` stays at the kernel default
+    (0.5) and ``ml_score`` stays ``None``, which makes the fused term exactly the
+    historical ``(confidence − 0.5) × 2`` — the legacy behaviour bit-identical.
+    """
+    kwargs: dict = {"ml_confidence": float(pred.get("p_up", 0.5))}
+    base_rate = pred.get("base_rate")
+    score = pred.get("score")
+    if base_rate is not None:
+        kwargs["ml_base_rate"] = float(base_rate)
+    if score is not None or base_rate is not None:
+        # An abstention carries no directional information: score 0.0 (neutral).
+        kwargs["ml_score"] = 0.0 if pred.get("abstained") else score
+    return kwargs
+
+
+def _ml_feature_indicators(indicators: dict) -> dict:
+    """``REQUIRED_INDICATORS`` overlaid with the strategy's own indicator params.
+
+    The feature contract (``core.ml.features``) computes every input it needs,
+    but a strategy may tune e.g. ``rsi.period``; honouring that keeps the
+    strategy's own indicator series (which its entry conditions read) identical
+    to the ML feature series.
+    """
+    ranges = {k: dict(v) for k, v in REQUIRED_INDICATORS.items()}
+    for name, cfg in (indicators or {}).items():
+        if name in ranges and isinstance(cfg, dict):
+            ranges[name].update(cfg)
+    return ranges
+
+
 class BacktestEngine:
     """Synchronous backtesting engine with ML prediction and signal fusion."""
 
@@ -58,6 +173,10 @@ class BacktestEngine:
         self.strategy_engine = strategy_engine
         self.risk_manager = risk_manager
         self.order_executor = order_executor
+        #: Base rate of the most recent ``_train_ml_model`` fit (P2 item 4) —
+        #: lets a prediction be centred on the model's own rate without a
+        #: persisted sidecar.
+        self._ml_last_base_rate: float | None = None
 
     def _select_engine(self, strategies, engine_mode: str) -> str:
         """Determine which engine to use: 'hybrid' or 'legacy'."""
@@ -125,7 +244,9 @@ class BacktestEngine:
                                   ml_engine: str = "lightgbm",
                                   skip_ml_training: bool = False,
                                   per_strategy_isolation: bool = False,
-                                  spread_overrides: dict | None = None):
+                                  spread_overrides: dict | None = None,
+                                  use_live_spread: bool = True,
+                                  per_genome_ledger: bool | None = None):
         """Full backtest with ML predictions, signal fusion, and risk controls.
 
         Args:
@@ -141,7 +262,23 @@ class BacktestEngine:
             spread_overrides: Optional per-symbol spread (%) map for THIS run —
                 an explicit override beats the live depth-derived value and the
                 documented default (core/backtest/cost_model.py).
+            use_live_spread: When False the live order book is NOT queried and an
+                unmapped symbol resolves straight to
+                ``backtest.default_spread_pct``.  GA/WF evaluation passes False:
+                a walk-forward over 2025 must not price 2025 fills with today's
+                order book (and the run would otherwise depend on the network,
+                which breaks reproducibility).  The resolved source of every
+                symbol is reported under ``metrics["spread_sources"]``.
+            per_genome_ledger: The GA-evaluation semantics.  Each strategy gets
+                (a) its OWN position slots — ``max_open_trades // n_strategies``
+                each, counted over its own positions — and (b) its OWN
+                cash/equity sub-ledger, returned under ``per_strategy_equity``.
+                Off by default so the hybrid/legacy parity contract (one shared
+                cash balance, one shared position counter) is untouched.
         """
+        t0 = time.time()
+        if per_genome_ledger is None:
+            per_genome_ledger = False
         t0 = time.time()
 
         # ── Cost model: derive the spread for the symbols THIS run uses ──
@@ -149,7 +286,25 @@ class BacktestEngine:
         # Resolved once here (cached ~5 min) and pinned on the instance so the
         # trade loop never does I/O and every symbol of the run gets its own
         # spread instead of the old "5 hardcoded pairs, else 0.03" guess.
-        self._run_spread_pct = freeze_run_spreads(symbols, self.config, spread_overrides)
+        if use_live_spread:
+            self._run_spread_pct = freeze_run_spreads(
+                symbols, self.config, spread_overrides)
+            from core.backtest.cost_model import resolve_spreads as _resolve_spreads
+            self._run_spread_sources = {
+                sym: entry["source"]
+                for sym, entry in _resolve_spreads(
+                    symbols, self.config, spread_overrides).items()}
+        else:
+            # No network, no "today's book" for a historical window: an unmapped
+            # symbol takes the configured default spread and the source is
+            # recorded so the run's provenance shows it was not live-derived.
+            from core.backtest.cost_model import resolve_spreads as _resolve_spreads
+            _resolved = _resolve_spreads(
+                symbols, self.config, spread_overrides, use_live=False)
+            self._run_spread_pct = {
+                sym: entry["spread_pct"] for sym, entry in _resolved.items()}
+            self._run_spread_sources = {
+                sym: entry["source"] for sym, entry in _resolved.items()}
 
         # ── Engine mode selection ──
         _engine_mode = getattr(self.config, 'backtest_engine_mode', 'auto')
@@ -240,11 +395,43 @@ class BacktestEngine:
 
         # ML state — per-strategy×symbol models, each matched to the strategy's timeframe
         ml_models: dict[str, object] = {}  # "strategy_name|symbol" -> trained model
-        ml_predictions: dict[str, float] = {}  # "strategy_name|symbol" -> latest confidence
-        ml_correct = 0
-        ml_total = 0
-        # Collect (prediction, actual_return) pairs for post-hoc accuracy evaluation
-        ml_eval_pairs: list[tuple[float, float, float]] = []  # (confidence, actual_ret, threshold)
+        ml_predictions: dict[str, float] = {}  # "strategy_name|symbol" -> latest P(up)
+        #: Training base rate per model key (P2 contract): persisted model
+        #: metadata when available, else the label mean of the fitting window.
+        #: ``None`` ⇒ unknown, so the fusion kernel keeps its 0.5 default.
+        ml_base_rates: dict[str, float] = {}
+        #: Latest signed score + abstention flag per key (P2 contract, item 4).
+        ml_scores: dict[str, float] = {}
+        ml_abstained: dict[str, bool] = {}
+        #: ML feature matrix cache — one full-history matrix per feature
+        #: configuration, sliced by timestamp (see ``_ml_features_up_to``).
+        #: Without it the per-bar ML path re-ran ``compute_all`` (including the
+        #: per-row Hurst loop) over the whole expanding history — O(bars²).
+        _ml_feature_cache: dict[tuple, pd.DataFrame] = {}
+
+        #: Indicator frames for the ML contract, keyed by the same feature
+        #: configuration.  The strategy's own indicator cache holds only *its*
+        #: indicators, while the contract also needs atr/hurst/swing_points/
+        #: frac_diff — computed once per configuration here.
+        _ml_indicator_cache: dict[tuple, pd.DataFrame] = {}
+
+        def _ml_indicator_frame(sym: str, tf: str, indicators: dict) -> pd.DataFrame | None:
+            """Full-history frame with every indicator the ML contract needs."""
+            key = self._ml_feature_config(indicators, None)
+            frame = _ml_indicator_cache.get(key)
+            if frame is None:
+                raw = feeder.get_all_data_for_symbol(sym, tf)
+                if raw is None or len(raw) < 2:
+                    return None
+                frame = compute_all(raw, _ml_feature_indicators(indicators or {}))
+                if len(_ml_indicator_cache) >= self._ML_FEATURE_CACHE_MAX:
+                    _ml_indicator_cache.pop(next(iter(_ml_indicator_cache)), None)
+                _ml_indicator_cache[key] = frame
+            return frame
+
+        # Collect (prediction, actual_return, label_threshold) pairs for the
+        # post-hoc accuracy diagnostic.  The first element is the model's P(up).
+        ml_eval_pairs: list[tuple[float, float, float]] = []
         # Training cost per retrain: LightGBM ~0.3s, PatchTST ~8s, TFT ~15s
         # Use longer intervals for expensive models to keep backtest time reasonable.
         if ml_engine == "tft":
@@ -480,6 +667,90 @@ class BacktestEngine:
         def _pkey(sym: str, s_name: str = "") -> str:
             return f"{s_name}|{sym}" if per_strategy_isolation else sym
 
+        # ── Per-genome slots (isolated evaluation only) ──────────────────
+        # ``max_positions`` above is a per-strategy allowance.  The entry loop
+        # must therefore count only THIS strategy's open positions: the old
+        # ``len(positions) >= max_positions`` test counted every strategy of the
+        # chunk and then ``break``-ed, so the first genome of a 20-genome chunk
+        # took the single slot and the other 19 never traded at all (measured:
+        # 1 genome × 407 trades, 19 × 0 trades, identical best fitness for
+        # generations 1-3).  Non-isolated runs keep the plain length test so the
+        # hybrid/legacy parity contract is untouched.
+        def _own_positions(s_name: str) -> int:
+            if not per_genome_ledger:
+                return len(positions)
+            return sum(1 for p in positions.values()
+                       if p.get("strategy_name") == s_name)
+
+        # ── Per-genome sub-ledger (GA evaluation only) ───────────────────
+        # One shared ``balance`` made every genome's PnL depend on its siblings'
+        # fills (a genome that never traded still showed the chunk's losses).
+        # When isolated, each strategy gets its own cash balance + equity series,
+        # which is also what the fitness Sharpe/DSR/max-drawdown components need.
+        ledger_balances: dict[str, float] = {}
+        ledger_equity: dict[str, list[dict]] = {}
+        if per_genome_ledger:
+            for _s_cfg in strategy_configs:
+                ledger_balances[_s_cfg.name] = float(initial_balance)
+                ledger_equity[_s_cfg.name] = []
+
+        def _strategy_balance(s_name: str) -> float:
+            if per_genome_ledger:
+                return ledger_balances.get(s_name, float(initial_balance))
+            return balance
+
+        def _credit_ledger(s_name: str, delta: float) -> None:
+            """Add *delta* to genome *s_name*'s sub-ledger (isolated runs only)."""
+            if per_genome_ledger:
+                ledger_balances[s_name] = ledger_balances.get(
+                    s_name, float(initial_balance)) + delta
+
+        #: Ledger handed to every ``_close_position`` call (None when not isolated).
+        __ledger = ledger_balances if per_genome_ledger else None
+
+        def _close_and_credit(pos_key, pos, exit_price, ts, reason):
+            """Close a position and route the realised cash to the right ledger.
+
+            With per-genome ledgers the position's OWN sub-ledger is both the base
+            and the target of the close.  Passing the shared ``balance`` variable
+            worked only while one genome closed at a time: the forced end-of-run
+            close loop walks every genome's positions, so genome #2 would be
+            credited ``balance`` *plus* its own notional — every genome after the
+            first gained the previous one's whole account (measured: a genome whose
+            trades summed to -41.86 USDT ended at 90 390).
+            """
+            nonlocal balance
+            new_balance = self._close_position(
+                pos_key, pos, exit_price, ts, reason, trades, events,
+                _strategy_balance(pos.get("strategy_name", "")), positions,
+                per_matrix, ledger_balances=__ledger)
+            if not per_genome_ledger:
+                # Non-isolated runs keep the single shared cash balance.
+                balance = new_balance
+            return new_balance
+
+        def _conditions_met(df, s_cfg, side: str) -> bool:
+            """Entry conditions for one side, honouring the genome's logic gene.
+
+            ``evaluate_entry_conditions`` is the shared OR kernel and stays the
+            default; a GA chromosome may carry ``condition_logic == "and"``
+            (AND is strictly stricter than OR, so the live/backtest parity
+            contract — which never sets that attribute — is unchanged).
+            """
+            conditions = (getattr(s_cfg, "entry_conditions", None) or {}).get(side, [])
+            if not conditions:
+                return False
+            if str(getattr(s_cfg, "condition_logic", "or")).lower() != "and":
+                return None  # sentinel: caller uses the shared OR kernel
+            for cond in conditions:
+                try:
+                    mask = evaluate_condition(df, cond)
+                except Exception:
+                    return False
+                if not (hasattr(mask, "iloc") and bool(mask.iloc[-1])):
+                    return False
+            return True
+
         # Per-strategy×symbol results matrix (use YAML config names as keys)
         per_matrix: dict[str, dict[str, dict]] = {}
         for s_cfg in strategy_configs:
@@ -537,6 +808,31 @@ class BacktestEngine:
 
             # --- ML PREDICTION (walk-forward, per-strategy×symbol) ---
             # Each strategy gets its own ML model matched to its primary timeframe.
+            def _record_ml_prediction(raw, key: str, df_tf, sliced, ts) -> None:
+                """Publish one raw model output under the P2 prediction contract.
+
+                Normalises ``raw`` (bare float / ``(direction, confidence)`` /
+                dict), stores the *model's* P(up), base rate, signed score and
+                abstention flag, and queues the pair for the post-loop
+                diagnostic.  Called from all three model paths so none of them
+                can drift back to "confidence only".
+                """
+                pred = _normalise_ml_prediction(raw)
+                ml_conf = float(pred.get("p_up", 0.5))
+                ml_predictions[key] = ml_conf
+                ml_base_rates[key] = pred.get("base_rate")
+                ml_scores[key] = pred.get("score")
+                ml_abstained[key] = bool(pred.get("abstained", False))
+                # Defer the accuracy comparison to post-loop (purely diagnostic).
+                fwd = tf_params["forward"]
+                th = tf_params["threshold"]
+                future_df = df_tf[df_tf.index > ts]
+                if len(future_df) >= fwd:
+                    cur_close = float(sliced.iloc[-1]["close"])
+                    fut_close = float(future_df.iloc[fwd - 1]["close"])
+                    ret = (fut_close - cur_close) / cur_close
+                    ml_eval_pairs.append((ml_conf, ret, th))
+
             for strategy in strategy_configs:
                 primary_tf = min(strategy.timeframes, key=_tf_minutes) if strategy.timeframes else "1h"
                 tf_params = _ML_TF_PARAMS.get(primary_tf, _ML_TF_PARAMS["1h"])
@@ -550,9 +846,14 @@ class BacktestEngine:
 
                     key = f"{strategy.name}|{sym}"
                     retrain_idx = _ml_key_idx.get(key, 0)
+                    # Phase P2 item 6: ``key not in ml_models`` used to be part of
+                    # this test, which meant every model was fitted ONCE (on the
+                    # first step of its rotation slot) and then frozen for the
+                    # whole backtest while the module comments claimed round-robin
+                    # retraining.  The rotation schedule below is the retraining
+                    # schedule: each key refits when the step lands on its slot.
                     should_retrain = (
                         not skip_ml_training and
-                        key not in ml_models and
                         step % _ml_retrain_stagger == retrain_idx % _ml_retrain_stagger and
                         step > 0
                     )
@@ -573,26 +874,20 @@ class BacktestEngine:
                             if len(sliced) >= 150:
                                 model = self._train_patchtst_model(
                                     patchtst_trainer, sliced, sym, primary_tf,
-                                    feature_list=strategy.ml_config.features if strategy.ml_config else None)
+                                    feature_list=strategy.ml_config.features if strategy.ml_config else None,
+                                    indicators=strategy.indicators)
                                 if model is not None:
                                     ml_models[key] = model
+                                    # model updated (round-robin)
 
                         model = ml_models.get(key)
                         if model is not None:
                             try:
-                                conf = self._predict_patchtst(
-                                    patchtst_trainer, model, sliced)
-                                if conf is not None:
-                                    ml_predictions[key] = conf
-                                    # Defer accuracy evaluation to post-loop
-                                    fwd = tf_params["forward"]
-                                    th = tf_params["threshold"]
-                                    future_df = df_tf[df_tf.index > ts]
-                                    if len(future_df) >= fwd:
-                                        cur_close = float(sliced.iloc[-1]["close"])
-                                        fut_close = float(future_df.iloc[fwd - 1]["close"])
-                                        ret = (fut_close - cur_close) / cur_close
-                                        ml_eval_pairs.append((conf, ret, th))
+                                raw = self._predict_patchtst(
+                                    patchtst_trainer, model, sliced,
+                                    indicators=strategy.indicators)
+                                if raw is not None:
+                                    _record_ml_prediction(raw, key, df_tf, sliced, ts)
                             except Exception:
                                 pass
 
@@ -602,54 +897,57 @@ class BacktestEngine:
                             if len(sliced) >= 150:
                                 model = self._train_tft_model(
                                     tft_trainer, sliced, sym, primary_tf,
-                                    feature_list=strategy.ml_config.features if strategy.ml_config else None)
+                                    indicators=strategy.indicators)
                                 if model is not None:
                                     ml_models[key] = model
-                            # model updated (round-robin)
+                                    # model updated (round-robin)
 
                         model = ml_models.get(key)
                         if model is not None:
                             try:
-                                conf = self._predict_tft(
-                                    tft_trainer, model, sliced)
-                                if conf is not None:
-                                    ml_predictions[key] = conf
-                                    # Defer accuracy evaluation to post-loop
-                                    fwd = tf_params["forward"]
-                                    th = tf_params["threshold"]
-                                    future_df = df_tf[df_tf.index > ts]
-                                    if len(future_df) >= fwd:
-                                        cur_close = float(sliced.iloc[-1]["close"])
-                                        fut_close = float(future_df.iloc[fwd - 1]["close"])
-                                        ret = (fut_close - cur_close) / cur_close
-                                        ml_eval_pairs.append((conf, ret, th))
+                                raw = self._predict_tft(
+                                    tft_trainer, model, sliced,
+                                    indicators=strategy.indicators)
+                                if raw is not None:
+                                    _record_ml_prediction(raw, key, df_tf, sliced, ts)
                             except Exception:
                                 pass
 
                     # ── LightGBM path ──
                     else:
+                        ml_full_ind = _ml_indicator_frame(sym, primary_tf, strategy.indicators)
                         if should_retrain:
-                            model = self._train_ml_model(sliced, tf_params)
+                            model = self._train_ml_model(
+                                sliced, tf_params,
+                                feature_list=strategy.ml_config.features if strategy.ml_config else None,
+                                indicators=strategy.indicators,
+                                full_df=ml_full_ind, ts=ts, cache=_ml_feature_cache)
                             if model is not None:
                                 ml_models[key] = model
-                            # model updated (round-robin)
+                                # model updated (round-robin)
 
                         model = ml_models.get(key)
                         if model is not None:
                             try:
-                                conf = self._predict_ml(model, sliced)
-                                if conf is not None:
-                                    ml_predictions[key] = conf
-
-                                    # Defer accuracy evaluation to post-loop
-                                    fwd = tf_params["forward"]
-                                    th = tf_params["threshold"]
-                                    future_df = df_tf[df_tf.index > ts]
-                                    if len(future_df) >= fwd:
-                                        cur_close = float(sliced.iloc[-1]["close"])
-                                        fut_close = float(future_df.iloc[fwd - 1]["close"])
-                                        ret = (fut_close - cur_close) / cur_close
-                                        ml_eval_pairs.append((conf, ret, th))
+                                raw = self._predict_ml(
+                                    model, sliced,
+                                    feature_list=strategy.ml_config.features if strategy.ml_config else None,
+                                    indicators=strategy.indicators,
+                                    full_df=ml_full_ind, ts=ts, cache=_ml_feature_cache)
+                                if raw is not None:
+                                    if raw.get("base_rate") is None and raw.get("score") is None:
+                                        # The engine's own fit has no sidecar: use
+                                        # the base rate of the window this model was
+                                        # fitted on, or the persisted model metadata
+                                        # when it exists.  A model that publishes a
+                                        # neutral P(up) is left neutral — attaching a
+                                        # base rate to it must not turn "no call"
+                                        # into a directional vote.
+                                        rate = (getattr(self, "_ml_last_base_rate", None)
+                                                or self._meta_base_rate(sym, strategy.name))
+                                        if rate is not None and float(raw.get("p_up", 0.5)) != 0.5:
+                                            raw["base_rate"] = float(rate)
+                                    _record_ml_prediction(raw, key, df_tf, sliced, ts)
                             except Exception:
                                 pass
 
@@ -703,7 +1001,13 @@ class BacktestEngine:
                                     pos["quantity"] -= reduce_qty
                                     pos["amount_usdt"] -= reduce_amount
                                     pos["reduce_count"] = reduce_count + 1
-                                    balance += reduce_amount + reduce_pnl
+                                    # Credited to the position's own genome ledger
+                                    # (isolated runs) or to the shared balance.
+                                    if per_genome_ledger:
+                                        _credit_ledger(
+                                            strategy.name, reduce_amount + reduce_pnl)
+                                    else:
+                                        balance += reduce_amount + reduce_pnl
 
                                     events.append({
                                         "time": str(ts), "type": "reduce",
@@ -772,9 +1076,7 @@ class BacktestEngine:
                     if sl_price > 0:
                         if (pos["side"] == "long" and price_now <= sl_price) or \
                            (pos["side"] == "short" and price_now >= sl_price):
-                            balance = self._close_position(
-                                pos_key, pos, sl_price, ts, "stop_loss",
-                                trades, events, balance, positions, per_matrix)
+                            _close_and_credit(pos_key, pos, sl_price, ts, "stop_loss")
                             continue
 
                     # ---- TAKE-PROFIT CHECK ----
@@ -782,9 +1084,8 @@ class BacktestEngine:
                     for tp_price, tp_pct in tp_levels:
                         if (pos["side"] == "long" and price_now >= tp_price) or \
                            (pos["side"] == "short" and price_now <= tp_price):
-                            balance = self._close_position(
-                                pos_key, pos, tp_price, ts, f"tp_{int(tp_pct*100)}pct",
-                                trades, events, balance, positions, per_matrix)
+                            _close_and_credit(
+                                pos_key, pos, tp_price, ts, f"tp_{int(tp_pct*100)}pct")
                             break
 
                 if pos_key not in positions:
@@ -814,9 +1115,7 @@ class BacktestEngine:
                         opened = pd.Timestamp(pos["opened_at"])
                         held_hours = (ts - opened).total_seconds() / 3600
                         if held_hours >= max_hours:
-                            balance = self._close_position(
-                                pos_key, pos, price_now, ts, "max_hold",
-                                trades, events, balance, positions, per_matrix)
+                            _close_and_credit(pos_key, pos, price_now, ts, "max_hold")
                             continue
                     except Exception:
                         pass
@@ -842,9 +1141,8 @@ class BacktestEngine:
                             if evaluate_exit_conditions(
                                 df, strategy.exit_conditions, pos["side"]):
                                 exit_price = float(df["close"].iloc[-1])
-                                balance = self._close_position(
-                                    pos_key, pos, exit_price, ts, "indicator",
-                                    trades, events, balance, positions, per_matrix)
+                                _close_and_credit(
+                                    pos_key, pos, exit_price, ts, "indicator")
                             if pos_key not in positions:
                                 break
                         if pos_key not in positions:
@@ -876,8 +1174,14 @@ class BacktestEngine:
                         continue  # strategy not assigned to this symbol
                     if _pkey(sym, strategy.name) in positions:
                         continue
-                    if len(positions) >= max_positions:
+                    if _own_positions(strategy.name) >= max_positions:
+                        # This genome has used up its own slots — move on to the
+                        # NEXT genome instead of starving the rest of the chunk.
+                        # (The old `break` fired on the first genome that filled
+                        # the shared counter, leaving every later genome with 0
+                        # trades and a -999-class fitness.)
                         break
+                    _strat_balance = _strategy_balance(strategy.name)
 
                     # Sort timeframes: shortest first (primary signal), rest act as filters
                     sorted_tfs = sorted(strategy.timeframes, key=_tf_minutes)
@@ -895,8 +1199,13 @@ class BacktestEngine:
                         continue
 
                     # ── Shared Kernel: Entry condition evaluation ──
-                    long_active, short_active = evaluate_entry_conditions(
-                        df_primary, strategy.entry_conditions)
+                    long_and = _conditions_met(df_primary, strategy, "long")
+                    short_and = _conditions_met(df_primary, strategy, "short")
+                    if long_and is None and short_and is None:
+                        long_active, short_active = evaluate_entry_conditions(
+                            df_primary, strategy.entry_conditions)
+                    else:
+                        long_active, short_active = bool(long_and), bool(short_and)
 
                     if long_active and short_active:
                         continue
@@ -921,15 +1230,28 @@ class BacktestEngine:
                         hist_vol = float(ret_series.iloc[-21:].std())
                         vol_expanding = recent_vol > hist_vol
 
+                    # P2 item 4: feed the *signed* score, centred on the model's
+                    # own base rate, whenever the ML path published one.  With no
+                    # base rate and no score (the legacy contract) the kernel
+                    # falls back to its historical (conf − 0.5) × 2 term, so
+                    # non-ML and legacy runs stay bit-identical.
+                    fusion_ml = {
+                        "ml_confidence": ml_conf,
+                        "ml_base_rate": ml_base_rates.get(ml_key),
+                        "ml_score": ml_scores.get(ml_key),
+                    }
+                    if fusion_ml["ml_base_rate"] is None and fusion_ml["ml_score"] is None:
+                        fusion_ml = {"ml_confidence": ml_conf}
+
                     final_score = fuse_signals(
                         indicator_signal=indicator_signal,
-                        ml_confidence=ml_conf,
                         news_sentiment=None,  # backtest mode — no historical news
                         w_indicator=w_ind,
                         w_ml=w_ml,
                         w_news=w_news,
                         ml_enabled=ml_enabled,
                         strategy_ml_weight=strategy.ml_config.weight if ml_enabled else None,
+                        **fusion_ml,
                     )
 
                     # ── Shared Kernel: Higher-timeframe trend alignment ──
@@ -956,8 +1278,11 @@ class BacktestEngine:
                     price = float(df_primary["close"].iloc[-1])
 
                     # ---- POSITION SIZING (volatility-aware) ----
+                    # Sizing uses THIS genome's ledger balance when isolated: with
+                    # one shared balance a genome's position size (and therefore
+                    # its fills) depended on its siblings' cash.
                     qty, risk_amount = sizer.calculate_position_size(
-                        balance, price, "satellite",
+                        _strat_balance, price, "satellite",
                         volatility_expanding=vol_expanding)
                     if qty <= 0:
                         continue
@@ -966,25 +1291,28 @@ class BacktestEngine:
                     # Tighter stop → larger position for same risk budget
                     re = strategy.risk_exit
                     if re is not None:
-                        risk_capital = balance * 0.01  # risk 1% of capital per trade
+                        risk_capital = _strat_balance * 0.01  # risk 1% of capital per trade
                         sl_dist = re.stop_loss_pct / 100.0
                         qty_risk = risk_capital / (price * sl_dist)
                         # Blend: use risk-based if it's more conservative, else keep base
                         qty = min(qty, qty_risk) if qty_risk > 0 else qty
 
                     # Check max position size
-                    max_amount = balance * (self.config.hard_limits.max_position_size_pct / 100)
+                    max_amount = _strat_balance * (self.config.hard_limits.max_position_size_pct / 100)
                     if risk_amount > max_amount:
                         risk_amount = max_amount
                         qty = risk_amount / price
 
                     amount_usdt = qty * price
-                    if amount_usdt > balance * 0.95:
+                    if amount_usdt > _strat_balance * 0.95:
                         continue  # don't use >95% of balance
 
                     pos_counter += 1
                     trade_group = f"bt_{pos_counter}_{int(ts.timestamp())}"
-                    balance -= amount_usdt
+                    if per_genome_ledger:
+                        _credit_ledger(strategy.name, -amount_usdt)
+                    else:
+                        balance -= amount_usdt
 
                     # Use strategy-specific risk exits if configured, else PositionSizer defaults
                     re = strategy.risk_exit
@@ -1033,10 +1361,29 @@ class BacktestEngine:
 
             # --- EQUITY CURVE ---
             invested = sum(p.get("amount_usdt", 0) for p in positions.values())
-            equity_curve.append({
-                "time": str(ts), "equity": round(balance + invested, 2),
-                "balance": round(balance, 2), "invested": round(invested, 2),
-            })
+            if per_genome_ledger:
+                # One equity point per genome + an aggregate point.  The aggregate
+                # is the sum of the sub-ledgers, so calculate_metrics() (used for
+                # the run's headline numbers) still sees a coherent portfolio.
+                agg_balance = 0.0
+                for _s_name in ledger_balances:
+                    _inv = sum(p.get("amount_usdt", 0) for p in positions.values()
+                               if p.get("strategy_name") == _s_name)
+                    _bal = ledger_balances[_s_name]
+                    ledger_equity[_s_name].append({
+                        "time": str(ts), "equity": round(_bal + _inv, 2),
+                        "balance": round(_bal, 2), "invested": round(_inv, 2),
+                    })
+                    agg_balance += _bal
+                equity_curve.append({
+                    "time": str(ts), "equity": round(agg_balance + invested, 2),
+                    "balance": round(agg_balance, 2), "invested": round(invested, 2),
+                })
+            else:
+                equity_curve.append({
+                    "time": str(ts), "equity": round(balance + invested, 2),
+                    "balance": round(balance, 2), "invested": round(invested, 2),
+                })
 
         # ── Force-close positions still open at the end ──
         # Without this, open positions never appear in `trades`, so win rate,
@@ -1057,30 +1404,104 @@ class BacktestEngine:
                         final_price = float(df_slice.iloc[-1]["close"])
                 except Exception:
                     pass
-                balance = self._close_position(
-                    pos_key, pos, final_price, last_ts, "end_of_backtest",
-                    trades, events, balance, positions, per_matrix)
+                _close_and_credit(pos_key, pos, final_price, last_ts, "end_of_backtest")
             # Reflect the realised cash in the final equity point.
-            equity_curve[-1]["balance"] = round(balance, 2)
-            equity_curve[-1]["invested"] = 0.0
-            equity_curve[-1]["equity"] = round(balance, 2)
+            if per_genome_ledger:
+                for _s_name in ledger_balances:
+                    if ledger_equity[_s_name]:
+                        ledger_equity[_s_name][-1]["balance"] = round(
+                            ledger_balances[_s_name], 2)
+                        ledger_equity[_s_name][-1]["invested"] = 0.0
+                        ledger_equity[_s_name][-1]["equity"] = round(
+                            ledger_balances[_s_name], 2)
+                equity_curve[-1]["balance"] = round(sum(ledger_balances.values()), 2)
+                equity_curve[-1]["invested"] = 0.0
+                equity_curve[-1]["equity"] = round(sum(ledger_balances.values()), 2)
+            else:
+                equity_curve[-1]["balance"] = round(balance, 2)
+                equity_curve[-1]["invested"] = 0.0
+                equity_curve[-1]["equity"] = round(balance, 2)
 
         # Use last equity value (includes open position value), not just cash balance
         final_balance = equity_curve[-1]["equity"] if equity_curve else balance
 
-        # ── Post-hoc ML accuracy evaluation (no look-ahead bias) ──
+        # ── Post-hoc ML accuracy evaluation (no look-ahead bias, item 1) ──
         # Accuracy is computed from the collected eval pairs after the loop,
         # ensuring it is purely diagnostic and doesn't affect trading decisions.
-        for conf, ret, th in ml_eval_pairs:
-            if abs(ret) >= th:
-                ml_total += 1
-                if (ret >= th and conf >= 0.5) or (ret <= -th and conf < 0.5):
-                    ml_correct += 1
+        #
+        # Phase P2 handed the Lead the corrected diagnostic
+        # (``core.ml.credibility.ml_accuracy_neutral_abstention``): the inline
+        # loop that used to live here scored a 0.38–0.62 "neutral" prediction as
+        # a *bearish* call (``conf < 0.5``), which biased the number toward the
+        # market's direction — measured band share on the deployed model is
+        # 25.7 % / 24.1 %.  A neutral prediction is now an **abstention**:
+        # excluded from accuracy and reported separately as ``coverage_pct`` /
+        # ``neutral_pct``.
+        from core.ml.credibility import ml_accuracy_neutral_abstention
+
+        _ml_diag = ml_accuracy_neutral_abstention(
+            [(conf, ret) for conf, ret, _th in ml_eval_pairs],
+            [ret for _conf, ret, _th in ml_eval_pairs],
+            threshold=0.005)
+        ml_total = int(_ml_diag["n_predictions"])
 
         metrics = calculate_metrics(trades, equity_curve, initial_balance, final_balance)
-        metrics["ml_accuracy_pct"] = round(
-            ml_correct / ml_total * 100 if ml_total > 0 else 0, 1)
+        metrics["ml_accuracy_pct"] = float(_ml_diag["accuracy_pct"])
+        metrics["ml_coverage_pct"] = float(_ml_diag["coverage_pct"])
+        metrics["ml_neutral_pct"] = float(_ml_diag["neutral_pct"])
+        metrics["ml_scored"] = int(_ml_diag["n_scored"])
+        metrics["ml_predictions"] = ml_total
+        metrics["ml_abstained"] = int(sum(1 for v in ml_abstained.values() if v))
         metrics["runtime_seconds"] = round(time.time() - t0, 1)
+
+        # ── Buy & hold benchmark of the SAME window and symbols ──
+        # GA selection used to score pure market drift as alpha (a synthetic
+        # random walk scored Sharpe 13.7).  The equal-weighted buy & hold return
+        # of the run's window is the beta baseline the fitness subtracts.
+        buy_hold_pct = None
+        try:
+            if equity_curve:
+                first_ts = pd.Timestamp(equity_curve[0]["time"])
+                last_ts_bh = pd.Timestamp(equity_curve[-1]["time"])
+                rets = []
+                for sym in symbols:
+                    df_bh = feeder.get_all_data_for_symbol(sym, "1h")
+                    if df_bh is None or len(df_bh) < 2:
+                        continue
+                    window = df_bh[(df_bh.index >= first_ts) & (df_bh.index <= last_ts_bh)]
+                    if len(window) < 2:
+                        window = df_bh[df_bh.index <= last_ts_bh]
+                    if len(window) < 2:
+                        continue
+                    first_close = float(window.iloc[0]["close"])
+                    last_close = float(window.iloc[-1]["close"])
+                    if first_close > 0:
+                        rets.append((last_close - first_close) / first_close)
+                if rets:
+                    buy_hold_pct = sum(rets) / len(rets) * 100.0
+        except Exception as e:  # never let the benchmark break a backtest
+            logger.debug(f"Buy&hold benchmark unavailable: {e}")
+        metrics["buy_hold_pct"] = round(buy_hold_pct, 4) if buy_hold_pct is not None else None
+        metrics["spread_sources"] = dict(getattr(self, "_run_spread_sources", {}) or {})
+
+        # ── Per-genome ledgers (isolated GA evaluation) ──
+        # ``trades`` is append-only and therefore chronological, so slicing it per
+        # strategy reconstructs exactly that genome's trade list.  Fitness needs
+        # the trades (mean win for the shrunk profit factor) and the equity series
+        # (Sharpe / DSR / max drawdown) *per genome* — the shared ones are the
+        # sum over all genomes of the chunk and cannot score an individual.
+        per_strategy_equity = None
+        if per_genome_ledger:
+            per_strategy_equity = {
+                s_name: {
+                    "trades": [t for t in trades if t.get("strategy") == s_name],
+                    "equity_curve": ledger_equity.get(s_name, []),
+                    "initial_balance": initial_balance,
+                    "final_balance": round(ledger_balances.get(s_name, initial_balance), 2),
+                    "buy_hold_pct": metrics["buy_hold_pct"],
+                }
+                for s_name in ledger_balances
+            }
 
         # ── Monte Carlo robustness assessment ──
         try:
@@ -1106,58 +1527,136 @@ class BacktestEngine:
             "strategies": strategies, "symbols": symbols,
             "date_start": date_start, "date_end": date_end, "mode": mode,
             "per_matrix": per_matrix,
+            "per_strategy_equity": per_strategy_equity,
             "monte_carlo": mc_result,
         }
 
     def _close_position(self, pos_key, pos, exit_price, ts, reason, trades, events,
-                         balance, positions, per_matrix):
+                         balance, positions, per_matrix,
+                         ledger_balances: dict | None = None):
         """Close a position and record the trade. Used for SL/TP/indicator exits.
 
         Thin wrapper over the shared implementation in
         :mod:`core.backtest.trade_book` (previously a copy-paste clone that the
         hybrid engine duplicated).
+
+        When *ledger_balances* is given (isolated GA evaluation) the realised
+        cash is credited to ``pos["strategy_name"]``'s own sub-ledger, so one
+        genome's PnL never touches another's.  The returned value is the
+        ledger balance of that genome, or the shared balance otherwise.
         """
-        return close_position(
+        new_balance = close_position(
             pos_key, pos, exit_price, ts, reason, trades, balance, positions, per_matrix,
             cost_fn=lambda ep, xp, q, s: apply_trading_costs(
                 ep, xp, q, s, self.config,
                 overrides=getattr(self, "_run_spread_pct", None)),
             events=events,
         )
+        if ledger_balances is not None:
+            s_name = pos.get("strategy_name", "")
+            ledger_balances[s_name] = new_balance
+            return new_balance
+        return new_balance
 
     # ---- ML Helpers ----
 
-    # Indicator config used for ML feature computation (imported from features.py)
-    # Kept as instance attribute for consistent access
-    _ML_INDICATORS = {
-        "rsi": {"period": 14, "source": "close"},
-        "macd": {"fast": 12, "slow": 26, "signal": 9},
-        "bollinger": {"period": 20, "stddev": 2},
-        "adx": {"period": 14},
-    }
+    # ── ML helpers ────────────────────────────────────────────────────
+    #
+    # The feature contract (``core.ml.features``) is the single source of truth
+    # for both the live and the backtest ML path (plan §二 P2.4 / §一 "47 vs 40
+    # features").  The engine used to carry its own ``_ML_INDICATORS`` (rsi /
+    # macd / bollinger / adx only) and call ``compute_features`` with
+    # ``feature_list=None``; with the P2 contract that raises
+    # ``FeatureContractError`` because the hurst / swing-point / fractional-diff
+    # inputs were never computed.  The indicator config now comes from
+    # ``REQUIRED_INDICATORS`` and the column list from ``FEATURE_NAMES`` (39), so
+    # the matrix the engine trains on is the matrix the live predictor scores.
 
-    def _compute_ml_features(self, df: pd.DataFrame,
-                             feature_list: list[str] | None = None) -> pd.DataFrame:
-        """Compute the full feature set for ML, optionally filtered.
+    @property
+    def _ML_INDICATORS(self) -> dict:
+        """Indicator config the ML feature contract needs (kept for compatibility)."""
+        return REQUIRED_INDICATORS
 
-        Uses the shared compute_features() from core.ml.features.
-        feature_list=None → all features; non-empty list → filter.
+    #: Upper bound on cached ML feature matrices per run (FIFO eviction).
+    _ML_FEATURE_CACHE_MAX = 16
+
+    @staticmethod
+    def _ml_feature_config(indicators: dict, feature_list) -> tuple:
+        """Hashable cache key for one ML feature configuration."""
+        import json as _json
+
+        cols = list(feature_list) if feature_list else list(FEATURE_NAMES)
+        return (_json.dumps(indicators or {}, sort_keys=True, ensure_ascii=True),
+                tuple(cols))
+
+    def _ml_features_up_to(self, df: pd.DataFrame, ts, *,
+                           feature_list=None, indicators=None,
+                           full_df: pd.DataFrame | None = None,
+                           cache: dict | None = None) -> pd.DataFrame:
+        """Feature matrix rows ``≤ ts`` of *df* — computed once per bar, cached.
+
+        Before this, every bar re-ran ``compute_all`` (which includes the
+        per-row Hurst/swing-point loops) over the whole expanding history, i.e.
+        O(bars²) work per backtest.  The full-history matrix depends only on the
+        price history, so it is computed once per configuration and sliced by
+        timestamp; only the last row is new at each step.
+
+        ``full_df`` is the unsliced indicator-bearing frame the caller already
+        holds (the strategy has its own indicator cache in the engine); when it
+        is given, no second ``compute_all`` is done here.
         """
-        from core.strategy.indicators import compute_all
-        from core.ml.features import compute_features as _compute_features
+        key = self._ml_feature_config(indicators, feature_list)
+        matrix = None if cache is None else cache.get(key)
+        if matrix is None:
+            from core.strategy.indicators import compute_all
+            from core.ml.features import compute_features as _compute_features
 
-        df_ind = compute_all(df.copy(), self._ML_INDICATORS)
-        # None = all features; [] or non-empty list = filter
-        fl = feature_list if feature_list else None
-        return _compute_features(df_ind, fl)
+            source = full_df if full_df is not None else df
+            if full_df is None:
+                source = compute_all(source.copy(),
+                                     _ml_feature_indicators(indicators or {}))
+            cols = list(feature_list) if feature_list else list(FEATURE_NAMES)
+            matrix = _compute_features(source, cols)
+            if cache is not None:
+                if len(cache) >= self._ML_FEATURE_CACHE_MAX:
+                    cache.pop(next(iter(cache)), None)
+                cache[key] = matrix
+        if ts is None:
+            return matrix
+        return matrix[matrix.index <= ts]
+
+    def _meta_base_rate(self, symbol: str, strategy_name: str) -> float | None:
+        """Training base rate from the persisted model sidecar, when present."""
+        try:
+            from core.ml.trainer import MLTrainer
+            meta = MLTrainer(str(self.config.data_dir)).load_meta(
+                symbol, strategy_name, "binary")
+        except Exception:
+            return None
+        if not meta:
+            return None
+        rate = meta.get("train_base_rate", meta.get("base_rate"))
+        try:
+            rate = float(rate)
+        except (TypeError, ValueError):
+            return None
+        return rate if 0.0 < rate < 1.0 else None
 
     def _train_ml_model(self, df: pd.DataFrame, tf_params: dict = None,
-                         feature_list: list[str] | None = None):
+                         feature_list: list[str] | None = None,
+                         indicators: dict | None = None,
+                         full_df: pd.DataFrame | None = None,
+                         ts=None, cache: dict | None = None):
         """Train a LightGBM classifier (XGBoost fallback) with timeframe-appropriate labels.
 
         Each strategy's primary timeframe gets its own model with matched
         forward_periods and threshold (e.g., 1m→20 periods, 1h→4 periods).
         Tries LightGBM first; falls back to XGBoost if LightGBM is unavailable.
+
+        Phase P2 added ``eval_set`` early stopping to the shared trainer; the
+        engine's own fit uses the same chronological tail hold-out so a retrain
+        stops when the held-out log-loss stops improving instead of always
+        running the full ``n_estimators``.
         """
         if tf_params is None:
             tf_params = {"forward": 4, "threshold": 0.005, "min_candles": 100}
@@ -1168,7 +1667,9 @@ class BacktestEngine:
         try:
             from core.ml.features import create_binary_label
 
-            feature_df = self._compute_ml_features(df, feature_list)
+            feature_df = self._ml_features_up_to(
+                df, ts, feature_list=feature_list, indicators=indicators,
+                full_df=full_df, cache=cache)
             labels = create_binary_label(
                 df, forward_periods=tf_params["forward"],
                 threshold=tf_params["threshold"])
@@ -1177,11 +1678,24 @@ class BacktestEngine:
             if len(common_idx) < min_samples:
                 return None
             X = feature_df.loc[common_idx].values.astype(float)
-            y = labels.loc[common_idx].values
+            y = labels.loc[common_idx].values.astype(int)
 
             n_up = int(y.sum())
             n_down = len(y) - n_up
             scale_pos_weight = max(1.0, n_down / max(n_up, 1))
+
+            # Training base rate of THIS fitting window: the fusion kernel centres
+            # the signed score on it (P2 item 4), so a P(up) above the label rate
+            # is a bullish contribution and one below it is bearish.
+            base_rate = (n_up / len(y)) if len(y) else None
+            self._ml_last_base_rate = (
+                float(base_rate) if base_rate and 0.0 < base_rate < 1.0 else None)
+
+            # Chronological hold-out for early stopping (never random: the label
+            # has a forward window, so a shuffled split would leak).
+            cut = max(1, int(len(X) * 0.8))
+            X_tr, y_tr = X[:cut], y[:cut]
+            X_es, y_es = X[cut:], y[cut:]
 
             # Try LightGBM first (faster, often more accurate)
             try:
@@ -1193,11 +1707,15 @@ class BacktestEngine:
                     min_child_samples=20,
                     reg_alpha=0.1, reg_lambda=0.1,
                     verbosity=-1, random_state=42)
-                model.fit(X, y)
+                fit_kwargs: dict = {}
+                if len(X_es) > 0 and len(set(y_es.tolist())) > 1 and len(X_tr) >= 40:
+                    fit_kwargs["eval_set"] = [(X_es, y_es)]
+                    fit_kwargs["callbacks"] = [lgb.early_stopping(20, verbose=False)]
+                model.fit(X_tr if fit_kwargs else X, y_tr if fit_kwargs else y,
+                          **fit_kwargs)
                 return model
             except ImportError:
                 pass
-
             # XGBoost fallback
             import xgboost as xgb
             model = xgb.XGBClassifier(
@@ -1205,35 +1723,50 @@ class BacktestEngine:
                 subsample=0.8, colsample_bytree=0.8,
                 scale_pos_weight=scale_pos_weight,
                 eval_metric='logloss', verbosity=0, random_state=42)
-            model.fit(X, y)
+            fit_kwargs = {}
+            if len(X_es) > 0 and len(set(y_es.tolist())) > 1 and len(X_tr) >= 40:
+                fit_kwargs["eval_set"] = [(X_es, y_es)]
+                fit_kwargs["verbose"] = False
+            model.fit(X_tr if fit_kwargs else X, y_tr if fit_kwargs else y,
+                      **fit_kwargs)
             return model
         except Exception as e:
             logger.debug(f"ML train failed: {e}")
             return None
 
-    def _predict_ml(self, model, df: pd.DataFrame) -> float | None:
-        """Predict probability(price up >= 0.5%) using the trained model.
+    def _predict_ml(self, model, df: pd.DataFrame,
+                    feature_list: list[str] | None = None,
+                    indicators: dict | None = None,
+                    full_df: pd.DataFrame | None = None,
+                    ts=None, cache: dict | None = None) -> dict | None:
+        """Predict P(price rises ≥ the timeframe threshold) for the latest bar.
 
-        Returns confidence in [0,1] or None if data is insufficient.
-        If the model is too uncertain (0.38–0.62), returns 0.5 (neutral).
-        The wider neutral band reflects the 30-dim feature set's higher
-        dimensionality.
+        Returns the P2 prediction contract — ``{p_up, base_rate, score,
+        abstained}`` — or ``None`` when the data is insufficient.  ``base_rate``
+        and ``score`` are left ``None`` here: the caller fills ``base_rate`` in
+        from :attr:`_ml_last_base_rate` / the persisted model metadata, and
+        ``fuse_signals`` then derives the signed score from ``p_up`` against it.
+
+        The 0.38–0.62 "neutral band" is **not** applied here any more: with a
+        real base rate the band is meaningless (a 0.6 P(up) against a 0.62 base
+        rate is a bearish call).  ``_normalise_ml_prediction`` keeps the band for
+        callers that hand over a bare legacy confidence float.
         """
         if len(df) < 50:
             return None
         try:
-            feature_df = self._compute_ml_features(df)
+            feature_df = self._ml_features_up_to(
+                df, ts, feature_list=feature_list, indicators=indicators,
+                full_df=full_df, cache=cache)
             if len(feature_df) == 0:
                 return None
             X = feature_df.iloc[-1:].values.astype(float)
             proba = model.predict_proba(X)
             if proba.shape[1] >= 2:
-                conf = float(proba[0][1])
-                # Shrink toward 0.5 if model is uncertain
-                if 0.38 <= conf <= 0.62:
-                    return 0.5  # neutral — model doesn't know
-                return conf
-            return 0.5
+                return {"p_up": float(proba[0][1]), "base_rate": None,
+                        "score": None, "abstained": False}
+            return {"p_up": 0.5, "base_rate": None, "score": None,
+                    "abstained": False}
         except Exception as e:
             logger.debug(f"ML predict failed: {e}")
             return None
@@ -1241,23 +1774,24 @@ class BacktestEngine:
     # ── TFT helpers ──────────────────────────────────────────────────
 
     def _train_tft_model(self, tft_trainer, df: pd.DataFrame, symbol: str,
-                         interval: str, max_train_rows: int = 5000):
+                         interval: str, max_train_rows: int = 5000,
+                         indicators: dict | None = None):
         """Train a TFT model on sliced DataFrame (walk-forward safe).
 
         Caps training data to *max_train_rows* most recent candles so that
         retrain time stays constant regardless of how far the backtest has
-        progressed.
+        progressed.  Features come from the shared contract (``FEATURE_NAMES``).
         """
         try:
             from core.strategy.indicators import compute_all
-            from core.ml.features import compute_features as _cf, create_regression_label, REQUIRED_INDICATORS
+            from core.ml.features import compute_features as _cf, create_regression_label
 
             # Cap to recent data to keep training time constant
             if len(df) > max_train_rows:
                 df = df.iloc[-max_train_rows:]
 
-            df_ind = compute_all(df.copy(), REQUIRED_INDICATORS)
-            X = _cf(df_ind, None)
+            df_ind = compute_all(df.copy(), _ml_feature_indicators(indicators or {}))
+            X = _cf(df_ind, list(FEATURE_NAMES))
             y = create_regression_label(df_ind, forward_periods=4)
             X["label"] = y.values
 
@@ -1284,26 +1818,35 @@ class BacktestEngine:
             logger.debug(f"TFT train failed for {symbol}: {e}")
             return None
 
-    def _predict_tft(self, tft_trainer, model, df: pd.DataFrame) -> float | None:
-        """Predict with TFT — returns confidence in [0, 1]."""
+    def _predict_tft(self, tft_trainer, model, df: pd.DataFrame,
+                     indicators: dict | None = None) -> dict | None:
+        """Predict with TFT — returns the P2 prediction contract (or ``None``).
+
+        ``result["confidence"]`` is a *magnitude* (``sigmoid(|P50|/IQR)``), not a
+        probability, so the directional sign is carried separately: ``p_up`` is
+        the neutral 0.5 when the model is directionless (a real neutral vote),
+        and ``score`` is the direction × magnitude signed score.
+        """
         if len(df) < 100:
             return None
         try:
             from core.strategy.indicators import compute_all
-            from core.ml.features import compute_features as _cf, REQUIRED_INDICATORS
+            from core.ml.features import compute_features as _cf
 
-            df_ind = compute_all(df.copy(), REQUIRED_INDICATORS)
-            X = _cf(df_ind, None)
+            df_ind = compute_all(df.copy(), _ml_feature_indicators(indicators or {}))
+            X = _cf(df_ind, list(FEATURE_NAMES))
             result = tft_trainer.predict(model, X)
             if result is None:
                 return None
 
-            tft_conf = result["confidence"]
-            tft_dir = result["direction"]
-            if tft_dir > 0:
-                return tft_conf
-            else:
-                return 1.0 - tft_conf
+            tft_conf = float(result["confidence"])
+            tft_dir = int(result["direction"])
+            # None ⇒ the caller's base rate (or the kernel default) centres it.
+            p_up = (tft_conf if tft_dir > 0
+                    else (1.0 - tft_conf if tft_dir < 0 else 0.5))
+            return {"p_up": p_up, "base_rate": None,
+                    "score": float(result.get("score", tft_conf)) * (1 if tft_dir > 0 else -1 if tft_dir < 0 else 0),
+                    "abstained": tft_dir == 0}
         except Exception as e:
             logger.debug(f"TFT predict failed: {e}")
             return None
@@ -1312,19 +1855,20 @@ class BacktestEngine:
 
     def _train_patchtst_model(self, trainer, df: pd.DataFrame, symbol: str,
                               interval: str, max_train_rows: int = 5000,
-                              feature_list: list[str] | None = None):
+                              feature_list: list[str] | None = None,
+                              indicators: dict | None = None):
         """Train a PatchTST model with triple-barrier labels."""
         try:
             from core.strategy.indicators import compute_all
             from core.ml.features import (compute_features as _cf,
-                  create_triple_barrier_label, REQUIRED_INDICATORS)
+                  create_triple_barrier_label)
 
             if len(df) > max_train_rows:
                 df = df.iloc[-max_train_rows:]
 
-            df_ind = compute_all(df.copy(), REQUIRED_INDICATORS)
-            # feature_list=None or [] → use all features; non-empty → filter
-            fl = feature_list if feature_list else None
+            df_ind = compute_all(df.copy(), _ml_feature_indicators(indicators or {}))
+            # None/[] → the full contract; non-empty → the strategy's subset
+            fl = list(feature_list) if feature_list else list(FEATURE_NAMES)
             X = _cf(df_ind, fl)
             # Triple barrier: 2% up/down, 24 periods lookahead
             y = create_triple_barrier_label(
@@ -1352,28 +1896,37 @@ class BacktestEngine:
             logger.debug(f"PatchTST train failed for {symbol}: {e}")
             return None
 
-    def _predict_patchtst(self, trainer, model, df: pd.DataFrame) -> float | None:
-        """Predict with PatchTST — returns confidence in [0, 1]."""
+    def _predict_patchtst(self, trainer, model, df: pd.DataFrame,
+                          indicators: dict | None = None) -> dict | None:
+        """Predict with PatchTST — returns the P2 prediction contract (or ``None``).
+
+        The trainer publishes true class probabilities (``p_up`` /
+        ``p_up_conditional``); ``p_up_conditional`` (P(up) normalised over the
+        two directional classes) is the probability the fusion kernel expects,
+        with 0.5 for a timeout-dominated (directionless) bar.
+        """
         if len(df) < 100:
             return None
         try:
             from core.strategy.indicators import compute_all
-            from core.ml.features import compute_features as _cf, REQUIRED_INDICATORS
+            from core.ml.features import compute_features as _cf
 
-            df_ind = compute_all(df.copy(), REQUIRED_INDICATORS)
-            X = _cf(df_ind, None)
+            df_ind = compute_all(df.copy(), _ml_feature_indicators(indicators or {}))
+            X = _cf(df_ind, list(FEATURE_NAMES))
             result = trainer.predict(model, X)
             if result is None:
                 return None
 
-            direction = result["direction"]
-            confidence = result["confidence"]
-            if direction > 0:
-                return confidence
-            elif direction < 0:
-                return 1.0 - confidence
-            else:
-                return 0.5  # timeout/neutral
+            direction = int(result["direction"])
+            confidence = float(result["confidence"])
+            p_up = result.get("p_up_conditional", result.get("p_up"))
+            if p_up is None:
+                p_up = (confidence if direction > 0
+                        else (1.0 - confidence if direction < 0 else 0.5))
+            score = float(result.get("score", confidence))
+            return {"p_up": float(p_up), "base_rate": None,
+                    "score": score * (1 if direction > 0 else -1 if direction < 0 else 0),
+                    "abstained": direction == 0}
         except Exception as e:
             logger.debug(f"PatchTST predict failed: {e}")
             return None

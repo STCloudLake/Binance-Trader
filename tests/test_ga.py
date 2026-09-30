@@ -54,8 +54,14 @@ def test_strategy_to_chromosome_roundtrip():
     assert "ema" in decoded.indicators
     assert decoded.entry_conditions["long"] == ["rsi < 30", "close > ema_fast"]
     assert decoded.exit_conditions["long"] == ["rsi > 65"]
-    assert decoded.ml_config.enabled is True
-    assert decoded.ml_config.weight == 0.3
+    # P1 score/publish consistency: ``evaluate_chromosome`` always scores with
+    # ``ml_config.enabled = False``, so the decoder must emit a disabled,
+    # zero-weight ML config — otherwise the live entry set differs from the
+    # scored one (measured fusion: off 0.5000 / w=0.1 → 0.6250 / w=0.5 → 0.4167).
+    # The confidence THRESHOLD is still carried through.
+    assert decoded.ml_config.enabled is False
+    assert decoded.ml_config.weight == 0.0
+    assert decoded.ml_config.confidence_threshold == 0.65
 
 
 def test_strategy_to_chromosome_minimal():

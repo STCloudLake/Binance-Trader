@@ -178,7 +178,10 @@ class PatchTSTModel(nn.Module):
           'logits' / 'quantiles' — raw outputs
           'probs' — softmax for triple_barrier mode
           'direction' — +1 (up), -1 (down), 0 (timeout/neutral)
-          'confidence' — max probability among up/down
+          'confidence' — **NOT a probability**: ``max(p_up, p_down)`` ignores the
+              timeout class entirely (Phase P2 item 8).  Kept by name for existing
+              callers; new code should read ``p_up``/``p_down``/``p_timeout`` or the
+              alias ``score``.
         """
         B = x.shape[0]
 
@@ -218,7 +221,15 @@ class PatchTSTModel(nn.Module):
                 "p_down": p_down,    # class 0 = lower barrier hit
                 "p_timeout": probs[:, 2],  # class 2 = timeout
                 "direction": direction,
+                # Real probability of the directional class that wins, normalised
+                # over the two directional classes (timeout excluded) — this is
+                # what `core.strategy.evaluation_kernel` should fuse.
+                "p_directional": torch.where(
+                    (p_up + p_down) > 0,
+                    torch.max(p_up, p_down) / (p_up + p_down + 1e-12),
+                    torch.full_like(p_up, 0.5)),
                 "confidence": confidence,
+                "score": confidence,
             }
         else:
             return {
@@ -226,6 +237,7 @@ class PatchTSTModel(nn.Module):
                 "p50": raw[:, 1],
                 "direction": torch.sign(raw[:, 1]),
                 "confidence": torch.sigmoid(torch.abs(raw[:, 1]) / (raw[:, 2] - raw[:, 0] + 1e-6)),
+                "score": torch.sigmoid(torch.abs(raw[:, 1]) / (raw[:, 2] - raw[:, 0] + 1e-6)),
             }
 
 

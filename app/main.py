@@ -485,34 +485,64 @@ async def main():
 
     background_tasks.append(asyncio.create_task(_rest_polling_loop(), name="rest_polling_loop"))
 
-    # Train ML models for each symbol on the registry's ML interval (1h)
-    for symbol in watchlist:
-        try:
-            result = await ml_predictor.train_model(symbol, "default", DEFAULT_ML_INTERVAL)
-            if "error" in result:
-                logger.warning(f"ML training skipped for {symbol}: {result['error']}")
-            else:
-                logger.info(f"ML model trained: {symbol} — accuracy={result.get('accuracy', 'N/A')}, f1={result.get('f1', 'N/A')}")
-        except Exception as e:
-            logger.warning(f"ML training failed for {symbol}: {e}")
-    logger.info("ML training round complete")
+    # Train ML models for each symbol on the registry's ML interval (1h).
+    # Gated on `ml.enabled` (audit P2 #9): the old loop trained a model for every
+    # watchlist symbol even with ML switched off, burning the full feature
+    # pipeline (O(n) rolling Hurst) plus a LightGBM fit per symbol on every
+    # start-up — and writing artefacts nothing was allowed to load.  Training is
+    # still reachable deliberately:
+    #   * `MLPredictor.train_model(symbol, strategy)` — the manual path below,
+    #     used when `ml.enabled` is true (and by `_retrain_loop`), and
+    #   * `python scripts/ml_credibility_measure.py` — the offline experiment/
+    #     measurement path, which needs no config change.
+    if bool(getattr(config, "ml_enabled", False)):
+        for symbol in watchlist:
+            try:
+                result = await ml_predictor.train_model(symbol, "default", DEFAULT_ML_INTERVAL)
+                if "error" in result:
+                    logger.warning(f"ML training skipped for {symbol}: {result['error']}")
+                else:
+                    logger.info(f"ML model trained: {symbol} — accuracy={result.get('accuracy', 'N/A')}, f1={result.get('f1', 'N/A')}, gate={'PASS' if (result.get('gate') or {}).get('allowed') else 'FAIL'}")
+            except Exception as e:
+                logger.warning(f"ML training failed for {symbol}: {e}")
+        logger.info("ML training round complete")
+    else:
+        logger.info(
+            "ML training skipped: ml.enabled=false (the gate has not passed for any "
+            "symbol). Use MLPredictor.train_model(...) or "
+            "scripts/ml_credibility_measure.py for training experiments.")
 
-    # Publish ML predictions and directly seed strategy engine cache
+    # Publish ML predictions and directly seed strategy engine cache.
+    # Always runs: with ML disabled (or a gate-refused model) the predictor
+    # returns a neutral verdict, which keeps the live monitor honest.
     from core.strategy.indicators import compute_all
-    from core.ml.features import REQUIRED_INDICATORS
+    from core.ml.features import MIN_FEATURE_ROWS, REQUIRED_INDICATORS
     for symbol in watchlist:
         try:
             df = await market_data.get_historical(symbol, DEFAULT_ML_INTERVAL, limit=200)
-            if df is not None and len(df) >= 50:
+            if df is not None and len(df) >= MIN_FEATURE_ROWS:
                 # Use REQUIRED_INDICATORS to match training feature set (prevents 29≠30 mismatch)
                 df = compute_all(df, REQUIRED_INDICATORS)
-                # Use the predictor's full feature list (matches training)
-                confidence = await ml_predictor.predict(symbol, df)
+                # The full verdict — p_up, the model's base rate, the signed score
+                # and the abstention flag.  `predict()` only returned the scalar
+                # P(up), so the engine fused an abstention as a small bearish vote
+                # (audit P2 #5).
+                detail = await ml_predictor.predict_detail(symbol, df)
+                confidence = float(detail["p_up"])
                 # Directly seed engine cache (bypasses async event queue)
                 strategy_engine._ml_confidence[symbol] = confidence
+                strategy_engine._ml_prediction[symbol] = {
+                    "confidence": confidence,
+                    "base_rate": float(detail.get("base_rate", 0.5)),
+                    "score": float(detail.get("score", 0.0)),
+                    "abstained": bool(detail.get("abstained", False)),
+                }
                 await event_bus.publish(Event(EventType.ML_PREDICTION, {
                     "symbol": symbol, "interval": DEFAULT_ML_INTERVAL,
                     "confidence": confidence,
+                    "ml_base_rate": float(detail.get("base_rate", 0.5)),
+                    "ml_score": float(detail.get("score", 0.0)),
+                    "ml_abstained": bool(detail.get("abstained", False)),
                 }))
         except Exception as e:
             # Previously silent: a failure here means the strategy engine keeps

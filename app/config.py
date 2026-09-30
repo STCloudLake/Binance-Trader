@@ -273,6 +273,26 @@ class Config:
         self.backtest_market_data_host = str(
             cost_cfg.get("market_data_host") or self.market_data_host).rstrip("/")
 
+        # ── GA evaluation settings (`ga:` in config.yaml) ──
+        # These only affect how a genome is SCORED during GA/walk-forward:
+        #   use_live_spread      — never price a historical fill from today's book
+        #   min_champion_trades  — publication gate's trade-count floor
+        #   alpha_weight         — weight of the DSR/Sharpe/buy&hold term
+        #   evaluation_leverage  — 1.0 = cash model (the documented choice)
+        ga_cfg = self._get("ga", {})
+        if not isinstance(ga_cfg, dict):
+            ga_cfg = {}
+        self.ga_use_live_spread = _as_bool(ga_cfg.get("use_live_spread"), False)
+        try:
+            self.ga_min_champion_trades = max(
+                int(ga_cfg.get("min_champion_trades", 30)), 1)
+        except (TypeError, ValueError):
+            self.ga_min_champion_trades = 30
+        self.ga_alpha_weight = max(
+            _as_float(ga_cfg.get("alpha_weight"), 1.0), 0.0)
+        self.ga_evaluation_leverage = max(
+            _as_float(ga_cfg.get("evaluation_leverage"), 1.0), 1.0)
+
         # Simulated-account cost model (docs/overhaul/TRADE_PAGE_API.md §五之二).
         # Deliberately separate from `backtest.cost_model` above: the backtest model
         # charges its costs at close time on top of the raw prices and must not
@@ -300,6 +320,69 @@ class Config:
 
         self.sim_default_spread_pct = _as_float(
             self.sim_spread_pct.get("default"), DEFAULT_SIM_SPREAD_PCT)
+
+        # ── ML credibility block (docs/overhaul/ALGO_UPGRADE_PLAN.md §二 P2) ──
+        # SAFE DEFAULT: `enabled` ships false.  The gate requires OOS AUC > 0.55
+        # AND net-of-cost expectancy > 0; the measured live model has AUC
+        # 0.396–0.447 (worse than the majority class), so ML stays off until a
+        # newly trained, calibrated, gated model replaces it.
+        ml = self._get("ml", {})
+        if not isinstance(ml, dict):
+            ml = {}
+        self.ml_enabled = _as_bool(ml.get("enabled"), False)
+        self.ml_model_type = str(ml.get("model_type", "lightgbm") or "lightgbm").lower()
+        self.ml_calibration = str(ml.get("calibration", "isotonic") or "isotonic").lower()
+        # `gate_auc_min` / `gate_net_expectancy_min` / `min_oos_rows` feed
+        # `credibility_gate` through `MLPredictor._gate_config()`, and
+        # `gate_min_trades` / `gate_min_t_stat` add the significance floor the
+        # audit demanded (P2 #3).  `gate_enabled` and `gate_disable_url` were
+        # deleted: the first was a switch that could not be honoured (an
+        # unrecognised `true` must never be able to enable a refused model) and
+        # the second pointed at `/api/ml`, which does not exist.
+        self.ml_gate_auc_min = _as_float(ml.get("gate_auc_min"), 0.55)
+        if not 0.5 <= self.ml_gate_auc_min <= 1.0:
+            logger.warning(f"Invalid ml.gate_auc_min '{ml.get('gate_auc_min')}', "
+                           f"falling back to 0.55")
+            self.ml_gate_auc_min = 0.55
+        self.ml_gate_net_expectancy_min = _as_float(ml.get("gate_net_expectancy_min"), 0.0)
+        self.ml_gate_min_trades = int(_as_float(ml.get("gate_min_trades"), 100))
+        self.ml_gate_min_t_stat = _as_float(ml.get("gate_min_t_stat"), 2.0)
+        self.ml_gate_min_psr = _as_float(ml.get("gate_min_psr"), 0.95)
+        self.ml_feature_list = list(ml.get("feature_list") or []) or None
+
+        # Label / evaluation knobs.  `confidence_threshold` used to be evolved by
+        # the GA and never read; it is now the *decision* threshold applied to the
+        # calibrated P(up) (None → use the cost-aware threshold from the gate).
+        self.ml_confidence_threshold = _as_float(ml.get("confidence_threshold"), None)
+        self.ml_default_confidence_threshold = _as_float(
+            ml.get("default_confidence_threshold"), 0.55)
+        self.ml_forward_periods = int(_as_float(ml.get("forward_periods"), 4))
+        self.ml_label_threshold = _as_float(ml.get("label_threshold"), 0.005)
+        # Effective label threshold = max(label_threshold, k * round-trip cost).
+        # 0.0 keeps the audited ±0.5 % threshold (40.5 % of BTC 1h bars tradeable);
+        # 4.0 makes the target beat four times its own cost, which moves more mass
+        # into the `flat` class.
+        self.ml_label_cost_multiple = _as_float(ml.get("label_cost_multiple"), 0.0)
+        self.ml_max_hold_bars = int(_as_float(ml.get("max_hold_bars"), 24))
+        self.ml_label_params = dict(ml.get("label_params") or {})
+        self.ml_barrier_atr_period = int(_as_float(ml.get("barrier_atr_period"), 14))
+        self.ml_barrier_atr_multiple = _as_float(ml.get("barrier_atr_multiple"), 1.5)
+        self.ml_barrier_min_pct = _as_float(ml.get("barrier_min_pct"), 0.004)
+        self.ml_barrier_max_pct = _as_float(ml.get("barrier_max_pct"), 0.06)
+        self.ml_embargo_bars = int(_as_float(ml.get("embargo_bars"), self.ml_forward_periods))
+        self.ml_min_oos_rows = int(_as_float(ml.get("min_oos_rows"), 100))
+
+        # Cost inputs.  All default to **None** so `core.ml.credibility` resolves
+        # the round-trip cost through the `sim.cost_model` numbers — the same
+        # source the fills pay (audit P2 #2: the old default fell back to
+        # `backtest_taker_fee_pct` 0.04 %, half the real VIP0 taker fee, so the
+        # gate gated on a cost 2× cheaper than reality).
+        self.ml_taker_fee_pct = _as_float(ml.get("taker_fee_pct"), None)
+        self.ml_half_spread_pct = _as_float(ml.get("half_spread_pct"), None)
+        self.ml_slippage_bps = _as_float(ml.get("slippage_bps"), None)
+        _bnb = ml.get("use_bnb_discount")
+        self.ml_use_bnb_discount = None if _bnb is None else _as_bool(_bnb, False)
+        self.ml_retrain_interval_hours = _as_float(ml.get("retrain_interval_hours"), 24.0)
 
         ai = self._get("ai", {})
         self.ai_mode = ai.get("mode", "semi_auto") if isinstance(ai, dict) else "semi_auto"

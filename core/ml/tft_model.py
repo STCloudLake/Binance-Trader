@@ -261,7 +261,10 @@ class TFTModel(nn.Module):
             'quantiles' : (batch, num_quantiles) — predicted quantile values
             'attention' : (batch, num_heads, seq_len, seq_len) — attention weights
             'direction' : (batch,) — +1 for up, -1 for down (from P50)
-            'confidence': (batch,) — signal strength in [0, 1]
+            'confidence': (batch,) — **NOT a probability**: a heuristic
+                ``sigmoid(|P50| / IQR)`` signal strength in [0, 1] (Phase P2
+                item 8 renamed the concept; the key is kept for old callers and
+                aliased as 'score').
             'uncertainty': (batch,) — P90-P10 width (larger = more uncertain)
         """
         batch, seq, _ = x.shape
@@ -295,7 +298,9 @@ class TFTModel(nn.Module):
                                 -torch.ones_like(p50))
 
         uncertainty = p90 - p10
-        # Confidence: how far P50 is from zero, scaled by uncertainty
+        # "Confidence" here is a score, not a probability: it only says how far
+        # P50 sits from zero relative to the P10–P90 spread (Phase P2 item 8).
+        # The interface exposes it as `score` and keeps `confidence` as an alias.
         confidence = torch.sigmoid(torch.abs(p50) / (uncertainty + 1e-6) - 0.5) * 2
         confidence = torch.clamp(confidence, 0.0, 1.0)
 
@@ -303,6 +308,7 @@ class TFTModel(nn.Module):
             'quantiles': quantile_preds,
             'direction': direction,
             'confidence': confidence,
+            'score': confidence,
             'uncertainty': uncertainty,
             'attention': attn_weights,
             'p50': p50,

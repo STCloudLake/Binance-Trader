@@ -81,6 +81,28 @@ def job_symbols(job: dict, config=None) -> list:
     return _watchlist_fallback(config) or list(DEFAULT_FALLBACK_SYMBOLS)
 
 
+def _job_seed(job: dict) -> int:
+    """Job seed (deterministic when the route supplied one, else job-file seeded)."""
+    try:
+        seed = int(job.get("seed") or 0)
+    except (TypeError, ValueError):
+        seed = 0
+    if seed:
+        return seed
+    # Derive from the job file path so a replay of the SAME file is identical.
+    import hashlib
+    digest = hashlib.sha256(str(job.get("_job_file", "")).encode()).hexdigest()
+    return int(digest[:8], 16)
+
+
+def _seed_everything(seed: int) -> None:
+    """Seed Python + NumPy so a job's population and mutation stream repeat."""
+    import random
+    import numpy as np
+    random.seed(seed)
+    np.random.seed(seed % (2 ** 32))
+
+
 def run_ga(job: dict, job_file: str):
     """Run standard GA evolution."""
     from app.config import Config
@@ -91,6 +113,7 @@ def run_ga(job: dict, job_file: str):
     from core.risk.manager import RiskManager
     from core.executor.executor import OrderExecutor
     from app.event_bus import EventBus
+    from core.backtest.cost_model import clear_live_spread_cache
 
     config = Config.load("sim")
     config.backtest_cost_enabled = job.get("cost_enabled", True)
@@ -101,6 +124,14 @@ def run_ga(job: dict, job_file: str):
         **(getattr(config, "backtest_spread_pct", None) or {}),
         **(job.get("spread_pct") or {})}
     config.backtest_engine_mode = "legacy"  # subprocess doesn't have full engine stack
+
+    seed = _job_seed(job)
+    _seed_everything(seed)
+    # Historical fills are never priced from TODAY's order book unless the
+    # operator explicitly asks for it (`ga.use_live_spread: true`).
+    clear_live_spread_cache()
+    live_spread = bool(getattr(config, "ga_use_live_spread", False))
+    config.backtest_live_spread_enabled = live_spread
 
     event_bus = EventBus()
     risk_manager = RiskManager(config, event_bus)
@@ -118,6 +149,7 @@ def run_ga(job: dict, job_file: str):
         elite_count=max(4, pop_size // 10),
         immigrant_count=max(4, pop_size // 10),
         max_workers=job.get("max_workers", 1),  # >1 uses multi-process (safe for TA-Lib)
+        seed=seed,
     )
 
     evolver = GAStrategyEvolver(engine, loader, ga_cfg)
@@ -155,7 +187,13 @@ def run_ga(job: dict, job_file: str):
         symbols, date_start, date_end,
         seed_strategies=seed_strategies,
         validation_start=validation_start,
+        # ``resume`` used to be accepted by the route and then dropped here, so
+        # "resume" silently started a fresh population.
+        resume=bool(job.get("resume", False)),
+        seed=seed,
+        window_key=f"{date_start}~{validation_start or date_end}",
     )
+    result["seed"] = seed
     write_result(job_file, result)
 
 
@@ -170,6 +208,7 @@ def run_walkforward(job: dict, job_file: str):
     from core.risk.manager import RiskManager
     from core.executor.executor import OrderExecutor
     from app.event_bus import EventBus
+    from core.backtest.cost_model import clear_live_spread_cache
 
     config = Config.load("sim")
     config.backtest_cost_enabled = job.get("cost_enabled", True)
@@ -180,6 +219,12 @@ def run_walkforward(job: dict, job_file: str):
         **(getattr(config, "backtest_spread_pct", None) or {}),
         **(job.get("spread_pct") or {})}
     config.backtest_engine_mode = "legacy"  # subprocess doesn't have full engine stack
+
+    seed = _job_seed(job)
+    _seed_everything(seed)
+    clear_live_spread_cache()
+    config.backtest_live_spread_enabled = bool(
+        getattr(config, "ga_use_live_spread", False))
 
     event_bus = EventBus()
     risk_manager = RiskManager(config, event_bus)
@@ -197,6 +242,7 @@ def run_walkforward(job: dict, job_file: str):
         elite_count=max(4, pop_size // 10),
         immigrant_count=max(4, pop_size // 10),
         max_workers=job.get("max_workers", 1),  # >1 uses multi-process (safe for TA-Lib)
+        seed=seed,
     )
 
     wf_cfg = WFConfig(
@@ -263,7 +309,8 @@ def run_walkforward(job: dict, job_file: str):
     _progress_thread.start()
 
     try:
-        report = runner.run(symbols, date_start, date_end, wf_cfg, ga_cfg)
+        report = runner.run(symbols, date_start, date_end, wf_cfg, ga_cfg,
+                            resume=bool(job.get("resume", False)))
     finally:
         _progress_stop = True
         _progress_thread.join(timeout=5)
@@ -271,6 +318,7 @@ def run_walkforward(job: dict, job_file: str):
     write_result(job_file, {
         "type": "walkforward",
         "report": report.to_dict(),
+        "seed": seed,
     })
 
 
@@ -283,6 +331,9 @@ def main():
     try:
         with open(args.job_file) as f:
             job = json.load(f)
+        # Keep the file path on the payload so a replay of the same file derives
+        # the same fallback seed.
+        job["_job_file"] = args.job_file
 
         update_progress(args.job_file, {"phase": "starting", "job_type": args.job_type})
 

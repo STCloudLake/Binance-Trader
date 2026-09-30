@@ -35,6 +35,8 @@ class PatchTSTTrainer:
         self.num_heads = num_heads
         self.num_layers = num_layers
         self.dropout = dropout
+        #: Train-time scaler (set by :meth:`train` / :meth:`load`).
+        self.scaler = None
 
         if device is None:
             if torch.cuda.is_available():
@@ -51,7 +53,16 @@ class PatchTSTTrainer:
 
     def prepare_sequences(self, df: pd.DataFrame,
                           feature_cols: list[str] | None = None,
-                          label_col: str = "label") -> tuple[torch.Tensor, torch.Tensor]:
+                          label_col: str = "label",
+                          scaler=None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sliding windows + optional **train-time** scaler.
+
+        Normalisation used to be "expanding mean/std per window", which can only
+        be reproduced at inference by replaying the whole history — and was not
+        (inference used global stats).  Pass a
+        :class:`core.ml.scalers.TrainTimeScaler` fitted on the training rows, or
+        ``None`` for raw values.
+        """
         if feature_cols is None:
             feature_cols = [c for c in df.columns
                           if c not in (label_col,) and df[c].dtype in ('float64', 'float32', 'int64')]
@@ -68,17 +79,13 @@ class PatchTSTTrainer:
                     torch.empty(0, dtype=torch.long))
 
         num_samples = len(data) - self.seq_len
-        # Expanding-window normalization: for each window i, use mean/std
-        # of all data [0 : i+seq_len]. Preserves trend/regime information.
-        X_list = []
-        for i in range(num_samples):
-            window = data[i:i + self.seq_len].copy()
-            full_up_to = data[:i + self.seq_len]
-            f_mean = full_up_to.mean(axis=0)
-            f_std = full_up_to.std(axis=0) + 1e-8
-            X_list.append((window - f_mean) / f_std)
-        X = np.stack(X_list, axis=0)
+        windows = np.stack(
+            [data[i:i + self.seq_len] for i in range(num_samples)], axis=0)
         y = labels[self.seq_len:]
+        if scaler is not None:
+            windows = scaler.transform(
+                windows.reshape(-1, windows.shape[-1])).reshape(windows.shape)
+        X = windows
 
         return torch.tensor(X), torch.tensor(y, dtype=torch.long)
 
@@ -92,13 +99,23 @@ class PatchTSTTrainer:
               learning_rate: float = 1e-3,
               validation_split: float = 0.2,
               patience: int = 15) -> tuple[Optional[PatchTSTModel], dict]:
-        X, y = self.prepare_sequences(df, feature_cols, label_col)
+        from core.ml.scalers import TrainTimeScaler
+
+        X, y = self.prepare_sequences(df, feature_cols, label_col, scaler=None)
         if len(X) < 60:
             return None, {"error": f"Insufficient sequences: {len(X)}"}
 
         split_idx = int(len(X) * (1 - validation_split))
         X_train, X_val = X[:split_idx], X[split_idx:]
         y_train, y_val = y[:split_idx], y[split_idx:]
+
+        # Fit on the training windows only; identical transform at inference.
+        scaler = TrainTimeScaler.fit(X_train.reshape(-1, X_train.shape[-1]).numpy())
+        self.scaler = scaler
+        X_train = torch.tensor(scaler.transform(
+            X_train.reshape(-1, X_train.shape[-1]).numpy()).reshape(X_train.shape))
+        X_val = torch.tensor(scaler.transform(
+            X_val.reshape(-1, X_val.shape[-1]).numpy()).reshape(X_val.shape))
 
         n_classes = 3  # up, down, timeout
         num_features = X.shape[2]
@@ -181,6 +198,7 @@ class PatchTSTTrainer:
             "num_sequences": len(X),
             "num_features": num_features,
             "device": self.device,
+            "scaler": scaler.to_dict(),
         }
         return model, metrics
 
@@ -188,7 +206,8 @@ class PatchTSTTrainer:
 
     def predict(self, model: PatchTSTModel,
                 df: pd.DataFrame,
-                feature_cols: list[str] | None = None) -> dict | None:
+                feature_cols: list[str] | None = None,
+                scaler=None) -> dict | None:
         if len(df) < self.seq_len:
             return None
 
@@ -198,24 +217,38 @@ class PatchTSTTrainer:
                           if c not in ('label',) and recent[c].dtype in ('float64', 'float32', 'int64')]
 
         data = recent[feature_cols].values.astype(np.float32)
-        # Normalize with full history stats
-        full_data = df[feature_cols].values.astype(np.float32)
-        for feat in range(data.shape[1]):
-            f_mean = full_data[:, feat].mean()
-            f_std = full_data[:, feat].std() + 1e-8
-            data[:, feat] = (data[:, feat] - f_mean) / f_std
+        scaler = scaler if scaler is not None else getattr(self, "scaler", None)
+        if scaler is not None and getattr(scaler, "fitted", False):
+            data = scaler.transform(data)
+        else:
+            # Legacy checkpoint without a persisted scaler.
+            full_data = df[feature_cols].values.astype(np.float32)
+            for feat in range(data.shape[1]):
+                f_mean = full_data[:, feat].mean()
+                f_std = full_data[:, feat].std() + 1e-8
+                data[:, feat] = (data[:, feat] - f_mean) / f_std
 
         X = torch.tensor(data).unsqueeze(0).to(self.device)
         model.eval()
         with torch.no_grad():
             out = model(X)
 
+        p = out["probs"][0]
+        p_down, p_up, p_timeout = float(p[0]), float(p[1]), float(p[2])
+        # `confidence` is NOT a probability (item 8): max(p_up, p_down) ignores
+        # the timeout class entirely.  It is kept as `score` for old readers and
+        # the true probabilities are the interface new code should use.
         return {
             "direction": int(out["direction"].item()),
             "confidence": round(float(out["confidence"].item()), 4),
-            "p_up": round(float(out.get("p_up", out["probs"][0, 0]).item()), 4),
-            "p_down": round(float(out.get("p_down", out["probs"][0, 1]).item()), 4),
-            "p_timeout": round(float(out.get("p_timeout", out["probs"][0, 2]).item()), 4),
+            "score": round(float(out["confidence"].item()), 4),
+            "p_up": round(p_up, 4),
+            "p_down": round(p_down, 4),
+            "p_timeout": round(p_timeout, 4),
+            # P(up) normalised over the two directional classes — a real
+            # probability to feed the fusion kernel (0.5 when timeout dominates).
+            "p_up_conditional": round(
+                p_up / (p_up + p_down) if (p_up + p_down) > 0 else 0.5, 4),
         }
 
     # ── Persistence ──────────────────────────────────────────────────
@@ -230,6 +263,8 @@ class PatchTSTTrainer:
                 "d_model": model.d_model, "num_heads": model.num_heads,
                 "num_layers": model.num_layers, "dropout": model.dropout,
             },
+            "scaler": getattr(self, "scaler", None).to_dict()
+            if getattr(self, "scaler", None) is not None else None,
         }, path)
         return str(path)
 
@@ -238,6 +273,8 @@ class PatchTSTTrainer:
         if not path.exists():
             return None
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        from core.ml.scalers import TrainTimeScaler
+        self.scaler = TrainTimeScaler.from_dict(ckpt.get("scaler"))
         cfg = ckpt["config"]
         model = PatchTSTModel(
             num_features=cfg["num_features"], seq_len=cfg["seq_len"],

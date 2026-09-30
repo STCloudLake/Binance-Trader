@@ -14,6 +14,11 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
+#: Minimum out-of-sample bars a walk-forward window must contain.  A window with
+#: fewer bars is rejected loudly instead of producing a meaningless validation
+#: number (the previous code validated every window on ONE bar).
+MIN_VALIDATION_BARS = 30
+
 
 @dataclass
 class WFConfig:
@@ -237,10 +242,24 @@ class WalkForwardRunner:
 
             evolver.set_progress_callback(_ga_progress)
 
+            # ── Out-of-sample window sanity (fail loudly, never silently) ──
+            # ``evolve`` treats ``date_end`` as the OOS end and
+            # ``validation_start`` as both train end and validation start, so it
+            # MUST be called as ``evolve(symbols, tr_start, val_end,
+            # validation_start=val_start)``.  The old call passed ``tr_end`` as
+            # ``date_end`` while ``val_start == tr_end``, so every window
+            # "validated" on the single bar [tr_end, tr_end] — the production log
+            # shows ``validate=2025-11-01~2025-11-01`` for all 24 jobs.
+            bars = self._assert_window(val_start, val_end, symbols)
+            logger.info(f"WF window {i + 1}: OOS {val_start}~{val_end} = {bars} bars")
+
             champion = evolver.evolve(
-                symbols, tr_start, tr_end,
+                symbols, tr_start, val_end,
                 seed_strategies=seed_strategies,
                 validation_start=val_start,
+                resume=resume,
+                seed=getattr(ga_config, "seed", 0) or None,
+                window_key=f"{tr_start}~{tr_end}|{val_start}~{val_end}",
             )
 
             val_data = champion.get("validation", {}) or {}
@@ -281,6 +300,53 @@ class WalkForwardRunner:
     def stop(self):
         """Signal the runner to stop after the current window completes."""
         self._running = False
+
+    def _assert_window(self, val_start: str, val_end: str,
+                       symbols: list[str]) -> int:
+        """Validate an out-of-sample window; return its bar count.
+
+        Raises ``ValueError`` (which aborts the whole walk-forward job loudly)
+        when ``val_start >= val_end`` or when the window holds fewer than
+        :data:`MIN_VALIDATION_BARS` bars.  The previous implementation never
+        checked anything and happily "validated" on a single bar.
+        """
+        if not (pd.Timestamp(val_start) < pd.Timestamp(val_end)):
+            raise ValueError(
+                f"invalid walk-forward window: val_start={val_start} must be "
+                f"earlier than val_end={val_end}")
+        bars = self._validation_bars(symbols, val_start, val_end)
+        if bars < MIN_VALIDATION_BARS:
+            raise ValueError(
+                f"out-of-sample window {val_start}~{val_end} has only {bars} bars "
+                f"(min {MIN_VALIDATION_BARS}); refusing to validate on a "
+                "degenerate window")
+        return bars
+
+    def _validation_bars(self, symbols: list[str], val_start: str,
+                         val_end: str, interval: str = "1h") -> int:
+        """Number of bars available in an out-of-sample window (0 = none).
+
+        Reads the same cached parquet the backtest uses.  A missing cache
+        returns 0, which the caller treats as a hard failure — a window with no
+        data must not silently "validate".
+        """
+        try:
+            market_dir = Path(self.data_dir) / "market"
+        except Exception:
+            return 0
+        best = 0
+        for sym in symbols or []:
+            try:
+                path = market_dir / sym / f"{interval}.parquet"
+                if not path.exists():
+                    continue
+                df = pd.read_parquet(path, columns=["close"])
+                window = df[(df.index >= pd.Timestamp(val_start))
+                            & (df.index <= pd.Timestamp(val_end))]
+                best = max(best, int(len(window)))
+            except Exception as e:
+                logger.warning(f"WF: cannot count OOS bars for {sym}: {e}")
+        return best
 
     def get_state(self) -> dict | None:
         """Return current WF state for status polling."""

@@ -13,7 +13,9 @@ import copy
 import random
 import itertools
 from dataclasses import dataclass, field
-from core.strategy.loader import StrategyConfig, MLConfig
+from core.strategy.loader import (
+    StrategyConfig, MLConfig, normalize_condition_logic,
+)
 from core.market_data.provider import (
     DEFAULT_INTERVALS, DEFAULT_TIMEFRAME, interval_minutes)
 
@@ -184,7 +186,14 @@ NEW_GENE_RANGES = {
     "frac_diff_d": (10, 60, 5, 40),  # stored as int*100 → 0.10-0.60
 }
 
-# Condition → required indicator mapping (for sanitization)
+#: Columns ``compute_all`` (core/strategy/indicators.py) ALWAYS adds to the frame,
+#: whatever the indicator config is: the raw close, the volume ratio, EMA9/EMA21
+#: (backfilled when the config does not ask for its own EMA pair) and the plain
+#: ``sma`` alias.  A condition may reference these even when the matching
+#: indicator gene is off, so sanitisation must keep them.
+ALWAYS_AVAILABLE_COLUMNS = {"close", "volume_ratio", "ema_fast", "ema_slow", "sma"}
+
+#: Condition → required indicator mapping (for sanitization)
 CONDITION_INDICATOR_MAP = {
     "rsi": ["rsi"],
     "macd_histogram": ["macd"],
@@ -240,10 +249,19 @@ def strategy_to_chromosome(config: StrategyConfig) -> dict:
         adx = ind["adx"]
         continuous.append(ContinuousGene("adx_period", adx.get("period", 14), 7, 28, 1))
 
-    # EMA
+    # EMA — a FAST/SLOW pair, not a single period.  The old single
+    # ``ema_period`` gene emitted ``{"ema": {"period": p}}``, which
+    # ``compute_all`` turns into an ``ema_{p}`` column while every condition
+    # template uses ``ema_fast``/``ema_slow`` — and those are backfilled to a
+    # hardcoded EMA9/EMA21, so the gene was inert (5 vs 50 → identical 672
+    # trades).  ``fast_period``/``slow_period`` is the schema ``compute_all``
+    # actually reads to build ``ema_fast``/``ema_slow``.
     if "ema" in ind:
         ema = ind["ema"]
-        continuous.append(ContinuousGene("ema_period", ema.get("period", 9), 5, 50, 2))
+        fast_default = int(ema.get("fast_period", ema.get("period", 9)) or 9)
+        slow_default = int(ema.get("slow_period", 21) or 21)
+        continuous.append(ContinuousGene("ema_fast_period", fast_default, 5, 30, 2))
+        continuous.append(ContinuousGene("ema_slow_period", slow_default, 12, 60, 2))
 
     # ATR
     if "atr" in ind:
@@ -286,13 +304,20 @@ def strategy_to_chromosome(config: StrategyConfig) -> dict:
         sm = ind["sma"]
         continuous.append(ContinuousGene("sma_period", sm.get("period", 50), 10, 100, 2))
 
-    # ML
+    # ── ML genes deliberately carry NO effect ──
+    # Scoring and live entry must agree.  ``evaluate_chromosome`` disables
+    # ``ml_config`` (fitness.py) while the decoder used to emit
+    # ``enabled = weight > 0`` — measured fusion difference: ML off 0.5000,
+    # weight 0.1 → 0.6250, weight 0.5 → 0.4167, i.e. a GA champion was traded
+    # with an entry set it was never scored on.  The score path is the one that
+    # is measured, so the emitted weight is pinned to 0.0: the genes stay in the
+    # chromosome (mutation/crossover shape, checkpoint compatibility) but can
+    # never re-introduce a live/scored mismatch.
     ml_weight = 0.0
     ml_threshold = 0.6
     if config.ml_config:
-        ml_weight = config.ml_config.weight
         ml_threshold = config.ml_config.confidence_threshold
-    continuous.append(ContinuousGene("ml_weight", ml_weight, 0.0, 0.5, 0.05))
+    continuous.append(ContinuousGene("ml_weight", ml_weight, 0.0, 0.0, 0.05))
     continuous.append(ContinuousGene("ml_threshold", ml_threshold, 0.5, 0.85, 0.05))
 
     # ── Categorical genes ──
@@ -303,6 +328,14 @@ def strategy_to_chromosome(config: StrategyConfig) -> dict:
     categorical.append(
         CategoricalGene("timeframes", ",".join(config.timeframes),
                         [",".join(c) for c in itertools.combinations(TIMEFRAME_OPTIONS, 2)]))
+
+    # ── Evolvable entry logic (OR = looser, AND = stricter) ──
+    # A first-class ``StrategyConfig`` field (schema-level), so the chromosome
+    # gene survives into the published YAML and the reloaded strategy is
+    # evaluated with the same entry structure the genome was scored under.
+    # ``getattr`` keeps duck-typed/legacy configs (no field) working as "or".
+    condition_logic = normalize_condition_logic(
+        getattr(config, "condition_logic", None))
 
     # ── Structural genes ──
     structural = []
@@ -329,6 +362,7 @@ def strategy_to_chromosome(config: StrategyConfig) -> dict:
         "categorical": categorical,
         "structural": structural,
         "indicator_genes": indicator_genes,
+        "condition_logic": condition_logic,
         "name": config.name,
     }
 
@@ -359,14 +393,27 @@ def chromosome_to_strategy(chromosome: dict) -> StrategyConfig:
         }
     if ind_genes.get("adx", True) and "adx_period" in cont:
         indicators["adx"] = {"period": int(cont.get("adx_period", 14))}
-    if ind_genes.get("ema", True) and "ema_period" in cont:
-        indicators["ema"] = {"period": int(cont.get("ema_period", 9)), "source": "close"}
+    if ind_genes.get("ema", True) and ("ema_fast_period" in cont or "ema_period" in cont):
+        # Accept the legacy single ``ema_period`` gene too (old checkpoints).
+        fast_default = int(cont.get("ema_fast_period", cont.get("ema_period", 9)) or 9)
+        slow_default = int(cont.get("ema_slow_period", 21) or 21)
+        if slow_default <= fast_default:
+            slow_default = fast_default + 5
+        indicators["ema"] = {
+            "fast_period": max(2, fast_default),
+            "slow_period": max(3, slow_default),
+            "source": "close",
+        }
     if ind_genes.get("atr", False) and "atr_period" in cont:
         indicators["atr"] = {"period": int(cont.get("atr_period", 14))}
     if ind_genes.get("stoch", False) and "stoch_k_period" in cont:
+        # ``compute_all`` reads ``slowk_period``/``slowd_period`` + ``period`` as
+        # the fast-K period (indicators.py).  Emitting ``k_period``/``d_period``
+        # left the stochastic on its defaults, i.e. another inert gene.
         indicators["stoch"] = {
-            "k_period": int(cont.get("stoch_k_period", 14)),
-            "d_period": int(cont.get("stoch_d_period", 3)),
+            "period": int(cont.get("stoch_k_period", 14)),
+            "slowk_period": int(cont.get("stoch_d_period", 3)),
+            "slowd_period": int(cont.get("stoch_d_period", 3)),
         }
     if ind_genes.get("cci", False) and "cci_period" in cont:
         indicators["cci"] = {"period": int(cont.get("cci_period", 14))}
@@ -392,25 +439,43 @@ def chromosome_to_strategy(chromosome: dict) -> StrategyConfig:
                 "slow": int(cont.get("macd_slow", 26)),
                 "signal": int(cont.get("macd_signal", 9)),
             }
-        elif "ema_period" in cont:
-            indicators["ema"] = {"period": int(cont.get("ema_period", 9)), "source": "close"}
+        elif "ema_fast_period" in cont or "ema_period" in cont:
+            indicators["ema"] = {
+                "fast_period": int(cont.get("ema_fast_period", cont.get("ema_period", 9)) or 9),
+                "slow_period": int(cont.get("ema_slow_period", 21) or 21),
+                "source": "close",
+            }
 
+    # ── ML config: must match what the fitness path scored ──
+    # ``evaluate_chromosome`` forces ``ml_config.enabled = False``; the decoder
+    # used to emit ``enabled = weight > 0``.  Measured fusion divergence:
+    # off 0.5000 / w=0.1 → 0.6250 / w=0.5 → 0.4167, so the live entry set
+    # differed from the scored one.  Both are pinned to "disabled, weight 0".
     ml_config = MLConfig(
-        enabled=cont.get("ml_weight", 0) > 0,
-        weight=round(cont.get("ml_weight", 0), 2),
+        enabled=False,
+        weight=0.0,
         confidence_threshold=round(cont.get("ml_threshold", 0.6), 2),
     )
 
     timeframes = cat.get("timeframes", DEFAULT_TIMEFRAME).split(",")
 
-    # ── Condition sanitization: remove conditions referencing disabled indicators ──
-    enabled_set = {name for name, enabled in ind_genes.items() if enabled}
+    # ── Condition sanitization ──
+    # The old code built the enabled set from the BOOLEAN genes.  A chromosome
+    # whose genes were switched off while the continuous params remained (or a
+    # legacy chromosome missing the boolean genes) therefore kept conditions for
+    # indicators the decoded config no longer carries — production logged
+    # ``'adx > 20' — name 'adx' is not defined``.  The authoritative set is the
+    # DECODED ``indicators`` dict, plus the columns ``compute_all`` always adds
+    # (``close``/``volume_ratio``/``ema_fast``/``ema_slow``/``sma``).
+    enabled_set = set(indicators.keys()) | ALWAYS_AVAILABLE_COLUMNS
+    if "sma" in indicators:
+        enabled_set.add("sma")
     entry_long = _sanitize_conditions(struct.get("entry_long", []), enabled_set, "long")
     entry_short = _sanitize_conditions(struct.get("entry_short", []), enabled_set, "short")
     exit_long = _sanitize_conditions(struct.get("exit_long", []), enabled_set, "long")
     exit_short = _sanitize_conditions(struct.get("exit_short", []), enabled_set, "short")
 
-    return StrategyConfig(
+    config = StrategyConfig(
         name=chromosome.get("name", "ga_strategy"),
         enabled=True,
         mode=cat.get("mode", "trend"),
@@ -420,12 +485,20 @@ def chromosome_to_strategy(chromosome: dict) -> StrategyConfig:
             "long": entry_long,
             "short": entry_short,
         },
+        # ── Evolvable entry logic (AND / OR) ──
+        # A plain schema field: the gene is written into the champion YAML and
+        # read back by the ONE shared entry-structure evaluator
+        # (``StrategyConfig.entry_sides``), used by GA evaluation and by
+        # post-load trading alike.  An unknown gene value warns and falls back
+        # to "or" inside the model validator.
+        condition_logic=chromosome.get("condition_logic", "or"),
         exit_conditions={
             "long": exit_long,
             "short": exit_short,
         },
         ml_config=ml_config,
     )
+    return config
 
 
 # ── Random initialization ─────────────────────────────────────────────
@@ -456,6 +529,8 @@ def random_chromosome(name: str = "ga_strategy") -> dict:
     )
     chrom = strategy_to_chromosome(config)
     # indicator_genes are already set by strategy_to_chromosome based on config.indicators
+    # Evolvable entry logic: random init explores both OR and AND.
+    chrom["condition_logic"] = random.choice(["or", "or", "and"])
     return chrom
 
 
@@ -514,7 +589,9 @@ def _sanitize_conditions(conditions: list[str], enabled_indicators: set[str],
         Sanitized list with at least one condition (fallback if all filtered).
     """
     clean = []
-    for cond in conditions:
+    for cond in conditions or []:
+        if not isinstance(cond, str) or not cond.strip():
+            continue
         ok = True
         for col_pattern, required in CONDITION_INDICATOR_MAP.items():
             if col_pattern in cond and required:
@@ -525,7 +602,9 @@ def _sanitize_conditions(conditions: list[str], enabled_indicators: set[str],
             clean.append(cond)
 
     if not clean:
-        # Fallback: inject a safe condition that always works
+        # Fallback: inject a safe condition — the result must NEVER be an empty
+        # list (an empty entry/exit list makes ``evaluate_condition`` comparisons
+        # meaningless and used to raise ValueError downstream).
         if "ema" in enabled_indicators:
             clean = ["close > ema_fast"] if direction == "long" else ["close < ema_fast"]
         elif "bollinger" in enabled_indicators:

@@ -19,6 +19,7 @@ shared through ``app.state.universe``):
 """
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import time
@@ -221,6 +222,10 @@ _ga_state = {
     "best_trades": 0, "champion_name": "", "champion_config": None,
     "population_size": 0, "started": 0, "history": [],
     "error": None,
+    # ── Credibility metrics (previously dropped here while the panel template
+    # already rendered them — the DSR/WF block was dead UI) ──
+    "validation": None, "dsr": None, "provenance": None,
+    "published": None, "rejection_reasons": [], "seed": 0,
 }
 
 # ── Walk-Forward state ────────────────────────────────────────────
@@ -257,6 +262,12 @@ def register(app: FastAPI, ctx) -> None:
         max_workers = _int_param(body, "max_workers", 1, minimum=1, maximum=16)  # clamp 1-16
         seed_strategies = _list_param(body, "seed_strategies")
         resume = _bool_param(body, "resume", False)
+        # ── Reproducibility: every job carries a seed ──
+        # 0/absent → a fresh seed (recorded in the job file and the provenance
+        # block), so a caller can replay the exact same run.
+        seed = _int_param(body, "seed", 0, minimum=0)
+        if not seed:
+            seed = int.from_bytes(os.urandom(4), "big")
 
         # ── Runtime cost model params (override config.yaml) ──
         cost_enabled = _bool_param(body, "cost_enabled", True)
@@ -297,6 +308,7 @@ def register(app: FastAPI, ctx) -> None:
             "taker_fee_pct": taker_fee_pct,
             "spread_pct": spread_pct,
             "resume": resume,
+            "seed": seed,
         }
         with open(job_file, "w") as f:
             json.dump(job_data, f)
@@ -329,12 +341,15 @@ def register(app: FastAPI, ctx) -> None:
             "eval_completed": 0, "eval_total": 0, "phase": "init",
             "history": [], "error": None, "stopped": False, "resumable": False,
             "checkpoint_gen": 0, "job_file": job_file,
+            "validation": None, "dsr": None, "provenance": None,
+            "published": None, "rejection_reasons": [], "seed": seed,
             "params": {
                 "date_start": date_start, "date_end": date_end,
                 "validation_start": validation_start,
                 "population_size": pop_size, "generations": generations,
                 "max_workers": max_workers,
                 "symbols": symbols,
+                "seed": seed,
                 "mode": "ga",
             },
         })
@@ -370,6 +385,18 @@ def register(app: FastAPI, ctx) -> None:
                                 _ga_state["champion_config"] = result.get("champion_config")
                                 _ga_state["best_fitness"] = result.get("fitness", 0)
                                 _ga_state["best_sharpe"] = result.get("sharpe", 0)
+                                _ga_state["best_win_rate"] = result.get("win_rate", 0)
+                                _ga_state["best_trades"] = result.get("trade_count", 0)
+                                # Credibility metrics — these were computed by the
+                                # worker all along and dropped right here.
+                                _ga_state["validation"] = result.get("validation")
+                                _ga_state["dsr"] = result.get("dsr")
+                                _ga_state["provenance"] = result.get("provenance")
+                                _ga_state["published"] = result.get("published")
+                                _ga_state["rejection_reasons"] = result.get(
+                                    "rejection_reasons", []) or []
+                                _ga_state["seed"] = result.get(
+                                    "seed", _ga_state.get("seed", 0))
                         else:
                             _ga_state["running"] = False
                             _ga_state["error"] = f"Worker exited with code {poll_result}"
