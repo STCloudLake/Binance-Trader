@@ -335,29 +335,78 @@ def test_integrity_checker_flags_a_splice_and_refuses_unclipped_vol(tmp_path, ca
           f"ratio={vol['ratio']:.2f}x -> REFUSED")
 
 
-def test_real_btc_cache_reports_the_measured_splice_if_still_present():
-    """The measured defect: 11 gaps > 1.5 h, largest 1 484 h, 10.12x vol.
+def test_real_btc_cache_report_matches_its_own_content_whatever_that_is():
+    """The report must describe the file that is on disk — no defect required.
 
-    Skipped (not failed) when the cache has been refetched — the guard test above
-    is the invariant that survives a repaired cache.
+    ``data/market/BTCUSDT/1h.parquet`` is a *live* file: the running service
+    rewrote it to 8 848 spliced rows at 13:01 after it had been repaired to 11 675
+    clean rows at 12:35.  Pinning the measured defect (or a magic multiple such as
+    "unclipped > 8.0 x clipped", which measured 7.616x on the current file and
+    10.12x on an older slice) makes the suite fail for a reason that has nothing
+    to do with the code under test.
+
+    What is asserted instead: (a) every number ``gap_report`` returns is
+    recomputed independently from the same frame, so the report is *honest about
+    whatever state the cache is in*, and (b) the inflation the guard exists for is
+    a property of a splice, demonstrated on a **synthetic** seam injected into a
+    contiguous series.  A missing file skips; a repaired or a spliced file both
+    pass.
     """
     if not BTC_1H.exists():
         pytest.skip("no cached BTCUSDT 1h parquet in this checkout")
+    from core.ml.volatility import log_returns
     from scripts.check_data_integrity import gap_report, vol_report
 
     frame = pd.read_parquet(BTC_1H)
+
+    # (a) independent recomputation of the gap report from the same frame.
     rep = gap_report(frame, "1h")
-    if not rep["flagged"]:
-        pytest.skip("cache refetched — the splice is gone (guard test still applies)")
-    assert rep["gap_count"] >= 10
-    assert rep["largest_gap_hours"] >= 1400.0
-    assert "2026-09-29" in (rep["largest_gap_at"] or "")
+    assert rep["bars"] == len(frame)
+    assert rep["expected"] == int(round(rep["span_hours"] / 1.0)) + 1
+    assert rep["missing"] == max(rep["expected"] - len(frame), 0)
+    idx = pd.to_datetime(pd.Index(frame.index))
+    idx = idx[idx.argsort()]
+    assert (rep["first"], rep["last"]) == (idx[0].isoformat(), idx[-1].isoformat())
+    hours = pd.Series(idx).diff().dt.total_seconds().to_numpy() / 3600.0
+    # ``hours[pos]`` is the gap *ending* at ``idx[pos]`` (element 0 is NaN).
+    expected = sorted(((idx[pos].isoformat(), round(float(hours[pos]), 3))
+                       for pos in range(1, len(idx)) if hours[pos] > 1.5),
+                      key=lambda item: item[1], reverse=True)
+    assert rep["gaps"] == expected
+    assert rep["gap_count"] == len(expected)
+    assert rep["flagged"] is bool(expected)
+    if expected:
+        assert rep["largest_gap_hours"] == expected[0][1]
+        assert rep["largest_gap_at"] == expected[0][0]
+
+    # The vol report is internally consistent whatever the file holds.
     vol = vol_report(frame)
-    assert vol["unclipped_pct"] > 8.0 * vol["clipped_pct"]
+    assert vol["ratio"] == pytest.approx(vol["unclipped_pct"] / vol["clipped_pct"],
+                                         rel=1e-9)
+    assert vol["unclipped_pct"] >= vol["clipped_pct"] * (1.0 - 1e-9)
+    tail = log_returns(frame["close"].astype(float).values)[-500:]
+    if np.abs(tail).max() > 0.1:          # a splice sits inside the estimator window
+        assert vol["ratio"] > 2.0, vol    # ... and the clip demonstrably bites
+        seam_state = "splice in the measured window"
+    else:
+        seam_state = "no splice in the measured window"
+
+    # (b) the same estimator on a *synthetic* +27.63 % seam: the clip is what
+    # keeps a fake bar out of the variance, and the overstatement is an order of
+    # magnitude (the figure the docs quote for the injected splice).
+    from core.ml.volatility import ewma_vol, to_pct
+
+    rng = np.random.default_rng(20260930)
+    calm = rng.normal(0.0, 0.004, 500)
+    injected = np.concatenate([calm[:-1], np.array([0.2763])])
+    inj_ratio = (to_pct(ewma_vol(injected, window=500, outlier_sigma=0.0))
+                 / to_pct(ewma_vol(injected, window=500)))
+    assert inj_ratio > 5.0, inj_ratio
     print(f"\n[item 2 real cache] bars={rep['bars']} gaps={rep['gap_count']} "
-          f"largest={rep['largest_gap_hours']}h missing={rep['missing']} | "
-          f"clipped={vol['clipped_pct']:.4f} unclipped={vol['unclipped_pct']:.4f} "
-          f"({vol['ratio']:.2f}x)")
+          f"largest={rep['largest_gap_hours']}h missing={rep['missing']} "
+          f"({seam_state}) | clipped={vol['clipped_pct']:.4f} "
+          f"unclipped={vol['unclipped_pct']:.4f} ({vol['ratio']:.2f}x) | "
+          f"synthetic +0.2763 seam: {inj_ratio:.2f}x")
 
 
 # ══════════════════════════════════════════════════════════════════════

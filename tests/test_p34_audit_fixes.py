@@ -836,26 +836,37 @@ def test_vol_forecaster_cache_keeps_recently_used_entries():
 def test_per_bar_budget_holds_for_the_default_path_and_garch_is_opt_in():
     """The documented per-bar budget is a *default-path* promise.
 
-    Re-measured: the default ``ewma`` path costs ~0.3 ms/call (budget
-    ``PER_BAR_BUDGET_SEC`` = 2 ms), while the free-ω GARCH MLE costs ~0.5–0.9 s
-    per call — three orders of magnitude over budget, so it cannot be the default
-    and the docs must not quote it as ~2.2 ms.  This test pins both halves: the
-    default path meets the budget, and the expensive path is opt-in rather than
-    silently reachable from the per-bar method list.
+    Re-measured on the frozen revision: the default ``ewma`` path costs
+    **≈1.5 ms/call** (budget ``PER_BAR_BUDGET_SEC`` = 2 ms) — ``ewma_variance`` is
+    a per-bar Python recursion, so the earlier ~0.2 ms figure belongs to an older
+    (vectorised) implementation; the realised family is 0.06–0.09 ms.  The free-ω
+    GARCH MLE costs ≈0.18–0.19 s/call on a 500-bar window (≈4.1 s on the full
+    11 674-bar history) — two to three orders of magnitude over budget, so it
+    cannot be the default and the docs must not quote the grid fallback's ~2.2 ms
+    for it.  This test pins both halves: the default path meets the budget, and
+    the expensive path is opt-in rather than silently reachable from the per-bar
+    method list.  Timings use the minimum of a few batches, which is robust to a
+    loaded machine (a single 20-call batch was measured at 2.06 ms under load).
     """
     import time
 
     from core.ml.volatility import (METHODS, PER_BAR_BUDGET_SEC, VolForecaster,
                                     forecast_vol)
 
+    def per_call_seconds(fn, *, batches: int = 3, reps: int = 10) -> float:
+        fn()                                       # warm up
+        best = float("inf")
+        for _ in range(batches):
+            t0 = time.perf_counter()
+            for _ in range(reps):
+                fn()
+            best = min(best, (time.perf_counter() - t0) / reps)
+        return best
+
     df = _btc(600)
     budget_ms = PER_BAR_BUDGET_SEC * 1e3
     # Default method only — this is what the live per-bar path runs.
-    forecast_vol(df)                                   # warm up
-    t0 = time.perf_counter()
-    for _ in range(20):
-        forecast_vol(df)
-    per_call = (time.perf_counter() - t0) / 20
+    per_call = per_call_seconds(lambda: forecast_vol(df), reps=20)
     assert per_call < PER_BAR_BUDGET_SEC, (
         f"default path costs {per_call * 1e3:.2f} ms, above the {budget_ms:.1f} ms budget")
     # garch11 is a declared method but must not be the default, and the live
@@ -867,11 +878,8 @@ def test_per_bar_budget_holds_for_the_default_path_and_garch_is_opt_in():
     # "budget" is a property of everything the live path can select.
     for method in ("ewma", "realized_cc", "realized_parkinson",
                    "realized_garman_klass"):
-        forecast_vol(df, method=method)                # warm up
-        t0 = time.perf_counter()
-        for _ in range(10):
-            forecast_vol(df, method=method)
-        assert (time.perf_counter() - t0) / 10 < PER_BAR_BUDGET_SEC, method
+        cost = per_call_seconds(lambda m=method: forecast_vol(df, method=m))
+        assert cost < PER_BAR_BUDGET_SEC, (method, cost)
     # The expensive path is opt-in.  Its cost is data-dependent (measured
     # 0.12–0.49 s on 500-bar windows: the Nelder-Mead polish exits early on a
     # flat synthetic surface and runs ~575 likelihood passes on real BTC), so the

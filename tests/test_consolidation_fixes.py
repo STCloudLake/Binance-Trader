@@ -80,38 +80,76 @@ def test_doc_ten_injected_splice_figure_is_the_measured_one():
     assert "9.8" in doc and ("历史" in doc or "不可" in doc)
 
 
-def test_doc_ten_says_the_shipped_cache_splice_is_repaired():
-    """The shipped cache no longer carries the defect, so the clip is a no-op."""
+def test_doc_ten_describes_whichever_cache_state_is_present():
+    """The doc must describe the live file's *both* states, not just one.
+
+    ``data/market/BTCUSDT/1h.parquet`` is rewritten by the running service: this
+    audit observed 11 675 rows with the gap repaired (``max|log return| = 0.0494``)
+    at 12:35 and 8 848 rows with the 1 484 h splice back (``0.2763``) at 13:01.
+    A test that pins one state is flaky by construction, so this asserts the doc
+    names both states with their numbers and that the live branch is conditional.
+    """
     from core.ml.volatility import DEFAULT_WINDOW, ewma_vol
 
     doc = _doc(DOC_TEN)
-    r = _btc_returns()
-    tail = r[-DEFAULT_WINDOW:]
+    assert "8 848" in doc and "11 675" in doc          # both observed states
+    assert "0.2763" in doc and "0.0494" in doc
+    assert "9.49" in doc and "1.000" in doc
+    assert "13:01" in doc and "12:35" in doc
+    assert "接缝" in doc
+    # The invariant the doc may assert about the file, whatever its state:
+    tail = _btc_returns()[-DEFAULT_WINDOW:]
     clipped = ewma_vol(tail, window=0)
     unclipped = ewma_vol(tail, window=0, outlier_sigma=0.0)
-    if np.abs(tail).max() > 0.1:                  # a splice is back in the window
-        assert unclipped / clipped > 5.0
-        assert "接缝" in doc
-        return
-    # Current state: the repair holds, so unclipped == clipped and the doc says so.
-    assert unclipped == pytest.approx(clipped, rel=1e-4)
-    assert "修复" in doc
-    assert "0.0494" in doc                        # the measured max |log return|
+    if np.abs(tail).max() > 0.1:                      # splice in the measured window
+        assert unclipped / clipped > 5.0              # the clip really bites
+    else:                                             # repaired: clip is a no-op
+        assert unclipped == pytest.approx(clipped, rel=1e-4)
 
 
 def test_doc_ten_garch_cost_is_not_the_grid_fallback_number():
-    """Doc 10 must quote the MLE cost, and must not present 2.2 ms as its own."""
+    """Doc 10 must quote the MLE cost, and must not present 2.2 ms as its own.
+
+    The corner-mean figures are *sample* numbers (the live cache moves by the
+    hour), so the reproducible claim asserted here is the semantics — the IGARCH
+    corner is a pathologically bad fit (mean objective orders of magnitude above
+    the MLE's ~1) — plus the fact that the doc labels them as sample-dependent
+    and drops the wrong 36 / 7.2e5 pair.
+    """
+    from core.ml.volatility import _garch11_avg_ll
+
     doc = _doc(DOC_TEN)
     assert "自由 ω 的 MLE" in doc
     assert "IGARCH" in doc and "0/0" in doc
     # The 2.2 ms figure survives only as the optimiser-free grid fallback.
     assert "2.2 ms" in doc and "网格" in doc
-    # The measured MLE costs are named (default window and full history).
-    assert "0.24–0.49" in doc or "0.24-0.49" in doc
-    assert "6.2–6.4" in doc or "6.2-6.4" in doc
+    # The measured MLE costs are named (default window and full history), and the
+    # default path's own cost is quoted against the 2 ms budget.
+    assert "0.18–0.19" in doc or "0.18-0.19" in doc
+    assert "4.1" in doc
     assert "opt-in" in doc
-    # And the refuted corner means are the re-measured ones, not 36 / 7.2e5.
-    assert "91.19" in doc and "2 004.18" in doc
+    assert "1.5 ms/bar" in doc and "2 ms" in doc
+    # Recompute the corner means on whatever the cache currently holds: the corner
+    # must be a bad fit and the floor must be worse.
+    r = _btc_returns()
+    x = r * 100.0
+    x2 = x * x
+    var_s = float(np.var(x, ddof=1))
+    corner = _garch11_avg_ll(x2, var_s, 1.0, 0.0)
+    floor = _garch11_avg_ll(x2, var_s, 0.001, 0.0)
+    assert 1.0 < corner < 1e6, corner
+    assert floor > corner
+    # The doc must quote the corner means it measured on the two observed cache
+    # states and label them sample-dependent.  The live file is rewritten by the
+    # running service (and can be repaired), so its *own* corner mean is
+    # deliberately not pinned to either number — only the semantics above are
+    # asserted, which is what "a defect in data/market must never be required"
+    # means for a live sample.
+    assert "随样本" in doc or "样本变化" in doc
+    for documented in (48.46, 91.19):
+        assert f"{documented}" in doc
+    assert corner > 10.0, (
+        f"the IGARCH corner is not the pathological fit doc 10 describes: {corner:.2f}")
     assert "7.2e5" not in doc
 
 

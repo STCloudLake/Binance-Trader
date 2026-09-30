@@ -7,7 +7,7 @@ import pandas as pd
 from app.event_bus import EventBus, Event, EventType
 from app.config import Config
 from core.market_data.data_client import MarketDataClient, MarketDataError
-from core.market_data.ohlcv_cache import OHLVCache
+from core.market_data.ohlcv_cache import OHLVCache, merge_history
 
 # ======================================================================
 # Interval registry — the single source of truth for kline intervals
@@ -188,6 +188,14 @@ class MarketDataProvider:
 
         Skips intervals that already have sufficient data on disk (e.g. from
         the download_history script) to avoid overwriting larger datasets.
+
+        When an interval *is* fetched it is **merged** into the on-disk history
+        instead of replacing it: the fetched window is only ``batches × 1000``
+        candles, so a file that exists but sits below the ``min_candles`` skip
+        threshold (or one repaired while this process was running) must not lose
+        the bars it already had.  ``OHLVCache.save`` re-reads the file and unions
+        the timestamps again, so the guarantee also covers a repair that lands
+        between this read and the write.
         """
         from loguru import logger
 
@@ -231,7 +239,10 @@ class MarketDataProvider:
                     df.set_index("close_time", inplace=True)
                     df = df[~df.index.duplicated(keep='last')]
                     df.sort_index(inplace=True)
-                    self.cache.update(symbol, interval, df)
+                    # Union with the history already known (disk + memory): the
+                    # fetched window is a *widening*, never a replacement.
+                    self.cache.update(symbol, interval,
+                                      merge_history(existing, df))
                     self.cache.save(symbol, interval)
 
         logger.info(f"Pre-fetched history for {len(symbols)} symbols x {len(intervals)} intervals")

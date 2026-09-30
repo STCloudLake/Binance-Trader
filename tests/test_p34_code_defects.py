@@ -70,6 +70,47 @@ def _rolling_windows(r, *, window=AUDIT_WINDOW):
         yield end - window, r[end - window:end]
 
 
+def _regime_series(n: int = AUDIT_N, seed: int = SEED):
+    """The audited length with volatility regimes **and** the splice.
+
+    ``max |Δ| = 0.048`` is the audit's figure for how far one already-emitted
+    clipped value travelled between two windows.  A constant-volatility series
+    cannot move a per-window MAD that far (the MAD is robust to the single
+    splice: measured 1.5e-3); a real crypto series carries volatility regimes, so
+    this one alternates 0.4 %/bar and 2.0 %/bar blocks and carries the splice.
+    """
+    rng = np.random.default_rng(seed)
+    sd = np.where((np.arange(n) // 700) % 2 == 0, 0.004, 0.020)
+    r = rng.normal(0.0, sd)
+    r[int(n * 0.55)] = 0.276
+    return r
+
+
+def _clipped_value_spread(r, *, mode, window=AUDIT_WINDOW):
+    """``(max spread of an emitted clipped value, the bar that spread most)``.
+
+    Every window emits a clipped value for each bar it contains; this is the
+    largest ``max − min`` any single bar's emitted value reaches across all the
+    windows that contained it — the audit's "previously emitted value changed"
+    magnitude, not just the consecutive-step delta.
+    """
+    anchor = V.series_anchor(r) if mode == "after" else None
+    lo = np.full(r.size, np.inf)
+    hi = np.full(r.size, -np.inf)
+    for start, w in _rolling_windows(r, window=window):
+        if mode == "after":
+            c = V.clip_outliers(w, sigma=V.DEFAULT_OUTLIER_SIGMA, anchor=anchor)
+        elif mode == "plain":
+            c = V.clip_outliers(w, sigma=V.DEFAULT_OUTLIER_SIGMA, anchored=False)
+        else:
+            c = V.clip_outliers(w, sigma=V.DEFAULT_OUTLIER_SIGMA)
+        np.minimum(lo[start:start + c.size], c, out=lo[start:start + c.size])
+        np.maximum(hi[start:start + c.size], c, out=hi[start:start + c.size])
+    spread = hi - lo
+    bar = int(np.argmax(spread))
+    return float(spread[bar]), bar
+
+
 def _rolling_limit_changes(r, *, mode, window=AUDIT_WINDOW):
     """(#steps, #steps whose Winsor limit moved, #observations that changed value).
 
@@ -137,6 +178,32 @@ def test_rolling_window_changes_no_previously_emitted_value():
     # path (`anchored=False`).
     _s, plain_changes, plain_obs = _rolling_limit_changes(r, mode="before_plain")
     assert plain_changes > 0 and plain_obs > 0
+
+
+def test_no_emitted_clip_value_moves_across_windows():
+    """The audit's ``max |Δ| = 0.048``: one bar, many windows, different values.
+
+    On a regime-switching series of the audited length the pre-fix rule moved a
+    single emitted clipped value by **0.088** across the windows that contained
+    it (the audit measured 0.048 on its own, since-repaired cache); with one
+    anchor per series the spread is exactly ``0.0`` — every window clips that bar
+    to the same number.  On the shipped series the same defect reads 0.016.
+    """
+    r = _regime_series()
+    before, bar = _clipped_value_spread(r, mode="before")
+    assert before > 0.04, before
+    assert r[bar] == pytest.approx(0.276)          # the spliced bar spread most
+    plain, _ = _clipped_value_spread(r, mode="plain")
+    assert plain > 0.04
+    after, _ = _clipped_value_spread(r, mode="after")
+    assert after == 0.0, f"an emitted clipped value still moves by {after}"
+
+    if BTC_1H.exists():
+        shipped = V.log_returns(pd.read_parquet(BTC_1H)["close"].values)
+        shipped_before, _ = _clipped_value_spread(shipped, mode="before")
+        shipped_after, _ = _clipped_value_spread(shipped, mode="after")
+        assert shipped_before > 0.01
+        assert shipped_after == 0.0
 
 
 def test_estimators_clip_the_whole_series_and_not_the_window(monkeypatch):
