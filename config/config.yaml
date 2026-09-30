@@ -161,8 +161,9 @@ risk:
     enabled: false
     # Estimator: 'ewma' (RiskMetrics λ=0.94, the documented default) |
     # 'realized_cc' | 'realized_parkinson' | 'realized_garman_klass' | 'garch11'.
-    # Cheap methods are ~1 ms/bar; 'garch11' measures ~12 ms/bar and is for
-    # research/reporting, not the hot path.
+    # Cheap methods are ≤1 ms/bar on the live ≤600-bar shape（实测 ewma 0.14–0.20 ms）；
+    # 'garch11' 每次调用实测 ≈0.13–0.16 s（默认 window=500）/ ≈3.7 s（window=0 全历史），
+    # 用于研究/汇报，不适合热路径。
     method: ewma
     # EWMA decay and the bar window the estimator sees.
     lam: 0.94
