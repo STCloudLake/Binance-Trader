@@ -393,6 +393,60 @@ class RiskManager:
         self._vol_cache[key] = (now, float(vol))
         return float(vol)
 
+    async def resolve_recent_quote_volume(self, signal: dict):
+        """Recent quote (USDT) volume for one signal — P6-A's live seam (P6-B).
+
+        The P6-A sizer hook (:meth:`PositionSizer.calculate_position_size` →
+        :meth:`PositionSizer.apply_participation_cap`) needs the traded notional
+        over ``risk.liquidity.lookback_bars`` bars, and until P6-B the live path
+        simply never passed it, so the participation ceiling could not fire in
+        production.  This resolver is the wiring, and it is **inert by default**:
+
+        * ``risk.liquidity.enabled: false`` (the shipped value) returns ``None``
+          immediately, without touching the market-data source at all — so the
+          sizing arithmetic is bit-identical to the pre-P6 path, which
+          ``tests/test_volume_seams.py`` asserts;
+        * resolution order, cheapest first: the signal itself
+          (``recent_quote_volume``, for an upstream caller that already has the
+          frame) → the injected market-data history
+          (:func:`core.risk.liquidity.recent_quote_volume`, which prefers the
+          cache's ``quote_volume`` column and falls back to the documented
+          ``volume × close`` proxy);
+        * ``None`` (never ``0.0``) when nothing answered: the sizer treats both
+          alike (it only calls the cap when the value is not ``None``, and
+          ``cap_notional`` refuses on a non-positive window), but ``None`` keeps
+          "we did not measure it" distinguishable from "nothing traded".
+        """
+        from core.risk.liquidity import (
+            liquidity_for_symbol, recent_quote_volume, resolve_liquidity_config)
+
+        block = liquidity_for_symbol(
+            resolve_liquidity_config(self.config), str((signal or {}).get("symbol") or ""))
+        if block is None or not bool(getattr(block, "enabled", False)):
+            return None
+        raw = (signal or {}).get("recent_quote_volume")
+        if raw is not None:
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                value = 0.0
+            if math.isfinite(value) and value > 0.0:
+                return value
+        symbol = str((signal or {}).get("symbol") or "")
+        interval = ((signal or {}).get("timeframe") or (signal or {}).get("interval")
+                    or _DEFAULT_VOL_INTERVAL)
+        frame = await self._history_frame(symbol, interval)
+        if frame is None or len(frame) == 0:
+            return None
+        try:
+            value = float(recent_quote_volume(
+                frame, int(getattr(block, "lookback_bars", 20) or 20)))
+        except Exception as e:  # a data hiccup must never break the risk loop
+            from loguru import logger
+            logger.warning(f"RiskManager: quote-volume lookup failed for "
+                           f"{symbol} {interval}: {e}")
+            return None
+        return value if value > 0.0 else None
     async def resolve_forecast_vol_pct(self, signal: dict) -> float | None:
         """Forecast vol (%) for one signal, or ``None`` for the fixed fraction.
 
@@ -521,9 +575,21 @@ class RiskManager:
         # ``None`` (switch off, no history, spliced series) leaves the arithmetic
         # exactly as it was before P3 — see PositionSizer.calculate_position_size.
         forecast_vol_pct = await self.resolve_forecast_vol_pct(signal)
+        # P6-B: the P6-A participation seam.  ``None`` while
+        # ``risk.liquidity.enabled`` is false (the shipped value), and the sizer
+        # only consults it when non-``None`` AND the switch is on, so this extra
+        # argument is inert by default — the same identity the volatility
+        # forecast above follows.
+        quote_volume = await self.resolve_recent_quote_volume(signal)
         qty, risk_amount = self.sizer.calculate_position_size(
             self._account_balance, price, signal.get("position_type", "satellite"),
-            forecast_vol_pct=forecast_vol_pct
+            forecast_vol_pct=forecast_vol_pct,
+            recent_quote_volume=quote_volume,
+            # P6-A per-symbol overrides (`risk.liquidity.per_symbol`) select on
+            # this argument: without it the live path could only ever see the
+            # top-level block, while the backtest cost model resolved the symbol's
+            # own entry — two different ceilings for one trade.
+            symbol=symbol,
         )
         if forecast_vol_pct is not None:
             scale = self.sizer.vol_scale(forecast_vol_pct)

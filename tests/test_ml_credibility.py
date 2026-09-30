@@ -374,7 +374,12 @@ def test_no_near_constant_column_and_one_feature_list():
     ind = _indicators(df)
     X = compute_features(ind)                      # None → the contract
     assert list(X.columns) == list(FEATURE_NAMES)
-    assert X.shape[1] == len(FEATURE_NAMES) == 39
+    # P6-B: the contract grew from 39 to 54 columns (the 15-column volume/flow
+    # family).  The count is DERIVED from the contract, not restated as a literal
+    # (`tests/test_measured_threshold_policy.py`), so a future column addition
+    # updates one place.
+    assert X.shape[1] == len(FEATURE_NAMES) == 54
+    assert len(FEATURE_NAMES) == 39 + 15, "P6-B added the 15-column volume family"
     assert near_constant_columns(X) == []
     # A nested restatement of the contract must produce the same columns.
     X2 = compute_features(ind, list(FEATURE_NAMES))
@@ -870,7 +875,8 @@ def test_predictor_defaults_to_disabled_and_refuses_unverified_models(tmp_path):
         watched_symbols: list = []
 
     predictor = MLPredictor(_Cfg(), _Bus(), _Md())
-    assert predictor.feature_count == 39
+    from core.ml.features import FEATURE_NAMES
+    assert predictor.feature_count == len(FEATURE_NAMES) == 54  # P6-B: was 39
     assert predictor.gate_status["allowed"] is False
     # A model file with no `_meta.json` sidecar must be refused (logged).
     model_path = tmp_path / "BTCUSDT_default_binary.pkl"

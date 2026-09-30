@@ -27,6 +27,27 @@ duplicates in place.  The declared bar length is the only sound basis, so
 already applies on the download path).  Re-measured at ``1a452ce`` the live file
 no longer holds the close-convention rows at all: every adjacent step is exactly
 3 600.0 s, in the raw stamps and in the bar keys alike.
+
+Column schema (P6-B)
+--------------------
+A bar is ``close_time`` + :data:`PRICE_VOLUME_COLUMNS` — ``open``/``high``/
+``low``/``close``/``volume`` — plus, when the source supplies them,
+``quote_volume`` (quote-asset / USDT traded notional) and ``trade_count`` (the
+kline's trade count).  The two extra columns were added by P6-B; their rules:
+
+* **writers keep what they have** — :func:`merge_history` unions frames on the
+  *index*, and ``pandas.concat`` fills a column the other side lacks with
+  ``NaN``.  A frame written by a pre-P6-B writer (or read from a pre-P6-B file)
+  therefore cannot be corrupted by a P6-B writer, and vice versa;
+* **NaN is the documented "absent" value** — readers must not crash and must not
+  treat ``NaN`` as zero.  ``core.risk.liquidity.recent_quote_volume`` already
+  sums a frame's ``quote_volume`` column with ``NaN`` rows dropped, and
+  ``core.ml.features`` falls back to the documented ``volume × close`` proxy
+  when the column is missing entirely (``NaN`` values inside an existing column
+  are *kept* — a hole must not silently become a synthetically filled bar);
+* **:func:`canonical_columns`** is the one place the column order/dtype is
+  defined, so the REST prefetch, the WebSocket candle, the download script and
+  the backfill all persist the same shape.
 """
 from __future__ import annotations
 
@@ -35,6 +56,64 @@ import pandas as pd
 from pathlib import Path
 from collections import defaultdict
 from loguru import logger
+
+
+#: The bar columns every cached file has always carried (and the order they are
+#: written in).
+PRICE_VOLUME_COLUMNS: tuple[str, ...] = ("open", "high", "low", "close", "volume")
+
+#: Columns P6-B adds.  Both are optional **per file**: a pre-P6-B parquet simply
+#: lacks them, which is why every reader must treat "absent" and "NaN" alike.
+EXTENDED_COLUMNS: tuple[str, ...] = ("quote_volume", "trade_count")
+
+#: The full column order of a fresh P6-B file.
+CACHE_COLUMNS: tuple[str, ...] = PRICE_VOLUME_COLUMNS + EXTENDED_COLUMNS
+
+
+def canonical_columns(frame: pd.DataFrame | None,
+                      *,
+                      extended: bool | None = None,
+                      reorder: bool = True) -> pd.DataFrame | None:
+    """Reorder/normalise a cache frame to the documented column schema.
+
+    ``extended=None`` keeps the columns the frame already has; ``True`` forces
+    both P6-B columns to exist (absent → ``NaN``); ``False`` keeps only the five
+    legacy columns.  Numeric columns are coerced to float64 and
+    ``trade_count`` as well — a parquet store that mixes ``int64`` and
+    ``float64`` for one column across writers would otherwise make "did this
+    write change the file?" depend on the writer.
+
+    ``reorder=False`` keeps the frame's existing column *order* and only fixes
+    the dtypes (and, with ``extended=True``, adds a missing column at the end).
+    The write paths use that form: :func:`_frame_hash` hashes the column names
+    **in order**, so reordering a pre-P6-B file that is already deduped would
+    report a spurious change and rewrite every cache file on the next flush —
+    exactly the "no-op flush must not touch bytes" property
+    ``tests/test_reaudit_fixes.py`` pins.  ``None`` in, ``None`` out (an empty
+    frame is returned unchanged).
+    """
+    if frame is None or len(frame) == 0:
+        return frame
+    out = frame.copy()
+    have = list(out.columns)
+    if extended is True:
+        wanted = list(CACHE_COLUMNS)
+    elif extended is False:
+        wanted = [c for c in PRICE_VOLUME_COLUMNS if c in have]
+    else:
+        wanted = ([c for c in CACHE_COLUMNS if c in have]
+                  + [c for c in have if c not in CACHE_COLUMNS])
+    for column in CACHE_COLUMNS:
+        if column in wanted and column not in out.columns:
+            out[column] = np.nan
+    for column in CACHE_COLUMNS:
+        if column in out.columns:
+            out[column] = pd.to_numeric(out[column], errors="coerce").astype(float)
+    if not reorder:
+        # Keep the on-disk order; append any newly added column at the end.
+        wanted = [c for c in have if c in out.columns]
+        wanted += [c for c in out.columns if c not in wanted]
+    return out[wanted]
 
 
 #: Bar length in nanoseconds per interval label — a verbatim mirror of
@@ -361,6 +440,11 @@ class OHLVCache:
         if path.exists():
             df = pd.read_parquet(path)
             if not df.empty:
+                # Schema order/dtype is normalised on the way out (P6-B), so a
+                # reader never sees two different column orders for one layout.
+                # The columns themselves are NOT widened: a pre-P6-B file keeps
+                # exactly the columns it has (absent = absent, documented).
+                df = canonical_columns(df)
                 self._cache[symbol][interval] = df
             return df
         return None
@@ -372,6 +456,10 @@ class OHLVCache:
         new_row = pd.DataFrame([candle])
         new_row["close_time"] = pd.to_datetime(new_row["close_time"], unit="ms")
         new_row.set_index("close_time", inplace=True)
+        # A live candle from a pre-P6-B caller (no quote_volume/trade_count keys)
+        # gets the documented NaN for them instead of a missing column, so the
+        # merged frame keeps one shape whatever wrote it.
+        new_row = canonical_columns(new_row, extended=True)
 
         existing = self._cache.get(symbol, {}).get(interval)
         if existing is not None and not existing.empty:
@@ -389,7 +477,11 @@ class OHLVCache:
 
         A corrupt file must never take the periodic flush down, so a read error
         is logged and reported as "no existing history" — the same behaviour as
-        a missing file.
+        a missing file.  The returned frame is **not** reordered here: a read is
+        also how :meth:`dedupe` decides whether a write would change the file,
+        and normalising a pre-P6-B file's column *order* would report a spurious
+        change (and rewrite it) on every flush.  Normalisation happens on the way
+        *out* (:meth:`get`) and on the way *in* (the write paths).
         """
         if not path.exists():
             return None
@@ -447,6 +539,7 @@ class OHLVCache:
             combined = merge_history(existing, self._cache[symbol][interval],
                                      interval)
             if combined is not None:
+                combined = canonical_columns(combined, reorder=False)
                 combined.to_parquet(path)
                 self._cache[symbol][interval] = combined
             self._dirty.discard((symbol, interval))
@@ -512,8 +605,14 @@ class OHLVCache:
         existing = self._read_disk(path)
         if existing is None or len(existing) == 0:
             return False
+        # `reorder=False`: the frame the hash compares against is the *on-disk*
+        # frame, so normalising the column ORDER here would report a change on
+        # every flush of a file nobody appended to.  Only the dtype/columns are
+        # canonicalised, which `_frame_hash` is insensitive to.
+        existing = canonical_columns(existing, reorder=False)
         combined, changed = _canonical_write(
-            existing, self._cache[symbol][interval], interval)
+            existing, canonical_columns(self._cache[symbol][interval],
+                                        reorder=False), interval)
         if combined is None:
             return False
         # The in-memory frame converges on the deduped store either way, so the
@@ -521,5 +620,5 @@ class OHLVCache:
         self._cache[symbol][interval] = combined
         if not changed:
             return False
-        combined.to_parquet(path)
+        canonical_columns(combined, extended=None).to_parquet(path)
         return True

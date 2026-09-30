@@ -257,7 +257,15 @@ def _series(frame):
                 and hasattr(frame, "shape"))
     if is_frame:
         if "quote_volume" in list(frame.columns):
-            return _as_list(frame["quote_volume"]), "quote_volume"
+            quoted = _as_list(frame["quote_volume"])
+            # P6-B: a cache file may carry the column but hold only NaN (a bar
+            # whose backfill has not run yet).  Falling through to the proxy is
+            # the documented behaviour for "the column has no usable number" —
+            # returning `"quote_volume"` with an all-NaN list would make every
+            # window read 0.0 = "unknown volume", which refuses orders that the
+            # proxy can size honestly.
+            if quoted is not None and any(math.isfinite(v) for v in quoted):
+                return quoted, "quote_volume"
         if "volume" in list(frame.columns):
             if "close" in list(frame.columns):
                 return _as_list(frame["volume"]), "volume*close"
@@ -298,6 +306,13 @@ def recent_quote_volume(bars=None, lookback_bars: int = DEFAULT_LOOKBACK_BARS,
 
     ``lookback_bars`` bounds the lookback (``<= 0`` means "all of it"); the
     **most recent** bars are used, i.e. the tail of the series.
+
+    A frame whose ``quote_volume`` column is entirely absent **or entirely
+    non-finite** (P6-B: a cache file whose backfill has not run yet) falls back to
+    the documented ``Σ volume × close`` proxy.  A frame with only *some* bars
+    quoted sums the quoted ones and drops the rest — a hole is reported as "not
+    measured" (fewer bars in the sum) rather than being filled with a proxy that
+    would look like data.
 
     Returns ``0.0`` — never NaN, never an exception — when there is no data or
     the window is empty.  ``0.0`` is the documented "unknown volume" signal:

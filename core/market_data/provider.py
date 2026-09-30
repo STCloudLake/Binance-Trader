@@ -66,6 +66,27 @@ DEFAULT_ML_INTERVAL = "1h"
 #: Interval used whenever a caller/strategy names none.
 DEFAULT_TIMEFRAME = "1h"
 
+
+def _kline_float(kline, key) -> float:
+    """``float(kline[key])`` when the payload has it, else ``NaN``.
+
+    The P6-B kline fields are read through here — positionally from a REST kline
+    array (``quote_volume`` = 7, ``trade_count`` = 8) or by key from a WebSocket
+    kline object (``"q"`` / ``"n"``) — so a short/odd payload produces the
+    documented NaN instead of an ``IndexError``/``KeyError`` that would take the
+    whole prefetch or the stream handler down.
+    """
+    try:
+        value = kline[key]
+    except (IndexError, KeyError, TypeError):
+        return float("nan")
+    if value is None:
+        return float("nan")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
 #: Fallbacks for an interval that is not (or only partly) in INTERVAL_SPEC.
 _INTERVAL_DEFAULTS: dict = {"minutes": 60, "min_candles": 200, "batches": 1,
                             "poll_secs": 300, "ml_enabled": False}
@@ -240,6 +261,13 @@ class MarketDataProvider:
                         "open": float(k[1]), "high": float(k[2]),
                         "low": float(k[3]), "close": float(k[4]),
                         "volume": float(k[5]),
+                        # P6-B: the kline's quote-asset notional (field 7) and
+                        # trade count (field 8) are persisted with the bar, so a
+                        # reader of the cache gets the source's USDT volume
+                        # instead of the `volume × close` proxy.  A short/odd
+                        # payload leaves them NaN (the documented "absent").
+                        "quote_volume": _kline_float(k, 7),
+                        "trade_count": _kline_float(k, 8),
                     } for k in all_klines])
                     df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
                     df.set_index("close_time", inplace=True)
@@ -328,6 +356,11 @@ class MarketDataProvider:
             "low": float(kline["l"]),
             "close": float(kline["c"]),
             "volume": float(kline["v"]),
+            # P6-B: `q` = quote-asset volume, `n` = number of trades, both NaN
+            # when the stream omits them (the documented "absent" value, not a
+            # column that exists for some bars and not others).
+            "quote_volume": _kline_float(kline, "q"),
+            "trade_count": _kline_float(kline, "n"),
         }
         self.cache.append_candle(symbol, interval, candle)
         self._price_cache[symbol] = float(kline["c"])
@@ -388,8 +421,14 @@ class MarketDataProvider:
                 "taker_buy_quote", "ignore"
             ])
             df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
-            df = df[["close_time", "open", "high", "low", "close", "volume"]].copy()
-            for col in ["open", "high", "low", "close", "volume"]:
+            # P6-B: the cache schema is `open..volume + quote_volume +
+            # trade_count`; the source column is `trades`, the cache column is
+            # `trade_count` (same number, the cache's documented name).
+            df = df[["close_time", "open", "high", "low", "close", "volume",
+                     "quote_volume", "trades"]].rename(
+                         columns={"trades": "trade_count"}).copy()
+            for col in ["open", "high", "low", "close", "volume",
+                        "quote_volume", "trade_count"]:
                 df[col] = df[col].astype(float)
             df.set_index("close_time", inplace=True)
             self.cache.update(symbol, interval, df)

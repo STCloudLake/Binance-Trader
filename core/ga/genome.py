@@ -11,6 +11,7 @@ Each strategy is encoded as a mixed-type chromosome:
 
 import copy
 import random
+import re
 import itertools
 from dataclasses import dataclass, field
 from core.strategy.loader import (
@@ -86,6 +87,91 @@ class StructuralGene:
 
 # ── Chromosome ↔ StrategyConfig ───────────────────────────────────────
 
+# ── P6-D: volume / flow condition templates ───────────────────────────
+#
+# Every template below is a plain condition string evaluated by the ONE shared
+# kernel (``core.strategy.indicators.evaluate_condition``) on a frame built by
+# ``compute_all``.  The scalar path (``evaluate_entry_conditions`` /
+# ``StrategyConfig.entry_sides``) and the vectorised path
+# (``core/backtest/signal_matrix.py``) both call that exact function, so the new
+# templates do not fork the evaluator — they are new *strings*, not a new
+# predicate engine.
+#
+# They read only columns that exist on EVERY frame (the raw bar columns plus the
+# auto-derived ``volume_sma`` / ``volume_ratio``) or a column an existing
+# indicator gene owns (``obv``).  ``TEMPLATE_REQUIRED_COLUMNS`` declares that
+# (and ``COLUMN_INDICATOR_OWNER`` is the indicator availability mapping);
+# ``audit_template_ownership`` — run over every pool by
+# ``tests/test_ga_volume_genes.py`` — refuses a template with no owner, a
+# declaration that disagrees with the string, or an owner the sanitiser ignores.
+
+#: Rolling 20-bar VWAP, ``Σ(close·volume)/Σ(volume)``.  ``sma(x, n)`` in the
+#: condition language is a rolling mean, so the ratio of two ``sma`` calls is the
+#: volume-weighted average price — no new indicator column is needed.
+_VWAP20 = "sma(close * volume, 20) / sma(volume, 20)"
+
+#: RVOL z-score of ``volume_ratio`` against its own 60-bar mean/variance.
+#: The condition language has no sqrt or power operator, so ``|z| > k`` is
+#: written as the equivalent ``z² > k²`` with the variance expanded as
+#: ``E[x²] − E[x]²``; the trailing comparison carries the sign of ``z``.
+#:
+#: The two thresholds are deliberately different.  ``volume_ratio`` is
+#: right-skewed (volume_ratio ≥ 0 and spikes are one-sided), so on 11 549 cached
+#: BTCUSDT 1h bars P(z < −1) = 4.79 % but P(z < −1.5) = 0.026 % and
+#: P(z < −2) = 0.000 %: a symmetric ±2 would make the "dry volume" template
+#: unreachable — a template that never fires is exactly what the P6 plan says to
+#: roll back, so the low side uses the measured reachable threshold.
+def _rvol_z_squared(k: float) -> str:
+    return ("(volume_ratio - sma(volume_ratio, 60))"
+            " * (volume_ratio - sma(volume_ratio, 60))"
+            f" > {k * k} * (sma(volume_ratio * volume_ratio, 60)"
+            " - sma(volume_ratio, 60) * sma(volume_ratio, 60))")
+
+
+RVOL_Z_THRESHOLD_HIGH = 2.0
+RVOL_Z_THRESHOLD_LOW = 1.0
+RVOL_ZSPIKE_HIGH = (f"{_rvol_z_squared(RVOL_Z_THRESHOLD_HIGH)}"
+                    " and volume_ratio > sma(volume_ratio, 60)")
+RVOL_ZDRY_LOW = (f"{_rvol_z_squared(RVOL_Z_THRESHOLD_LOW)}"
+                 " and volume_ratio < sma(volume_ratio, 60)")
+
+VWAP_RECLAIM = f"cross(close, {_VWAP20})"
+VWAP_LOSS = f"cross({_VWAP20}, close)"
+VWAP_BELOW = f"close < {_VWAP20}"
+VWAP_ABOVE = f"close > {_VWAP20}"
+
+#: OBV **slope**: a fast mean of the OBV line against a slow one.  The level
+#: (``obv > obv_sma``) is the pre-P6 template; this one is the direction.
+OBV_SLOPE_UP = "sma(obv, 5) > sma(obv, 20)"
+OBV_SLOPE_DOWN = "sma(obv, 5) < sma(obv, 20)"
+
+#: A/D **slope**: the accumulation/distribution line's increment per bar is
+#: ``CLV · volume`` with ``CLV = ((close−low) − (high−close)) / (high−low)``.
+#: Its 20-bar slope is proportional to the mean of those increments, and
+#: ``close``/``high``/``low``/``volume`` are raw columns — no cumulative column.
+_CLV_VOLUME = "((close - low) - (high - close)) / (high - low) * volume"
+AD_SLOPE_UP = f"sma({_CLV_VOLUME}, 20) > 0"
+AD_SLOPE_DOWN = f"sma({_CLV_VOLUME}, 20) < 0"
+
+#: MFI(14) on the typical price ``tp = high+low+close`` (∝ ``(h+l+c)/3``) with the
+#: one-bar change ``d = tp − sma(tp, 2)`` (``sma(tp, 2) = (tpₜ+tpₜ₋₁)/2``).
+#: Signed money flow is ``mfd = tp · volume · d``; with ``pos = (mfd+|mfd|)/2``
+#: and ``neg = (|mfd|−mfd)/2``, ``MFI = 100 − 100/(1+pos/neg)``, so
+#: ``MFI > 80 ⇔ pos > 4·neg ⇔ sma(mfd) > 0.6·sma(|mfd|)`` and
+#: ``MFI < 20 ⇔ sma(mfd) < −0.6·sma(|mfd|)`` (the 0.6 is exact, not a fit).
+_MONEY_FLOW = ("(high + low + close) * volume"
+               " * ((high + low + close) - sma(high + low + close, 2))")
+MFI_OVERBOUGHT = f"sma({_MONEY_FLOW}, 14) > 0.6 * sma(abs({_MONEY_FLOW}), 14)"
+MFI_OVERSOLD = f"sma({_MONEY_FLOW}, 14) < -0.6 * sma(abs({_MONEY_FLOW}), 14)"
+
+#: Volume/price divergence: price and volume moved in OPPOSITE directions on the
+#: bar (``x − sma(x, 2) = Δx/2``, so the comparison is a genuine one-bar change),
+#: i.e. the move has no participation behind it.  Bullish = price fell while
+#: volume dried up (seller exhaustion); bearish = price rose while volume dried
+#: up (buyer exhaustion).
+VP_DIVERGENCE_BULL = "close < sma(close, 2) and volume < sma(volume, 2)"
+VP_DIVERGENCE_BEAR = "close > sma(close, 2) and volume < sma(volume, 2)"
+
 # Template condition pool for mutation
 CONDITION_POOL = {
     "long": [
@@ -110,6 +196,13 @@ CONDITION_POOL = {
         "dist_to_low_pct < 0.02",
         "swing_range_pct > 0.03",
         "hurst > 0.55",
+        # P6-D: volume / flow
+        RVOL_ZSPIKE_HIGH,
+        VWAP_RECLAIM,
+        OBV_SLOPE_UP,
+        AD_SLOPE_UP,
+        MFI_OVERSOLD,
+        VP_DIVERGENCE_BULL,
     ],
     "short": [
         "rsi > 70",
@@ -133,6 +226,13 @@ CONDITION_POOL = {
         "dist_to_high_pct < 0.02",
         "swing_range_pct > 0.03",
         "hurst < 0.45",
+        # P6-D: volume / flow
+        RVOL_ZSPIKE_HIGH,
+        VWAP_LOSS,
+        OBV_SLOPE_DOWN,
+        AD_SLOPE_DOWN,
+        MFI_OVERBOUGHT,
+        VP_DIVERGENCE_BEAR,
     ],
 }
 
@@ -146,6 +246,10 @@ EXIT_CONDITION_POOL = {
         "stoch_k > 75",
         "cci > 150",
         "close < sma",
+        # P6-D: volume / flow
+        VWAP_BELOW,
+        RVOL_ZDRY_LOW,
+        MFI_OVERBOUGHT,
     ],
     "short": [
         "rsi < 35",
@@ -156,6 +260,10 @@ EXIT_CONDITION_POOL = {
         "stoch_k < 25",
         "cci < -150",
         "close > sma",
+        # P6-D: volume / flow
+        VWAP_ABOVE,
+        RVOL_ZDRY_LOW,
+        MFI_OVERSOLD,
     ],
 }
 
@@ -184,6 +292,9 @@ NEW_GENE_RANGES = {
     "hurst_lookback": (50, 200, 10, 100),
     "swing_lookback": (3, 10, 1, 5),
     "frac_diff_d": (10, 60, 5, 40),  # stored as int*100 → 0.10-0.60
+    # P6-D volume genes (0.0 = off; both neutral by default)
+    "volume_filter_rvol": (0.0, 3.0, 0.1, 0.0),
+    "volume_scale_k": (0.0, 1.0, 0.05, 0.0),
 }
 
 #: Columns ``compute_all`` (core/strategy/indicators.py) ALWAYS adds to the frame,
@@ -213,7 +324,347 @@ CONDITION_INDICATOR_MAP = {
     "hurst": ["hurst"], "hurst_signal": ["hurst"],
     "frac_close": ["frac_diff"],
     "volume_ratio": [], "close": [],
+    # P6-D: the raw bar columns the volume/flow templates read are present on
+    # every frame, so they carry no indicator requirement.  Declared explicitly
+    # so the mapping stays in step with ``RAW_ALWAYS_AVAILABLE_COLUMNS``.
+    "volume": [], "high": [], "low": [], "volume_sma": [],
 }
+
+# ── P6-D: indicator availability + template ownership ──────────────────
+#
+# Two tables and one auditor, so "no orphan template" is a property a test can
+# fail, not a promise:
+#
+# * ``RAW_ALWAYS_AVAILABLE_COLUMNS`` — the columns ``compute_all`` adds to every
+#   frame whatever the indicator config is (raw bars + auto-derived volume
+#   statistics).  A template reading only these needs no indicator gene.
+# * ``COLUMN_INDICATOR_OWNER`` — column → indicator gene ``compute_all`` needs to
+#   add it (``None`` = raw/always available).
+# * ``TEMPLATE_REQUIRED_COLUMNS`` — every template in every pool → the columns it
+#   reads.  Declared, not inferred: ``audit_template_ownership`` compares the
+#   declaration with the identifiers actually parsed out of the string and with
+#   what the sanitiser does, so a stale or missing entry fails loudly.
+
+#: Columns present on every OHLCV frame ``compute_all`` is handed.
+RAW_ALWAYS_AVAILABLE_COLUMNS = frozenset({
+    "open", "high", "low", "close", "volume", "volume_sma", "volume_ratio",
+})
+
+#: Columns the *sanitiser* keeps even though ``compute_all`` only adds them when
+#: the matching indicator gene is on.  ``sma`` is the single pre-existing
+#: exemption (``compute_all`` writes ``sma``/``sma_{period}`` only for the ``sma``
+#: indicator, while ``ALWAYS_AVAILABLE_COLUMNS`` — P1's sanitisation contract —
+#: lists it).  Recorded here so the guard can assert the set cannot grow
+#: silently: that is a change to ``core/strategy/**``, outside P6-D's scope.
+SANITISER_ONLY_COLUMNS = frozenset({"sma"})
+
+#: Column → indicator gene required for ``compute_all`` to add it.
+COLUMN_INDICATOR_OWNER: dict[str, str | None] = {
+    "open": None, "high": None, "low": None, "close": None,
+    "volume": None, "volume_sma": None, "volume_ratio": None,
+    "ema_fast": None, "ema_slow": None,          # backfilled for every frame
+    "sma": "sma",
+    "rsi": "rsi", "macd_histogram": "macd",
+    "bollinger_lower": "bollinger", "bollinger_middle": "bollinger",
+    "bollinger_upper": "bollinger",
+    "adx": "adx", "stoch_k": "stoch", "stoch_d": "stoch", "cci": "cci",
+    "atr_ratio": "atr", "obv": "obv", "obv_sma": "obv",
+    "hurst": "hurst", "hurst_signal": "hurst",
+    "swing_high": "swing_points", "swing_low": "swing_points",
+    "dist_to_high_pct": "swing_points", "dist_to_low_pct": "swing_points",
+    "swing_range_pct": "swing_points", "frac_close": "frac_diff",
+}
+
+#: Indicator gene → the config ``compute_all`` needs to produce its columns.
+#: Used by the guard to prove every declared column really is producible.
+INDICATOR_CONFIG_FOR_COLUMNS: dict[str, dict] = {
+    "rsi": {"period": 14, "source": "close"},
+    "macd": {"fast": 12, "slow": 26, "signal": 9},
+    "bollinger": {"period": 20, "stddev": 2.0},
+    "adx": {"period": 14},
+    "ema": {"fast_period": 9, "slow_period": 21, "source": "close"},
+    "atr": {"period": 14},
+    "stoch": {"period": 14, "slowk_period": 3, "slowd_period": 3},
+    "cci": {"period": 14},
+    "obv": {"period": 14},
+    "sma": {"period": 20},
+    "hurst": {"lookback": 100},
+    "swing_points": {"lookback": 5},
+    "frac_diff": {"d": 0.4},
+}
+
+#: Every pool template → the columns it reads.  Compact by construction: a
+#: template's row groups templates that share a column set.
+TEMPLATE_REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {}
+for _cols, _templates in (
+    (("rsi",), ("rsi < 30", "rsi < 35", "rsi > 70", "rsi > 65",
+                "rsi > 55", "rsi < 35", "rsi < 45", "rsi > 65", "rsi < 20",
+                "rsi > 80")),
+    (("macd_histogram",), ("macd_histogram > 0", "macd_histogram < 0")),
+    (("close", "bollinger_lower"), ("close > bollinger_lower",
+                                    "close < bollinger_lower")),
+    (("close", "bollinger_upper"), ("close > bollinger_upper",
+                                    "close < bollinger_upper")),
+    (("close", "bollinger_middle"), ("close < bollinger_middle",
+                                     "close > bollinger_middle")),
+    (("close", "ema_fast"), ("close > ema_fast", "close < ema_fast")),
+    (("close", "ema_slow"), ("close < ema_slow", "close > ema_slow")),
+    (("ema_fast", "ema_slow"), ("ema_fast > ema_slow", "ema_fast < ema_slow")),
+    (("volume_ratio",), ("volume_ratio > 1.5", "volume_ratio > 2.0")),
+    (("adx",), ("adx > 20", "adx > 25")),
+    (("stoch_k",), ("stoch_k < 20", "stoch_k > 80", "stoch_k > 75",
+                    "stoch_k < 25")),
+    (("stoch_k", "stoch_d"), ("stoch_k > stoch_d", "stoch_k < stoch_d")),
+    (("cci",), ("cci < -100", "cci < -200", "cci > 100", "cci > 200",
+                "cci > 150", "cci < -150")),
+    (("atr_ratio",), ("atr_ratio > 1.5", "atr_ratio < 0.7")),
+    (("obv", "obv_sma"), ("obv > obv_sma", "obv < obv_sma")),
+    (("close", "sma"), ("close > sma", "close < sma")),
+    (("dist_to_low_pct",), ("dist_to_low_pct < 0.02",)),
+    (("dist_to_high_pct",), ("dist_to_high_pct < 0.02",)),
+    (("swing_range_pct",), ("swing_range_pct > 0.03",)),
+    (("hurst",), ("hurst > 0.55", "hurst < 0.45")),
+    # ── P6-D: volume / flow ──
+    (("volume_ratio",), (RVOL_ZSPIKE_HIGH, RVOL_ZDRY_LOW)),
+    (("close", "volume"), (VWAP_RECLAIM, VWAP_LOSS, VWAP_BELOW, VWAP_ABOVE,
+                           VP_DIVERGENCE_BULL, VP_DIVERGENCE_BEAR)),
+    (("obv",), (OBV_SLOPE_UP, OBV_SLOPE_DOWN)),
+    (("high", "low", "close", "volume"), (AD_SLOPE_UP, AD_SLOPE_DOWN,
+                                          MFI_OVERBOUGHT, MFI_OVERSOLD)),
+):
+    for _template in _templates:
+        TEMPLATE_REQUIRED_COLUMNS[_template] = tuple(_cols)
+del _cols, _templates, _template
+
+
+def template_identifier_columns(template: str) -> set[str]:
+    """Column identifiers actually referenced by *template* (verified, not trusted).
+
+    Parses the condition with the same grammar the evaluator accepts and returns
+    the ``Name`` nodes that are **not** calls to the whitelisted condition
+    functions (``sma``/``cross``/``abs``/``min``/``max``/``round``) — i.e. the
+    columns the expression really reads.
+    """
+    import ast as _ast
+
+    functions = {"sma", "cross", "abs", "min", "max", "round"}
+    tree = _ast.parse(template, mode="eval")
+    columns = set()
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Name):
+            columns.add(node.id)
+    return {c for c in columns if c not in functions}
+
+
+def template_owners(template: str) -> set[str]:
+    """Indicator genes *template* needs (from its declared columns)."""
+    owners = set()
+    for column in TEMPLATE_REQUIRED_COLUMNS.get(template, ()):
+        owner = COLUMN_INDICATOR_OWNER.get(column)
+        if owner:
+            owners.add(owner)
+    return owners
+
+
+def audit_template_ownership(pools: dict[str, dict[str, list[str]]] | None = None,
+                             extra: dict[str, tuple[str, ...]] | None = None
+                             ) -> list[str]:
+    """``[problem, ...]`` for the template pools — empty means "no orphans".
+
+    Checks, for every template of every pool (entry/exit × long/short):
+
+    1. it has a ``TEMPLATE_REQUIRED_COLUMNS`` declaration (missing ⇒ orphan);
+    2. every declared column is in the availability mapping
+       (``COLUMN_INDICATOR_OWNER`` / ``RAW_ALWAYS_AVAILABLE_COLUMNS``);
+    3. the declaration matches the identifiers parsed from the string, and the
+       string parses at all under the condition grammar;
+    4. the sanitiser agrees with the ownership: the template survives
+       ``_sanitize_conditions`` exactly when its owners are enabled.
+
+    ``extra`` lets a test inject a deliberately broken template (for example one
+    reading a column no indicator produces) together with the columns it claims;
+    its problems are reported exactly like a pool template's.
+    """
+    pools = pools if pools is not None else {
+        "entry": CONDITION_POOL, "exit": EXIT_CONDITION_POOL}
+    declared = dict(TEMPLATE_REQUIRED_COLUMNS)
+    injected = dict(extra or {})
+    all_indicators = set(INDICATOR_NAMES) | set(ALWAYS_AVAILABLE_COLUMNS)
+    problems: list[str] = []
+
+    audit_targets: list[tuple[str, str]] = []
+    for pool_name, sides in pools.items():
+        for side, templates in sides.items():
+            audit_targets.extend((f"{pool_name}.{side}", t) for t in templates)
+    audit_targets.extend(("injected", t) for t in injected)
+
+    for where, template in audit_targets:
+        if template not in declared and template not in injected:
+            problems.append(f"{where}: orphan template (no declared "
+                            f"columns): {template[:60]}")
+            continue
+        columns = injected.get(template, declared.get(template, ()))
+        try:
+            parsed = template_identifier_columns(template)
+        except SyntaxError as exc:
+            problems.append(f"{where}: unparseable template "
+                            f"({exc}): {template[:60]}")
+            continue
+        missing = parsed - set(columns)
+        if missing:
+            problems.append(f"{where}: undeclared column(s) "
+                            f"{sorted(missing)} in {template[:60]}")
+        unknown = [c for c in columns
+                   if c not in COLUMN_INDICATOR_OWNER
+                   and c not in RAW_ALWAYS_AVAILABLE_COLUMNS]
+        if unknown:
+            problems.append(f"{where}: column(s) {sorted(unknown)} are "
+                            f"not produced by any indicator: "
+                            f"{template[:60]}")
+        # The sanitiser must keep the template iff its owners are on.
+        owners = template_owners(template)
+        side = "long"
+        for pool_name, sides in pools.items():
+            for _side, templates in sides.items():
+                if template in templates:
+                    side = _side
+        with_all = _sanitize_conditions([template], all_indicators, side)
+        if template not in with_all:
+            problems.append(f"{where}: sanitiser drops the template even "
+                            f"with every indicator enabled: "
+                            f"{template[:60]}")
+        for owner in sorted(owners):
+            without = _sanitize_conditions(
+                [template], all_indicators - {owner}, side)
+            if template in without:
+                problems.append(
+                    f"{where}: sanitiser keeps the template while its "
+                    f"owner '{owner}' is off: {template[:60]}")
+    return problems
+
+
+# ── P6-D: the two volume genes ────────────────────────────────────────
+#
+# ``volume_filter_rvol`` — "only take entries while RVOL > x", 0.0 = off.
+# ``volume_scale_k``    — "scale the traded size with recent volume", 0.0 = off.
+#
+# Both are neutral by default, so a config/chromosome that does not carry them
+# decodes exactly as it did before P6-D.
+
+#: Reserved pseudo-indicator key that parks the two volume genes inside a decoded
+#: ``StrategyConfig``.  ``StrategyConfig`` is the runtime schema and carries no
+#: filter/sizing field; P6-D's write scope deliberately excludes
+#: ``core/strategy/loader.py``, so the genes ride in the free-form
+#: ``indicators`` dict — which ``compute_all`` walks and ignores for any name its
+#: elif chain does not know, i.e. the key is inert at evaluation time.  It is
+#: written ONLY when a gene is non-neutral (a pre-P6 config decodes byte-for-byte
+#: as before) and exists so the genome round-trips and a champion YAML stays
+#: self-describing about the genes it was scored with.
+VOLUME_GENE_INDICATOR_KEY = "_ga_volume_genes"
+
+#: Documented gene bounds (docs/core-algorithms/16-ga-volume-genes.md).
+VOLUME_FILTER_MAX_RVOL = 3.0
+VOLUME_FILTER_STEP = 0.1
+VOLUME_SCALE_MAX_K = 1.0
+VOLUME_SCALE_STEP = 0.05
+
+#: The conjunct the filter gene renders into every entry condition.
+_VOLUME_FILTER_SUFFIX = re.compile(
+    r"^(?P<base>\(.*\))\s+and\s+\(volume_ratio > (?P<value>[0-9.]+)\)$", re.S)
+
+
+def volume_filter_condition(rvol: float) -> str:
+    """The conjunct the filter gene adds: ``volume_ratio > rvol``."""
+    return f"volume_ratio > {float(rvol):g}"
+
+
+def with_volume_filter(condition: str, rvol: float) -> str:
+    """AND the RVOL filter into *condition*.
+
+    ANDing the filter into **each** entry condition is what makes the gene a
+    real filter under both entry structures the decoder can emit:
+
+        OR_i (c_i ∧ f)  =  (OR_i c_i) ∧ f
+        AND_i (c_i ∧ f) =  (AND_i c_i) ∧ f
+
+    so a volume filter narrows entries whether ``condition_logic`` is ``or`` or
+    ``and``, through the ONE shared kernel (``evaluate_condition``) — no bespoke
+    evaluation path, scalar and vectorised alike.
+    """
+    return f"({condition}) and ({volume_filter_condition(rvol)})"
+
+
+def strip_volume_filter(condition: str) -> tuple[str, float | None]:
+    """Inverse of :func:`with_volume_filter` → ``(base, rvol)``.
+
+    Only the *wrapped* form matches, so the plain pool template
+    ``volume_ratio > 1.5`` is never mistaken for the filter gene.
+    """
+    match = _VOLUME_FILTER_SUFFIX.match(condition or "")
+    if not match:
+        return condition, None
+    # ``group("base")`` carries the wrapper's own parentheses; drop exactly those
+    # so ``strip(with_volume_filter(c, v)) == (c, v)`` for every c.
+    return match.group("base")[1:-1], float(match.group("value"))
+
+
+def _volume_genes_from_conditions(config: StrategyConfig,
+                                  parked: dict) -> tuple[float, float]:
+    """``(filter_rvol, scale_k)`` recovered from a decoded config.
+
+    The parked ``_ga_volume_genes`` entry is authoritative for the sizing gene
+    (it has no condition footprint); the filter value is read back from the
+    wrapped entry conditions so the emitted strategy — not a side-channel — is
+    the source of truth for the filter that will actually be evaluated.
+    """
+    scale_k = 0.0
+    try:
+        scale_k = float(parked.get("scale_k", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        scale_k = 0.0
+    scale_k = max(0.0, min(VOLUME_SCALE_MAX_K, round(scale_k, 3)))
+
+    filter_rvol = 0.0
+    for side in ("long", "short"):
+        for condition in (config.entry_conditions or {}).get(side, []) or []:
+            _base, value = strip_volume_filter(condition)
+            if value is not None:
+                filter_rvol = max(filter_rvol, value)
+    try:
+        filter_rvol = max(filter_rvol, float(parked.get("filter_rvol", 0.0) or 0.0))
+    except (TypeError, ValueError):
+        pass
+    filter_rvol = max(0.0, min(VOLUME_FILTER_MAX_RVOL, round(filter_rvol, 1)))
+    return filter_rvol, scale_k
+
+
+def _coerce_volume_gene(value, maximum: float, ndigits: int) -> float:
+    """Clamp one volume gene to its documented bounds (never raises)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if number != number or number in (float("inf"), float("-inf")):
+        return 0.0
+    return max(0.0, min(maximum, round(number, ndigits)))
+
+
+def _randomise_volume_genes(chrom: dict) -> None:
+    """Random initial values for the two volume genes (off half of the time).
+
+    The genes must be *reachable* for the GA (acceptance: a fixed-seed run
+    selects each new gene), but never forced on: 50 % neutral keeps the search
+    honest and keeps the "off" path the default.
+    """
+    values = {
+        "volume_filter_rvol": (0.0 if random.random() < 0.5
+                               else round(random.uniform(1.1, 2.5), 1)),
+        "volume_scale_k": (0.0 if random.random() < 0.5
+                           else round(random.uniform(0.2, VOLUME_SCALE_MAX_K), 2)),
+    }
+    for gene in chrom.get("continuous", []):
+        if gene.name in values:
+            gene.value = values[gene.name]
 
 
 def strategy_to_chromosome(config: StrategyConfig) -> dict:
@@ -271,8 +722,19 @@ def strategy_to_chromosome(config: StrategyConfig) -> dict:
     # Stochastic
     if "stoch" in ind:
         s = ind["stoch"]
-        continuous.append(ContinuousGene("stoch_k_period", s.get("k_period", 14), 5, 21, 1))
-        continuous.append(ContinuousGene("stoch_d_period", s.get("d_period", 3), 3, 9, 1))
+        # Accept BOTH spellings: ``_random_indicators`` and pre-P6 checkpoints
+        # write ``k_period``/``d_period``, while ``chromosome_to_strategy`` emits
+        # the schema ``compute_all`` reads (``period``/``slowk_period``).  Reading
+        # only the first spelling made encode(decode(x)) reset a decoded stoch
+        # genome to 14/3/3 — it could never round-trip (found while pinning the
+        # P6-D round-trip property; the GA itself never re-encodes a champion, so
+        # only the seed-strategy path is affected).
+        continuous.append(ContinuousGene(
+            "stoch_k_period",
+            s.get("k_period", s.get("period", 14)), 5, 21, 1))
+        continuous.append(ContinuousGene(
+            "stoch_d_period",
+            s.get("d_period", s.get("slowk_period", 3)), 3, 9, 1))
 
     # CCI
     if "cci" in ind:
@@ -320,6 +782,23 @@ def strategy_to_chromosome(config: StrategyConfig) -> dict:
     continuous.append(ContinuousGene("ml_weight", ml_weight, 0.0, 0.0, 0.05))
     continuous.append(ContinuousGene("ml_threshold", ml_threshold, 0.5, 0.85, 0.05))
 
+    # ── P6-D: volume genes (both NEUTRAL by default) ──
+    # ``volume_filter_rvol`` 0.0 = no filter; ``volume_scale_k`` 0.0 = no sizing
+    # model.  They are recovered from the decoded config when it carries them
+    # (see ``VOLUME_GENE_INDICATOR_KEY``), so encode→decode round-trips; a
+    # pre-P6 config, a checkpoint chromosome or a hand-written YAML without them
+    # decodes to exactly HEAD's config.
+    volume_genes = (config.indicators or {}).get(VOLUME_GENE_INDICATOR_KEY) or {}
+    if not isinstance(volume_genes, dict):
+        volume_genes = {}
+    filter_rvol, scale_k = _volume_genes_from_conditions(
+        config, volume_genes)
+    continuous.append(ContinuousGene(
+        "volume_filter_rvol", filter_rvol, 0.0, VOLUME_FILTER_MAX_RVOL,
+        VOLUME_FILTER_STEP))
+    continuous.append(ContinuousGene(
+        "volume_scale_k", scale_k, 0.0, VOLUME_SCALE_MAX_K, VOLUME_SCALE_STEP))
+
     # ── Categorical genes ──
     categorical = [
         CategoricalGene("mode", config.mode, MODE_OPTIONS),
@@ -340,9 +819,16 @@ def strategy_to_chromosome(config: StrategyConfig) -> dict:
     # ── Structural genes ──
     structural = []
     for side in ["long", "short"]:
-        entry = config.entry_conditions.get(side, [])
+        # The P6-D filter gene is *rendered into* the entry conditions (it has to
+        # be, to be honoured by the shared kernel); encoding therefore unwraps it
+        # again, so ``encode(decode(x))`` is the identity and the gene is not
+        # applied twice on the next decode.
+        entry = []
+        for condition in config.entry_conditions.get(side, []) or []:
+            base, _value = strip_volume_filter(condition)
+            entry.append(base)
         structural.append(StructuralGene(
-            f"entry_{side}", list(entry),
+            f"entry_{side}", entry,
             template_pool=CONDITION_POOL.get(side, [])))
 
     for side in ["long", "short"]:
@@ -475,6 +961,22 @@ def chromosome_to_strategy(chromosome: dict) -> StrategyConfig:
     exit_long = _sanitize_conditions(struct.get("exit_long", []), enabled_set, "long")
     exit_short = _sanitize_conditions(struct.get("exit_short", []), enabled_set, "short")
 
+    # ── P6-D volume filter gene ──
+    # Applied AFTER sanitisation: the conjunct only reads ``volume_ratio``, which
+    # every frame carries, so it can never be dropped for a missing indicator, and
+    # the filter must hold even for a condition that survived on its own.
+    filter_rvol = _coerce_volume_gene(cont.get("volume_filter_rvol", 0.0),
+                                      VOLUME_FILTER_MAX_RVOL, 1)
+    scale_k = _coerce_volume_gene(cont.get("volume_scale_k", 0.0),
+                                  VOLUME_SCALE_MAX_K, 3)
+    if filter_rvol > 0:
+        entry_long = [with_volume_filter(c, filter_rvol) for c in entry_long]
+        entry_short = [with_volume_filter(c, filter_rvol) for c in entry_short]
+    if filter_rvol > 0 or scale_k > 0:
+        # Round-trip carrier + self-describing champion YAML (see the constant).
+        indicators[VOLUME_GENE_INDICATOR_KEY] = {
+            "filter_rvol": filter_rvol, "scale_k": scale_k}
+
     config = StrategyConfig(
         name=chromosome.get("name", "ga_strategy"),
         enabled=True,
@@ -531,6 +1033,8 @@ def random_chromosome(name: str = "ga_strategy") -> dict:
     # indicator_genes are already set by strategy_to_chromosome based on config.indicators
     # Evolvable entry logic: random init explores both OR and AND.
     chrom["condition_logic"] = random.choice(["or", "or", "and"])
+    # P6-D volume genes: random init explores them, half the time neutral.
+    _randomise_volume_genes(chrom)
     return chrom
 
 

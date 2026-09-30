@@ -30,10 +30,15 @@ class PositionGuard:
     #: the exchange for klines on every tick.
     _VOL_CACHE_TTL_SEC = 300.0
     #: Bars requested per refresh — enough for the estimator's window to matter,
-    #: cheap enough to keep the REST call small.
+    #: cheap enough to keep the REST call small.  The quote-volume lookup
+    #: (:meth:`recent_quote_volume`, P6-B) reuses the same window, so an enabled
+    #: ``risk.liquidity`` block adds no extra history requests.
     _VOL_HISTORY_LIMIT = 600
     #: Interval used when a position does not record its own timeframe.
     _DEFAULT_INTERVAL = "1h"
+    #: Bars of quote volume behind one participation decision when the guard has
+    #: to read the cache itself (mirrors ``risk.liquidity.lookback_bars``).
+    _DEFAULT_LIQUIDITY_LOOKBACK = 20
 
     def __init__(self, config: Config, event_bus: EventBus):
         self.config = config
@@ -154,11 +159,69 @@ class PositionGuard:
         self._vol_cache[key] = (now, float(vol))
         return float(vol)
 
+    # ── quote-volume plumbing (P6-A seam, P6-B wiring) ──────────────────
+
+    def quote_volume_enabled(self) -> bool:
+        """True only when ``risk.liquidity.enabled`` is set in the config.
+
+        The guard is a **reader**, never a sizer: it publishes the window's USDT
+        notional so the live sizing path and the backtest cost model price one
+        participation decision from the same number.  While the switch ships
+        false, :meth:`recent_quote_volume` returns ``None`` without touching the
+        market-data source, so nothing about the live path changes.
+        """
+        from core.risk.liquidity import liquidity_for_symbol, resolve_liquidity_config
+
+        block = liquidity_for_symbol(resolve_liquidity_config(self.config), None)
+        return bool(block is not None and getattr(block, "enabled", False))
+
+    async def recent_quote_volume(self, symbol: str,
+                                  interval: str | None = None) -> float | None:
+        """Quote (USDT) notional over the last ``lookback_bars`` bars, or ``None``.
+
+        ``None`` is returned — without any I/O — when ``risk.liquidity.enabled``
+        is false (the shipped value), when there is no market-data source, or when
+        the frame carries no usable volume; the same "unknown ⇒ do not cap, do not
+        charge impact" rule :func:`core.risk.liquidity.recent_quote_volume`
+        documents.  The number is the one P6-A's participation hook and impact
+        term consume, and it prefers the cache's ``quote_volume`` column over the
+        ``volume × close`` proxy.
+        """
+        from core.risk.liquidity import (
+            liquidity_for_symbol, recent_quote_volume, resolve_liquidity_config)
+
+        block = liquidity_for_symbol(resolve_liquidity_config(self.config), symbol)
+        if block is None or not getattr(block, "enabled", False):
+            return None
+        if not self._market_data:
+            return None
+        getter = getattr(self._market_data, "get_historical", None)
+        if getter is None:
+            return None
+        tf = interval or self._DEFAULT_INTERVAL
+        try:
+            frame = await getter(symbol, tf, limit=self._VOL_HISTORY_LIMIT)
+        except Exception as e:  # never let a data hiccup break the risk loop
+            logger.warning(f"PositionGuard: quote-volume history unavailable for "
+                           f"{symbol} {tf}: {e}")
+            return None
+        if frame is None or len(frame) == 0:
+            return None
+        try:
+            value = float(recent_quote_volume(
+                frame, int(getattr(block, "lookback_bars",
+                                   self._DEFAULT_LIQUIDITY_LOOKBACK)
+                           or self._DEFAULT_LIQUIDITY_LOOKBACK)))
+        except Exception as e:
+            logger.warning(f"PositionGuard: quote-volume lookup failed for "
+                           f"{symbol} {tf}: {e}")
+            return None
+        return value if value > 0.0 else None
+
     async def start(self):
         self._running = True
         self._task = asyncio.create_task(self._guard_loop())
         logger.info("PositionGuard started (trailing + emergency stop)")
-
     async def _guard_loop(self):
         while self._running:
             try:

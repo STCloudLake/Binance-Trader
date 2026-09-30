@@ -33,7 +33,7 @@ from core.ml.calibration import ProbabilityCalibrator
 from core.ml.features import (
     FEATURE_NAMES, MIN_FEATURE_ROWS, REQUIRED_INDICATORS,
     compute_features, create_volatility_label,
-    feature_schema_hash, FeatureContractError,
+    feature_schema_hash, feature_schema_mismatch_reason, FeatureContractError,
 )
 
 
@@ -670,17 +670,19 @@ class MLPredictor:
         # positionally — and a sidecar with **no** hash at all is refused the same
         # way, because an absent hash cannot be compared.  The old `if stored and
         # ...` let a hand-written or truncated sidecar through on names alone.
+        #
+        # P6-B: the refusal is **named by contract version** — a model whose
+        # sidecar carries the v1 hash (`335e63360104`, the 39-column P2 contract)
+        # is refused with "v1" in the reason instead of a bare hex pair, and the
+        # wording is shared with the engine's preload gate through
+        # `feature_schema_mismatch_reason` so the two cannot drift.
         stored_hash = meta.get("feature_schema_hash")
         expected_hash = feature_schema_hash(self._feature_list)
-        if not stored_hash:
-            raise FeatureContractError(
-                f"model {model_path} carries no feature schema hash "
-                f"(feature_schema_hash missing); this predictor requires "
-                f"{expected_hash} — refusing to score positionally")
-        if str(stored_hash) != expected_hash:
-            raise FeatureContractError(
-                f"model {model_path} was trained on feature schema "
-                f"{stored_hash} but this predictor uses {expected_hash}")
+        if not stored_hash or str(stored_hash) != expected_hash:
+            reason = feature_schema_mismatch_reason(stored_hash, expected_hash)
+            _log_gate_refusal(symbol, strategy_name, meta, reason)
+            self._status = _refusal_status(reason, gate)
+            raise FeatureContractError(f"model {model_path}: {reason}")
 
         model = self.trainer.load_model(model_path)
         if model is None:

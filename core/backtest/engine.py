@@ -390,6 +390,16 @@ class BacktestEngine:
         feeder = DataFeeder(cache_dir, symbols, intervals, date_start, date_end)
         feeder.load()
 
+        #: P6-B: the feeder and the bar being replayed, for the per-bar
+        #: quote-volume lookup the P6-A impact seam needs
+        #: (:meth:`_recent_quote_volume_for`).  Both are set on this instance
+        #: because ``close_position`` (core.backtest.trade_book) calls the cost
+        #: function with only ``(entry, exit, qty, symbol)`` — the window has to
+        #: come from the run, not from the call.
+        self._feeder = feeder
+        self._current_ts = None
+        self._impact_bars_cache = None
+
         if len(feeder) == 0:
             return {"error": NO_MARKET_DATA_MESSAGE}
 
@@ -809,6 +819,8 @@ class BacktestEngine:
             if step % 200 == 0:
                 time.sleep(0)
             ts = slice_data["timestamp"]
+            # P6-B: the bar whose close the P6-A impact window ends at.
+            self._current_ts = ts
             # Report progress every 10 steps or at start/end
             if progress_callback and (step % 10 == 0 or step == 1 or step == total_steps):
                 progress_callback(step, total_steps, ts)
@@ -1606,7 +1618,17 @@ class BacktestEngine:
             pos_key, pos, exit_price, ts, reason, trades, balance, positions, per_matrix,
             cost_fn=lambda ep, xp, q, s: apply_trading_costs(
                 ep, xp, q, s, self.config,
-                overrides=(getattr(self, "_run_state", {}) or {}).get("spread_pct")),
+                overrides=(getattr(self, "_run_state", {}) or {}).get("spread_pct"),
+                # ── P6-A impact seam, fed per bar (P6-B) ──
+                # ``recent_quote_volume`` is the position's own timeframe summed
+                # over ``risk.liquidity.lookback_bars`` bars ending at this close
+                # (the cache's `quote_volume` column when the file has it, the
+                # documented `volume × close` proxy otherwise).  It is **inert**:
+                # `apply_trading_costs` short-circuits to the pre-P6 arithmetic
+                # when `risk.liquidity.impact_k <= 0` (the shipped value) or when
+                # the window is unknown, and `_current_ts` is only used for that
+                # lookup, so a k=0 run is bit-identical to before.
+                recent_quote_volume=self._recent_quote_volume_for(pos)),
             events=events,
         )
         if ledger_balances is not None:
@@ -1615,8 +1637,71 @@ class BacktestEngine:
             return new_balance
         return new_balance
 
-    # ---- ML Helpers ----
+    def _recent_quote_volume_for(self, pos) -> float:
+        """Quote (USDT) notional behind one close, on the position's own timeframe.
 
+        The backtest half of the P6-A seam (P6-B): until now the engine could not
+        pass ``recent_quote_volume`` to
+        :func:`core.backtest.cost_model.apply_trading_costs`, so the impact term
+        could never price a backtest trade.  The window is
+        ``risk.liquidity.lookback_bars`` bars ending at the **current** bar
+        (:attr:`_current_ts`, set once per feeder step), measured with
+        :func:`core.backtest.cost_model.recent_quote_volume_from_bars` so the
+        backtest and the live sizer read the same number.
+
+        ``0.0`` (the documented "unknown ⇒ no impact") on any failure — a missing
+        feed, a position without a timeframe, a data hiccup.  The lookup runs
+        **only** when the impact term is on: ``impact_k <= 0`` (the shipped value)
+        returns immediately, so a default run does not even slice a frame.
+        """
+        if self._impact_bars() <= 0:
+            return 0.0
+        try:
+            ts = getattr(self, "_current_ts", None)
+            if ts is None:
+                return 0.0
+            if isinstance(pos, dict):
+                symbol = pos.get("symbol")
+                interval = pos.get("timeframe") or "1h"
+            else:
+                symbol, interval = pos, "1h"
+            if not symbol:
+                return 0.0
+            store = getattr(self, "_feeder", None)
+            if store is None or not hasattr(store, "get_all_data_for_symbol"):
+                return 0.0
+            frame = store.get_all_data_for_symbol(symbol, interval)
+            if frame is None or len(frame) == 0:
+                return 0.0
+            cut = int(frame.index.searchsorted(ts, side="right"))
+            if cut <= 0:
+                return 0.0
+            from core.backtest.cost_model import recent_quote_volume_from_bars
+
+            return recent_quote_volume_from_bars(
+                frame.iloc[:cut], lookback_bars=self._impact_bars())
+        except Exception:  # a cost lookup must never take a run down
+            return 0.0
+
+    def _impact_bars(self) -> int:
+        """``risk.liquidity.lookback_bars`` when the impact term is enabled, else 0.
+
+        One cached answer per run (the config cannot change mid-run): ``0`` means
+        "the impact seam is off", which is the value that makes
+        :meth:`_recent_quote_volume_for` return without doing any work.
+        """
+        cached = getattr(self, "_impact_bars_cache", None)
+        if cached is not None:
+            return cached
+        from core.backtest.cost_model import (_liquidity_impact_params,
+                                              liquidity_lookback_bars)
+
+        k, _exponent = _liquidity_impact_params(self.config)
+        value = liquidity_lookback_bars(self.config) if k > 0.0 else 0
+        self._impact_bars_cache = value
+        return value
+
+    # ---- ML Helpers ----
     # ── ML helpers ────────────────────────────────────────────────────
     #
     # The feature contract (``core.ml.features``) is the single source of truth
@@ -1764,7 +1849,8 @@ class BacktestEngine:
         if not gate.get("allowed"):
             return False, f"gate refused the model: {gate.get('reason', 'gate failed')}"
         try:
-            from core.ml.features import feature_schema_hash
+            from core.ml.features import (feature_schema_hash,
+                                          feature_schema_mismatch_reason)
             strategy_name = stem.split("_", 1)[1] if "_" in stem else stem
             expected = self._ml_feature_contract(strategy_name)
             names = list(meta.get("feature_names") or [])
@@ -1782,13 +1868,11 @@ class BacktestEngine:
             # `gate.allowed` and matching feature *names* but **no schema hash**
             # (the audit's e2e loaded 2 of 7 artefacts that way).  A hash that is
             # absent cannot be compared, so it is a refusal — the same rule the
-            # mismatch below already follows.
-            if not stored:
-                return False, ("feature schema hash missing: the sidecar carries no "
-                               f"feature_schema_hash (engine expects {current})")
-            if str(stored) != current:
-                return False, (f"feature schema hash mismatch: sidecar {stored} vs "
-                               f"engine {current}")
+            # mismatch below already follows, and the same reason text
+            # `MLPredictor.load_model` produces (P6-B shares it so the live and
+            # backtest refusals cannot drift).
+            if not stored or str(stored) != current:
+                return False, feature_schema_mismatch_reason(stored, current)
         except Exception as e:
             return False, f"feature contract could not be verified ({e})"
         return True, "verified"

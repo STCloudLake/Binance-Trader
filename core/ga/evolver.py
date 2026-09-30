@@ -92,6 +92,9 @@ class GAStrategyEvolver:
         self._window_key = str(getattr(self.config, "window_key", "") or "")
         self._prior_trials = 0
         self._checkpoint_path = Path(loader.strategies_dir).parent / "data" / "ga_checkpoint.pkl"
+        #: P6-D: one lazily-built volume context per run (None while the
+        #: executability model is off for the whole population).
+        self._volume_context = None
 
     @property
     def generation(self) -> int:
@@ -217,6 +220,9 @@ class GAStrategyEvolver:
                     batch_trials=_batch_trials,
                     prior_trials=self._prior_trials,
                     seed=self._seed,
+                    # P6-D: None unless the executability model is on for some genome.
+                    volume_context=self.volume_context_for(
+                        symbols, date_start, train_end),
                     progress_callback=lambda c, t: self._report_progress(self._generation or 1, c, t))
             else:
                 # Single-process: use existing threaded batch evaluation
@@ -231,6 +237,9 @@ class GAStrategyEvolver:
                     use_live_spread=False,
                     batch_trials=_batch_trials,
                     prior_trials=self._prior_trials,
+                    # P6-D: None unless the executability model is on for some genome.
+                    volume_context=self.volume_context_for(
+                        symbols, date_start, train_end),
                     progress_callback=lambda c, t: self._report_progress(self._generation or 1, c, t))
 
             # Count this generation's trials for the DSR ledger.
@@ -499,6 +508,40 @@ class GAStrategyEvolver:
         self._stop_after_gen = True
 
     # ── Internal methods ──────────────────────────────────────────
+
+    def volume_context_for(self, symbols: list[str], date_start: str,
+                           date_end: str):
+        """P6-D volume context for the executability model — built once, lazily.
+
+        Returns ``None`` (and reads nothing) while the model is off for the whole
+        population: ``risk.liquidity.impact_k <= 0`` **and** no genome carries a
+        non-neutral ``volume_scale_k``.  That is the shipped configuration, so a
+        default run does no extra I/O and the evaluations are bit-identical to
+        pre-P6.  The context is picklable, so the multiprocess path shares one
+        build instead of re-reading the parquet cache per chunk.
+        """
+        from core.ga.fitness import (build_volume_context,
+                                     chromosome_volume_scale_k,
+                                     executability_params)
+        cfg = getattr(self.engine, "config", None)
+        params = executability_params(cfg)
+        needed = params["impact_k"] > 0.0 or any(
+            chromosome_volume_scale_k(chrom) > 0.0 for chrom in self._population)
+        if not needed:
+            self._volume_context = None
+            return None
+        if self._volume_context is None:
+            intervals = sorted({
+                tf for chrom in self._population
+                for gene in chrom.get("categorical", []) or []
+                if getattr(gene, "name", "") == "timeframes"
+                for tf in str(getattr(gene, "value", "")).split(",") if tf})
+            self._volume_context = build_volume_context(
+                cfg, symbols, intervals or ["1h"], date_start, date_end)
+            logger.info(
+                f"P6-D executability model active: impact_k={params['impact_k']} "
+                f"volume context={'built' if self._volume_context else 'unavailable'}")
+        return self._volume_context
 
     def _init_population(self, seed_strategies: list[str] | None) -> list[dict]:
         """Create initial population mixing random + seeded."""

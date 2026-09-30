@@ -41,8 +41,8 @@ from core.ml.evaluation import (
     sample_uniqueness_weights,
 )
 from core.ml.features import (
-    FEATURE_NAMES, REQUIRED_INDICATORS, compute_features, feature_schema_hash,
-    near_constant_columns,
+    FEATURE_NAMES, FEATURE_SCHEMA_VERSION, REQUIRED_INDICATORS, compute_features,
+    feature_schema_hash, near_constant_columns,
 )
 from core.ml.labels import class_distribution, create_three_class_label, CLASS_DOWN, CLASS_UP
 from core.ml.trainer import default_binary_factory
@@ -405,6 +405,7 @@ def main() -> int:
     from app.config import Config
     config = Config.load("sim")
     report: dict = {
+        "feature_schema_version": int(FEATURE_SCHEMA_VERSION),
         "feature_schema_hash": feature_schema_hash(),
         "n_features": len(FEATURE_NAMES),
         "measurements": {},

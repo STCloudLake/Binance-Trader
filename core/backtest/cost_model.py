@@ -422,6 +422,46 @@ def _liquidity_impact_params(config) -> tuple[float, float]:
             DEFAULT_IMPACT_EXPONENT if exponent is None else exponent)
 
 
+def liquidity_lookback_bars(config, default: int = 20) -> int:
+    """``risk.liquidity.lookback_bars`` — the window the impact seam measures.
+
+    The engine reads the **same** window the participation cap uses, so an
+    enabled ``risk.liquidity`` block prices one trade from one lookback rather
+    than two.  An absent/duck-typed block returns the documented default (20);
+    a non-positive one is clamped to 1, matching ``liquidity_key_warnings``.
+    """
+    from core.risk.liquidity import (DEFAULT_LOOKBACK_BARS,
+                                     resolve_liquidity_config)
+
+    block = resolve_liquidity_config(config)
+    value = _to_float(getattr(block, "lookback_bars", None)) if block is not None else None
+    if value is None:
+        return int(default if default else DEFAULT_LOOKBACK_BARS)
+    return max(int(value), 1)
+
+
+def recent_quote_volume_from_bars(frame, *, lookback_bars: int = 20) -> float:
+    """Quote (USDT) notional over the most recent ``lookback_bars`` bars of *frame*.
+
+    The backtest's per-bar feed for the P6-A impact seam: the frame is the
+    position's own timeframe sliced up to the current bar, and the measurement is
+    delegated to :func:`core.risk.liquidity.recent_quote_volume` (same units, same
+    ``quote_volume``-then-``volume × close`` rule, same "0.0 = unknown").  ``0.0``
+    for an empty/absent frame — the documented "no measured volume ⇒ no impact"
+    case, which :func:`apply_trading_costs` already short-circuits.
+    """
+    if frame is None:
+        return 0.0
+    try:
+        if len(frame) == 0:
+            return 0.0
+    except TypeError:  # pragma: no cover - a non-sized object is "unknown"
+        return 0.0
+    from core.risk.liquidity import recent_quote_volume
+
+    return float(recent_quote_volume(frame, int(lookback_bars) or 20))
+
+
 def impact_cost_usdt(entry_notional: float, exit_notional: float,
                      recent_quote_volume: float, k: float,
                      exponent: float = 0.5) -> float:

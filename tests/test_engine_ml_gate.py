@@ -265,17 +265,18 @@ def test_multi_window_backtest_retrains_the_model(market_dir, run_tmp):
 # 3 — the backtest ML path uses the single feature contract
 # ══════════════════════════════════════════════════════════════════════════
 
-def test_ml_enabled_backtest_runs_on_the_39_column_contract(market_dir, run_tmp):
-    """``ml_enabled: true`` runs end-to-end with a 39-column feature matrix.
+def test_ml_enabled_backtest_runs_on_the_volume_contract(market_dir, run_tmp):
+    """``ml_enabled: true`` runs end-to-end with the full feature contract.
 
     The engine's private ``_ML_INDICATORS`` (rsi/macd/bollinger/adx) plus
     ``feature_list=None`` raised ``FeatureContractError`` from the P2
     ``compute_features``.  It now feeds ``REQUIRED_INDICATORS`` and scores
-    ``FEATURE_NAMES``.
+    ``FEATURE_NAMES``.  P6-B grew that contract from 39 to 54 columns (the
+    volume/flow family); the count is derived from the contract itself.
     """
     from core.ml.features import FEATURE_NAMES
 
-    assert len(FEATURE_NAMES) == 39
+    assert len(FEATURE_NAMES) == 54, "39 (P2) + 15 (P6-B volume/flow family)"
 
     cfg, engine, _loader = _engine(market_dir, run_tmp)
     trained_on: list[tuple[int, ...]] = []

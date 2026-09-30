@@ -7,7 +7,7 @@ live predictor, the trainers and the backtest path.  Phase P2 removed the
 module the only place a feature list is defined, and by having
 :func:`compute_features` refuse to return a short matrix.
 
-Feature groups:
+Feature groups (contract **v2**, :data:`FEATURE_SCHEMA_VERSION`):
 - Price momentum (6): multi-period returns + acceleration
 - Volatility (4): rolling std + volatility regime
 - Volume (4): volume changes + trend
@@ -17,6 +17,17 @@ Feature groups:
 - Sequence (3): consecutive direction, return distribution shape
 - Market structure (5): rolling Hurst, swing distances, swing range, reversals
 - Fractional memory (3): fractional-differenced returns + their volatility
+- **Volume / flow family (15, P6-B)**: see the block below
+
+Name collision that MUST NOT be misread
+---------------------------------------
+``vol_5`` / ``vol_10`` / ``vol_20`` / ``vol_regime`` are **return volatility**
+(rolling std of ``ret_1``), not volume.  The P6-B volume family is therefore
+named ``volr_*`` (volume **r**atio), ``volz_*``, ``vwap_*``, ``flow_*`` and
+``obv_*``: ``volr_5`` is "5-bar relative volume", ``vol_5`` is "5-bar return
+std".  The two prefixes were chosen so a reader cannot confuse them, and
+``tests/test_volume_features_v2.py`` pins the distinction (a constant-volume
+series has zero variance in ``vol_5`` yet ``volr_5 == 1.0``).
 
 Phase P2 audit finding (item 5): **10 of the old 40 columns were literal
 constants on the production path** because ``REQUIRED_INDICATORS`` only computed
@@ -35,13 +46,13 @@ import pandas as pd
 import numpy as np
 
 
-# ── Canonical feature list (39 features) ────────────────────────────────
+# ── Canonical feature list (54 features) ────────────────────────────────
 
 DEFAULT_FEATURES: list[str] = [
     # Price momentum
     "ret_1", "ret_5", "ret_10", "ret_20",
     "acceleration_5", "momentum_ratio",
-    # Volatility
+    # Volatility (of RETURNS — see the module docstring)
     "vol_5", "vol_10", "vol_20", "vol_regime",
     # Volume
     "volume_ratio", "vol_chg_5", "vol_chg_20", "vol_trend",
@@ -66,7 +77,38 @@ DEFAULT_FEATURES: list[str] = [
     "roll_hurst_20",
     # ── Fractional memory ──
     "frac_ret_5", "frac_ret_10", "frac_vol_10",
+    # ── Volume / flow family v2 (P6-B) ──
+    # "volr_*" = relative VOLUME (volume / its own rolling mean).  The existing
+    # `vol_5`/`vol_10`/`vol_20` are return std — deliberately different prefix.
+    "volr_5", "volr_10", "volr_20", "volr_60",
+    # z-score of log volume against an ANCHORED median/MAD (see `_expanding_mad`):
+    # a rolling window cannot retroactively move a historical value.
+    "volz_60",
+    # VWAP deviation: rolling 20-bar VWAP, and the causal expanding ("session")
+    # VWAP measured from the first bar of the series.
+    "vwap_dev_20", "vwap_dev_session",
+    # Volume-weighted price pressure inside the bar (where the close sits in the
+    # body, weighted by how much of the window's volume traded in it).
+    "flow_close_position_weighted",
+    # Slopes (not levels) of the cumulative volume lines.
+    "obv_slope_10", "ad_slope_10",    # Flow oscillators / illiquidity / participation shape.
+    "flow_cmf_20", "flow_mfi_14", "flow_amihud_20",
+    "flow_vol_price_corr_20", "flow_vol_centroid_20",
 ]
+
+#: Contract version.  v1 = the 39-column P2 contract (hash ``335e63360104`` for
+#: the exact v1 column list), v2 = v1 + the 15-column volume/flow family above.
+#: A model whose sidecar carries a v1 hash is **refused by name** (see
+#: :data:`FEATURE_SCHEMA_V1_HASH` and
+#: :func:`feature_schema_mismatch_reason`) rather than silently scored on a
+#: reordered matrix.
+FEATURE_SCHEMA_VERSION = 2
+
+#: The frozen v1 hash — ``feature_schema_hash`` of the 39-column P2 contract, as
+#: persisted by every model trained before P6-B.  Kept as a literal (and not
+#: recomputed, it *cannot* be recomputed once ``DEFAULT_FEATURES`` grows) so the
+#: refusal message can say "this is a v1 model".
+FEATURE_SCHEMA_V1_HASH = "335e63360104"
 
 #: The one and only feature contract.  Trainers persist this list in the model
 #: metadata and refuse to score a matrix whose columns differ (item 5).
@@ -135,6 +177,111 @@ def _indicator_presence(df: pd.DataFrame, name: str) -> list[str]:
 MIN_FEATURE_ROWS = HURST_LOOKBACK + 140
 
 
+# ── Volume / flow family (P6-B) ─────────────────────────────────────────
+#: Relative-volume windows of the ``volr_*`` family (bars).
+VOLR_WINDOWS: tuple[int, ...] = (5, 10, 20, 60)
+
+#: Window of the ``volz_60`` z-score and the stride of its **anchored**
+#: median/MAD anchor.  See :func:`_expanding_mad` for why the anchor is
+#: recomputed only every :data:`VOLZ_ANCHOR_STRIDE` bars.
+VOLZ_WINDOW = 60
+VOLZ_ANCHOR_STRIDE = 20
+
+#: ``1.4826`` — the normal-consistent scaling of the MAD to a standard
+#: deviation (``E[MAD] = 0.6745 σ`` ⇒ ``σ ≈ 1.4826 · MAD``).  Same constant as
+#: ``core.ml.volatility``; duplicated here so this module stays import-light.
+_MAD_TO_SIGMA = 1.4826
+
+#: Window of the volume-price correlation / centroid features.
+VOL_PRICE_WINDOW = 20
+
+#: Window of the OBV / A-D **slope** features.  The slope of the cumulative
+#: line is the information; its level is a random walk whose magnitude depends
+#: on where the series starts.
+VOLUME_SLOPE_WINDOW = 10
+
+#: Windows of the flow oscillators.
+CMF_WINDOW = 20
+MFI_WINDOW = 14
+
+
+def _rolling_slope(series: pd.Series, window: int = VOLUME_SLOPE_WINDOW) -> pd.Series:
+    """Least-squares slope of ``series`` over a trailing ``window`` (per bar).
+
+    ``sum((t - mean(t)) * (x - mean(x))) / sum((t - mean(t))**2)`` with ``t`` the
+    0..window-1 position **inside the window**, so the slope is in units of the
+    series per bar and is a function of the trailing window only (no
+    look-ahead).  NaN/inf inputs propagate to NaN; the ``compute_features``
+    cleanup fills them like every other feature.
+    """
+    w = max(int(window), 2)
+    x = pd.to_numeric(series, errors="coerce").astype(float)
+    t = np.arange(w, dtype=float)
+    t_centred = t - t.mean()
+    denom = float((t_centred ** 2).sum())
+
+    def _slope(values: np.ndarray) -> float:
+        if not np.all(np.isfinite(values)):
+            return float("nan")
+        return float(np.dot(t_centred, values - values.mean()) / denom)
+
+    return x.rolling(w).apply(_slope, raw=True)
+
+
+def _expanding_mad(series: pd.Series, *,
+                   stride: int = VOLZ_ANCHOR_STRIDE
+                   ) -> tuple[pd.Series, pd.Series]:
+    """Causal **(median, 1.4826 · MAD)** anchor of ``series``, per bar.
+
+    "Anchored" in the sense of P3's :class:`core.ml.volatility.AnchorMAD`: the
+    scale is a *median/MAD pair*, not a mean/σ pair, so one volume spike cannot
+    inflate it, and it is computed **once per closed block** rather than over a
+    rolling window — the value at bar ``t`` is a function of
+    ``series[:block_start(t)]`` with ``block_start(t) = floor(t/stride)·stride``,
+    i.e. **strictly earlier bars only**, so appending future bars cannot
+    retroactively change a historical anchor.
+
+    The two rejected alternatives, and what each would cost:
+
+    * a **rolling** window (what the plan's ``median/1.4826·MAD over 60 bars``
+      literally says) cannot be "anchored" — it is exactly the construction P3
+      replaced, because the same observation is scaled differently in every
+      window it appears in;
+    * a **whole-series** anchor (P3's literal recipe) is stable per call but is
+      *not causal*: appending 500 bars moves every historical z-score.  Measured
+      on the live BTC 1h cache this is not hypothetical — see
+      ``tests/test_volume_features_v2.py``.
+
+    The price of the closed-block form is a bounded staleness: the anchor at bar
+    ``t`` uses data up to ``block_start(t)``, i.e. at most ``stride − 1`` bars
+    old.  Cost: ``n/stride`` median/MAD evaluations over growing prefixes; a
+    full per-bar expanding median was measured at ~40× the whole feature
+    pipeline's budget on 11 600 real bars.  ``stride <= 1`` gives the exact
+    per-bar expanding median over ``series[:t]`` — supported, and used by the
+    causality test to prove the anchor is causal at **every** bar.
+    """
+    values = pd.to_numeric(series, errors="coerce").astype(float).to_numpy()
+    n = len(values)
+    centres = np.full(n, np.nan)
+    scales = np.full(n, np.nan)
+    step = max(int(stride), 1)
+    for start in range(0, n, step):
+        # Only the CLOSED bars before this block are ever read, so no bar in
+        # [start, start+step) can influence its own anchor (step == 1 included).
+        block = values[:start]
+        block = block[np.isfinite(block)]
+        if block.size == 0:
+            continue
+        centre = float(np.median(block))
+        scale = float(np.median(np.abs(block - centre))) * _MAD_TO_SIGMA
+        stop = min(start + step, n)
+        centres[start:stop] = centre
+        scales[start:stop] = scale
+    return (pd.Series(centres, index=series.index),
+            pd.Series(scales, index=series.index))
+
+
+
 class FeatureContractError(RuntimeError):
     """Raised when a feature matrix violates the canonical contract."""
 
@@ -143,6 +290,51 @@ def feature_schema_hash(feature_names: list[str] | tuple[str, ...] | None = None
     """Stable hash of a feature list — stored in model metadata."""
     names = list(FEATURE_NAMES if feature_names is None else feature_names)
     return hashlib.sha1(json.dumps(names).encode("utf-8")).hexdigest()[:12]
+
+
+def feature_schema_label(stored_hash) -> str:
+    """Human name of the contract a stored hash belongs to.
+
+    ``"v1 (39-column P2 contract)"`` for :data:`FEATURE_SCHEMA_V1_HASH`, ``"v2
+    (54-column P6-B contract)"`` for the current one, ``"unknown"`` otherwise.
+    The label is what makes a refusal *named* rather than generic.
+    """
+    stored = "" if stored_hash is None else str(stored_hash)
+    current = feature_schema_hash()
+    if stored and stored == current:
+        return f"v{FEATURE_SCHEMA_VERSION} ({len(FEATURE_NAMES)}-column P6-B contract)"
+    if stored == FEATURE_SCHEMA_V1_HASH:
+        return "v1 (39-column P2 contract)"
+    return "unknown"
+
+
+def feature_schema_mismatch_reason(stored_hash, expected_hash=None) -> str:
+    """The refusal text for a model trained on a different feature contract.
+
+    One function so the live predictor (:meth:`MLPredictor.load_model`) and the
+    backtest preload gate (:meth:`BacktestEngine._verify_ml_model_sidecar`)
+    cannot word the same refusal two ways.  The text always contains
+    ``"schema hash mismatch"`` (the substring ``tests/test_final_audit_fixes.py``
+    and ``tests/test_reaudit_fixes.py`` pin) and always names the **version** of
+    both sides, so a v1 model is refused *by name*:
+
+    >>> feature_schema_mismatch_reason("335e63360104")  # doctest: +SKIP
+    'feature schema hash mismatch: model was trained on v1 (39-column P2 ...'
+
+    ``expected_hash=None`` means "the current contract"
+    (:func:`feature_schema_hash`).
+    """
+    expected = feature_schema_hash() if expected_hash is None else str(expected_hash)
+    stored = "" if stored_hash is None else str(stored_hash)
+    if not stored:
+        return (f"feature schema hash missing: the model carries no "
+                f"feature_schema_hash (this predictor requires {expected}, "
+                f"{feature_schema_label(expected)}) — refusing to score "
+                f"positionally")
+    return (f"feature schema hash mismatch: model was trained on "
+            f"{feature_schema_label(stored)} [{stored}] but the current contract "
+            f"is {feature_schema_label(expected)} [{expected}] — a model trained "
+            f"on a different feature set must be retrained, not scored")
 
 
 def missing_feature_columns(result: pd.DataFrame,
@@ -266,6 +458,132 @@ def _rolling_hurst_bounded(
     series = pd.Series(out, index=close.index)
     # Forward-fill the stride gaps (each value is a stale-but-knowable window).
     return series.ffill()
+
+
+def _volume_flow_features(df: pd.DataFrame, close: pd.Series, vol: pd.Series,
+                          high: pd.Series, low: pd.Series) -> pd.DataFrame:
+    """The 15-column volume/flow family (P6-B, contract v2).
+
+    Every column is a function of bars ``<= t`` only (no shift(-k), no
+    whole-series anchor), and every *window* is trailing, so appending future
+    bars leaves all historical values bit-identical — the P6-B "no look-ahead"
+    acceptance criterion, asserted per column by
+    ``tests/test_volume_features_v2.py``.
+
+    Units / definitions
+    -------------------
+    ``volr_{5,20,60}``      ``volume / rolling_mean(volume, w)`` (dimensionless,
+                            ``1.0`` = at the window's average).
+    ``volz_60``             ``(log volume − anchored median) / anchored MAD``
+                            over :data:`VOLZ_WINDOW` bars, the anchor being the
+                            causal block form of :func:`_expanding_mad`.
+    ``vwap_dev_20``         ``close / rolling VWAP(20) − 1`` — how far price sits
+                            from the volume-weighted average paid in the window.
+    ``vwap_dev_session``    the same against the **causal expanding** VWAP from
+                            the first bar of the series ("session" = one pass
+                            over one series; the expanding definition is what
+                            makes the column time-additive and therefore
+                            look-ahead free — a calendar-day session VWAP would
+                            re-anchor at each UTC midnight, which is also causal,
+                            but it is *not* invariant when bars are appended to
+                            the series, so it cannot satisfy the acceptance
+                            test and is not used).
+    ``obv_slope_10``        slope per bar of On-Balance Volume, normalised by the
+                            20-bar mean volume (a level would be a random walk).
+    ``ad_slope_10``         slope per bar of the accumulation/distribution line,
+                            same normalisation.
+    ``flow_cmf_20``         Chaikin money flow: ``Σ(mfv, 20) / Σ(volume, 20)``
+                            with ``mfv = ((c−l)−(h−c))/(h−l) · volume``.
+    ``flow_mfi_14``         Money Flow Index(14), 0–100.
+    ``flow_amihud_20``      Amihud illiquidity ``mean(|ret_1| / quote_volume)``
+                            × 1e6 (a readable scale), 20-bar trailing mean.
+    ``flow_vol_price_corr_20``  rolling 20 correlation of ``|ret_1|`` with
+                            ``Δ log(volume)`` — volume arriving *with* the move.
+    ``flow_vol_centroid_20``    ``volume / Σ(volume, 20)`` — the bar's share of
+                            the window's volume, i.e. where the volume sits.
+
+    ``quote_volume`` is used when the frame carries it (the P6-B cache columns);
+    otherwise the documented fallback is ``volume × close`` (the same proxy
+    ``core.risk.liquidity`` uses).  Both paths are causal.
+    """
+    out = pd.DataFrame(index=df.index)
+    volume = vol.replace(0.0, np.nan) if (vol == 0).any() else vol
+    log_vol = np.log(vol.clip(lower=1e-12))
+
+    # Quote (USDT) notional per bar: the real column when the cache has it, the
+    # documented `volume × close` proxy otherwise.
+    if "quote_volume" in df.columns:
+        quote_volume = pd.to_numeric(df["quote_volume"], errors="coerce").astype(float)
+    else:
+        quote_volume = vol * close
+
+    # ── relative volume, multi-window ──
+    for window in VOLR_WINDOWS:
+        mean_vol = vol.rolling(window).mean()
+        out[f"volr_{window}"] = vol / (mean_vol + 1e-12)
+
+    # ── anchored volume z-score ──
+    anchor_centre, anchor_scale = _expanding_mad(log_vol)
+    out["volz_60"] = ((log_vol - anchor_centre)
+                      / (anchor_scale.replace(0.0, np.nan) + 1e-12))
+
+    # ── VWAP deviation ──
+    typical = (high + low + close) / 3.0
+    pv = typical * volume
+    rolling_pv = pv.rolling(20).sum()
+    rolling_vol = volume.rolling(20).sum()
+    vwap_20 = rolling_pv / (rolling_vol + 1e-12)
+    out["vwap_dev_20"] = close / (vwap_20 + 1e-12) - 1.0
+    expanding_pv = pv.fillna(0.0).cumsum()
+    expanding_vol = volume.fillna(0.0).cumsum()
+    vwap_session = expanding_pv / (expanding_vol + 1e-12)
+    out["vwap_dev_session"] = close / (vwap_session + 1e-12) - 1.0
+
+    # ── OBV / A-D slopes (not levels) ──
+    direction = np.sign(close.diff(1)).fillna(0.0)
+    obv = (direction * volume.fillna(0.0)).cumsum()
+    scale_vol = vol.rolling(20).mean() + 1e-12
+    out["obv_slope_10"] = _rolling_slope(obv) / scale_vol
+
+    money_flow_multiplier = (
+        ((close - low) - (high - close)) / (high - low + 1e-12)
+    ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    ad_line = (money_flow_multiplier * volume.fillna(0.0)).cumsum()
+    out["ad_slope_10"] = _rolling_slope(ad_line) / scale_vol
+
+    # ── Chaikin money flow ──
+    mfv = money_flow_multiplier * volume.fillna(0.0)
+    out["flow_cmf_20"] = (mfv.rolling(CMF_WINDOW).sum()
+                          / (volume.fillna(0.0).rolling(CMF_WINDOW).sum() + 1e-12))
+
+    # ── Money Flow Index(14) ──
+    raw_flow = typical * volume.fillna(0.0)
+    up_flow = raw_flow.where(typical.diff(1) > 0, 0.0)
+    down_flow = raw_flow.where(typical.diff(1) < 0, 0.0)
+    positive = up_flow.rolling(MFI_WINDOW).sum()
+    negative = down_flow.rolling(MFI_WINDOW).sum()
+    money_ratio = positive / (negative + 1e-12)
+    out["flow_mfi_14"] = 100.0 - 100.0 / (1.0 + money_ratio)
+
+    # ── Amihud illiquidity (|ret| / quote notional), 20-bar mean × 1e6 ──
+    abs_ret = close.pct_change(1).abs()
+    illiquidity = abs_ret / (quote_volume.abs() + 1e-12)
+    out["flow_amihud_20"] = illiquidity.rolling(20).mean() * 1e6
+
+    # ── volume–price agreement ──
+    out["flow_vol_price_corr_20"] = (
+        abs_ret.rolling(VOL_PRICE_WINDOW).corr(log_vol.diff(1))
+    ).fillna(0.0)
+
+    # ── volume centroid (the bar's share of the window's volume) ──
+    centroid = vol / (vol.rolling(VOL_PRICE_WINDOW).sum() + 1e-12)
+    out["flow_vol_centroid_20"] = centroid
+
+    # ── volume-weighted closing position ("where did the volume close") ──
+    close_position = ((close - low) / (high - low + 1e-12)).clip(0.0, 1.0)
+    out["flow_close_position_weighted"] = close_position * centroid
+
+    return out
 
 
 def build_features(df: pd.DataFrame, feature_list: list[str] | None = None) -> pd.DataFrame:
@@ -411,6 +729,15 @@ def compute_features(df: pd.DataFrame,
     low = df.get("low", close)
     result["close_position"] = (close - low) / (high - low + 1e-9)
     result["high_low_range"] = (high - low) / (close + 1e-9)
+
+    # ── Volume / flow family v2 (P6-B) ──────────────────────────────
+    # Computed here (not earlier) because the family needs `high`/`low`, which
+    # this block binds.  Order inside `compute_features` never affects a value:
+    # every feature reads only the raw inputs and its own window of them.
+    # ``pd.concat`` (never ``DataFrame.update``: update only overwrites columns
+    # that already exist and would silently add none of the 15).
+    result = pd.concat([result, _volume_flow_features(df, close, vol, high, low)],
+                       axis=1)
 
     # ── Sequence / distribution ─────────────────────────────────────
     # Consecutive directional bars (approximate — uses close vs prev close)

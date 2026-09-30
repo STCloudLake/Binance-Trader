@@ -121,6 +121,7 @@ def evaluate_chromosome(
     initial_balance: float = 10000.0,
     n_trials: int = 1,
     use_live_spread: bool = False,
+    volume_context: "VolumeContext | None" = None,
 ) -> dict:
     """Evaluate a single chromosome via backtest.
 
@@ -165,6 +166,17 @@ def evaluate_chromosome(
             trades = result.get("trades", [])
 
         stats = stats_from_trades(trades, equity_curve, initial_balance)
+        # ── P6-D executability (impact term + volume-aware sizing) ──
+        if executability_applies(chromosome, getattr(engine, "config", None)):
+            modelled = apply_executability_model(
+                list(trades), list(equity_curve), chromosome,
+                getattr(engine, "config", None), volume_context=volume_context,
+                initial_balance=initial_balance)
+            if modelled["applied"]:
+                stats = stats_from_trades(modelled["trades"],
+                                          modelled["equity_curve"],
+                                          initial_balance)
+                stats["executability"] = modelled["summary"]
         stats["buy_hold_pct"] = metrics.get("buy_hold_pct")
         stats["max_dd"] = stats["max_dd_pct"]
         if not stats["max_dd"]:
@@ -221,6 +233,404 @@ def complexity_penalty(chromosome: dict) -> float:
     penalty += n_indicators * 1.2        # each indicator type
     penalty += len(continuous) * 0.3     # each tunable parameter
     return penalty
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# P6-D — executability in fitness: the P6-A impact term and volume-aware sizing
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# The GA used to score a genome on fills that ignored what its own size costs the
+# market.  This block lets the fitness **cost model** carry P6-A's impact term
+# (``risk.liquidity.impact_k``) and a volume-aware size model, both OFF by default:
+#
+# * ``impact_k <= 0`` (the shipped value) and ``volume_scale_k == 0`` (the gene's
+#   neutral value) short-circuit at the top of :func:`apply_executability_model`,
+#   which then returns its inputs **unchanged** — the OFF path is the identity,
+#   not an approximation.
+# * The impact charge is *replaced*, never added: the engine may already have
+#   priced it (P6-B wired ``recent_quote_volume`` into
+#   ``BacktestEngine._close_position``), so the model measures the impact already
+#   inside ``trade["cost"]`` and recomputes the cost from the modelled notional.
+# * Size is shrink-only (``≤ 1.0``) and is then put through P6-A's participation
+#   ceiling (``cap_notional``), which only ever shrinks further — the model can
+#   never assume more capacity than ``risk.liquidity.max_participation_pct``
+#   allows.
+#
+# Units: ``recent_quote_volume`` is quote (USDT) notional over a bar window,
+# ``max_participation_pct`` is a PERCENT (P6-A's config unit), ``impact_k`` is the
+# dimensionless square-root-law coefficient.
+
+#: Bars behind the RVOL the size gene reads (``volume_ratio`` in the templates is
+#: ``volume / sma(volume, 20)`` — the same 20, so the gene and the condition
+#: family measure one quantity).
+RVOL_LOOKBACK_BARS = 20
+#: Bounds of the modelled size factor.  ``1.0`` is the engine's size, so the gene
+#: is shrink-only: it can never claim more size than the backtest actually traded.
+VOLUME_SCALE_MIN = 0.25
+VOLUME_SCALE_CAP = 1.0
+#: Tolerance for "the engine already charged an impact term on this trade".
+_IMPACT_EPSILON = 1e-9
+
+
+def _gene_value(chromosome: dict | None, name: str, default: float = 0.0) -> float:
+    """Value of the continuous gene *name* (0.0 when absent — pre-P6 genomes)."""
+    for gene in (chromosome or {}).get("continuous", []) or []:
+        if getattr(gene, "name", None) == name:
+            try:
+                return float(getattr(gene, "value", default))
+            except (TypeError, ValueError):
+                return default
+    return default
+
+
+def chromosome_volume_scale_k(chromosome: dict | None) -> float:
+    """``volume_scale_k`` gene clamped to its documented bounds (0.0 = off)."""
+    value = _gene_value(chromosome, "volume_scale_k", 0.0)
+    if value != value or value in (float("inf"), float("-inf")):
+        return 0.0
+    return max(0.0, min(2.0, value))
+
+
+def chromosome_volume_filter_rvol(chromosome: dict | None) -> float:
+    """``volume_filter_rvol`` gene (0.0 = no filter) — for reporting/tests."""
+    value = _gene_value(chromosome, "volume_filter_rvol", 0.0)
+    if value != value or value in (float("inf"), float("-inf")):
+        return 0.0
+    return max(0.0, min(5.0, value))
+
+
+def volume_size_factor(rvol, k: float,
+                       floor: float = VOLUME_SCALE_MIN,
+                       cap: float = VOLUME_SCALE_CAP) -> float:
+    """Size factor for a bar whose relative volume is *rvol*, gene value *k*.
+
+    ``factor = clip(1 + k·(rvol − 1), floor, cap)``: above-average volume keeps
+    (or, at ``cap = 1``, cannot exceed) the base size, below-average volume
+    shrinks it, and the result is always inside ``[floor, cap]``.  ``k <= 0``,
+    an unknown ``rvol`` or a non-positive one → ``1.0`` (no change).
+    """
+    try:
+        k = float(k)
+        rvol = float(rvol)
+    except (TypeError, ValueError):
+        return 1.0
+    if k <= 0.0 or rvol != rvol or rvol <= 0.0:
+        return 1.0
+    factor = 1.0 + k * (rvol - 1.0)
+    return float(max(floor, min(cap, factor)))
+
+
+def executability_params(config) -> dict:
+    """P6-A knobs for the fitness cost model (never raises; off when absent)."""
+    params = {"impact_k": 0.0, "impact_exponent": 0.5,
+              "max_participation_pct": 0.0, "lookback_bars": RVOL_LOOKBACK_BARS,
+              "participation_enabled": False}
+    try:
+        from core.risk.liquidity import resolve_liquidity_config
+
+        block = resolve_liquidity_config(config)
+    except Exception:  # pragma: no cover - duck-typed configs
+        block = None
+    if block is None:
+        return params
+    try:
+        params["impact_k"] = float(getattr(block, "impact_k", 0.0) or 0.0)
+        params["impact_exponent"] = float(
+            getattr(block, "impact_exponent", 0.5) or 0.5)
+        params["max_participation_pct"] = float(
+            getattr(block, "max_participation_pct", 0.0) or 0.0)
+        params["lookback_bars"] = int(
+            getattr(block, "lookback_bars", RVOL_LOOKBACK_BARS)
+            or RVOL_LOOKBACK_BARS)
+        params["participation_enabled"] = bool(
+            getattr(block, "enabled", False))
+    except (TypeError, ValueError):  # pragma: no cover - malformed block
+        return params
+    if params["impact_k"] != params["impact_k"]:
+        params["impact_k"] = 0.0
+    return params
+
+
+def executability_applies(chromosome: dict | None, config) -> bool:
+    """True when the model would change anything (the OFF gate)."""
+    if chromosome_volume_scale_k(chromosome) > 0.0:
+        return True
+    return executability_params(config)["impact_k"] > 0.0
+
+
+class VolumeContext:
+    """Per-(symbol, interval) volume statistics for one GA run.
+
+    Built once per run (not per genome/generation) and picklable, so the
+    multiprocess evaluation path can share one build.  ``lookup`` returns
+    ``(rvol, recent_quote_volume)`` for a bar timestamp or ``None``.
+
+    ``window_quote_volume`` is a **cumulative** sum of the per-bar quote notional
+    with non-finite entries counted as 0, so a window is
+    ``cum[cut] − cum[cut − lookback]`` — the exact same number
+    :func:`core.risk.liquidity.recent_quote_volume` returns for the same slice
+    (it sums the finite values of the last ``lookback`` rows).  ``rvol`` is
+    ``volume / mean(volume, 20)``, i.e. the ``volume_ratio`` column the new
+    condition templates read.
+    """
+
+    __slots__ = ("frames", "lookback_bars")
+
+    def __init__(self, frames: dict | None = None,
+                 lookback_bars: int = RVOL_LOOKBACK_BARS):
+        self.frames = frames or {}
+        self.lookback_bars = max(int(lookback_bars or RVOL_LOOKBACK_BARS), 1)
+
+    def lookup(self, symbol: str, interval: str, ts):
+        entry = self.frames.get((str(symbol), str(interval or "1h")))
+        if entry is None or ts is None:
+            return None
+        try:
+            cut = int(np.searchsorted(entry["index"], np.datetime64(
+                pd.Timestamp(ts).to_datetime64()), side="right"))
+        except Exception:
+            return None
+        if cut <= 0:
+            return None
+        rvol = entry["rvol"][cut - 1]
+        start = max(0, cut - self.lookback_bars)
+        volume = float(entry["cum_qv"][cut] - entry["cum_qv"][start])
+        rvol = None if rvol != rvol else float(rvol)
+        return rvol, volume
+
+
+def build_volume_context(config, symbols, intervals, date_start: str,
+                         date_end: str, lookback_bars: int = RVOL_LOOKBACK_BARS
+                         ) -> VolumeContext | None:
+    """Read the parquet cache once and pre-compute the per-bar volume statistics.
+
+    Returns ``None`` (never raises) when there is no data dir / no cache — the
+    executability model then falls back to what the engine itself priced.
+    """
+    try:
+        from core.backtest.data_feeder import DataFeeder
+        from pathlib import Path
+
+        cache_dir = str(Path(getattr(config, "data_dir", "data")) / "market")
+        frames: dict = {}
+        for symbol in symbols or []:
+            for interval in intervals or []:
+                feeder = DataFeeder(cache_dir, [symbol], [interval],
+                                    date_start, date_end)
+                feeder.load()
+                raw = feeder.get_all_data_for_symbol(symbol, interval)
+                if raw is None or len(raw) == 0:
+                    continue
+                volume = pd.to_numeric(raw["volume"], errors="coerce").astype(float)
+                mean = volume.rolling(RVOL_LOOKBACK_BARS).mean()
+                rvol = np.where(mean > 0, volume / mean, np.nan)
+                quote = None
+                if "quote_volume" in raw.columns:
+                    candidate = pd.to_numeric(raw["quote_volume"],
+                                              errors="coerce").to_numpy(dtype=float)
+                    if np.isfinite(candidate).any():
+                        quote = candidate
+                if quote is None:
+                    close = pd.to_numeric(raw["close"], errors="coerce").to_numpy(dtype=float)
+                    quote = volume.to_numpy(dtype=float) * close
+                quote = np.where(np.isfinite(quote), quote, 0.0)
+                frames[(str(symbol), str(interval))] = {
+                    "index": raw.index.to_numpy(),
+                    "rvol": np.asarray(rvol, dtype=float),
+                    "cum_qv": np.concatenate([[0.0], np.cumsum(quote)]),
+                }
+        if not frames:
+            return None
+        return VolumeContext(frames, lookback_bars)
+    except Exception as exc:  # pragma: no cover - a missing cache is not fatal
+        logger.debug(f"volume context unavailable: {exc}")
+        return None
+
+
+def _legacy_cost(trade: dict, config) -> float:
+    """Fees + half-spread for this trade's ORIGINAL notional (no impact term).
+
+    ``recent_quote_volume=None`` makes :func:`apply_trading_costs` short-circuit to
+    the pre-P6 arithmetic even when ``impact_k > 0``, which is exactly what is
+    needed to measure how much impact the engine already charged.
+    """
+    from core.backtest.cost_model import apply_trading_costs
+
+    entry = _finite(trade.get("entry_price"))
+    exit_price = _finite(trade.get("exit_price"))
+    qty = _finite(trade.get("quantity"))
+    if entry <= 0 or qty <= 0:
+        return 0.0
+    return _finite(apply_trading_costs(
+        entry, exit_price, qty, str(trade.get("symbol") or ""), config,
+        recent_quote_volume=None))
+
+
+def _engine_impact_in_cost(trade: dict, config) -> float:
+    """Impact already inside ``trade["cost"]`` (0.0 when the engine priced none)."""
+    charged = _finite(trade.get("cost"))
+    legacy = _legacy_cost(trade, config)
+    return max(0.0, charged - legacy)
+
+
+def apply_executability_model(trades: list[dict], equity_curve: list[dict],
+                              chromosome: dict | None, config,
+                              volume_context: VolumeContext | None = None,
+                              initial_balance: float = 10000.0) -> dict:
+    """Modelled trades/equity under the P6-A impact term and the size gene.
+
+    Returns ``{"applied", "trades", "equity_curve", "summary"}``.  When the model
+    is off — ``impact_k <= 0`` and ``volume_scale_k == 0`` — it returns the
+    **same objects** it was given, so the OFF path cannot perturb a single bit of
+    the fitness.
+    """
+    summary = {"applied": False, "impact_k": 0.0, "scale_k": 0.0,
+               "trades": 0, "trades_scaled": 0, "trades_capped": 0,
+               "unmeasured_volume": 0, "impact_usdt": 0.0,
+               "engine_impact_usdt": 0.0, "legacy_cost_usdt": 0.0,
+               "notional_before": 0.0, "notional_after": 0.0,
+               "min_factor": 1.0, "mean_factor": 1.0}
+    params = executability_params(config)
+    scale_k = chromosome_volume_scale_k(chromosome)
+    summary["impact_k"] = round(params["impact_k"], 6)
+    summary["scale_k"] = round(scale_k, 6)
+    if not trades or (params["impact_k"] <= 0.0 and scale_k <= 0.0):
+        return {"applied": False, "trades": trades,
+                "equity_curve": equity_curve, "summary": summary}
+
+    from core.risk.liquidity import cap_notional, total_impact_usdt
+
+    adjusted: list[dict] = []
+    pnl_delta: list[tuple] = []          # (closed_at, d_pnl, opened_at, d_notional)
+    factors: list[float] = []
+    for trade in trades:
+        record = dict(trade)
+        entry = _finite(trade.get("entry_price"))
+        exit_price = _finite(trade.get("exit_price"))
+        qty = _finite(trade.get("quantity"))
+        cost_old = _finite(trade.get("cost"))
+        pnl_old = _finite(trade.get("pnl"))
+        entry_notional = qty * entry
+        exit_notional = qty * exit_price
+        if entry_notional <= 0 or qty <= 0:
+            adjusted.append(record)
+            factors.append(1.0)
+            continue
+
+        symbol = str(trade.get("symbol") or "")
+        interval = str(trade.get("timeframe") or "1h")
+        entry_bar = volume_context.lookup(symbol, interval,
+                                          trade.get("opened_at")) \
+            if volume_context is not None else None
+        exit_bar = volume_context.lookup(symbol, interval,
+                                         trade.get("closed_at")) \
+            if volume_context is not None else None
+        rvol = entry_bar[0] if entry_bar else None
+        window = exit_bar[1] if exit_bar else None
+        if window is None and volume_context is not None:
+            summary["unmeasured_volume"] += 1
+
+        factor = volume_size_factor(rvol, scale_k) if scale_k > 0 else 1.0
+        target = entry_notional * factor
+        capped, _reason = target, ""
+        if window is not None and window > 0 and params["max_participation_pct"] > 0:
+            capped, _reason = cap_notional(target, window,
+                                           params["max_participation_pct"])
+        f = capped / entry_notional if entry_notional > 0 else 1.0
+        f = max(0.0, f)
+        if f < factor - 1e-12:
+            summary["trades_capped"] += 1
+        factors.append(f)
+
+        engine_impact = _engine_impact_in_cost(trade, config)
+        impact_new = 0.0
+        measured = window is not None and window > 0
+        if params["impact_k"] > 0.0 and measured:
+            impact_new = _finite(total_impact_usdt(
+                capped, exit_notional * f, window, params["impact_k"],
+                params["impact_exponent"]))
+        # The engine may already have priced impact into ``trade["cost"]`` (P6-B
+        # wired the P6-A seam into the engine).  Replace it ONLY when this model
+        # can re-measure the same window; with an unmeasured window the charge is
+        # left inside the cost (never stripped, never added twice).
+        base_cost = cost_old - (engine_impact if measured else 0.0)
+        legacy_new = base_cost * f
+        gross = pnl_old + cost_old
+        pnl_new = gross * f - legacy_new - impact_new
+
+        record["pnl"] = round(pnl_new, 2)
+        record["pnl_pct"] = (round(pnl_new / entry_notional * 100.0, 2)
+                             if entry_notional > 0 else 0)
+        record["amount_usdt"] = round(capped, 2)
+        record["cost"] = round(legacy_new + impact_new, 4)
+        record["exec_scale"] = round(f, 6)
+        record["exec_impact_usdt"] = round(impact_new, 4)
+        record["exec_engine_impact_usdt"] = round(engine_impact, 4)
+        record["exec_recent_quote_volume"] = (round(float(window), 4)
+                                             if window is not None else None)
+        adjusted.append(record)
+        pnl_delta.append((trade.get("closed_at"), pnl_new - pnl_old,
+                          trade.get("opened_at"), capped - entry_notional))
+        summary["impact_usdt"] += impact_new
+        summary["engine_impact_usdt"] += engine_impact
+        summary["legacy_cost_usdt"] += legacy_new
+        summary["notional_before"] += entry_notional
+        summary["notional_after"] += capped
+
+    summary["applied"] = True
+    summary["trades"] = len(trades)
+    summary["trades_scaled"] = sum(1 for f in factors if abs(f - 1.0) > 1e-12)
+    if factors:
+        summary["min_factor"] = round(min(factors), 6)
+        summary["mean_factor"] = round(sum(factors) / len(factors), 6)
+    for key in ("impact_usdt", "engine_impact_usdt", "legacy_cost_usdt",
+                "notional_before", "notional_after"):
+        summary[key] = round(summary[key], 4)
+
+    return {"applied": True, "trades": adjusted,
+            "equity_curve": _adjust_equity_curve(equity_curve, pnl_delta),
+            "summary": summary}
+
+
+def _adjust_equity_curve(equity_curve: list[dict], deltas: list[tuple]) -> list[dict]:
+    """Apply the modelled trade deltas **on top of** the engine's own curve.
+
+    For each original point ``t``::
+
+        equity(t) += Σ (pnl_new − pnl_old)   over trades closed at/before t
+                   + Σ (notional_new − notional_old)  over trades open at t
+
+    which mirrors the engine's per-genome ledger (``balance + invested``).  With
+    no deltas the points are returned unchanged, so the identity holds exactly.
+    """
+    if not equity_curve or not deltas:
+        return equity_curve
+    out: list[dict] = []
+    for point in equity_curve:
+        try:
+            ts = pd.Timestamp(point.get("time"))
+        except Exception:  # pragma: no cover - malformed point
+            out.append(dict(point))
+            continue
+        realised = 0.0
+        invested = 0.0
+        for closed_at, d_pnl, opened_at, d_notional in deltas:
+            if closed_at is not None and pd.Timestamp(closed_at) <= ts:
+                realised += d_pnl
+            elif (opened_at is not None and pd.Timestamp(opened_at) <= ts
+                  and closed_at is not None and pd.Timestamp(closed_at) > ts):
+                invested += d_notional
+        if realised == 0.0 and invested == 0.0:
+            out.append(point)
+            continue
+        updated = dict(point)
+        updated["equity"] = round(_finite(point.get("equity")) + realised + invested, 2)
+        if "balance" in point:
+            updated["balance"] = round(_finite(point.get("balance")) + realised, 2)
+        if "invested" in point:
+            updated["invested"] = round(_finite(point.get("invested")) + invested, 2)
+        out.append(updated)
+    return out
 
 
 def deflated_sharpe_ratio(
@@ -519,8 +929,18 @@ def score_stats(stats: dict, chromosome: dict | None = None,
 
 
 def stats_from_engine_result(result: dict, strategy_name: str,
-                             initial_balance: float = 10000.0) -> dict:
-    """Per-genome stats from an isolated engine result (falls back gracefully)."""
+                             initial_balance: float = 10000.0,
+                             chromosome: dict | None = None,
+                             config=None,
+                             volume_context: "VolumeContext | None" = None) -> dict:
+    """Per-genome stats from an isolated engine result (falls back gracefully).
+
+    With *chromosome*/*config* given, the P6-D executability model is applied to
+    this genome's own trades and equity points before the statistics are derived
+    (impact term + volume-aware sizing).  It is the identity when the model is
+    off, and ``stats["executability"]`` carries the model's summary — so a fitness
+    that was priced with the P6-A impact term says so.
+    """
     per = (result.get("per_strategy_equity") or {}).get(strategy_name)
     if per is None:
         all_per = result.get("per_strategy_equity") or {}
@@ -538,7 +958,18 @@ def stats_from_engine_result(result: dict, strategy_name: str,
         if not trades and len(result.get("strategies", []) or []) == 1:
             trades = list(result.get("trades", []) or [])
     equity_curve = per.get("equity_curve") or result.get("equity_curve") or []
+    modelled = None
+    if chromosome is not None and config is not None \
+            and executability_applies(chromosome, config):
+        modelled = apply_executability_model(
+            list(trades), list(equity_curve), chromosome, config,
+            volume_context=volume_context, initial_balance=initial_balance)
+    if modelled is not None and modelled["applied"]:
+        trades = modelled["trades"]
+        equity_curve = modelled["equity_curve"]
     stats = stats_from_trades(trades, equity_curve, initial_balance)
+    if modelled is not None:
+        stats["executability"] = modelled["summary"]
     metrics = result.get("metrics", {}) or {}
     stats["buy_hold_pct"] = metrics.get("buy_hold_pct")
     if not stats["max_dd_pct"]:
@@ -571,6 +1002,7 @@ def evaluate_population_batch(
     use_live_spread: bool = False,
     batch_trials: int = 1,
     prior_trials: int = 0,
+    volume_context: "VolumeContext | None" = None,
 ) -> list[dict]:
     """Evaluate chromosomes in parallel batched backtests.
 
@@ -653,7 +1085,10 @@ def evaluate_population_batch(
         for i, config in enumerate(chunk_configs):
             idx = chunk_start + i
             chrom = population[idx]
-            stats = stats_from_engine_result(result, config.name, initial_balance)
+            stats = stats_from_engine_result(
+                result, config.name, initial_balance,
+                chromosome=chrom, config=getattr(engine, "config", None),
+                volume_context=volume_context)
             stats = score_stats(stats, chrom, weights=weights,
                                 n_trials=batch_trials,
                                 prior_trials=prior_trials)
@@ -763,6 +1198,7 @@ def _mp_worker(worker_args: dict) -> list:
     date_end = worker_args["date_end"]
     initial_balance = worker_args["initial_balance"]
     weights = worker_args.get("weights")
+    volume_context = worker_args.get("volume_context")
 
     # ── Test hook: lets a suite inject a deterministic/failing evaluator without
     # replacing this module-level worker (which must stay picklable). ──
@@ -805,7 +1241,10 @@ def _mp_worker(worker_args: dict) -> list:
     for i, config_obj in enumerate(chunk_configs):
         idx = chunk_start + i
         chrom = population_chunk[i]
-        stats = stats_from_engine_result(result, config_obj.name, initial_balance)
+        stats = stats_from_engine_result(
+            result, config_obj.name, initial_balance,
+            chromosome=chrom, config=getattr(engine, "config", None),
+            volume_context=volume_context)
         stats = score_stats(stats, chrom, weights=weights,
                             n_trials=worker_args.get("batch_trials", 1),
                             prior_trials=worker_args.get("prior_trials", 0))
@@ -874,6 +1313,7 @@ def evaluate_population_multiprocess(
     batch_trials: int = 1,
     prior_trials: int = 0,
     seed: int = 0,
+    volume_context: "VolumeContext | None" = None,
 ) -> list[dict]:
     """Evaluate chromosomes in parallel PROCESSES (not threads).
 
@@ -932,6 +1372,9 @@ def evaluate_population_multiprocess(
             "use_live_spread": use_live_spread,
             "batch_trials": batch_trials,
             "prior_trials": prior_trials,
+            # P6-D: one shared, picklable volume context for the executability
+            # model (None when the model is off — nothing is measured then).
+            "volume_context": volume_context,
             # Deterministic per-chunk seed (identical for a given job seed).
             "seed": (int(seed) + _ci) if seed else 0,
         }

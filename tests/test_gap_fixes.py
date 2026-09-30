@@ -677,7 +677,7 @@ def test_named_fit_and_predict_emit_no_feature_name_warning():
           "names-less predict on the same model warns (root cause reproduced)")
 
 
-def test_engine_ml_fit_keeps_the_39_column_contract_without_warnings(tmp_path):
+def test_engine_ml_fit_keeps_the_full_feature_contract_without_warnings(tmp_path):
     """Integration: one real ``_train_ml_model`` + ``_predict_ml`` round trip."""
     from app.event_bus import EventBus
     from core.backtest.engine import BacktestEngine
@@ -708,9 +708,11 @@ def test_engine_ml_fit_keeps_the_39_column_contract_without_warnings(tmp_path):
         prediction = engine._predict_ml(model, frame)
 
     assert list(model.feature_names_in_) == list(FEATURE_NAMES)
-    assert len(FEATURE_NAMES) == 39
+    # P6-B: 39 → 54 (the 15-column volume/flow family); derived, not restated.
+    assert len(FEATURE_NAMES) == 54
     assert prediction is not None and 0.0 <= prediction["p_up"] <= 1.0
     feature_warnings = [w for w in caught if "feature names" in str(w.message)]
     assert feature_warnings == [], [str(w.message) for w in feature_warnings]
-    print(f"\n[item 5 integration] 39 named columns, p_up={prediction['p_up']:.3f}, "
+    print(f"\n[item 5 integration] {len(FEATURE_NAMES)} named columns, "
+          f"p_up={prediction['p_up']:.3f}, "
           f"feature-name warnings={len(feature_warnings)}")
