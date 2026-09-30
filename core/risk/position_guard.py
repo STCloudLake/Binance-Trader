@@ -179,6 +179,18 @@ class PositionGuard:
                                   interval: str | None = None) -> float | None:
         """Quote (USDT) notional over the last ``lookback_bars`` bars, or ``None``.
 
+        **This method is not on any production path** (audit finding 6).  The live
+        participation decision is made inside :meth:`RiskManager.check_signal`,
+        which resolves the same number through
+        :meth:`RiskManager.resolve_recent_quote_volume` (`core/risk/manager.py:583-587`)
+        and passes it to ``PositionSizer.calculate_position_size``;
+        ``PositionGuard`` is the trailing-stop/emergency-stop loop and never
+        sizes.  The method is kept as the guard-side reader that the P6-A plan
+        described and that ``tests/test_volume_seams.py`` exercises (the
+        switch-off-without-I/O contract), but nothing consumes it at runtime — if
+        a future change wires sizing through the guard, that is a new decision,
+        not a latent one.
+
         ``None`` is returned — without any I/O — when ``risk.liquidity.enabled``
         is false (the shipped value), when there is no market-data source, or when
         the frame carries no usable volume; the same "unknown ⇒ do not cap, do not

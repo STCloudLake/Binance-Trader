@@ -14,13 +14,14 @@
 > survive.** On the real cache the plan's literal criterion (JB **and** excess
 > kurtosis both down, interval excluding 0) passes in **1 of 12** cells
 > (SOLUSDT dollar bars at 500 target bars). The decisive protocol refuses
-> **both** samplings — dollar AUC **0.4823** vs time AUC **0.5350**, both
+> **both** samplings — dollar AUC **0.4664** vs time AUC **0.5361** (re-measured
+> 2026-09-30; the time row is stable, the dollar one moves with the cache), both
 > net-negative after cost, both `allowed=false` — so the answer to the question
 > P6-C actually asks is **"no improvement"**.
 >
 > The one thing that *does* replicate is conditional and comes with a caveat:
-> the cached 1-minute series has **27 holes** (166 476 missing minutes = **23.9 %**
-> of its 697 719-minute span, the largest 61.8 days). Once the returns that span
+> the cached 1-minute series has **27 holes** (166 499 missing minutes = **23.9 %**
+> of its 697 805-minute span, measured 2026-09-30, the largest 61.8 days). Once the returns that span
 > those holes are removed from **both** samplings by one shared rule, activity
 > sampling shows a lower excess kurtosis in all 12 cells and a
 > block-bootstrap-supported reduction in 10 of them (all six at 4 000 bars, e.g.
@@ -118,8 +119,10 @@ nothing else (`test_keeping_the_partial_bar_is_the_only_thing_that_can_move`).
 ## 3. The data caveat that decides how the table must be read
 
 `print_gap_times` finds **27 holes** in `BTCUSDT/1m` (spacing > 4 × the 1-minute
-median): **166 476 missing minutes**, 23.9 % of the 697 719-minute span, the
-largest **5 338 560 s ≈ 61.8 days** (a second hole of 41.6 days follows). They
+median): **166 499 missing minutes**, 23.9 % of the 697 805-minute span, the
+largest **5 338 560 s ≈ 61.8 days** (a second hole of 41.6 days follows).
+Missing minutes and span are measurements of a cache revision (2026-09-30,
+531 307 prints); the *share* has stayed 23.9 %. They
 are concentrated in the last four months of the cache; the first year is
 contiguous. A time bar resampled across such a hole prices a jump that never
 traded, and at coarse sampling a handful of those returns dominates a kurtosis:
@@ -253,23 +256,34 @@ python tools/p6_volume_bars_experiment.py gate --symbol BTCUSDT --target-bars 40
 
 | sampling | bars | OOS rows | AUC | accuracy (majority) | Brier | net OOS | trades | t | PSR | gate |
 |---|---|---|---|---|---|---|---|---|---|---|
-| time | 3 889 | 2 235 | **0.5350** | 0.5002 (0.5060) | 0.2586 | **−0.3281 %** | 1 796 | −7.635 | 8.4e-15 | **FAIL** |
-| dollar | 3 888 | 2 661 | 0.4823 | 0.5130 (0.5145) | 0.2624 | −0.3178 % | 1 235 | −4.999 | 2.1e-10 | **FAIL** |
+| time | 3 890 | 2 236 | **0.5361** | 0.5004 (0.5058) | 0.2584 | **−0.3276 %** | 1 790 | −7.600 | 1.1e-14 | **FAIL** |
+| dollar | 3 889 | 2 662 | 0.4664 | 0.4996 (0.5143) | 0.2677 | −0.3335 % | 939 | −4.461 | 2.2e-08 | **FAIL** |
 
-**Verdict: dollar bars did NOT improve the gate verdict.** Both samplings are
-refused on the same counts (AUC ≤ 0.55, net expectancy ≤ 0, significance with the
-wrong sign). Dollar bars are **worse on the calibration-independent AUC
-(−0.0527)** and marginally better net of cost (+0.0103 pp) — both still ~0.3 %
-negative per trade, i.e. a measured loss of roughly the round-trip cost with no
-direction. Substituting the clock changed how many observations the sample holds,
-not the information the features carry. `ml.enabled` stays `false`.
+**Verdict: dollar bars did NOT improve the gate verdict — they are worse.** Both
+samplings are refused on the same counts (AUC ≤ 0.55, net expectancy ≤ 0,
+significance with the wrong sign). Dollar bars are **worse on the
+calibration-independent AUC (−0.0697)** *and* **worse net of cost (−0.0059 pp)**
+on the 2026-09-30 22:17 run; a repeat nine minutes later (same time-bar series, a
+dollar series that had completed more prints) gave AUC **−0.0613** and net
+**−0.0978 pp**. The net delta is negative in both, so the earlier "marginally
+better net of cost (+0.0103 pp)" reading was a stale revision's noise, not a
+property of the sampling — this is ≈0.33 % lost per trade either way, i.e.
+roughly the round-trip cost with no direction. Substituting the clock changed how
+many observations the sample holds, not the information the features carry.
+`ml.enabled` stays `false`.
 
 **This measurement moves with the cache.** Repeating the whole gate protocol at
 three cache revisions during one session gave dollar AUC 0.5079 → 0.5014 →
 0.4823 while the time-bar number stayed 0.5350 (its bars are unchanged by
-appended prints that fall in the dropped final bin). The verdict — two refusals,
-no improvement — is stable; the individual figure is a measurement of a
-revision, which is why the row counts above are part of the record.
+appended prints that fall in the dropped final bin). Two further back-to-back
+runs on 2026-09-30 (22:17 and 22:26) gave dollar AUC **0.4664 → 0.4748** with the
+time row identical (0.5361) and the net delta **−0.0059 → −0.0978 pp**: the
+dollar series is rebuilt from the 1-minute prints, so every appended print can
+move it, while the time series' extra prints fall in the dropped final bin. The
+signs that matter are stable in every revision measured — dollar AUC lower
+(−0.0527 to −0.0697) and both samplings net-negative — while the individual
+figure is a measurement of a revision, which is why the row counts above are part
+of the record.
 
 ---
 
@@ -341,9 +355,9 @@ config switch.
 
 ## 7. What did **not** improve (explicit)
 
-1. **The gate.** Both samplings refused; dollar AUC 0.0527 *lower* than the time
-   model's, net expectancy negative on both, `ml.enabled` unchanged. This is the
-   decisive result and it is negative.
+1. **The gate.** Both samplings refused; dollar AUC 0.0613–0.0697 *lower* than the
+   time model's (0.0527 at the archived revision), net expectancy negative on
+   both, `ml.enabled` unchanged. This is the decisive result and it is negative.
 2. **The plan's literal distribution criterion.** 1 of 12 cells passes (SOLUSDT
    dollar bars at 500 target bars); at 4 000 target bars, zero cells pass.
 3. **Volatility clustering.** Worse for dollar bars on BTCUSDT

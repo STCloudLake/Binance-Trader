@@ -417,12 +417,22 @@ def test_compute_features_and_the_live_predictor_agree_on_the_row_floor():
 def test_feature_pipeline_cost_is_bounded():
     """Audit P2 #7: the indicator+feature pipeline must not regress to 16 s.
 
-    Measured on 8 845 real BTC 1h bars: `compute_all(REQUIRED_INDICATORS)` +
+    Measured on the real BTCUSDT 1h cache: `compute_all(REQUIRED_INDICATORS)` +
     `compute_features` cost **16.62 s** before the fix (a 10-lag R/S Hurst per
-    bar) and **1.08 s** after (bounded 60-bar/4-lag Hurst, stride 4).  The bound
-    is deliberately generous (3.0 s, ~2.8×) so it catches a regression without
-    being flaky on a loaded CI machine.  Skipped when the cached parquet is
-    absent (the repo does not ship data/).
+    bar) and **1.08 s** after (bounded 60-bar/4-lag Hurst, stride 4).
+
+    **Wall clock alone is not a measurement on a shared machine.** On 2026-09-30
+    the same pipeline measured 0.63 s idle on this host and **3.46–3.59 s**
+    (min of three batches) while seven concurrent Python processes were busy —
+    a 5.5× inflation that failed the old single-reading 3.0 s bound.  The
+    reading is therefore the **minimum of three batches**, as in
+    ``tests/test_p34_audit_fixes.py``, and the regression guard is the
+    machine-independent ratio to the indicator-only pass measured in the same
+    session (measured **8.6×** idle, **9.4×** loaded; bound 25×).  The absolute
+    cap is 5.0 s: above the loaded reading (1.4×) and still below a genuinely
+    slow pipeline (≈5.8 s for a 10× slower feature stage on the current cache —
+    the archived 8 845-bar post-fix cost was 1.08 s — or the pre-P2 16.62 s).
+    Skipped when the cached parquet is absent (the repo does not ship data/).
     """
     import time
     from pathlib import Path
@@ -434,14 +444,33 @@ def test_feature_pipeline_cost_is_bounded():
     if not path.exists():
         pytest.skip("no cached BTCUSDT 1h parquet in this checkout")
     df = pd.read_parquet(path)
-    t0 = time.perf_counter()
-    ind = compute_all(df.copy(), REQUIRED_INDICATORS)
-    X = compute_features(ind)
-    elapsed = time.perf_counter() - t0
+
+    def _best(fn, batches: int = 3):
+        """(minimum wall clock over `batches` runs, last result)."""
+        fn()                                    # warm up (imports, allocator)
+        best, out = float("inf"), None
+        for _ in range(batches):
+            t0 = time.perf_counter()
+            out = fn()
+            best = min(best, time.perf_counter() - t0)
+        return best, out
+
+    def _indicators():
+        return compute_all(df.copy(), REQUIRED_INDICATORS)
+
+    ind_seconds, _ = _best(_indicators)
+    elapsed, X = _best(lambda: compute_features(_indicators()))
     assert len(X) == len(df)
-    assert elapsed < 3.0, (
+    assert elapsed < 5.0, (
         f"feature pipeline took {elapsed:.2f}s on {len(df)} bars "
-        f"(pre-P2 cost was 16.6s; the audit's item-7 regression)")
+        f"(min of 3 batches, idle cost 0.64s, loaded 3.5s; a 10x slower feature "
+        f"stage is ~5.8s, pre-P2 cost was 16.6s — the audit's item-7 regression)")
+    assert elapsed < 25.0 * ind_seconds, (
+        f"the whole pipeline costs {elapsed / ind_seconds:.1f}x the indicator-only "
+        f"pass ({ind_seconds:.3f}s) — measured 8.6x idle / 9.4x loaded; the "
+        f"audited 10-lag-Hurst regression would be ~10x higher")
+    print(f"\n[cost] {len(df)} bars: pipeline {elapsed:.3f}s, indicators "
+          f"{ind_seconds:.3f}s, ratio {elapsed / ind_seconds:.2f}x")
     # The bounded Hurst is still a real, varying feature — not a constant 0.5.
     assert X["hurst_signal"].std() > 0.01
     assert X["roll_hurst_20"].std() > 0.01

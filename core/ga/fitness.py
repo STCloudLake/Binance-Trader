@@ -438,6 +438,18 @@ def build_volume_context(config, symbols, intervals, date_start: str,
                 if quote is None:
                     close = pd.to_numeric(raw["close"], errors="coerce").to_numpy(dtype=float)
                     quote = volume.to_numpy(dtype=float) * close
+                # Audit finding 7(a): the `NaN → 0.0` here is **already** the
+                # "unmeasured bars are dropped, never forward-filled" rule
+                # `core.risk.liquidity` follows.  A missing bar contributes 0 to
+                # the running total and the window delta (`cum_qv[cut] −
+                # cum_qv[start]`) therefore equals `nansum` of the *measured*
+                # bars in it — verified against a frame with a 10-bar NaN run:
+                # every one of the 201 cumulative points equals the
+                # `np.where(isfinite, q, 0.0)` form bit for bit, and the window
+                # deltas equal `np.nansum` exactly.  The audit's "maps NaN→0 while
+                # liquidity drops the bar" is a *wording* difference, not a
+                # numeric one, so this line is deliberately unchanged (an
+                # equivalent rewrite would only churn the module).
                 quote = np.where(np.isfinite(quote), quote, 0.0)
                 frames[(str(symbol), str(interval))] = {
                     "index": raw.index.to_numpy(),

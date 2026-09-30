@@ -259,9 +259,14 @@ def _template_strategy(logic: str, narrow: bool = False):
     """A genome whose entries are the P6-D templates.
 
     ``narrow`` keeps two conditions per side.  They are the two *state-like*
-    P6-D templates (OBV and A/D slope), which overlap on 139 of the 587 bars of
-    the pinned window; ANDing six families would need every family to agree on
-    one bar, leaving the equivalence test vacuous.
+    P6-D templates (OBV and A/D slope), which are both active (long side) on
+    **139 of the 587 bars** the conditions are evaluated on — the
+    ``_indicator_frame`` window is 587 bars (2026-01-21 → 2026-02-15, the feeder
+    prepends its warm-up prefix), while the row the test's own
+    ``print(..., bars=...)`` reports is the shorter 337-bar traded window
+    ``DATE_START`` → ``DATE_END`` (2026-02-01 → 2026-02-15).  Both numbers are
+    measured; they are different objects.  ANDing six families would need every
+    family to agree on one bar, leaving the equivalence test vacuous.
     """
     from core.strategy.loader import MLConfig, StrategyConfig
 

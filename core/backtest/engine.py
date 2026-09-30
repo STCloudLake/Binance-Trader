@@ -1335,9 +1335,22 @@ class BacktestEngine:
                     # Sizing uses THIS genome's ledger balance when isolated: with
                     # one shared balance a genome's position size (and therefore
                     # its fills) depended on its siblings' cash.
+                    #
+                    # P6-A participation seam, fed per bar (audit finding 3): the
+                    # entry size now sees the same ``recent_quote_volume`` the exit
+                    # cost model reads, so a backtest can price the participation
+                    # cap and not only the impact term.  It is passed as a
+                    # **callable**, which the sizer only invokes while
+                    # ``risk.liquidity.enabled`` is true — so at the shipped
+                    # default the argument is never even evaluated and the run is
+                    # bit-identical to before (pinned in
+                    # ``tests/test_volume_seams.py``).
                     qty, risk_amount = sizer.calculate_position_size(
                         _strat_balance, price, "satellite",
-                        volatility_expanding=vol_expanding)
+                        volatility_expanding=vol_expanding,
+                        recent_quote_volume=self._quote_volume_provider(
+                            sym, primary_tf),
+                        symbol=sym)
                     if qty <= 0:
                         continue
 
@@ -1665,23 +1678,60 @@ class BacktestEngine:
                 interval = pos.get("timeframe") or "1h"
             else:
                 symbol, interval = pos, "1h"
-            if not symbol:
-                return 0.0
-            store = getattr(self, "_feeder", None)
-            if store is None or not hasattr(store, "get_all_data_for_symbol"):
-                return 0.0
-            frame = store.get_all_data_for_symbol(symbol, interval)
-            if frame is None or len(frame) == 0:
-                return 0.0
-            cut = int(frame.index.searchsorted(ts, side="right"))
-            if cut <= 0:
-                return 0.0
-            from core.backtest.cost_model import recent_quote_volume_from_bars
-
-            return recent_quote_volume_from_bars(
-                frame.iloc[:cut], lookback_bars=self._impact_bars())
+            return self._quote_volume_window(symbol, interval, ts)
         except Exception:  # a cost lookup must never take a run down
             return 0.0
+
+    def _quote_volume_window(self, symbol, interval, ts) -> float:
+        """The measured window itself: ``0.0`` ("unknown") on any failure.
+
+        The one implementation behind both the exit cost model's
+        :meth:`_recent_quote_volume_for` and the entry sizing seam's
+        :meth:`_quote_volume_provider` — the two must price the *same* number or
+        the cap and the impact term would disagree about the book.
+        """
+        if not symbol or ts is None:
+            return 0.0
+        store = getattr(self, "_feeder", None)
+        if store is None or not hasattr(store, "get_all_data_for_symbol"):
+            return 0.0
+        frame = store.get_all_data_for_symbol(symbol, interval)
+        if frame is None or len(frame) == 0:
+            return 0.0
+        cut = int(frame.index.searchsorted(ts, side="right"))
+        if cut <= 0:
+            return 0.0
+        from core.backtest.cost_model import (liquidity_lookback_bars,
+                                              recent_quote_volume_from_bars)
+
+        return recent_quote_volume_from_bars(
+            frame.iloc[:cut], lookback_bars=liquidity_lookback_bars(self.config))
+
+    def _quote_volume_provider(self, symbol, interval):
+        """The P6-A participation seam for **entry sizing** (audit finding 3).
+
+        Returns a **callable**, which is the shape
+        :meth:`core.risk.position_sizer.PositionSizer.apply_participation_cap`
+        documents: the sizer invokes it only after
+        ``risk.liquidity.enabled`` has been checked, so at the shipped default
+        (disabled) the frame is never read and a backtest run is bit-identical to
+        the pre-fix behaviour.  An eager number here would have to be computed for
+        every entry even when the switch is off.
+
+        The window is ``risk.liquidity.lookback_bars`` bars ending at the current
+        bar, the same measurement the exit cost model uses
+        (:meth:`_quote_volume_window`), so a backtest sizes *and* charges against
+        one book.  ``0.0`` is the documented "unknown ⇒ the cap refuses" value.
+        """
+
+        def _volume() -> float:
+            try:
+                return self._quote_volume_window(
+                    symbol, interval, getattr(self, "_current_ts", None))
+            except Exception:  # a sizing lookup must never take a run down
+                return 0.0
+
+        return _volume
 
     def _impact_bars(self) -> int:
         """``risk.liquidity.lookback_bars`` when the impact term is enabled, else 0.
@@ -1814,13 +1864,18 @@ class BacktestEngine:
         2. the sidecar carries a ``gate`` verdict,
         3. ``gate["allowed"]`` is true — i.e. the model really passed
            :func:`core.ml.credibility.credibility_gate` when it was trained,
-        4. the sidecar's ``feature_names`` equal the contract the engine will score
-           with (positional scoring on a different contract is silent corruption),
-        5. the sidecar's ``feature_schema_hash`` is **present and equal** to
+        4. the sidecar's ``feature_schema_hash`` is **present and equal** to
            :func:`core.ml.features.feature_schema_hash` of that contract — a
            missing hash is a refusal, not a pass (re-audit finding 5: the check
            used to be ``if stored and ...``, so a sidecar with ``gate.allowed``
-           and matching names but no hash was accepted).
+           and matching names but no hash was accepted),
+        5. the sidecar's ``feature_names`` equal the contract the engine will score
+           with (positional scoring on a different contract is silent corruption).
+
+        Step 4 precedes step 5 (audit finding 2): a genuine v1 artefact carries
+        the 39 v1 names, so a name-first order returned the generic "sidecar has
+        39 features, engine scores 54" and the named v1 refusal was unreachable
+        for every real v1 model.
 
         It deliberately does **not** instantiate a predictor (no market-data
         provider exists at this point in a backtest) and deliberately does not
@@ -1850,10 +1905,24 @@ class BacktestEngine:
             return False, f"gate refused the model: {gate.get('reason', 'gate failed')}"
         try:
             from core.ml.features import (feature_schema_hash,
-                                          feature_schema_mismatch_reason)
+                                          feature_schema_mismatch_reason,
+                                          schema_hash_is_known_contract)
             strategy_name = stem.split("_", 1)[1] if "_" in stem else stem
             expected = self._ml_feature_contract(strategy_name)
+            current = feature_schema_hash(expected)
+            stored = meta.get("feature_schema_hash")
             names = list(meta.get("feature_names") or [])
+            # Audit finding 2: a **recognisable but different** contract is
+            # refused before the name/count comparison.  A genuine v1 artefact
+            # carries the 39 v1 names, so a name-first order returned "sidecar has
+            # 39 features, engine scores 54" and the named v1 refusal was
+            # unreachable for every real v1 model.  An *unidentifiable* hash keeps
+            # the name-first order, so a short custom column list still gets the
+            # "feature contract mismatch" diagnostic
+            # `tests/test_final_audit_fixes.py` pins.
+            if (stored and str(stored) != current
+                    and schema_hash_is_known_contract(stored)):
+                return False, feature_schema_mismatch_reason(stored, current)
             if names != list(expected):
                 have = set(expected)
                 missing = [c for c in names if c not in have]
@@ -1862,13 +1931,10 @@ class BacktestEngine:
                                f"features, engine scores {len(expected)} "
                                f"(missing_from_engine={missing[:4]} "
                                f"extra_in_engine={extra[:4]})")
-            stored = meta.get("feature_schema_hash")
-            current = feature_schema_hash(expected)
             # Re-audit finding 5: `if stored and ...` accepted a sidecar that had
             # `gate.allowed` and matching feature *names* but **no schema hash**
             # (the audit's e2e loaded 2 of 7 artefacts that way).  A hash that is
-            # absent cannot be compared, so it is a refusal — the same rule the
-            # mismatch below already follows, and the same reason text
+            # absent cannot be compared, so it is a refusal — the same reason text
             # `MLPredictor.load_model` produces (P6-B shares it so the live and
             # backtest refusals cannot drift).
             if not stored or str(stored) != current:

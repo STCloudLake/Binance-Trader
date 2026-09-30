@@ -63,9 +63,10 @@ constant                      value      meaning
                                          ~1.9 MB (measured on this host), so polling faster
                                          than this is pure cost.
 ``MAX_STALE_MS``              1 800 000  beyond 30 min a cached observation is still returned,
-                                         but only as ``is_stale=True`` evidence, never as a
-                                         fresh reading.  A caller that needs fresh numbers must
-                                         treat this as "unavailable".
+                                         but only as ``is_stale=True``/``missing=True``
+                                         evidence, never as a fresh reading.  A caller that
+                                         needs fresh numbers must treat this as
+                                         "unavailable".
 ``FETCH_TIMEOUT_S``           45 s       per-request socket timeout.  The measured full-universe
                                          fetch is ~93 s wall clock, so the timeout alone is not
                                          a complete budget; ``callers`` should also bound their
@@ -295,6 +296,11 @@ class BreadthObservation:
     top_symbols: tuple[tuple[str, float], ...] = ()
     is_stale: bool = False
     stale_ms: Optional[int] = None
+    #: True when the observation is past :data:`MAX_STALE_MS` — the documented
+    #: "still returned, but treat it as unavailable" state.  Distinct from
+    #: *absent* (`latest()` returning ``None``) and from merely stale (past
+    #: ``TICKER24H_TTL_S`` but inside the bound).
+    missing: bool = False
     expected_pair_count: Optional[int] = None
 
     def to_dict(self) -> dict:
@@ -485,7 +491,9 @@ class BreadthCache:
     """Append-only JSONL record of breadth observations, with the TTL policy.
 
     * :meth:`latest` returns the newest usable observation, labelled with
-      ``is_stale``/``stale_ms`` against the caller's clock.
+      ``is_stale``/``stale_ms`` against the caller's clock; past
+      ``max_stale_ms`` it is additionally labelled ``missing=True`` (the
+      documented "still returned, but treat it as unavailable" state).
     * :meth:`fresh` returns it only while it is inside
       :data:`TICKER24H_TTL_S`; otherwise ``None``.
     * :meth:`refresh` fetches when the cached value is not fresh and falls back
@@ -551,9 +559,16 @@ class BreadthCache:
     def _with_staleness(self, obs: BreadthObservation) -> BreadthObservation:
         age = max(0, self.now_ms() - int(obs.as_of_ms))
         fresh = age <= self.ttl_s * 1000.0
+        # Audit finding 5: `max_stale_ms` used to be stored and never compared,
+        # while the module docstring gave it behaviour.  It is now the explicit
+        # "treat as unavailable" boundary *inside* a still-returned observation:
+        # a value older than it is not merely stale, it is `missing=True`, so a
+        # caller that cannot tolerate a 30-minute-old book does not have to
+        # re-derive the threshold from the constant (and a torn/absent line stays
+        # distinguishable from "the endpoint answered an hour ago").
         return BreadthObservation.from_dict({
             **obs.to_dict(), "source": "cache", "is_stale": not fresh,
-            "stale_ms": age})
+            "stale_ms": age, "missing": age > self.max_stale_ms})
 
     # -- writing -------------------------------------------------------
     def append(self, obs: Optional[BreadthObservation]) -> bool:

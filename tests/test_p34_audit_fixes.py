@@ -692,7 +692,17 @@ def test_doc_ten_numbers_are_reproducible_or_labelled():
     clip_off = ewma_vol(rr, window=0, outlier_sigma=0.0)
     assert clip_on > 0.0
     if np.abs(rr).max() > 0.1:                       # splice still in the window
-        assert clip_off / clip_on == pytest.approx(9.8, abs=1.0)
+        # Audit finding 4: this used to pin `== approx(9.8, abs=1.0)`, which is a
+        # *snapshot* of one measured window.  The live cache gains a bar every
+        # hour, so the window moves under the assertion and the measured ratio
+        # drifts out of a ±1.0 band (observed 12.06) without anything being wrong.
+        # The invariant the audit asked for is the *contract* form the
+        # splice-free branch below uses: the clip is inert without a splice and
+        # an order of magnitude above it otherwise.
+        assert "接缝" in doc or "splice" in doc.lower()
+        assert clip_off / clip_on > 5.0, (
+            f"a splice inside the measured window must lift the unclipped EWMA "
+            f"well above the clipped one, got {clip_off / clip_on:.4f}")
     else:
         assert "接缝" in doc or "splice" in doc.lower()
         # The doc's "clip is inert" row is labelled with *its own* snapshot
@@ -910,9 +920,12 @@ def test_per_bar_budget_holds_for_the_default_path_and_garch_is_opt_in():
     if BTC_1H.exists():
         from core.ml.volatility import garch11_forecast, log_returns
         rr = log_returns(df["close"].values)[-500:]
-        t0 = time.perf_counter()
+        # Same min-of-batches treatment as `per_call` above: measured 0.12 s idle
+        # and 0.61 s (min of 3) on 2026-09-30 with seven Python processes busy, so
+        # a single loaded reading is not comparable with a min-of-batches default.
+        elapsed = per_call_seconds(
+            lambda: garch11_forecast(rr, window=0), batches=3, reps=1)
         g = garch11_forecast(rr, window=0)
-        elapsed = time.perf_counter() - t0
         assert g > 0.0
         assert elapsed < 5.0, f"garch11 fit took {elapsed:.2f}s — check the backend"
         assert elapsed > 10 * per_call, (

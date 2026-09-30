@@ -342,6 +342,23 @@ def feature_schema_label(stored_hash) -> str:
     return "unknown"
 
 
+def schema_hash_is_known_contract(stored_hash) -> bool:
+    """True when *stored_hash* names a contract this module can identify.
+
+    Audit finding 2: the two governed refusals are the named ones — "trained on
+    ``v1`` / the current contract, which is not the one configured here" — and an
+    unidentifiable hash can only ever be reported as a mismatch against the
+    configured contract.  The check is what lets the live predictor and the
+    backtest preload gate let a *recognisable* contract speak before the generic
+    name/count comparison, so the named reason reaches a **real** artefact (a v1
+    sidecar carries v1's 39 names, so a name-first order refused it as
+    "expects 39 features but configured for 54").
+    """
+    stored = "" if stored_hash is None else str(stored_hash)
+    return bool(stored) and stored in {str(FEATURE_SCHEMA_V1_HASH),
+                                       str(feature_schema_hash())}
+
+
 def feature_schema_mismatch_reason(stored_hash, expected_hash=None) -> str:
     """The refusal text for a model trained on a different feature contract.
 
@@ -636,6 +653,14 @@ def _volume_flow_features(df: pd.DataFrame, close: pd.Series, vol: pd.Series,
     ``quote_volume`` is used when the frame carries it (the P6-B cache columns);
     otherwise the documented fallback is ``volume × close`` (the same proxy
     ``core.risk.liquidity`` uses).  Both paths are causal.
+
+    A missing measurement is never turned into a *zero*: an all-NaN
+    ``quote_volume`` column falls back to the same ``volume × close`` proxy
+    (audit finding 1 — otherwise every window reads 0.0 and ``flow_amihud_20``
+    is refused as near-constant), and a **partially** missing column leaves the
+    unmeasured bars' ``flow_amihud_20`` as NaN after the warm-up fill, because
+    ``0.0`` is the feature's *most liquid* value and would read as a fabricated
+    "perfectly liquid" bar.
     """
     out = pd.DataFrame(index=df.index)
     # The primitives below are shared with the GA indicator columns
@@ -650,6 +675,28 @@ def _volume_flow_features(df: pd.DataFrame, close: pd.Series, vol: pd.Series,
         quote_volume = pd.to_numeric(df["quote_volume"], errors="coerce").astype(float)
     else:
         quote_volume = vol * close
+    # A bar whose `quote_volume` was never measured must never be turned into
+    # Amihud 0.0 — that is the *most liquid* reading the feature can produce, so
+    # the fabrication would read as "perfectly liquid" exactly where the data is
+    # missing (audit finding 1).  The rule mirrors `core.risk.liquidity._series`,
+    # which is the module that sizes on the same number:
+    #
+    #   * the column is entirely non-finite (present but not backfilled yet) ⇒
+    #     use the documented `volume × close` proxy, the same fallback the
+    #     absent-column path already takes;
+    #   * the column is *partially* non-finite ⇒ keep NaN for the unmeasured
+    #     rows (NaN is refused by the final fill) instead of inventing 0.0.
+    #
+    # `unmeasured` is the mask of rows that had a `quote_volume` column but no
+    # usable number in it; the cleanup below re-applies NaN there after the
+    # family-wide NaN→0 warm-up fill, so only genuine measurement gaps survive
+    # as NaN (a warm-up zero is still a warm-up zero).
+    unmeasured = None
+    if "quote_volume" in df.columns:
+        if not np.any(np.isfinite(quote_volume.to_numpy(dtype=float))):
+            quote_volume = vol * close
+        else:
+            unmeasured = ~np.isfinite(quote_volume.to_numpy(dtype=float))
 
     # ── relative volume, multi-window ──
     for window in VOLR_WINDOWS:
@@ -689,6 +736,10 @@ def _volume_flow_features(df: pd.DataFrame, close: pd.Series, vol: pd.Series,
     abs_ret = close.pct_change(1).abs()
     illiquidity = abs_ret / (quote_volume.abs() + 1e-12)
     out["flow_amihud_20"] = illiquidity.rolling(20).mean() * 1e6
+    # `None` here when every bar had a usable quote notional (or the proxy was
+    # taken); otherwise a boolean mask of the rows whose Amihud window never saw
+    # a measurement.  The caller re-applies NaN there after the warm-up fill.
+    out.attrs["unmeasured_quote_volume"] = unmeasured
 
     # ── volume–price agreement ──
     out["flow_vol_price_corr_20"] = (
@@ -856,8 +907,14 @@ def compute_features(df: pd.DataFrame,
     # every feature reads only the raw inputs and its own window of them.
     # ``pd.concat`` (never ``DataFrame.update``: update only overwrites columns
     # that already exist and would silently add none of the 15).
-    result = pd.concat([result, _volume_flow_features(df, close, vol, high, low)],
-                       axis=1)
+    _volume_flow = _volume_flow_features(df, close, vol, high, low)
+    result = pd.concat([result, _volume_flow], axis=1)
+    # Audit finding 1: a partially missing ``quote_volume`` column leaves the
+    # unmeasured bars with no Amihud number at all.  They are NaN here (the
+    # rolling window refuses to average over a gap), but the family-wide
+    # NaN→0 warm-up fill below would turn that into "perfectly liquid" — so the
+    # mask is kept and re-applied in the cleanup block.
+    _unmeasured = _volume_flow.attrs.get("unmeasured_quote_volume")
 
     # ── Sequence / distribution ─────────────────────────────────────
     # Consecutive directional bars (approximate — uses close vs prev close)
@@ -933,6 +990,13 @@ def compute_features(df: pd.DataFrame,
     # ── Cleanup ─────────────────────────────────────────────────────
     result = result.replace([np.inf, -np.inf], np.nan)
     result = result.ffill().fillna(0)
+    # Audit finding 1, second half: restore "no measurement" for the bars whose
+    # `quote_volume` was missing.  NaN is the honest value (never `0.0`, which is
+    # the feature's *most liquid* reading); a NaN column is refused loudly by the
+    # ML trainers rather than silently read as a perfectly liquid bar.
+    if _unmeasured is not None and "flow_amihud_20" in result.columns:
+        gap = pd.Series(_unmeasured, index=result.index)
+        result.loc[gap, "flow_amihud_20"] = np.nan
 
     # Subset to the contract (or the caller's explicit subset).  `effective_list`
     # is used instead of `feature_list` so the None case is the contract too.

@@ -146,7 +146,18 @@ DSR 去偏 Sharpe × 证据量 − 最大回撤。
 > **发布门**消费（`core/ga/evolver.py` 的 `_publication_decision`：`alpha_vs_buy_hold > 0`）
 > 与 provenance 记录。fitness 的和只有 `base + alpha × w − complexity`。
 > 实测（同一份 stats，`buy_hold_pct` 由 `None` 改为 `25.0`）：
-> `fitness` 两次都是 **16.0846**，只有 `alpha_vs_buy_hold_pct` 从 `0.0` 变成 `−25.0`。
+> `fitness` 两次都是 **−29.99**，只有 `alpha_vs_buy_hold_pct` 从 `0.0` 变成 **`5.0`**。
+> 这组数字是
+> `tests/test_ga_credibility.py::test_buy_and_hold_is_reported_and_gates_but_does_not_rescore`
+> 里那份 stats（`stats_from_trades([{"pnl": 0.0, "side": "long"}], _equity_for([0.0]), 10000.0)`
+> 且 `total_return_pct = 30.0`、`buy_hold_pct ∈ {None, 0.0, 10.0, −50.0, 25.0}`、
+> `n_trials = 100`）实测得到的：五次调用 `fitness` 全为 **−29.99**（`fitness_base` 同值），
+> 只有 `alpha_vs_buy_hold_pct` 随基准变化。**审计发现 7(b)**：此前本文、
+> `docs/overhaul/ALGO_UPGRADE_EVIDENCE.md`（只读，属 Lead）与
+> `docs/research/CORE_ALGORITHMS.md` 就同一条不变性给了三个互不相同的实测值
+> （16.0846 / 22.9878 / 29.1535）——那是三份**不同的 stats**，不是同一个实验的三次测量。
+> 本文与 `CORE_ALGORITHMS.md` 现统一引用上面这份可复现 stats 的实测值；证据文档的那一行
+> 留给 Lead 处理。
 > 因此"beta 不再被计为 alpha"这句话对 **fitness** 不成立，对**发布门**成立——
 > 冠军可以因为跑输等权买持而被拒（归档冠军的唯一拒绝原因就是
 > `alpha_vs_buy_hold=-52.20% <= 0`）。

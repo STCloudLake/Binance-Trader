@@ -1619,18 +1619,18 @@ RESULT: 25/29 file(s) carry a gap beyond 1.5 x bar length.
 > | D-2 | 裁剪倍数四值 | **fixed here** | doc 10 §2 新增"D-2 口径对照"表：10.12×/10.1×/9.81× = 历史真实接缝的三种读数；12.3× = 合成注入；当前缓存 1.000000×（全历史）/1.0365×（尾窗 500） |
 > | D-3 | legacy ML 准确率 | open | `ALGO_UPGRADE_EVIDENCE.md:66,:69` vs `docs/core-algorithms/08-ml-triple-barrier.md:154-155`，两侧都不在本轮写范围 |
 > | D-4 | 特征契约 hash | **fixed by the code agent**（`117e5ea`） | v1 不再是字面量：`FEATURE_V1_NAMES` 由**排除法**从 `DEFAULT_FEATURES` 减去 `VOLUME_FLOW_FEATURES` 得到（`core/ml/features.py:136-137`），`FEATURE_SCHEMA_V1_HASH = _schema_hash(FEATURE_V1_NAMES)`（`:145`）；我在 HEAD 上复算得 39 列 → `335e63360104`、54 列 → `1f30fded996d`（§12.1）。`tests/test_feature_schema_v1.py`（5 项）钉死三值 |
-> | D-5 | 实盘波动率定仓接线 | open | doc 10:357-364 已过期（`core/risk/manager.py:577` 现调用 `resolve_forecast_vol_pct`）；本轮清单未列 |
+> | D-5 | 实盘波动率定仓接线 | **fixed**（本轮复核） | `core/risk/manager.py:577` 现调用 `resolve_forecast_vol_pct`，并在 `:584-593` 把它传给 `calculate_position_size(forecast_vol_pct=…)`；doc 10:357-364 的那组仓位表是**实测效果**表（0.45 %/bar → 1.000 scale → 240 USDT），不是"未接线"声明。接线本身已存在，doc 10 不需要改（本轮实测：`config.risk_vol_targeting.enabled` 默认 false ⇒ 同一条路径逐位不变） |
 > | D-6 | doc 12 测试数 20 | **fixed here** | doc 12:61 → **24**（`--collect-only` 实测） |
 > | D-7 | 归档 "≥95 %" | report-only (lead) | `ALGO_UPGRADE_EVIDENCE.md:14,:81`；doc 11 本轮已把同一张表标注 in-sample（见 D-11） |
-> | D-8 | pairs 文档 HMM 成本 cite 错误 | open | `core/strategy/regime.py:509` 引用了一份不含该数字的文档 |
+> | D-8 | pairs 文档 HMM 成本 cite 错误 | **fixed**（本轮复核） | `core/strategy/regime.py:508-510` 现在明写旧的 "≈18–21 s" **不在本文件、且不复现**，并给出本 checkout 的实测 **≈2.3–2.6 s**；`docs/core-algorithms/11-pairs-cointegration.md:290` 已引用同一区间并注明旧值不复现——两侧一致，引用错误不再存在 |
 > | D-9 | P6 计划冲击数字 | **fixed earlier** | P6 计划:61 已改为"已撤回、不要再用"（本轮复核） |
 > | D-10 | 流动性测试数 24/25/26 | **fixed here** | doc 13:291 → **26**；P6 计划:58 → **26**（`--collect-only` 实测 26） |
 > | D-11 | "三 regime"/≥95 % | **fixed here** | doc 11 表头 + ⚠️：0.9987/0.9993/0.9987 是 **in-sample**，可交易口径 **0.758/0.759/0.815**；归档两处表述待 lead |
 > | D-12 | doc 12 门写 OR | **fixed here** | doc 12:44 → **AND**（`core/ml/credibility.py:865`） |
-> | D-13 | config GARCH 成本注释 | **fixed by the code agent**（`363b4c0`） | `config/config.yaml:164-166` 现在是"cheap methods ≤1 ms/bar（实测 ewma 0.14–0.20 ms）；garch11 ≈0.13–0.16 s/call（window=500）/≈3.7 s（window=0）"——旧注释的 "~12 ms/bar" 与实测差一个数量级，已替换为实测区间 |
+> | D-13 | config GARCH 成本注释 | **fixed**（`363b4c0`，本轮复核确认） | `config/config.yaml:164-166` 现在是"cheap methods ≤1 ms/bar（实测 ewma 0.14–0.20 ms）；garch11 ≈0.13–0.16 s/call（window=500）/≈3.7 s（window=0）"——旧注释的 "~12 ms/bar" 与实测差一个数量级，已替换为实测区间。本轮 P6 审计已复核此行，状态无需再变 |
 > | D-14 | alpha 漏 √365 | **fixed by the code agent** | doc 06 + `core/ga/fitness.py` |
 > | D-15 | T<20 时 alpha 记 0 | open | `docs/core-algorithms/07-deflated-sharpe-ratio.md:62-63` |
-> | D-16 | fitness 减买入持有 | **fixed by the code agent**（`117e5ea`） | 决定是**改声明而不是加项**：`buy_hold_pct` 在默认引擎路径上非 None，减掉它会改变每一个默认 GA fitness。代码侧现在明写"基准被报告与门消费，不参与重新打分"（`core/ga/fitness.py:24-27`、`:928-932` 只写 `alpha_vs_buy_hold_pct`），测试改为断言**不变性**（fitness 22.9878 在 `buy_hold_pct` 为 None 与 25.0 时相同；alpha 0.0 → −14.7391） |
+> | D-16 | fitness 减买入持有 | **fixed by the code agent**（`117e5ea`） | 决定是**改声明而不是加项**：`buy_hold_pct` 在默认引擎路径上非 None，减掉它会改变每一个默认 GA fitness。代码侧现在明写"基准被报告与门消费，不参与重新打分"（`core/ga/fitness.py:24-27`、`:928-932` 只写 `alpha_vs_buy_hold_pct`），测试改为断言**不变性**（本轮实测的规范 stats —— `tests/test_ga_credibility.py::test_buy_and_hold_is_reported_and_gates_but_does_not_rescore` 的同一份：`fitness` **−29.99** 在 `buy_hold_pct` 为 None/0.0/10.0/−50.0/25.0 五种取值下全部相同；`alpha_vs_buy_hold_pct` 随基准变化，None→**0.0**、25.0→**5.0**）。**审计发现 7(b)**：本行旧值 22.9878/alpha −14.7391 与 doc 06 的 16.0846、§11 的 29.1535 是**三份不同 stats** 的三个数，不是同一实验的三次测量；doc 06 与本节已统一为上面这份可复现 stats，`docs/overhaul/ALGO_UPGRADE_EVIDENCE.md:164`（只读，属 Lead）仍写 22.9878 |
 > | D-17 | doc 07 门槛常数不自洽 | open | doc 07:36-37 与同页 :41 不自洽；docstring 在 `tests/test_ga_credibility.py` |
 > | D-18 | DSR 的两个 $N$ | **fixed by the code agent**（`117e5ea`） | 试验计数只剩**一个公式**：`core/ga/evolver.py:67-93` 的 `dsr_trial_counts(prior_trials, ledger_total, population, …)`；冠军复用本代的 prior，不再额外加一个 population（`:376-380`、`:433-434` 的 `n_trials`）。端到端 stub `evolve()` 钉死 prior_trials 0/4/8 → provenance `n_trials = 12`（`tests/test_ga_dsr_trial_counts.py`，7 项） |
 > | D-19 | `timeout_label` 自相矛盾 | **fixed by the code agent**（`117e5ea`） | 真缺陷：波动率缩放屏障路径现在把**完整前向窗口内未触障**的 bar 填成 timeout 类（`core/ml/labels.py:287-300`），持久化分布只有一处（`core/ml/predictor.py`），`timeout_share` 不再是硬编码 0（`labels.py:306-315`）。测试覆盖全平序列（share 1.0）、`timeout_label=None`（无 NA）、`max_rows` 前缀 |
@@ -1640,12 +1640,12 @@ RESULT: 25/29 file(s) carry a gap beyond 1.5 x bar length.
 > | D-23 | 配对成本两路径 | open | doc 11:95-99 只写 0.25 %/腿；`config=None` 的 0.14 %/腿 未写 |
 > | D-24 | 测试计数汇总 | **fixed here + fixed earlier** | doc 12/13、P6 计划本轮修；doc 11:111 的 **28**（25 def + 3 async）在前轮已修并本轮复核；`tests/test_condition_logic.py` 的 9 vs 10 仍 open |
 > | D-25 | 因果解码数字一处四值 | **fixed here（HMM 部分）** | doc 11 已标注 in-sample/causal（0.758–0.815）；Kalman 半衰期 `doc 11:145` 1.2 vs 代码 2.1、匹配零分布 `doc 11:33-35` −3.3015/−3.3098 vs 代码 −3.363/−3.370、`tests/test_pairs.py:203,:213` 的 `var(y)/R ≈ 100`（应为 4.3）仍 open |
-> | D-26 | 死代码与导出面 | **fixed by the code agent（部分，`117e5ea`）** | 七个无读取者的 GA 配置键已了结：`ga.alpha_weight`、`_GARCH_MLE_X0`（现被 `core/ml/volatility.py:721` 读取）、`total_trials` 接线，`PF_SHRINK`/`WEIGHT_GRID`/`overfit_penalty`/`ga.evaluation_leverage` **删除**——`ga:` 块现在只有 3 个键（`config/config.yaml:45` 起：`:50` `use_live_spread`、`:53` `min_champion_trades`、`:61` `alpha_weight`），并有"每个键都有生产读者"的守卫测试（`tests/test_final_audit_fixes.py:447`）。**仍未处理**：`_hmm_forward_last`、`HMM_MIN_SIGMA_RATIO`、`DEPTH_DECAY_BP` |
+> | D-26 | 死代码与导出面 | **fixed by the code agent（部分，`117e5ea`）** | 七个无读取者的 GA 配置键已了结：`ga.alpha_weight`、`_GARCH_MLE_X0`（**确实被读取**：`core/ml/volatility.py:721` 用 `_GARCH_MLE_X0[0]`/`[1]` 作 MLE 初值，定义在 `:694` —— 本轮逐行复核确认，旧条目"未被读取"的说法不成立）、`total_trials` 接线，`PF_SHRINK`/`WEIGHT_GRID`/`overfit_penalty`/`ga.evaluation_leverage` **删除**——`ga:` 块现在只有 3 个键（`config/config.yaml:45` 起：`:50` `use_live_spread`、`:53` `min_champion_trades`、`:61` `alpha_weight`），并有"每个键都有生产读者"的守卫测试（`tests/test_final_audit_fixes.py:447`）。**仍未处理**：`_hmm_forward_last`、`HMM_MIN_SIGMA_RATIO`（`core/strategy/regime.py:128/407/429`）、`DEPTH_DECAY_BP`（`core/market_data/microstructure.py:27/29/120/182`） |
 > | D-27 | garch 网格复杂度注释 | open | `core/ml/volatility.py:713` 写 O(20×8)，实际 4×8=32 |
 > | D-28 | OHLC 估计量根本不裁剪 | open | doc 10:113 的"所有估计量"对 parkinson/garman（`volatility.py:472,:494`）与 GARCH 拟合（σ=8，`:815`）不成立 |
 > | D-29 | `stop_distance_pct` 硬下限被省略 | open | doc 10:51；`core/risk/position_sizer.py:144` 是 `max(stop_min_pct, hard.min_stop_loss_distance_pct)` |
 > | D-30 | 裁剪锚点函数名/窗口计数 | open | doc 10:119-122 应写 `series_anchor`；"8 343/8 344" vs 代码 ":226-231" 的 11 176/11 176 |
-> | D-31 | `window` 语义 | open | doc 10:141-145 与 `_as_returns`（`core/ml/volatility.py:1214-1216`）显式忽略 window 冲突 |
+> | D-31 | `window` 语义 | **fixed**（本轮复核） | `core/ml/volatility.py:1232-1239` 现在明写 `_as_returns` **有意**不再切片、`window` 由各估计量在整段剪裁**之后**应用（`_clipped`），而 doc 10:161-163 写"`window` 对两种输入**都**生效"、:170-173 给出 window=500/400 的实测差（0.524216 vs 0.524062 %/bar）——文档与代码已一致，不存在"显式忽略 window"的冲突。（该轮引用的 doc 10:141-145 是剪裁锚稳定性段落，行号已随本轮修订移动。） |
 > | D-32 | `volume_bars.print_gap_times` 的洞计数 | open（**P6 新增，本轮发现**） | 代码 docstring 写 **23** 个洞 / 166 476 分钟 / 24 %（`core/strategy/volume_bars.py:672-674`），而同一模块的实验与 doc 15 写 **27** 个 / 23.9 %；我在 `b81094b` 实测 **27 / 166 489 / 23.86 %**（§12.4） |
 > | D-33 | P6-D 测试的窗口 bar 数 | open（**P6 新增**） | `tests/test_ga_volume_genes.py:262` 的 docstring 写"pinned window 的 587 根中的 139 根"，同一测试运行时打印 `bars=337`（2026-02-01…15 = 337 根 1h）；§12.6 记的是实测的 337 |
 > | D-34 | doc 15 的"美元棒净成本略优" | open（**P6 新增，数字随 revision 移动**） | `docs/core-algorithms/15-volume-bars-breadth.md:262-263` 写 dollar 净期望"marginally better net of cost (+0.0103 pp)"；我在 `b81094b` 的同一协议下重跑得 **−0.1012 pp**（美元棒更差），两次都拒绝两种采样（§12.4） |
@@ -1771,7 +1771,20 @@ RESULT: 25/29 file(s) carry a gap beyond 1.5 x bar length.
 * `core/ga/fitness.py:22-23`（模块 docstring）：`and the alpha term subtracting the equal-weighted buy & hold return of the same symbols and window, so beta is not scored as alpha.`
 * `config/config.yaml:54-56`：`… the run's return is scored against the equal-weighted buy & hold of the same window/symbols.`
 * **代码**：fitness 求和只有 `core/ga/fitness.py:451-456` + `:496-499`（base + alpha + 复杂度）；`alpha_vs_buy_hold_pct` 在 `:505-510` 只被**赋值**。
-* **实测反证（A 级）**：同一份 stats，`buy_hold_pct=None` 与 `25.0` 两次调用 `score_stats` 都返回 `fitness=29.1535`；只有 `alpha_vs_buy_hold_pct` 从 0.0 变为 −14.73907131946944。`tests/test_ga_credibility.py:340`（`test_buy_and_hold_is_subtracted_from_the_selection_metric`）**只断言上报字段**（`:350`, `:355`, `:358`），从不断言 `fitness`——测试名描述的机制与它验证的东西不同。
+* **实测反证（A 级，本轮重测并统一口径）**：规范 stats 是
+  `tests/test_ga_credibility.py::test_buy_and_hold_is_reported_and_gates_but_does_not_rescore`
+  的那一份（`stats_from_trades([{"pnl": 0.0, "side": "long"}], _equity_for([0.0]), 10000.0)`，
+  `total_return_pct = 30.0`，`n_trials = 100`）。把 `buy_hold_pct` 依次设为
+  `None / 0.0 / 10.0 / −50.0 / 25.0` 调用 `score_stats`，`fitness` **五次全部 = −29.99**
+  （`fitness_base` 同值，`len(set(fitnesses)) == 1`）；只有 `alpha_vs_buy_hold_pct`
+  随基准变化：`None → 0.0`、`25.0 → 5.0`（即 `total_return − buy_hold`）。
+  `tests/test_ga_credibility.py::test_buy_and_hold_is_reported_and_gates_but_does_not_rescore`
+  （旧名 `test_buy_and_hold_is_subtracted_from_the_selection_metric`）此前**只断言上报字段**，
+  从不断言 `fitness`——测试名描述的机制与它验证的东西不同（`117e5ea` 已把该测试改名为
+  它实际验证的机制，并在同一测试内加入 `fitness` 不变性断言）。
+  **审计发现 7(b)**：本节的旧值 29.1535 / alpha −14.7391、doc 06 的 16.0846、
+  D-16 汇总行的 22.9878 / alpha −14.7391 是**三份不同 stats** 的数字；doc 06 与本行
+  现已统一引用上面这份可复现 stats 的实测值。
 
 判定：买入持有只进**发布门**（`core/ga/evolver.py:461-463`）与 provenance（`:384-385`），不进 fitness。文档三处均错（`ALGO_UPGRADE_PLAN.md` 的 P1.3 是这些说法的源头）。
 

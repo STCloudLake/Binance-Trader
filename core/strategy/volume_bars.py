@@ -669,9 +669,12 @@ def print_gap_times(frame: pd.DataFrame, *, factor: float = 4.0) -> pd.DatetimeI
     """Timestamps of prints that arrive after a **hole in the print series**.
 
     A hole is a spacing larger than ``factor ×`` the median print spacing (for a
-    1-minute cache: more than 4 minutes).  Measured on ``BTCUSDT/1m``: 23 such
-    holes, 166 476 missing minutes = 24 % of the 697 719-minute span, the two
-    largest 61.8 and 41.6 days.
+    1-minute cache: more than 4 minutes).  Measured 2026-09-30 on ``BTCUSDT/1m``
+    (531 307 prints, 2025-06-03 → 2026-09-30): 27 such holes, 166 499 missing
+    minutes = 23.86 % of the 697 805-minute span, the two largest 61.8 and 41.6
+    days.  The missing minutes and the span both grow with the cache (the running
+    app rewrites ``data/market/**``), so re-measure before quoting them; the
+    *share* has stayed 23.9 % across revisions.
     """
     data = _prepare(frame)
     if len(data) < 3:

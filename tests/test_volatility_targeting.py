@@ -158,8 +158,22 @@ def test_per_bar_compute_budget():
     the 600-row frame at the default ``window=500`` — and ≈3.7–3.9 s when handed
     the whole 11 676-return cache with ``window=0``) so a regression is still
     caught.
+
+    The garch11 reading is the **minimum of three fits** (the repo's pattern in
+    ``tests/test_p34_audit_fixes.py``): on 2026-09-30 the fit measured 0.12 s
+    idle and 0.64 s (min of 3) while seven concurrent Python processes were
+    busy, so a single loaded reading would sit near the 1.0 s bound.
     """
     from core.ml.volatility import (METHODS, PER_BAR_BUDGET_SEC, forecast_vol)
+
+    def _best(fn, batches: int = 3) -> float:
+        fn()                                      # warm up
+        best = float("inf")
+        for _ in range(batches):
+            t0 = time.perf_counter()
+            fn()
+            best = min(best, time.perf_counter() - t0)
+        return best
 
     df = _btc(600)
     for method in ("ewma", "realized_cc", "realized_parkinson",
@@ -173,9 +187,7 @@ def test_per_bar_compute_budget():
         assert per_call < PER_BAR_BUDGET_SEC, (
             f"{method} costs {per_call * 1000:.2f} ms/bar, above the "
             f"{PER_BAR_BUDGET_SEC * 1000:.1f} ms budget")
-    t0 = time.perf_counter()
-    forecast_vol(df, method="garch11")
-    garch = time.perf_counter() - t0
+    garch = _best(lambda: forecast_vol(df, method="garch11"))
     assert garch < 1.0, f"garch11 fit costs {garch:.2f}s — not usable at all"
 
 

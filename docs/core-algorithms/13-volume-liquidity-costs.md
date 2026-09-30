@@ -257,12 +257,35 @@ above the code returns 0.8281.)
   bars smooths bursts: a 20-bar mean is not what the next minute will look like.
   Shorter intervals (1m) are more conservative, and the XRP row above shows the
   difference a window choice makes.
-* **The live sizing path is not yet wired.** `RiskManager` does not pass a
-  `recent_quote_volume`, so the participation cap is exercised by the sizer API
-  and the tests, not by live signals; the impact term is exercised by the backtest
-  cost model and by `total_costs_with_impact`. The backtest itself does not yet
-  feed per-bar volume into `apply_trading_costs` (the seam is one keyword
-  argument). These are stated as gaps, not implied as done.
+* **Both sizing/as-cost paths are wired, and both are still inert by default.**
+  The live path is `RiskManager.resolve_recent_quote_volume` (called at
+  `core/risk/manager.py:583-587`) → `PositionSizer.calculate_position_size(
+  recent_quote_volume=…, symbol=…)`, so a live signal *is* capped once
+  `risk.liquidity.enabled` is true. The backtest feeds both consumers of one
+  measurement: `BacktestEngine._recent_quote_volume_for` reaches
+  `apply_trading_costs` (the impact term) and
+  `BacktestEngine._quote_volume_provider` reaches the entry sizing call in
+  `run_with_exit_evaluation` (the participation cap). The provider is passed as a
+  **callable**, which the sizer evaluates only *after* it has checked the switch —
+  that is what keeps the default path from slicing a frame. It is also what keeps
+  a capped entry honest: `cap_notional` returns `0.0` (`no_volume`) for an unknown
+  window, so an unmeasured book refuses the order instead of being sized against
+  an invented denominator. At the shipped defaults (`enabled: false`,
+  `impact_k: 0.0`) neither wire is evaluated and a run is bit-identical to the
+  pre-P6 engine (`tests/test_volume_seams.py` pins the disabled pass-through, the
+  lazy provider and the whole-run k=0 identity). These are wired, not gaps.
+* **The event-driven (hybrid) engine is a separate, unwired site — reported as a
+  limitation.** `core/backtest/engine_hybrid.py::run_hybrid` (line 123) drives
+  `core/backtest/event_executor.py`, and that module neither passes
+  `recent_quote_volume` to entry sizing (`:266`) nor routes its close through
+  `apply_trading_costs`: `EventDrivenExecutor._close_position` (`:72-78`)
+  computes fees + fixed half-spread inline. So in `backtest_engine_mode: hybrid`
+  neither the participation cap nor the impact term can price a trade, whatever
+  `impact_k` says. Legacy/full runs are covered (the bullet above). Both sites are
+  outside this audit's write scope, so this is reported rather than fixed; wiring
+  the sizing argument is the same one-argument change, with the same
+  `_quote_volume_provider` laziness requirement, and routing the close through the
+  shared cost model is a larger, separate decision.
 * **Square-root is an empirical shape, not a law of nature.** It fits liquid
   futures/equities well at moderate participation; at very high participation
   impact is closer to linear. `impact_exponent` is configurable for that reason.

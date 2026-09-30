@@ -143,8 +143,11 @@
 P6-B 特征族已有的六条序列以可读名暴露给条件语法——`rvol`/`rvol_z`/`vwap`/`mfi`/
 `ad_line`/`obv_slope`（分别等于 `volr_20`/`volz_60`/滚动 VWAP 水平/`flow_mfi_14`/
 A/D 线/`obv_slope_10`，**同一实现**，不是重写）。它们是**按需**列：
-`compute_all(df, {"volume_flow": {}})` 才计算（实测整族 **95.7 ms / 8 844 根**，无条件
-计算会把 `compute_all` 从 56 ms 抬到 152 ms，即 GA/回测热路径 ~2.7×）；GA 解码器对任何
+`compute_all(df, {"volume_flow": {}})` 才计算（归档实测整族 **95.7 ms / 8 844 根**；
+2026-09-30 本机复测空闲 96.7 ms，`compute_all` 57.1 → 153.7 ms）；无条件
+计算会把 `compute_all` 从 56 ms 抬到 152 ms，即 GA/回测热路径 **≈2.6×（空闲实测
+wall 2.61×/2.70×、cpu 3.33×）～ 3×（7 个并发 Python 进程 / CPU 饱和下实测
+wall 2.39–2.88×）**——**该比值随负载变化，不是常数**；GA 解码器对任何
 **读取这些列的条件**自动打开该键（`core/ga/genome.py::_condition_reads_volume_flow`），
 因此"条件引用某列"与"该列被产出"是同一个不变量。P6-D 已有的模板**故意不改**：
 它们每一个都是对**另一个估计量**的精确代数展开（模板 VWAP 用 `Σ(close·volume)/Σ(volume)`，

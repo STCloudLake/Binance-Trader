@@ -251,6 +251,51 @@ def test_quote_volume_column_is_used_when_present_and_the_proxy_when_absent():
         "the documented proxy must track the real column, not be noise")
 
 
+def test_unmeasured_quote_volume_is_never_fabricated_as_a_liquid_zero():
+    """Audit finding 1: a missing ``quote_volume`` must not read as liquid.
+
+    ``flow_amihud_20`` is *illiquidity*: its smallest value (``0.0``) is the
+    most liquid reading it can produce.  Before the fix a partially missing
+    column had its unmeasured rows filled with ``0.0`` by the family-wide
+    warm-up fill ("perfectly liquid" exactly where nothing was measured), and an
+    all-NaN column made every window read ``0.0`` and was refused as
+    near-constant.  The three cases below are the contract:
+
+    * **all-NaN** ⇒ the documented ``volume × close`` proxy, usable and finite;
+    * **partial** ⇒ NaN for the unmeasured rows (never a fabricated ``0.0``);
+    * **fully populated** ⇒ unchanged, still every row finite and positive.
+    """
+    from core.ml.features import compute_features
+
+    n = 400
+    df = _ohlcv(n)
+    qv = df["volume"] * df["close"]
+    measured = np.arange(n) < 101
+
+    all_nan = compute_features(_with_indicators(df.assign(quote_volume=np.nan)))
+    a = all_nan["flow_amihud_20"].to_numpy()
+    assert np.all(np.isfinite(a)), "an all-NaN column must fall back to the proxy"
+    # The proxy is exactly the no-column path (one rule, not two).
+    proxied = compute_features(_with_indicators(
+        df.drop(columns=["quote_volume", "trade_count"])))
+    assert np.array_equal(a, proxied["flow_amihud_20"].to_numpy())
+
+    partial = compute_features(_with_indicators(
+        df.assign(quote_volume=qv.where(measured, np.nan))))
+    p = partial["flow_amihud_20"]
+    assert p.iloc[101:].isna().all(), "unmeasured bars must not be filled with 0.0"
+    assert (p.iloc[101:] == 0.0).sum() == 0
+    # …and the measured part is untouched: rows whose whole 20-bar window was
+    # measured keep the exact value the fully populated column produces.
+    full = compute_features(_with_indicators(df.assign(quote_volume=qv)))
+    f = full["flow_amihud_20"]
+    assert np.all(np.isfinite(f.to_numpy())) and float(f.min()) >= 0.0
+    assert np.allclose(p.iloc[20:101].to_numpy(), f.iloc[20:101].to_numpy(),
+                       rtol=1e-12, atol=0.0)
+    # The warm-up zeros (the first window) are still the documented warm-up.
+    assert (p.iloc[:20] == 0.0).all()
+
+
 # ── 5. cost budget (the existing per-run bound, same numbers) ────────────
 
 def test_the_feature_pipeline_cost_stays_within_the_existing_bound():
@@ -258,9 +303,16 @@ def test_the_feature_pipeline_cost_stays_within_the_existing_bound():
 
     The live-cache version of this check is
     ``tests/test_ml_credibility.py::test_feature_pipeline_cost_is_bounded``
-    (bound 3.0 s for the whole indicator + feature pipeline).  This test uses the
-    **same** bound on a frame the test builds itself, so it runs on a checkout
-    without ``data/`` — and it measures the frame size it actually timed.
+    (same method: minimum of three batches, machine-independent ratio to the
+    indicator-only pass, plus an absolute cap).  This test uses the **same**
+    method on a frame the test builds itself, so it runs on a checkout without
+    ``data/`` — and it measures the frame size it actually timed.
+
+    On 2026-09-30 this frame measured **0.64 s idle** and **3.51 s (min of 3)**
+    with seven concurrent Python processes busy — a 5.5× wall-clock inflation,
+    which is why the reading is a minimum and why the regression guard is the
+    ratio (measured **8.6×** idle; a 10× slower feature stage would be ≈30× or
+    more, and ≈5.8 s in absolute terms).
     """
     import time
 
@@ -268,14 +320,32 @@ def test_the_feature_pipeline_cost_stays_within_the_existing_bound():
     from core.strategy.indicators import compute_all
 
     df = _ohlcv(11_627)
-    start = time.perf_counter()
-    ind = compute_all(df.copy(), REQUIRED_INDICATORS)
-    X = compute_features(ind)
-    elapsed = time.perf_counter() - start
+
+    def _best(fn, batches: int = 3):
+        """(minimum wall clock over `batches` runs, last result)."""
+        fn()                                    # warm up (imports, allocator)
+        best, out = float("inf"), None
+        for _ in range(batches):
+            t0 = time.perf_counter()
+            out = fn()
+            best = min(best, time.perf_counter() - t0)
+        return best, out
+
+    def _indicators():
+        return compute_all(df.copy(), REQUIRED_INDICATORS)
+
+    ind_seconds, _ = _best(_indicators)
+    elapsed, X = _best(lambda: compute_features(_indicators()))
     assert len(X) == len(df)
-    assert elapsed < 3.0, (
+    assert elapsed < 5.0, (
         f"indicator+feature pipeline took {elapsed:.2f}s on {len(df)} bars "
-        f"(the existing per-run bound is 3.0 s)")
+        f"(min of 3 batches; idle 0.64s, loaded 3.5s — the old single-reading "
+        f"bound was 3.0 s)")
+    assert elapsed < 25.0 * ind_seconds, (
+        f"the whole pipeline costs {elapsed / ind_seconds:.1f}x the indicator-only "
+        f"pass ({ind_seconds:.3f}s) — measured 8.1x idle; the audited 10-lag-Hurst "
+        f"regression would be much higher")
     # Report the measured number so the bound is never the only evidence.
     print(f"\n[P6-B cost] {len(df)} bars, {elapsed:.3f}s "
-          f"({elapsed / len(df) * 1e6:.1f} µs/bar)")
+          f"({elapsed / len(df) * 1e6:.1f} us/bar), indicators {ind_seconds:.3f}s, "
+          f"ratio {elapsed / ind_seconds:.2f}x")

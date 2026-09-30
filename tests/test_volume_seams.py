@@ -553,6 +553,123 @@ def _run_twice(tmp_path):
     return out
 
 
+def test_entry_sizing_quote_volume_seam_is_lazy_and_inert_by_default(tmp_path):
+    """Audit finding 3: the participation seam now reaches **entry sizing**.
+
+    The backtest fed per-bar volume to the exit cost model but not to
+    ``calculate_position_size``, so the participation cap could never fire in a
+    backtest while the impact term could.  The engine now passes a **callable**
+    (the shape ``apply_participation_cap`` documents), which the sizer evaluates
+    only while ``risk.liquidity.enabled`` is true — the default-off path is
+    therefore bit-identical, and that is what this test pins.
+    """
+    from app.config import Config
+    from app.event_bus import EventBus
+    from core.backtest.engine import BacktestEngine
+    from core.executor.executor import OrderExecutor
+    from core.risk.liquidity import recent_quote_volume
+    from core.risk.manager import RiskManager
+    from core.risk.position_sizer import PositionSizer
+
+    market = tmp_path / "data" / "market" / "BTCUSDT"
+    market.mkdir(parents=True)
+    frame = _bars("2025-01-01", 24 * 60)
+    frame.to_parquet(market / "1h.parquet")
+
+    Config._instance = None
+    cfg = Config.load("sim")
+    cfg.data_dir = str(tmp_path / "data")
+    bus = EventBus()
+    engine = BacktestEngine(cfg, None, RiskManager(cfg, bus),
+                            OrderExecutor(cfg, bus))
+    engine._current_ts = frame.index[-1]
+    # `_feeder` is what the window lookup reads (set by the run loop).
+    from core.backtest.data_feeder import DataFeeder
+
+    feeder = DataFeeder(str(tmp_path / "data" / "market"), ["BTCUSDT"], ["1h"],
+                        "2025-01-01", "2025-03-01")
+    feeder.load()
+    engine._feeder = feeder
+
+    # The expectation is derived from the frame the engine will actually read —
+    # the feeder applies the run's date window, so `frame` itself is a superset.
+    stored = feeder.get_all_data_for_symbol("BTCUSDT", "1h")
+    assert stored is not None and len(stored) >= 20
+    expected = float(recent_quote_volume(stored, 20))
+    assert expected > 0.0
+
+    provider = engine._quote_volume_provider("BTCUSDT", "1h")
+    assert callable(provider)
+    assert provider() == pytest.approx(expected), (
+        "the entry seam must read the same window the exit cost model reads")
+
+    # Default (switch off): the sizer must never evaluate the provider and the
+    # size must equal the size computed with no volume argument at all.
+    calls = []
+
+    def counting():
+        calls.append(1)
+        return expected
+
+    cfg.risk_liquidity.enabled = False
+    sizer = PositionSizer(cfg.hard_limits, cfg.soft_params,
+                          cfg.core_capital_pct, cfg.satellite_capital_pct)
+    base = sizer.calculate_position_size(10_000.0, 50_000.0, "satellite")
+    with_arg = sizer.calculate_position_size(10_000.0, 50_000.0, "satellite",
+                                            recent_quote_volume=counting,
+                                            symbol="BTCUSDT")
+    assert calls == [], "the provider ran while risk.liquidity.enabled was false"
+    assert repr(base) == repr(with_arg), (
+        "passing the seam while disabled changed the size")
+
+    # Switch on: the provider runs exactly once and a cap bites.  The synthetic
+    # window is ~9e7 USDT, far too deep for the default 240 USDT notional to be
+    # capped, so the capped case uses a shallow 12 000 USDT book (1 % = 120).
+    cfg.risk_liquidity.enabled = True
+    cfg.risk_liquidity.max_participation_pct = 1.0
+    calls.clear()
+    capped = sizer.calculate_position_size(10_000.0, 50_000.0, "satellite",
+                                          recent_quote_volume=lambda: (
+                                              calls.append(1) or 12_000.0),
+                                          symbol="BTCUSDT")
+    assert calls == [1], "the provider must run once when the switch is on"
+    assert capped[1] == pytest.approx(120.0), (
+        "a 1 % participation cap on a 12 000 USDT window must shrink the notional")
+    assert capped[1] < base[1]
+
+
+def test_breadth_max_stale_ms_is_a_real_boundary_not_a_stored_constant(tmp_path):
+    """Audit finding 5: ``MAX_STALE_MS`` used to be stored and never compared.
+
+    The module docstring (and doc 15) give it behaviour — "beyond 30 min a cached
+    observation is still returned, but only as evidence; a caller needing fresh
+    numbers must treat it as unavailable".  The relabelling now sets
+    ``missing=True`` past that boundary, so a caller can tell "stale but usable"
+    from "treat as unavailable" without re-deriving the constant.
+    """
+    from core.market_data import breadth as B
+
+    path = tmp_path / "breadth.jsonl"
+    B.BreadthCache(path, now_ms=1_000_000).refresh(
+        fetcher=lambda: _breadth_payload(), expected_pair_count=1)
+
+    inside = B.BreadthCache(path, now_ms=1_000_000 + B.MAX_STALE_MS)
+    assert inside.latest().missing is False
+    assert inside.latest().is_stale is True          # past the 5-minute TTL
+
+    outside = B.BreadthCache(path, now_ms=1_000_000 + B.MAX_STALE_MS + 1)
+    beyond = outside.latest()
+    assert beyond is not None, "the value is still returned, only labelled"
+    assert beyond.missing is True and beyond.is_stale is True
+    assert outside.fresh() is None
+
+
+def _breadth_payload() -> list[dict]:
+    """One usable USDT pair — the shape the live ticker endpoint returns."""
+    return [{"symbol": "BTCUSDT", "quoteVolume": "1000", "priceChangePercent": "1.0",
+             "lastPrice": "50000", "count": 10, "closeTime": 1_000_000}]
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # 5 — the versioned contract: a v1 model is refused BY NAME, a v2 model loads
 # ══════════════════════════════════════════════════════════════════════════
@@ -572,19 +689,22 @@ def _write_model(models_dir: Path, stem: str, meta: dict) -> Path:
 
 
 def test_a_v1_hash_model_is_refused_with_a_named_reason(tmp_path):
-    from core.ml.features import (FEATURE_NAMES, FEATURE_SCHEMA_V1_HASH,
-                                  feature_schema_hash,
+    """Audit finding 2: a **genuine** v1 artefact (39 names + v1 hash) is refused
+    by the named hash branch, not by the count branch.
+
+    The pre-fix test wrote v1's *hash* next to v2's 54 *names* — a shape no real
+    v1 artefact has — so it passed while the named branch stayed unreachable for
+    every model trained before P6-B.  The sidecar below is what a v1 trainer
+    actually wrote: ``FEATURE_V1_NAMES`` (39) with ``FEATURE_SCHEMA_V1_HASH``.
+    """
+    from core.ml.features import (FEATURE_SCHEMA_V1_HASH, FEATURE_V1_NAMES,
+                                  FEATURE_NAMES, feature_schema_hash,
                                   feature_schema_mismatch_reason)
     from core.ml.predictor import FeatureContractError, MLPredictor
 
-    v1_names = [c for c in FEATURE_NAMES
-                if c not in {"volr_5", "volr_10", "volr_20", "volr_60", "volz_60",
-                             "vwap_dev_20", "vwap_dev_session",
-                             "flow_close_position_weighted", "obv_slope_10",
-                             "ad_slope_10", "flow_cmf_20", "flow_mfi_14",
-                             "flow_amihud_20", "flow_vol_price_corr_20",
-                             "flow_vol_centroid_20"}]
-    assert feature_schema_hash(v1_names) == FEATURE_SCHEMA_V1_HASH, (
+    assert len(FEATURE_V1_NAMES) == 39
+    assert len(FEATURE_NAMES) == 54
+    assert feature_schema_hash(FEATURE_V1_NAMES) == FEATURE_SCHEMA_V1_HASH, (
         "the frozen v1 hash must be the hash of the 39-column contract")
 
     class _Cfg:
@@ -604,23 +724,35 @@ def test_a_v1_hash_model_is_refused_with_a_named_reason(tmp_path):
         watched_symbols: list = []
 
     predictor = MLPredictor(_Cfg(), _Bus(), _Md())
-    # A v1 model with v2 column names (what a v1 hash can legitimately look like
-    # after a name-level migration): refused by HASH, and the reason names v1.
+    # A genuine v1 sidecar: the 39 v1 column names AND the v1 hash.
     v1 = _write_model(tmp_path, "BTCUSDT_default_binary", {
-        "feature_names": list(FEATURE_NAMES),
+        "feature_names": list(FEATURE_V1_NAMES),
         "feature_schema_hash": FEATURE_SCHEMA_V1_HASH,
         "train_base_rate": 0.5,
         "gate": {"allowed": True, "reason": "pass", "auc": 0.61,
                  "net_expectancy": 0.003}})
-    with pytest.raises(FeatureContractError, match="v1"):
+    with pytest.raises(FeatureContractError, match="feature schema hash mismatch"):
         predictor.load_model("BTCUSDT", str(v1))
+    # The refusal must be the NAMED one, not "expects 39 features but … 54".
     assert predictor.gate_status["allowed"] is False
     assert "v1" in predictor.gate_status["reason"]
+    assert "v1 (39-column P2 contract)" in predictor.gate_status["reason"]
     assert "feature schema hash mismatch" in predictor.gate_status["reason"]
+    assert "expects 39 features" not in predictor.gate_status["reason"]
     assert feature_schema_mismatch_reason(FEATURE_SCHEMA_V1_HASH).startswith(
         "feature schema hash mismatch")
 
-    # The positive control: the SAME sidecar with the v2 hash loads.
+    # A v1 hash is still refused when the names are v2's (the pre-fix shape) —
+    # the hash is the contract's marker and now speaks first.
+    mixed = _write_model(tmp_path, "BTCUSDT_mixed_binary", {
+        "feature_names": list(FEATURE_NAMES),
+        "feature_schema_hash": FEATURE_SCHEMA_V1_HASH,
+        "train_base_rate": 0.5,
+        "gate": {"allowed": True, "reason": "pass", "auc": 0.61}})
+    with pytest.raises(FeatureContractError, match="v1"):
+        predictor.load_model("BTCUSDT", str(mixed))
+
+    # The positive control: the v2 names with the v2 hash load.
     v2 = _write_model(tmp_path, "BTCUSDT_ok_binary", {
         "feature_names": list(FEATURE_NAMES),
         "feature_schema_hash": feature_schema_hash(FEATURE_NAMES),
@@ -636,12 +768,13 @@ def test_the_backtest_preload_gate_refuses_a_v1_hash_by_name(tmp_path):
     from app.event_bus import EventBus
     from core.backtest.engine import BacktestEngine
     from core.ml.features import (FEATURE_NAMES, FEATURE_SCHEMA_V1_HASH,
-                                  feature_schema_hash)
+                                  FEATURE_V1_NAMES, feature_schema_hash)
     from core.risk.manager import RiskManager
 
     models_dir = tmp_path / "data" / "models"
+    # Audit finding 2: a genuine v1 artefact — 39 v1 names + the v1 hash.
     v1 = _write_model(models_dir, "BTCUSDT_alpha_binary", {
-        "feature_names": list(FEATURE_NAMES),
+        "feature_names": list(FEATURE_V1_NAMES),
         "feature_schema_hash": FEATURE_SCHEMA_V1_HASH,
         "train_base_rate": 0.5,
         "gate": {"allowed": True, "reason": "pass", "auc": 0.61}})
@@ -660,7 +793,9 @@ def test_the_backtest_preload_gate_refuses_a_v1_hash_by_name(tmp_path):
 
     ok, reason = engine._verify_ml_model_sidecar(v1.stem, v1, "binary")
     assert ok is False and "v1" in reason
+    assert "v1 (39-column P2 contract)" in reason
     assert "schema hash mismatch" in reason
+    assert "sidecar has 39 features" not in reason
     ok2, reason2 = engine._verify_ml_model_sidecar(v2.stem, v2, "binary")
     assert ok2 is True and reason2 == "verified"
 

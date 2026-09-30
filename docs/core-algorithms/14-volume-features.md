@@ -132,7 +132,7 @@ anchor(t) = median/·MAD of series[: block_start(t)],   block_start(t) = floor(t
 
 | version | columns | `feature_schema_hash` |
 |---|---|---|
-| v1 | 39 (P2) | `335e63360104` (frozen literal `FEATURE_SCHEMA_V1_HASH`) |
+| v1 | 39 (P2) | `335e63360104` (`FEATURE_SCHEMA_V1_HASH`, *derived*: `_schema_hash(FEATURE_V1_NAMES)`, never a hand-written literal) |
 | v2 | 54 (P6-B) | `1f30fded996d` (`FEATURE_SCHEMA_VERSION = 2`) |
 
 A model artefact carries `feature_schema_hash` in its `*_meta.json` sidecar. Both
@@ -152,6 +152,16 @@ not scored
 A sidecar with **no** hash stays a refusal too ("feature schema hash missing …"),
 the re-audit finding that a `if stored and …` test let through.
 
+A sidecar whose hash names a contract this build **recognises**
+(`schema_hash_is_known_contract`: v1, or the current v2) is refused with the named
+reason *before* the column names are compared (audit finding 2). That ordering is
+what makes the message reach a real artefact: a genuine v1 sidecar carries v1's 39
+column names, so a name-first order answered "expects 39 features but the
+predictor is configured for 54" and the named reason could only ever appear for a
+contrived sidecar holding v1's hash beside v2's names. An unrecognised hash keeps
+the name-first order, so a short custom column list still gets the specific
+"expects N features" diagnostic.
+
 ## 4. The P6-A seams are now wired — and inert by default
 
 P6-A shipped the participation cap and the impact term but left two wires
@@ -162,13 +172,16 @@ sizer, and the backtest engine never passed per-bar volume to
 | wire | file | default behaviour |
 |---|---|---|
 | live | `RiskManager.resolve_recent_quote_volume` → `PositionSizer.calculate_position_size(recent_quote_volume=…, symbol=…)` | `risk.liquidity.enabled: false` → returns `None` **without touching market data**; the sizer calls the cap only for a non-`None` value while the switch is on |
-| live (reader) | `PositionGuard.recent_quote_volume` / `quote_volume_enabled` | `None` without I/O while the switch is off |
+| live (reader) | `PositionGuard.recent_quote_volume` / `quote_volume_enabled` | `None` without I/O while the switch is off — **and unconsumed at runtime** (audit finding 6): the live sizer is driven by `RiskManager`, not by the guard; the pair is kept as the tested guard-side reader |
 | backtest | `BacktestEngine._recent_quote_volume_for(pos)` → `apply_trading_costs(recent_quote_volume=…)`, window = `risk.liquidity.lookback_bars` bars ending at the current bar | `impact_k: 0.0` → `_impact_bars()` is `0`, the lookup returns `0.0` immediately and the cost arithmetic is the pre-P6 sum (the k=0 identity page 13 pins) |
+| backtest (entry sizing) | `BacktestEngine._quote_volume_provider(symbol, interval)` → `PositionSizer.calculate_position_size(recent_quote_volume=…)`, same window, passed as a **callable** | the sizer evaluates the callable only after the switch check, so with `risk.liquidity.enabled: false` it is never called and the size is bit-identical to the pre-P6 call |
 
 The number both sides read is the same function
-(`core.risk.liquidity.recent_quote_volume`), so a live participation decision and
-a backtest impact charge cannot be computed from two different definitions of
-"recent volume".
+(`core.risk.liquidity.recent_quote_volume`), so a live participation decision, a
+backtest impact charge and a backtest entry size cannot be computed from three
+different definitions of "recent volume". Note also that the backtest's *entry
+sizing* wire only reached the sizer after the audit (finding 3): before it, the
+participation cap could not fire in a backtest even though the impact term could.
 
 ## 5. Measured evidence (this revision)
 
