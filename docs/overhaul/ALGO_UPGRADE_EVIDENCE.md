@@ -1,6 +1,6 @@
 # 算法升级证据索引（P1 GA / P2 ML / P3 波动率 / P4 新能力 / gap fixes / 复核修复）
 
-**状态**: 证据已归档（本次实测，非引用） · **生成**: 2026-09-30 · **审计 revision**: `3e90013`（§11 的残留收口轮；本文档自身的编辑**只动文档**，不是被审计代码的一部分） · **上一轮审计 revision**: `5f50771`（§11 的裁决轮；更早一轮为 `1a452ce`，§0 表、§6、§9–§10 的全部数字都来自该 revision） · **提交链**: `git log --oneline f1f6a4c^..HEAD`（见 §8 提交清单，含被审计代码的 **14** 行；其后如有纯文档提交，按 §8 说明不并入被审计 revision）
+**状态**: 证据已归档（本次实测，非引用） · **生成**: 2026-09-30 · **审计 revision**: `cc63efd`（P6-B/C/D 实现；本文档自身的编辑**只动文档**，不是被审计代码的一部分） · **上一轮审计 revision**: `3e90013`（§11 的残留收口轮；其前为 `5f50771` 裁决轮，更早 `1a452ce` 为 §0 表、§6、§9–§10 的数字来源） · **提交链**: `git log --oneline f1f6a4c^..HEAD`（见 §8 提交清单，含被审计代码的 **17** 行；其后如有纯文档提交，按 §8 说明不并入被审计 revision）
 **工作树**: 本轮闭环修复（已提交为 `1a452ce`）由单一代理写入；改动文件为 `core/risk/manager.py`（D1/LOW-6：bar-key 折叠 + 非时间索引拒绝 + 覆盖范围说明）、`scripts/check_data_integrity.py`（同一折叠）、`core/market_data/ohlcv_cache.py`（LOW-5 注释）、`core/ml/credibility.py`（LOW-3 实测值）、`core/risk/position_guard.py`（R1 实测值）、`docs/core-algorithms/13-volume-liquidity-costs.md`（LOW-2）、本文件（LOW-4）、`README.md`（LOW-1）、`tests/test_residual_closure.py`（新）+ `tests/test_final_audit_fixes.py` / `tests/test_gap_fixes.py` / `tests/test_reaudit_fixes.py` / `tests/test_cache_durability.py` / `tests/test_measured_threshold_policy.py`（随行为/注册表同步）。上一轮（`b49883b` 工作树，后续提交为 `828e375`）的复核修复见 §9，改动文件为 `core/risk/position_guard.py`、`core/ml/credibility.py`、`core/ml/meta.py`、`core/backtest/engine.py`（仅 preload 校验）、`core/ml/predictor.py`（仅同侧车校验）、`core/market_data/ohlcv_cache.py` + `core/market_data/provider.py`（仅惰性去重/flush）、`docs/core-algorithms/13-*.md`、本文件、新增 `tests/test_reaudit_fixes.py`。`data/models/` 仍为 15 个 `.pkl` / **0 个 `_meta.json`**。
 **对应计划**: [`ALGO_UPGRADE_PLAN.md`](ALGO_UPGRADE_PLAN.md)（P1–P4 验收标准） · **审计快照**: [`REFACTOR_AUDIT.md`](REFACTOR_AUDIT.md)
 
@@ -135,7 +135,7 @@ P6 的目标、阶段划分与量化验收标准已冻结于
 
 **连带影响的既有测试（均为"旧行为被钉住"，随修复同步更正，非放宽）**：`tests/test_ml_credibility.py::test_gate_passes_a_model_with_real_signal_and_positive_expectancy`（补 `n_trades/t_stat/psr`）、`::test_gate_requires_a_significance_floor`（`t=2.0 & PSR=0.975` 由放行改为拒绝）、`tests/test_gap_fixes.py::test_live_kline_stream_is_the_last_resort_forecast_source`（candle 补 `close_time`，与两个生产发布者一致）。
 
-### 提交清单（截至被审计代码 revision `3e90013`）
+### 提交清单（截至被审计代码 revision `cc63efd`）
 
 `git log --oneline` 自计划冻结起的提交列表（**被审计代码 revision = `3e90013`**，即最新一个改动代码/测试的提交；其后若只有纯文档提交——例如本文件的 `P6_VOLUME_PLAN.md` 交叉链接——则按下方规则**不**并入被审计 revision，因为守卫只要求链覆盖到最新改动代码的提交）
 
@@ -154,7 +154,11 @@ P6 的目标、阶段划分与量化验收标准已冻结于
 | `09125bd` | README 测试数字更正（693 → 1055 passed） |
 | `1a452ce` | 闭环审计基线：bar-key 折叠先于缺口检测（D1）、非时间索引拒绝（LOW-6）、确定性实盘用例、末轮文档/数字更正；新增 `tests/test_residual_closure.py`，见 §10 |
 | `5f50771` | 上一轮：§11 的 5 项残留收口（evidence 守卫改钉运行期 HEAD/链长、measured-pin 的 skip 豁免改为"跳过必须支配函数体"、`test_liquidity` 容量上界改为按当次窗口推导、doc 11 计数 25→28）。改动全部在 `tests/` 与本文件 |
-| `3e90013` | **当前被审计代码 revision**：让证据索引守卫真正会失败（链长 == `git rev-list --count`、必须命名运行期 HEAD、链必须自 `f1f6a4c` 起无缺口）、measured-pin 豁免收窄为"skip 必须支配函数体"（并因此**暴露并修掉** `test_pairs.py` 中钉死 `120.0` 的隐藏断言）、`test_liquidity` 的深度前提改为按当次窗口推导。改动在 `tests/` + 文档 |
+| `3e90013` | 上一轮：让证据索引守卫真正会失败、measured-pin 豁免收窄为"skip 必须支配函数体"（并因此暴露并修掉 `test_pairs.py` 中钉死 `120.0` 的隐藏断言）、`test_liquidity` 的深度前提改为按当次窗口推导 |
+| `508e54a` | 冻结 P6 规划（`docs/overhaul/P6_VOLUME_PLAN.md`：P6-A…P6-E、量化验收标准、依赖、风险、DoD）并交叉链接；**纯文档** |
+| `c703b8b` | 证据索引守卫改为可维护：被审计 revision 定义为"最新改动经验证代码的提交"（`core/app/web/db/scripts/tools/tests/config`），守卫校验"连续最旧优先前缀 + 覆盖到该 revision + 命名该 revision"，纯文档提交不再强制刷新（此前任何新提交都会永久变红）。改动在 `tests/` |
+| `0b9266d` | 新增研究级公式文档 `docs/research/CORE_ALGORITHMS.md`（11 章 + 符号表 + 118 公式 + A/B/C 证据分级 + D-1…D-31 不一致清单）；撤回规划里过期的 P6-A 冲击百分比；**纯文档** |
+| `cc63efd` | **当前被审计代码 revision**：P6-B/C/D —— 缓存新增 `quote_volume`/`trade_count`（含回填与向后兼容）、ML 契约 **v1 39 列 → v2 54 列**（hash `335e63360104` → `1f30fded996d`）与版本化拒绝、P6-A 成交量缝隙接线（默认全关逐位一致）、`volume_bars.py`/`breadth.py`/实验工具、GA 量能模板与基因 + 冲击进入适应度。**v2 契约的门判定：两者均被拒**（BTCUSDT AUC 0.5228 / 0 笔；ETHUSDT AUC 0.5324 / 净 −0.4132% / 889 笔 / t=−3.67） |
 
 ## 9. 复核修复（`b49883b` 工作树）——7 项发现的 before/after
 
