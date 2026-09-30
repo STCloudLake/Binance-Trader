@@ -109,11 +109,19 @@ fitness = win_rate × 0.15            # w["wr"]
         + pf_term × 5.0              # w["pf"]
         + ROC × 50                   # w["roc"]，ROC = pnl / initial_balance（小数）
         - imbalance × 10.0           # w["bal"]，多空失衡
-        + alpha × 1.0                # ALPHA_WEIGHT
+        + alpha × ga.alpha_weight     # 默认 1.0（ALPHA_WEIGHT）
         - trade_penalty - loss_penalty - complexity_penalty
 
-alpha = DSR_deflated_sharpe × min(1, trades / 30) - max_drawdown_pct
+alpha = DSR_deflated_sharpe × √365 × min(1, trades / 30) - max_drawdown_pct
 ```
+
+> ⚠️ 两处单位修正（审计 D-14/D-16，2026 重测）：
+> * `alpha` 里的 DSR 是**每期**口径，代码先乘 `√365` 年化再乘证据量
+>   （`core/ga/fitness.py` 的 `dsr_sharpe = dsr × √365`）。上面若漏掉 `√365`，
+>   结果会比代码小约 19.1 倍：归档冠军（DSR 0.2119、75 笔、max_dd 0.12 %）按代码
+>   = 0.2119 × 19.105 − 0.12 = **3.928**，按漏掉的公式 = **0.092**。
+> * `ga.alpha_weight` 是**活配置**：`config.yaml` → `Config.ga_alpha_weight` →
+>   `evolver` → `score_stats(alpha_weight=...)`，默认 1.0 与旧字面量逐位相同。
 
 - **交易次数惩罚**：`<5 → −20`；`<15 → −5`；`>500 → −(trades−500)×0.02`
 - **亏损惩罚**：`pnl < −50 → −|pnl|×0.3`
@@ -130,8 +138,18 @@ alpha = DSR_deflated_sharpe × min(1, trades / 30) - max_drawdown_pct
 
 **为什么加 alpha**：旧的两个批量路径把 `sharpe` / `max_dd` 写死为 0，
 纯漂移的合成数据 Sharpe 13.7 也被当成 alpha。现在用**每基因净值序列**算
-DSR 去偏 Sharpe × 证据量 − 最大回撤，并**减去同窗口同币种的等权买入持有收益**
-（`metrics["buy_hold_pct"]`），beta 不再被计为 alpha。
+DSR 去偏 Sharpe × 证据量 − 最大回撤。
+
+> ⚠️ **买持基准不进 fitness**（审计 D-16，已按代码修正本文三处说法）。
+> `alpha_vs_buy_hold_pct = total_return_pct − metrics["buy_hold_pct"]`
+> （`core/ga/fitness.py` 的 `score_stats`）只被**赋值并上报**，随后只被
+> **发布门**消费（`core/ga/evolver.py` 的 `_publication_decision`：`alpha_vs_buy_hold > 0`）
+> 与 provenance 记录。fitness 的和只有 `base + alpha × w − complexity`。
+> 实测（同一份 stats，`buy_hold_pct` 由 `None` 改为 `25.0`）：
+> `fitness` 两次都是 **16.0846**，只有 `alpha_vs_buy_hold_pct` 从 `0.0` 变成 `−25.0`。
+> 因此"beta 不再被计为 alpha"这句话对 **fitness** 不成立，对**发布门**成立——
+> 冠军可以因为跑输等权买持而被拒（归档冠军的唯一拒绝原因就是
+> `alpha_vs_buy_hold=-52.20% <= 0`）。
 
 ## 统计显著性（DSR）与发布门槛
 
@@ -142,6 +160,14 @@ DSR 的完整单位约定见 `07-deflated-sharpe-ratio.md`。要点：
 - `N = population × generations + 历史试验数`。历史试验数来自
   `data/ga_trials.json`（`core/ga/trial_counter.py`），每代评估后累加——只数当前一次运行
   会严重低估多重检验负担（生产日志里有 ~24 个 walk-forward 任务）。
+  > ⚠️ 修复前**两个 N 并存**（审计 D-18）：代内每个基因的 DSR 用
+  > `population + prior`，而冠军/provenance 用 `population × generations + prior`，
+  > 于是被上报的冠军 DSR 与它自称试过的策略数不是同一个数。现在两条路径都走
+  > `core/ga/evolver.py::dsr_trial_counts`：第 g 代被评分的 N = 之前**已实际执行**的
+  > 试验数（`total_trials(ledger)`，下限为 `prior + population×(g−1)`）+ 本代
+  > `population`；冠军用同一个函数的 `prior`（此时所有代都已执行完，再加一个
+  > population 会重复计最后一**代**）。`tests/test_ga_dsr_trial_counts.py` 逐代钉住
+  > 传入的 `prior_trials` 与 provenance 的 `n_trials`。
 - **`DSR <= 0` 禁止发布**（`evolver._publication_decision`）。
 
 发布门槛（`core/ga/evolver.py`）：`trades ≥ 30`（`ga.min_champion_trades`）**且**
@@ -195,10 +221,16 @@ provenance:
 
 ## 杠杆口径（已选择）
 
-GA 评估保持**现金模型**（`ga.evaluation_leverage: 1.0`）：评估的就是将来会被检验的那份
-策略，1× 口径下的净值/回撤可直接与实盘信号对比。实盘 2–4× 杠杆
-（`config/risk_params.yaml`）会等比放大实盘盈亏与回撤，这个口径差**写在冠军 provenance 里**，
-而不是隐藏。要把杠杆纳入评分，需要同时改仓位管理与风控口径，属于另一阶段。
+GA 评估是**现金模型**：评估的就是将来会被检验的那份策略，1× 口径下的净值/回撤可直接与
+实盘信号对比。实盘 2–4× 杠杆（`config/risk_params.yaml`）会等比放大实盘盈亏与回撤，这个
+口径差**写在冠军 provenance 里**，而不是隐藏。
+
+> ⚠️ **没有 `ga.evaluation_leverage` 这个键**（审计：死配置开关）。它曾在
+> `config/config.yaml` 里承诺一个"现金模型 / 杠杆评估"的选择，但 `leverage` 在
+> `core/ga/**` 与 `core/backtest/engine.py` 里命中 **0** 次——现金模型是引擎的**唯一**行为，
+> 不是某个开关选出来的，因此该键已从 `config.yaml` 与 `app/config.py` 删除
+> （`tests/test_final_audit_fixes.py::test_every_ga_config_key_has_a_production_reader` 守住）。
+> 要把杠杆纳入评分，需要同时给引擎加杠杆输入并改仓位管理与风控口径，属于另一阶段。
 
 ## 文档一致性
 

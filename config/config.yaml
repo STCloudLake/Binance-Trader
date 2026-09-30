@@ -52,13 +52,18 @@ ga:
   # `enabled: false` and a `rejection_reasons` list in its provenance block.
   min_champion_trades: 30
   # Weight of the risk-adjusted term in the fitness formula:
-  # DSR-deflated Sharpe * min(1, trades/30) - max drawdown; the run's return is
-  # scored against the equal-weighted buy & hold of the same window/symbols.
+  # DSR-deflated Sharpe * √365 * min(1, trades/30) - max drawdown.  Read by the
+  # GA evolver (`config.ga_alpha_weight` -> `score_stats(alpha_weight=...)`).
+  #
+  # The equal-weighted buy & hold of the same window/symbols is NOT part of the
+  # fitness sum (audit D-16): it is reported as `alpha_vs_buy_hold_pct` and used
+  # by the PUBLICATION GATE and the champion provenance, nothing else.
   alpha_weight: 1.0
-  # Cash-only evaluation (1.0) — GA scores the artefact as it will be evaluated;
-  # live 2-4x leverage (risk_params.yaml) still scales live PnL/drawdown, and that
-  # mismatch is stated in the champion provenance instead of being hidden.
-  evaluation_leverage: 1.0
+  # NOTE: there is deliberately no `evaluation_leverage` key.  GA/backtest
+  # evaluation is a cash model because the engine has no leverage input at all
+  # (`leverage` appears 0 times in core/ga/** and core/backtest/engine.py); a
+  # config key promising an override would be a lie, so the mismatch with
+  # `risk_params.yaml` leverage is stated in the champion provenance instead.
 binance:
   # Trading/account client (orders, balances). testnet.binance.vision is reachable.
   testnet: true

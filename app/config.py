@@ -479,8 +479,11 @@ class Config:
         # These only affect how a genome is SCORED during GA/walk-forward:
         #   use_live_spread      — never price a historical fill from today's book
         #   min_champion_trades  — publication gate's trade-count floor
-        #   alpha_weight         — weight of the DSR/Sharpe/buy&hold term
-        #   evaluation_leverage  — 1.0 = cash model (the documented choice)
+        #   alpha_weight         — weight of the DSR alpha term in the fitness
+        # There is deliberately no `evaluation_leverage`: the engine has no
+        # leverage input, so the key could never be honoured.  Both that key and
+        # the `alpha_weight` reader existed without a consumer; `alpha_weight` is
+        # now consumed by `core.ga.evolver` (audit: dead config knobs).
         ga_cfg = self._get("ga", {})
         if not isinstance(ga_cfg, dict):
             ga_cfg = {}
@@ -492,8 +495,6 @@ class Config:
             self.ga_min_champion_trades = 30
         self.ga_alpha_weight = max(
             _as_float(ga_cfg.get("alpha_weight"), 1.0), 0.0)
-        self.ga_evaluation_leverage = max(
-            _as_float(ga_cfg.get("evaluation_leverage"), 1.0), 1.0)
 
         # Simulated-account cost model (docs/overhaul/TRADE_PAGE_API.md §五之二).
         # Deliberately separate from `backtest.cost_model` above: the backtest model

@@ -695,11 +695,24 @@ def test_doc_ten_numbers_are_reproducible_or_labelled():
         assert clip_off / clip_on == pytest.approx(9.8, abs=1.0)
     else:
         assert "接缝" in doc or "splice" in doc.lower()
-        # The clip is inert on this window (nothing exceeds ±6 MAD), so the two
-        # agree to float rounding of the clip boundary; they need not be bitwise
-        # equal because the anchored centre is the full-series median while the
-        # legacy one is this window's.
-        assert clip_off == pytest.approx(clip_on, rel=1e-3)
+        # The doc's "clip is inert" row is labelled with *its own* snapshot
+        # (11 675 rows @ 12:35, "1.000x, 相对差 2.7e-6"), and the live file gains
+        # a bar every hour: one appended bar can exceed this window's ±6·MAD
+        # limit without any splice (measured 0.5188 vs 0.5377 %/bar, 1.0365x), so
+        # pinning the snapshot equality is flaky by construction.  Recompute the
+        # *contract* from the frame just read instead — the clip may only replace
+        # bars above its own anchored limit, which keeps a splice-free window an
+        # order of magnitude below the splice regime (the doc's two labelled
+        # states are 1.000x and 9.49x) — and check the estimator really used the
+        # window's own anchor.
+        from core.ml.volatility import (DEFAULT_OUTLIER_SIGMA, clip_outliers,
+                                        series_anchor)
+
+        assert clip_off / clip_on < 5.0
+        anchor = series_anchor(rr)
+        assert clip_on == pytest.approx(
+            ewma_vol(clip_outliers(rr, sigma=DEFAULT_OUTLIER_SIGMA, anchor=anchor),
+                     window=0, outlier_sigma=0.0), rel=1e-12)
     assert to_pct(clip_on) > 0.0
 
 

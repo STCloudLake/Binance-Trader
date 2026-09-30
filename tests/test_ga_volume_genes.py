@@ -94,9 +94,13 @@ def test_no_orphan_templates_in_any_pool():
 
 def test_broken_templates_fail_the_guard():
     """The three ways a template can be an orphan, each must be reported."""
-    # (a) a column no indicator produces (the classic phantom-column template)
-    broken = G.audit_template_ownership(extra={"rvol_z > 2.0": ("rvol_z",)})
-    assert broken and "rvol_z" in broken[0] and "not produced" in broken[0]
+    # (a) a column no indicator produces (the classic phantom-column template).
+    # `rvol_z` was this test's example until the plan review made it a real
+    # indicator column (`compute_all(df, {"volume_flow": {}})`) — see
+    # `tests/test_volume_flow_indicator_columns.py`.
+    broken = G.audit_template_ownership(
+        extra={"phantom_signal > 2.0": ("phantom_signal",)})
+    assert broken and "phantom_signal" in broken[0] and "not produced" in broken[0]
 
     # (b) a declaration that under-states what the string reads
     under = G.audit_template_ownership(extra={"close > adx": ("close",)})

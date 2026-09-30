@@ -454,14 +454,19 @@ def test_default_weights():
         assert v > 0
 
 
-def test_weight_grid_coverage():
-    """Weight grid should cover a reasonable search space (1000-10000 combos)."""
-    from core.ga.fitness_calibrate import WEIGHT_GRID
-    total = 1
-    for key in WEIGHT_GRID:
-        total *= len(WEIGHT_GRID[key])
-    assert total > 1000, f"Grid too small: {total} combos"
-    assert total < 10000, f"Grid too large: {total} combos (may be slow)"
+def test_the_removed_calibration_grid_does_not_come_back():
+    """The calibration search is gone, so its search grid must not be dead data.
+
+    Audit D-26/D-4: `WEIGHT_GRID` had no reader at all (the module docstring
+    already stated the grid search "was never wired to any route or caller and
+    has been removed"), yet a 3 584-combination grid sat in the module looking
+    like a live search space.  A calibration search that comes back must arrive
+    together with its caller.
+    """
+    import core.ga.fitness_calibrate as fc
+    assert not hasattr(fc, "WEIGHT_GRID")
+    from core.ga.fitness_calibrate import DEFAULT_WEIGHTS
+    assert set(DEFAULT_WEIGHTS) == {"wr", "pf", "roc", "bal"}
 
 
 def test_spearman_perfect_correlation():

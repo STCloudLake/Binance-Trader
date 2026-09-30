@@ -36,7 +36,12 @@ import pandas as pd
 import pytest
 import yaml
 
-FEATURE_HASH = "335e63360104"     # core.ml.features.feature_schema_hash(FEATURE_NAMES)
+from core.ml.features import FEATURE_SCHEMA_V1_HASH as FEATURE_HASH  # noqa: F401
+# (audit D-4) — this used to be the literal ``"335e63360104"`` with a comment
+# claiming it was ``feature_schema_hash(FEATURE_NAMES)``; that is the **v2** hash
+# (``1f30fded996d``) now.  Importing the constant makes it definitionally
+# non-drifting, and ``tests/test_feature_schema_v1.py`` recomputes it from the
+# frozen 39-column list.
 REPO = Path(__file__).resolve().parents[1]
 
 
@@ -437,6 +442,60 @@ def test_every_ml_config_key_has_a_production_reader():
         if not any(pattern.search(text) for text in prod_text.values()):
             unread.append(key)
     assert unread == [], f"unread ml: keys (loaded but never read): {unread}"
+
+
+def test_every_ga_config_key_has_a_production_reader():
+    """Dead config knobs: the `ga:` block must not carry an unread key.
+
+    The same reader table as ``test_every_ml_config_key_has_a_production_reader``
+    for the GA block.  Before the fix, ``ga.alpha_weight`` was loaded into
+    ``Config.ga_alpha_weight`` and read by no code (the effective weight was the
+    literal ``ALPHA_WEIGHT = 1.0``), and ``ga.evaluation_leverage`` was not only
+    unread but **unhonourable** — ``leverage`` appears 0 times in ``core/ga/**``
+    and ``core/backtest/engine.py``, so the key was deleted rather than left
+    promising a cash/levered choice the engine cannot make.
+    """
+    from app.config import Config
+
+    data = yaml.safe_load((REPO / "config" / "config.yaml").read_text(encoding="utf-8"))
+    keys = list((data.get("ga") or {}).keys())
+    assert keys, "the ga: block must not be empty"
+    assert "evaluation_leverage" not in keys, (
+        "ga.evaluation_leverage cannot be honoured (no leverage input anywhere "
+        "in the engine) — do not re-add it without the plumbing")
+
+    config_src = (REPO / "app" / "config.py").read_text(encoding="utf-8")
+    prod_files = [p for p in list((REPO / "core").rglob("*.py"))
+                  + list((REPO / "app").rglob("*.py"))
+                  + list((REPO / "web").rglob("*.py"))
+                  + list((REPO / "scripts").rglob("*.py"))
+                  + list((REPO / "tools").rglob("*.py"))
+                  if p.name != "config.py" or p.parent.name != "app"]
+    prod_text = {p: p.read_text(encoding="utf-8", errors="ignore") for p in prod_files}
+
+    unread = []
+    for key in keys:
+        attr = f"ga_{key}"
+        assert f"self.{attr}" in config_src, f"ga.{key} is not even loaded"
+        pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(attr)}(?![A-Za-z0-9_])")
+        if not any(pattern.search(text) for text in prod_text.values()):
+            unread.append(key)
+    assert unread == [], f"unread ga: keys (loaded but never read): {unread}"
+
+    # The reader is real, not a mention: the weight reaches `score_stats`.
+    Config._instance = None
+    cfg = Config.load("sim")
+    assert cfg.ga_alpha_weight == 1.0        # shipped default
+    from core.ga.fitness import ALPHA_WEIGHT, score_stats
+    stats = {"trades": 60, "win_rate": 55.0, "profit_factor": 1.5,
+             "return_on_capital": 0.02, "long_trades": 30, "pnl": 200.0,
+             "sharpe": 2.0, "max_dd_pct": 1.0, "observations": 100,
+             "skew": 0.0, "kurtosis": 3.0}
+    wired = score_stats(dict(stats), None, n_trials=10,
+                        alpha_weight=cfg.ga_alpha_weight)
+    plain = score_stats(dict(stats), None, n_trials=10)
+    assert wired["fitness"] == plain["fitness"]          # bit-identical default
+    assert wired["alpha_weight"] == ALPHA_WEIGHT == 1.0
 
 
 def test_default_meta_cost_pct_matches_the_sim_fill_source():

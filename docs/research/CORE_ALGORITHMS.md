@@ -1592,6 +1592,47 @@ RESULT: 25/29 file(s) carry a gap beyond 1.5 x bar length.
 
 > 每条给出**两侧的原文与 `file:line`**。我没有修改任何既有文档（写权限限制）。
 
+> **状态跟踪（2026-09-30 更新，本表是这份清单的活口）**。标记含义：
+> **fixed here** = 本轮由文档清扫代理在其写范围内修好；**fixed by the code agent** = Lead
+> 分派给代码侧兄弟代理（D-4/D-16/D-19/死 GA 键/DSR 试验计数）；**fixed earlier** =
+> 前一轮已修，本轮复核仍成立；**report-only (lead)** = 不在本轮任何写范围（`config/`、
+> `docs/overhaul/ALGO_UPGRADE_EVIDENCE.md`、doc 06/07），只报告不修改；**open** = 仍然存在、
+> 本轮无人认领（含本轮清单未列的 doc 侧条目）。
+>
+> | # | 主题 | 状态 | 本轮记录 |
+> |---|---|---|---|
+> | D-1 | `ewma` 成本三值 | **fixed here** | `docs/core-algorithms/10-volatility-targeting.md` §3.2 按**形状**标注：实时 ≤600 根 `forecast_vol` 0.20 ms / 数组 0.16 ms；全历史 1.72 ms / 1.64 ms；`volatility.py` 的 ≈0.14 ms = 500 根数组；表的 ≈1.5 ms/bar = 全历史形状（本文 §3.9 的 0.2248/0.3093/0.2806 是同一批形状在负载下的读数） |
+> | D-2 | 裁剪倍数四值 | **fixed here** | doc 10 §2 新增"D-2 口径对照"表：10.12×/10.1×/9.81× = 历史真实接缝的三种读数；12.3× = 合成注入；当前缓存 1.000000×（全历史）/1.0365×（尾窗 500） |
+> | D-3 | legacy ML 准确率 | open | `ALGO_UPGRADE_EVIDENCE.md:66,:69` vs `docs/core-algorithms/08-ml-triple-barrier.md:154-155`，两侧都不在本轮写范围 |
+> | D-4 | 特征契约 hash | **fixed by the code agent** | `core/ml/features.py` + `tests/test_feature_schema_v1.py` |
+> | D-5 | 实盘波动率定仓接线 | open | doc 10:357-364 已过期（`core/risk/manager.py:577` 现调用 `resolve_forecast_vol_pct`）；本轮清单未列 |
+> | D-6 | doc 12 测试数 20 | **fixed here** | doc 12:61 → **24**（`--collect-only` 实测） |
+> | D-7 | 归档 "≥95 %" | report-only (lead) | `ALGO_UPGRADE_EVIDENCE.md:14,:81`；doc 11 本轮已把同一张表标注 in-sample（见 D-11） |
+> | D-8 | pairs 文档 HMM 成本 cite 错误 | open | `core/strategy/regime.py:509` 引用了一份不含该数字的文档 |
+> | D-9 | P6 计划冲击数字 | **fixed earlier** | P6 计划:61 已改为"已撤回、不要再用"（本轮复核） |
+> | D-10 | 流动性测试数 24/25/26 | **fixed here** | doc 13:291 → **26**；P6 计划:58 → **26**（`--collect-only` 实测 26） |
+> | D-11 | "三 regime"/≥95 % | **fixed here** | doc 11 表头 + ⚠️：0.9987/0.9993/0.9987 是 **in-sample**，可交易口径 **0.758/0.759/0.815**；归档两处表述待 lead |
+> | D-12 | doc 12 门写 OR | **fixed here** | doc 12:44 → **AND**（`core/ml/credibility.py:865`） |
+> | D-13 | config GARCH 成本注释 | report-only (lead) | `config/config.yaml:164`（HEAD 为 **:159**）"~12 ms/bar" vs 实测 ≈0.13 s/call / doc 10 ≈0.18–0.19 s |
+> | D-14 | alpha 漏 √365 | **fixed by the code agent** | doc 06 + `core/ga/fitness.py` |
+> | D-15 | T<20 时 alpha 记 0 | open | `docs/core-algorithms/07-deflated-sharpe-ratio.md:62-63` |
+> | D-16 | fitness 减买入持有 | **fixed by the code agent** | doc 06 + `core/ga/fitness.py` |
+> | D-17 | doc 07 门槛常数不自洽 | open | doc 07:36-37 与同页 :41 不自洽；docstring 在 `tests/test_ga_credibility.py` |
+> | D-18 | DSR 的两个 $N$ | **fixed by the code agent** | DSR 试验计数 |
+> | D-19 | `timeout_label` 自相矛盾 | **fixed by the code agent** | `core/ml/labels.py` |
+> | D-20 | doc 06 hybrid"残留"过期 | report-only (lead) | doc 06:50,:68（该文件在兄弟代理写范围，但不在其清单） |
+> | D-21 | doc 06 交叉引用失效 | report-only (lead) | doc 06:5,:210 引用不存在的"效用分析"节 |
+> | D-22 | `FEATURE_KEYS` 19 vs 20 | **fixed here** | P6 计划:17,:40 → **20**（`core/market_data/microstructure.py:125-131`） |
+> | D-23 | 配对成本两路径 | open | doc 11:95-99 只写 0.25 %/腿；`config=None` 的 0.14 %/腿 未写 |
+> | D-24 | 测试计数汇总 | **fixed here + fixed earlier** | doc 12/13、P6 计划本轮修；doc 11:111 的 **28**（25 def + 3 async）在前轮已修并本轮复核；`tests/test_condition_logic.py` 的 9 vs 10 仍 open |
+> | D-25 | 因果解码数字一处四值 | **fixed here（HMM 部分）** | doc 11 已标注 in-sample/causal（0.758–0.815）；Kalman 半衰期 `doc 11:145` 1.2 vs 代码 2.1、匹配零分布 `doc 11:33-35` −3.3015/−3.3098 vs 代码 −3.363/−3.370、`tests/test_pairs.py:203,:213` 的 `var(y)/R ≈ 100`（应为 4.3）仍 open |
+> | D-26 | 死代码与导出面 | **fixed by the code agent（部分）** | 死 GA 配置键由兄弟代理处理；`_hmm_forward_last`、`HMM_MIN_SIGMA_RATIO`、`DEPTH_DECAY_BP`、`_GARCH_MLE_X0` 仍未处理 |
+> | D-27 | garch 网格复杂度注释 | open | `core/ml/volatility.py:713` 写 O(20×8)，实际 4×8=32 |
+> | D-28 | OHLC 估计量根本不裁剪 | open | doc 10:113 的"所有估计量"对 parkinson/garman（`volatility.py:472,:494`）与 GARCH 拟合（σ=8，`:815`）不成立 |
+> | D-29 | `stop_distance_pct` 硬下限被省略 | open | doc 10:51；`core/risk/position_sizer.py:144` 是 `max(stop_min_pct, hard.min_stop_loss_distance_pct)` |
+> | D-30 | 裁剪锚点函数名/窗口计数 | open | doc 10:119-122 应写 `series_anchor`；"8 343/8 344" vs 代码 ":226-231" 的 11 176/11 176 |
+> | D-31 | `window` 语义 | open | doc 10:141-145 与 `_as_returns`（`core/ml/volatility.py:1214-1216`）显式忽略 window 冲突 |
+
 ### D-1 `ewma` 的单次成本：文档 vs 代码注释 vs 我的实测（三值）
 
 * `docs/core-algorithms/10-volatility-targeting.md:157-159`：`| **ewma（默认）** | 0.5242 | 49.06 | … | **≈1.5** |`（ms/次），并在 `:171-177` 写 "`forecast_vol(df)` = **≈1.5 ms/bar** … 在 2 ms 预算内，但余量只有 ~25%"。

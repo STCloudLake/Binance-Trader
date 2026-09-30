@@ -5,6 +5,16 @@ import pandas as pd
 import numpy as np
 import talib
 
+#: Indicator-config key that adds the first-class volume/flow columns
+#: (``rvol``/``rvol_z``/``vwap``/``mfi``/``ad_line``/``obv_slope``) from the
+#: audited P6-B feature implementations (`core.ml.features`, one implementation
+#: each: ``volr_20``, ``volz_60``, the rolling VWAP *level*, ``flow_mfi_14``, the
+#: A/D line, ``obv_slope_10``).  On demand so the hot path pays nothing for
+#: columns a strategy does not read; ``core/ga/genome.py`` enables it for any
+#: condition that reads one of them, and ``TEMPLATE_REQUIRED_COLUMNS`` declares
+#: the ownership.
+VOLUME_FLOW_INDICATOR = "volume_flow"
+
 
 def _safe_int(val, default):
     """Parse config value to int, handling empty strings and non-numeric values."""
@@ -30,7 +40,18 @@ def compute_all(df: pd.DataFrame, indicator_configs: dict) -> pd.DataFrame:
         source_col = cfg.get("source", "close")
         source = result[source_col].values if source_col in result.columns else result["close"].values
 
-        if name == "rsi":
+        if name == VOLUME_FLOW_INDICATOR:
+            # On demand, never unconditional: the family costs ~96 ms per 8 844
+            # bars (measured), which would roughly triple `compute_all` on the
+            # GA/backtest hot path for columns most strategies never read.  The
+            # GA decoder enables this key automatically for any condition that
+            # reads one of the columns (`core/ga/genome.py`), so a template can
+            # never reference a column whose producer is off.
+            from core.ml.features import volume_flow_indicator_columns
+            volume_flow = volume_flow_indicator_columns(result)
+            for column in volume_flow.columns:
+                result[column] = volume_flow[column]
+        elif name == "rsi":
             result["rsi"] = talib.RSI(source, timeperiod=period)
         elif name == "macd":
             fast = _safe_int(cfg.get("fast", 12), 12)

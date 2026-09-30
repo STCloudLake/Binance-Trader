@@ -58,11 +58,42 @@ class GARunConfig:
     tournament_size: int = 3
     mutation_rate: float = 0.25
     crossover_rate: float = 0.7
-    overfit_penalty: float = 0.3  # weight of sensitivity penalty
     max_workers: int = 4       # parallel backtest workers
     early_stop_generations: int = 10  # stop if no improvement for N gens
     seed: int = 0              # job seed (0 = derive from the clock, logged)
     window_key: str = ""       # walk-forward window identity for the checkpoint
+
+
+def dsr_trial_counts(prior_trials: int, ledger_total: int, population: int,
+                     trials_this_run: int) -> tuple[int, int]:
+    """``(prior_for_this_generation, cumulative)`` trial counts for the DSR.
+
+    The deflation must use the number of trials **actually performed**.  Two
+    numbers are needed and they come from this one formula (audit D-18):
+
+    * ``prior`` — everything tried *before* the generation being scored: the
+      persisted ledger (earlier runs plus every earlier generation of this run,
+      which ``record_trials`` updated at the end of each generation), floored by
+      the deterministic ``prior_trials + trials_this_run`` so a failed ledger
+      write can only understate, never overstate;
+    * ``cumulative`` — ``prior + population``, i.e. the count once the
+      generation being scored has performed its own trials.  The champion's DSR
+      uses the **first** number instead: by then every generation has already
+      been performed, so the ledger (== ``prior``) *is* the total — adding
+      another population there would double-count the last generation.
+
+    Before the fix the champion used ``population × generations + prior`` while
+    every in-generation score used ``population + prior``, so the reported
+    champion DSR and the gates disagreed about how many strategies had been
+    tried.  The two are now one number by construction
+    (``prior(last_generation) == champion_n_trials ==
+    cumulative(last_generation)``), which ``tests/test_ga_dsr_trial_counts.py``
+    pins.
+    """
+    deterministic = (max(int(prior_trials or 0), 0)
+                     + max(int(trials_this_run or 0), 0))
+    prior = max(int(ledger_total or 0), deterministic)
+    return prior, prior + max(int(population or 0), 0)
 
 
 class GAStrategyEvolver:
@@ -91,6 +122,8 @@ class GAStrategyEvolver:
         self._seed = int(getattr(self.config, "seed", 0) or 0)
         self._window_key = str(getattr(self.config, "window_key", "") or "")
         self._prior_trials = 0
+        #: Trials performed by THIS run's generations so far (the ledger floor).
+        self._trials_this_run = 0
         self._checkpoint_path = Path(loader.strategies_dir).parent / "data" / "ga_checkpoint.pkl"
         #: P6-D: one lazily-built volume context per run (None while the
         #: executability model is off for the whole population).
@@ -169,6 +202,13 @@ class GAStrategyEvolver:
                      if hasattr(self.loader, 'strategies_dir') else "data")
         from core.ga.trial_counter import load_trials, record_trials, total_trials
         self._prior_trials = load_trials(_data_dir)
+        self._trials_this_run = 0
+        # `ga.alpha_weight`: weight of the DSR alpha term in the fitness (wired
+        # here — P1 loaded the key from config and no code ever read it).  When
+        # the key is absent or the shipped `1.0`, the term is multiplied by
+        # exactly the same constant as before, so the default is bit-identical.
+        _bt_cfg = getattr(self.engine, 'config', None)
+        _alpha_weight = getattr(_bt_cfg, "ga_alpha_weight", None)
 
         logger.info(f"GA: population={cfg.population_size}, "
                     f"generations={cfg.generations}, "
@@ -203,6 +243,13 @@ class GAStrategyEvolver:
             _calibrated_weights = FitnessCalibrator.load_weights_static(_data_dir)
             _bt_cfg = getattr(self.engine, 'config', None)
             _batch_trials = len(self._population)
+            # The DSR's N is the number of trials ACTUALLY performed: this
+            # generation is scored against the ledger (earlier generations of
+            # this run + every earlier run) and the champion reuses the same
+            # formula, so the reported DSR and the gate cannot disagree (D-18).
+            _dsr_prior, _ = dsr_trial_counts(
+                self._prior_trials, total_trials(_data_dir, 0),
+                _batch_trials, self._trials_this_run)
 
             if getattr(cfg, 'max_workers', 1) > 1:
                 # Multi-process: each worker creates its own engine (avoids TA-Lib thread crash)
@@ -218,7 +265,8 @@ class GAStrategyEvolver:
                     engine_mode=getattr(_bt_cfg, 'backtest_engine_mode', 'legacy') if _bt_cfg else 'legacy',
                     use_live_spread=False,
                     batch_trials=_batch_trials,
-                    prior_trials=self._prior_trials,
+                    prior_trials=_dsr_prior,
+                    alpha_weight=_alpha_weight,
                     seed=self._seed,
                     # P6-D: None unless the executability model is on for some genome.
                     volume_context=self.volume_context_for(
@@ -236,7 +284,8 @@ class GAStrategyEvolver:
                     weights=_calibrated_weights,
                     use_live_spread=False,
                     batch_trials=_batch_trials,
-                    prior_trials=self._prior_trials,
+                    prior_trials=_dsr_prior,
+                    alpha_weight=_alpha_weight,
                     # P6-D: None unless the executability model is on for some genome.
                     volume_context=self.volume_context_for(
                         symbols, date_start, train_end),
@@ -247,6 +296,7 @@ class GAStrategyEvolver:
                 record_trials(_data_dir, _batch_trials, self._window_key)
             except Exception:  # pragma: no cover - never fail a run on bookkeeping
                 pass
+            self._trials_this_run += _batch_trials
 
             # 2. Sort by fitness
             self._population.sort(
@@ -321,12 +371,14 @@ class GAStrategyEvolver:
 
             # ── Out-of-sample validation (BEFORE publishing) ──
             validation = None
-            # Multiple-testing count for the DSR / gate: this run's
-            # population × generations PLUS every trial earlier runs recorded in
-            # the ledger (`data/ga_trials.json`), so the 24th walk-forward
-            # champion is not treated as if only 450 strategies had been tried.
-            n_trials = (cfg.population_size * max(self._generation, 1)
-                        + int(getattr(self, "_prior_trials", 0)))
+            # Multiple-testing count for the DSR / gate.  `prior` is the count of
+            # trials the run has ACTUALLY performed (the ledger, floored by
+            # `prior_trials + trials_this_run`) — the same formula and therefore
+            # the same number the last generation was scored against, never a
+            # smaller one (audit D-18).
+            n_trials, _ = dsr_trial_counts(
+                self._prior_trials, total_trials(_data_dir, 0),
+                cfg.population_size, self._trials_this_run)
             if has_validation:
                 logger.info(f"GA: validating champion on {validation_start}~{date_end}")
                 from core.ga.fitness import evaluate_chromosome
@@ -335,7 +387,8 @@ class GAStrategyEvolver:
                     validation_start, date_end,
                     self.engine, self.loader,
                     ga_loader=self.ga_loader,
-                    n_trials=n_trials)
+                    n_trials=n_trials,
+                    alpha_weight=_alpha_weight)
                 validation = {
                     "sharpe": val_result.get("sharpe", 0),
                     "win_rate": val_result.get("win_rate", 0),
@@ -377,8 +430,7 @@ class GAStrategyEvolver:
                 "condition_logic": champion_config.condition_logic,
                 "generations": self._generation,
                 "population_size": cfg.population_size,
-                "n_trials": (cfg.population_size * max(self._generation, 1)
-                             + int(getattr(self, "_prior_trials", 0))),
+                "n_trials": n_trials,
                 "prior_trials": int(getattr(self, "_prior_trials", 0)),
                 "fitness_components": {
                     "fitness": train_result.get("fitness"),

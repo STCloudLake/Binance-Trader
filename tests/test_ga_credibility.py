@@ -337,8 +337,16 @@ def test_batch_path_reports_real_sharpe_and_drawdown(market_dir, tmp_path):
         assert not (r["sharpe"] == 0 and r["max_dd"] == 0 and r["trade_count"] > 0)
 
 
-def test_buy_and_hold_is_subtracted_from_the_selection_metric(market_dir, tmp_path):
-    """A pure-drift window must not earn alpha credit."""
+def test_buy_and_hold_is_reported_and_gates_but_does_not_rescore(market_dir, tmp_path):
+    """The benchmark is reported and gates publication — it is NOT in `fitness`.
+
+    Audit D-16: this test used to be called
+    ``test_buy_and_hold_is_subtracted_from_the_selection_metric``, which named a
+    mechanism that does not exist.  It only ever asserted the reported field; the
+    assertion below now pins the *actual* contract as well, so the name and the
+    behaviour cannot drift apart again (``fitness`` must be invariant to
+    ``buy_hold_pct``; the gate consumes ``alpha_vs_buy_hold_pct``).
+    """
     from core.ga.fitness import score_stats, stats_from_trades
 
     # Flat strategy: no return of its own, market drifted +10% (pure beta).
@@ -356,6 +364,19 @@ def test_buy_and_hold_is_subtracted_from_the_selection_metric(market_dir, tmp_pa
     stats["total_return_pct"] = 10.0
     same = score_stats(stats, None, n_trials=100)
     assert same["alpha_vs_buy_hold_pct"] == pytest.approx(0.0)
+
+    # D-16, the contract that was documented three times and implemented zero
+    # times: `fitness` does not move when the benchmark does.
+    stats["total_return_pct"] = 30.0
+    fitnesses = []
+    for baseline in (None, 0.0, 10.0, -50.0, 25.0):
+        stats["buy_hold_pct"] = baseline
+        fitnesses.append(score_stats(dict(stats), None, n_trials=100)["fitness"])
+    assert len(set(fitnesses)) == 1, (
+        f"fitness must ignore buy_hold_pct, got {fitnesses}")
+    # ... while the reported alpha (what the publication gate reads) does move.
+    assert score_stats(dict(stats), None,
+                       n_trials=100)["alpha_vs_buy_hold_pct"] == pytest.approx(5.0)
 
 
 def test_engine_reports_the_buy_and_hold_baseline(market_dir, tmp_path):

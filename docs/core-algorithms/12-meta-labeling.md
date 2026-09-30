@@ -41,7 +41,9 @@ P2 审计已经证明：让 ML **选方向**是有害的（OOS AUC 0.396–0.447
 3. 阈值在**折内**的校准流上选出（`meta_cost_aware_threshold`），再作用于该折的测试行；
 4. 门控（`core.ml.credibility.gate_from_evaluation`）消费的是**外层**数字
    （`net_expectancy_oos` / `n_trades_oos` / `t_stat_oos` / `psr_oos`）：
-   AUC > 0.55、净期望 > 0、交易数 ≥ 100、t > 2 或 PSR ≥ 0.95。
+   AUC > 0.55、净期望 > 0、交易数 ≥ 100、t > 2 **且** PSR ≥ 0.95（`core/ml/credibility.py`
+   的门是 **AND**，不是 OR：`elif not (t_val > min_t_stat and psr_val >= min_psr)`，见
+   `core/ml/credibility.py:865`；doc 12 此前的 "或" 是错的）。
    池化搜索（在同一批被汇报的行上选阈值）只作为对照报出（`selection = pooled_optimistic`）。
 5. `thresholds_oos`（可部署阈值）= 各折选出阈值的**中位数**；若无折选出候选 →
    `threshold = None`（"无阈值"而不是"用池化最优"）。
@@ -58,7 +60,7 @@ P2 审计已经证明：让 ML **选方向**是有害的（OOS AUC 0.396–0.447
 | 硬门 | `meta_gate` → `core.ml.credibility.gate_from_evaluation` |
 | 过滤 + 缩放 | `MetaLabeler.decide` / `filter_series` / `MetaDecision.apply` |
 | 引擎集成缝 | `core/strategy/engine.py::StrategyEngine.wire_meta_filter`（`P4_META_FILTER_ENABLED = False`） |
-| 测试 | `tests/test_meta_labeling.py`（20 条） |
+| 测试 | `tests/test_meta_labeling.py`（**24** 条；`python -m pytest tests/test_meta_labeling.py --collect-only -q` 末行实测 24） |
 
 ## 实测数字（BTC/ETH 1h，5 条一级规则，共 10 次评估）
 

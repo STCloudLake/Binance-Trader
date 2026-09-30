@@ -435,9 +435,7 @@ class MLPredictor:
 
         from core.strategy.indicators import compute_all
         from core.ml.labels import (
-            class_distribution, create_three_class_label,
-            create_triple_barrier_label_vol,
-            CLASS_UP, CLASS_DOWN, CLASS_FLAT)
+            create_three_class_label, CLASS_UP, CLASS_DOWN, CLASS_FLAT)
         from core.ml.credibility import cost_pct_for, evaluate_model_oos, gate_from_evaluation
 
         df = compute_all(df, REQUIRED_INDICATORS)
@@ -456,11 +454,11 @@ class MLPredictor:
         # `ml.barrier_*` parameters and its class distribution is persisted
         # (audit P2 #8: those four keys and `max_hold_bars` were loaded and never
         # read).  Its time barrier is the strategy's real holding period.
-        barrier_kwargs = self._barrier_params()
-        barrier = create_triple_barrier_label_vol(
-            df, forward_periods=int(getattr(self.config, "ml_max_hold_bars", 24) or 24),
-            timeout_label=2.0, **barrier_kwargs)
-        barrier_dist = class_distribution(barrier)
+        # `_barrier_labels` is the ONE place the persisted distribution is
+        # computed, so the sidecar can never disagree with the labels
+        # (audit D-19: it used to read `timeout_share = 0.0` because the
+        # vol-scaled path never filled the timeout class).
+        barrier, barrier_dist, barrier_kwargs = self._barrier_labels(df)
         fwd = (df["close"].shift(-forward) - df["close"]) / df["close"]
         binary = pd.Series(pd.NA, index=df.index, dtype="Float64")
         binary[three == CLASS_UP] = 1.0
@@ -583,6 +581,25 @@ class MLPredictor:
             "min_pct": float(getattr(cfg, "ml_barrier_min_pct", 0.004)),
             "max_pct": float(getattr(cfg, "ml_barrier_max_pct", 0.06)),
         }
+
+    def _barrier_labels(self, df) -> tuple:
+        """``(labels, distribution, kwargs)`` for the persisted barrier sidecar.
+
+        The volatility-scaled triple barrier is built here and **only** here, so
+        the ``barrier.distribution`` written into the model metadata is by
+        construction ``class_distribution`` of the labels that were actually
+        produced (audit D-19: the two used to be able to disagree, and the
+        persisted ``timeout_share`` was always ``0.0``).
+        """
+        from core.ml.labels import (class_distribution,
+                                    create_triple_barrier_label_vol)
+
+        kwargs = self._barrier_params()
+        labels = create_triple_barrier_label_vol(
+            df,
+            forward_periods=int(getattr(self.config, "ml_max_hold_bars", 24) or 24),
+            timeout_label=2.0, **kwargs)
+        return labels, class_distribution(labels), kwargs
 
     # ── TFT training ─────────────────────────────────────────────────
 

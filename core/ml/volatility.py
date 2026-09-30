@@ -685,8 +685,12 @@ def garch11_loglik_grad(x2: np.ndarray, var_s: float, theta) -> tuple[float, np.
 #: likelihood **bounded**: as persistence → 1 the intercept ``omega`` shrinks
 #: toward 0 and the floor ``var_s × 1e-4`` starts to matter again.
 GARCH_MAX_PERSISTENCE = 0.999
-#: Variance-targeting start used by the coarse pre-search: the RiskMetrics-like
-#: ``(alpha, beta)`` the plan documents, with ``omega = V(1−α−β)``.
+#: The RiskMetrics-like ``(alpha, beta)`` the plan documents: the pre-search's
+#: starting point, and the ``(alpha, beta)`` of the fallback tuple
+#: :func:`_garch11_grid_scan` returns when no grid candidate is finite (the
+#: fallback's ``omega`` is that function's own ``0.05 · V`` default, not
+#: ``V(1−α−β)``).  Reference it rather than restating the numbers — the literals
+#: used to sit in the scan while this constant was read by nobody.
 _GARCH_MLE_X0 = (0.06, 0.93)
 #: The coarse pre-search grid, in ``(alpha, beta)``.  It exists because the
 #: GARCH likelihood surface on a 500-bar window is **flat and multi-modal**:
@@ -714,7 +718,7 @@ def _garch11_grid_scan(x2: np.ndarray, var_s: float) -> tuple[float, float, floa
     """
     a0, a1, astep = _GARCH_GRID_ALPHA
     b0, b1, bstep = _GARCH_GRID_BETA
-    best = (float(var_s) * 0.05, 0.06, 0.93)
+    best = (float(var_s) * 0.05, _GARCH_MLE_X0[0], _GARCH_MLE_X0[1])
     best_ll = float("inf")
     for a in np.arange(a0, a1 + 1e-12, astep):
         for b in np.arange(b0, b1 + 1e-12, bstep):

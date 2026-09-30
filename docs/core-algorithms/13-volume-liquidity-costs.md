@@ -288,7 +288,7 @@ references the key (`grep`-based, so the table cannot rot into a comment).
 ## 6. Reproduce the identities
 
 ```powershell
-python -m pytest tests/test_liquidity.py -q          # 24 passed
+python -m pytest tests/test_liquidity.py -q          # 26 passed
 python -m pytest tests/test_liquidity.py -q -s -k "call_cost"   # measured per-call cost
 ```
 

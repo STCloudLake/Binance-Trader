@@ -2,15 +2,15 @@
 
 Scoring contract (P1, GA credibility)
 -------------------------------------
-The fitness of a genome is a *risk-adjusted, trade-count-aware, benchmark-relative*
-score.  The pieces that used to be missing are the reason the GA could not
-optimise: profit factor was unbounded (a 5-trade all-winner genome scored 490
-while a 200-trade PF-2.0 genome scored 7.3), Sharpe and max drawdown were
-hardcoded to 0 in every batch path, and the buy & hold return of the same window
-was never subtracted (pure market drift scored as alpha).
+The fitness of a genome is a *risk-adjusted, trade-count-aware* score.  The
+pieces that used to be missing are the reason the GA could not optimise: profit
+factor was unbounded (a 5-trade all-winner genome scored 490 while a 200-trade
+PF-2.0 genome scored 7.3), and Sharpe and max drawdown were hardcoded to 0 in
+every batch path.
 
     fitness = base (win-rate / PF / ROC / long-short balance)
-              + weight_alpha * (DSR-deflated Sharpe * min(1, trades/30) - max_dd)
+              + weight_alpha * (DSR-deflated Sharpe * sqrt(365) * min(1, trades/30)
+                                - max_dd)
               - trade-count, loss, overtrading and complexity penalties
 
 with
@@ -19,8 +19,12 @@ with
     pf_term = min(pf, PF_TERM_CAP)                 # capped
     pf_term *= min(1, trades / PF_TRADE_FLOOR)     # scaled by evidence
 
-and the alpha term subtracting the equal-weighted buy & hold return of the same
-symbols and window, so beta is not scored as alpha.
+The equal-weighted buy & hold return of the same symbols and window is **NOT**
+subtracted here (audit D-16: three documents claimed it was).  It is reported as
+``alpha_vs_buy_hold_pct`` and consumed by the **publication gate**
+(``core.ga.evolver._publication_decision``) and the champion provenance only, so
+a genome that loses to buy & hold is rejected rather than re-scored.  A genome's
+``fitness`` is therefore identical for ``buy_hold_pct = None`` and any value.
 """
 
 import time
@@ -34,10 +38,9 @@ from core.ga.genome import chromosome_to_strategy
 from core.strategy.loader import StrategyLoader
 
 # ── Scoring constants (single source of truth) ──────────────────────────
-#: Synthetic loss used to shrink the profit factor: ``pf = gross_win/(gross_loss+mean_win)``.
-#: A genome with a single lucky winner therefore caps near 2.0 instead of 100.
-PF_SHRINK = True
 #: Hard ceiling on the profit-factor term (was effectively 500 with weight 5).
+#: The shrink itself is unconditional — see :func:`profit_factor_shrunk` (there
+#: used to be a ``PF_SHRINK`` flag here that nothing read).
 PF_TERM_CAP = 10.0
 #: Trade count at which the profit-factor term reaches full weight.
 PF_TRADE_FLOOR = 50
@@ -122,6 +125,7 @@ def evaluate_chromosome(
     n_trials: int = 1,
     use_live_spread: bool = False,
     volume_context: "VolumeContext | None" = None,
+    alpha_weight: float | None = None,
 ) -> dict:
     """Evaluate a single chromosome via backtest.
 
@@ -181,7 +185,8 @@ def evaluate_chromosome(
         stats["max_dd"] = stats["max_dd_pct"]
         if not stats["max_dd"]:
             stats["max_dd"] = abs(_finite(metrics.get("max_drawdown_pct", 0)))
-        score = score_stats(stats, chromosome, n_trials=n_trials)
+        score = score_stats(stats, chromosome, n_trials=n_trials,
+                            alpha_weight=alpha_weight)
         score["sharpe"] = round(_finite(score.get("sharpe")), 4)
         score["win_rate"] = round(_finite(stats["win_rate"]), 2)
         score["profit_factor"] = round(_finite(stats["profit_factor"]), 4)
@@ -834,14 +839,21 @@ def _days_span(equity_curve: list[dict]) -> float:
 
 def score_stats(stats: dict, chromosome: dict | None = None,
                 weights: dict | None = None, n_trials: int = 1,
-                prior_trials: int = 0) -> dict:
+                prior_trials: int = 0,
+                alpha_weight: float | None = None) -> dict:
     """The ONE fitness formula every GA path uses.
 
     See the module docstring for the formula and the rationale of each term.
+
+    ``alpha_weight`` overrides :data:`ALPHA_WEIGHT` (the ``ga.alpha_weight``
+    config key).  ``None`` — and the shipped ``1.0`` — are bit-identical, because
+    the term is then multiplied by exactly the same constant.
     """
     w = dict(DEFAULT_WEIGHTS)
     if weights:
         w.update({k: v for k, v in weights.items() if k in w})
+    weight_alpha = ALPHA_WEIGHT if alpha_weight is None else _finite(
+        alpha_weight, ALPHA_WEIGHT)
 
     trades = int(_finite(stats.get("trades")))
     win_rate = _finite(stats.get("win_rate"))
@@ -903,14 +915,15 @@ def score_stats(stats: dict, chromosome: dict | None = None,
     alpha = dsr_sharpe * evidence - stats_out["max_dd"]
     stats_out["alpha_pct"] = alpha
     stats_out["deflated_sharpe"] = _dsr["dsr"]
-    fitness += alpha * ALPHA_WEIGHT
+    fitness += alpha * weight_alpha
 
     if chromosome is not None:
         fitness -= complexity_penalty(chromosome)
 
     stats_out["fitness"] = round(fitness, 4)
-    stats_out["fitness_base"] = round(fitness - alpha * ALPHA_WEIGHT, 4)
-    stats_out["fitness_alpha"] = round(alpha * ALPHA_WEIGHT, 4)
+    stats_out["fitness_base"] = round(fitness - alpha * weight_alpha, 4)
+    stats_out["fitness_alpha"] = round(alpha * weight_alpha, 4)
+    stats_out["alpha_weight"] = weight_alpha
     # Alpha versus the equal-weighted buy & hold of the SAME window/symbols.
     baseline = stats.get("buy_hold_pct")
     if baseline is None:
@@ -1003,6 +1016,7 @@ def evaluate_population_batch(
     batch_trials: int = 1,
     prior_trials: int = 0,
     volume_context: "VolumeContext | None" = None,
+    alpha_weight: float | None = None,
 ) -> list[dict]:
     """Evaluate chromosomes in parallel batched backtests.
 
@@ -1091,7 +1105,8 @@ def evaluate_population_batch(
                 volume_context=volume_context)
             stats = score_stats(stats, chrom, weights=weights,
                                 n_trials=batch_trials,
-                                prior_trials=prior_trials)
+                                prior_trials=prior_trials,
+                                alpha_weight=alpha_weight)
             results[idx] = {
                 "fitness": stats["fitness"],
                 "fitness_base": stats.get("fitness_base"),
@@ -1247,7 +1262,8 @@ def _mp_worker(worker_args: dict) -> list:
             volume_context=volume_context)
         stats = score_stats(stats, chrom, weights=weights,
                             n_trials=worker_args.get("batch_trials", 1),
-                            prior_trials=worker_args.get("prior_trials", 0))
+                            prior_trials=worker_args.get("prior_trials", 0),
+                            alpha_weight=worker_args.get("alpha_weight"))
         results.append((idx, {
             "fitness": stats["fitness"],
             "fitness_base": stats.get("fitness_base"),
@@ -1314,6 +1330,7 @@ def evaluate_population_multiprocess(
     prior_trials: int = 0,
     seed: int = 0,
     volume_context: "VolumeContext | None" = None,
+    alpha_weight: float | None = None,
 ) -> list[dict]:
     """Evaluate chromosomes in parallel PROCESSES (not threads).
 
@@ -1372,6 +1389,8 @@ def evaluate_population_multiprocess(
             "use_live_spread": use_live_spread,
             "batch_trials": batch_trials,
             "prior_trials": prior_trials,
+            # `ga.alpha_weight` (None = the shipped ALPHA_WEIGHT).
+            "alpha_weight": alpha_weight,
             # P6-D: one shared, picklable volume context for the executability
             # model (None when the model is off — nothing is measured then).
             "volume_context": volume_context,

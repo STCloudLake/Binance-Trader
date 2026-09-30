@@ -184,6 +184,17 @@ y = create_triple_barrier_label(
   数据上这一项就移动了 24 根 bar；在真实 8 845 根 BTC 1h 数据上它摧毁了 16 个真实
   屏障触及（修复前标签数 8 840 / 修复后 8 844 中最后 4 行为 `NA`）。
   `timeout_label=None` 时整类超时为 `NA`（旧文档写反了）。
+- **样本内超时类现在真的会被填**（审计 D-19，已修代码）：docstring 一直写"设了
+  `timeout_label` 时样本内的 `NA` 被填成超时类、右边缘不填"，但实现里**没有任何
+  `fillna`**，因此 vol-scaled 路径**根本不产生类 2**，
+  `class_distribution(...)["timeout_share"]` 恒为 `0.0`，
+  `core/ml/predictor.py` 落盘的 `barrier.distribution.timeout_share` 也恒为 `0.0`
+  （而遗留定宽包装 `core/ml/features.py` **确实**在填）。现在
+  `create_triple_barrier_label_vol` 只对 `[start, stop)` 区间里的真实超时填
+  `timeout_label`：右边缘 `[stop, n)` 与 `max_rows` 之前的行保持 `NA`。
+  实测：完全不动屏障的平坦序列 → class-2 占比 **1.0**、`timeout_label=None` → 0 个非 NA；
+  `tests/test_ml_credibility.py::test_the_vol_scaled_path_emits_the_timeout_class_and_persists_it`
+  同时断言 `MLPredictor._barrier_labels` 落盘的分布**就是**它产出的标签的分布。
 - **滚动 Hurst 成本**：`compute_features` 现在用**有界** R/S Hurst
   （`HURST_LOOKBACK=60`、4 个 lag、每 4 根刷新并 ffill），不再依赖
   `REQUIRED_INDICATORS["hurst"]`（10 lag × 100 窗口 × 每根 bar，实测 8 845 根

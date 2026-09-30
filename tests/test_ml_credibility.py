@@ -571,6 +571,89 @@ def test_triple_barrier_tail_is_na_and_genuine_hits_survive():
     assert legacy.iloc[-horizon:].isna().all()
 
 
+def test_the_vol_scaled_path_emits_the_timeout_class_and_persists_it():
+    """Audit D-19: the vol-scaled barrier path produced **no class 2** at all.
+
+    ``create_triple_barrier_label_vol`` documents that an interior ``NA`` (no
+    barrier touched inside a complete forward window) is filled with
+    ``timeout_label``, but the implementation never called ``fillna`` — so
+    ``class_distribution(...)["timeout_share"]`` was ``0.0`` on that path and
+    ``core/ml/predictor.py`` persisted ``barrier.distribution.timeout_share=0.0``
+    for every model.  The legacy fixed-width wrapper *did* fill, so the two
+    paths disagreed about the same contract.
+    """
+    from core.ml.labels import (class_distribution,
+                                create_triple_barrier_label_vol)
+    from core.ml.features import create_triple_barrier_label
+
+    horizon = 24
+    # A dead-flat series can never touch a barrier (the width is clamped to a
+    # positive minimum), so every complete window is a genuine timeout.
+    flat = _ohlcv(300)
+    for col in ("open", "high", "low", "close"):
+        flat[col] = 100.0
+    flat["volume"] = 1000.0
+
+    labels = create_triple_barrier_label_vol(
+        flat, forward_periods=horizon, timeout_label=2.0)
+    dist = class_distribution(labels)
+    assert dist["timeout_share"] == pytest.approx(1.0)
+    assert dist["shares"][2] == pytest.approx(1.0)
+    assert labels.iloc[:-horizon].notna().all()
+    assert labels.iloc[-horizon:].isna().all()          # right edge stays NA
+    assert set(labels.dropna().unique()) == {0.0, 1.0, 2.0} - {0.0, 1.0}
+
+    # `timeout_label=None` keeps the whole timeout class NA (unchanged).
+    assert create_triple_barrier_label_vol(
+        flat, forward_periods=horizon, timeout_label=None).isna().all()
+
+    # `max_rows` labels only its own window: the prefix is NOT a timeout.
+    windowed = create_triple_barrier_label_vol(
+        flat, forward_periods=horizon, timeout_label=2.0, max_rows=100)
+    assert windowed.iloc[:-100].isna().all()
+    assert windowed.iloc[-24:].isna().all()
+    assert (windowed.iloc[-100:-horizon] == 2.0).all()
+
+    # The legacy fixed-width path agrees (it always filled).
+    legacy = create_triple_barrier_label(
+        flat, forward_periods=horizon, upper_pct=0.02, lower_pct=0.02,
+        timeout_label=2.0, vol_scaled=False)
+    assert class_distribution(legacy)["timeout_share"] == pytest.approx(1.0)
+
+    # The predictor persists `class_distribution` of THIS series: the sidecar
+    # and the labels must be one number (they used to be 0.0 by construction).
+    from core.ml.predictor import MLPredictor
+
+    class _Cfg:
+        data_dir = "data"
+        ml_enabled = False
+        ml_model_type = "lightgbm"
+        ml_feature_list = None
+
+    class _Bus:
+        def subscribe(self, *a, **k):
+            pass
+
+        def unsubscribe(self, *a, **k):
+            pass
+
+    class _Md:
+        watched_symbols: list = []
+
+    predictor = MLPredictor(_Cfg(), _Bus(), _Md())
+    persisted_labels, persisted_dist, kwargs = predictor._barrier_labels(flat)
+    assert kwargs == predictor._barrier_params()
+    assert persisted_dist["timeout_share"] == pytest.approx(1.0)
+    assert persisted_dist == class_distribution(persisted_labels)
+    # And on a live-shaped series the share is whatever the labels really are —
+    # never the hardcoded 0.0 the audit measured.
+    live_shaped = _ohlcv(2000)
+    labels2, dist2, _ = predictor._barrier_labels(live_shaped)
+    assert dist2 == class_distribution(labels2)
+    assert dist2["n"] == len(live_shaped) - int(
+        getattr(predictor.config, "ml_max_hold_bars", 24) or 24)
+
+
 def test_uniqueness_weights_range_is_not_documented_as_one():
     """Audit P2 #10: weights are mean-normalised to 1, max ≈ 2.08, not "(0,1]"."""
     from core.ml.evaluation import sample_uniqueness_weights

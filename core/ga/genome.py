@@ -274,6 +274,40 @@ TIMEFRAME_OPTIONS = list(DEFAULT_INTERVALS)
 
 INDICATOR_NAMES = ["rsi", "macd", "bollinger", "adx", "ema", "atr", "stoch", "cci", "obv", "sma", "hurst", "swing_points", "frac_diff"]
 
+# ── First-class volume / flow indicator columns (audit: clean columns) ──
+#
+# `rvol`/`rvol_z`/`vwap`/`mfi`/`ad_line`/`obv_slope` are the P6-B feature family's
+# own series under readable names, produced by `compute_all` when — and only when
+# — the indicator config carries :data:`VOLUME_FLOW_INDICATOR`
+# (`core/strategy/indicators.py`; on demand because the family costs ~96 ms per
+# 8 844 bars, measured, and most strategies read none of it).
+#
+# They are NOT a GA gene: adding one would change `random_chromosome`, i.e. the
+# shipped search space.  The decoder instead enables the key automatically for any
+# candidate condition that references one of the columns
+# (:func:`_condition_reads_volume_flow`), which is what keeps
+# "template references a column" and "the column is produced" one invariant — the
+# alternative is the `'adx' is not defined` defect class the sanitiser exists for.
+VOLUME_FLOW_INDICATOR = "volume_flow"
+VOLUME_FLOW_COLUMNS = ("rvol", "rvol_z", "vwap", "mfi", "ad_line", "obv_slope")
+
+
+def _condition_reads_volume_flow(condition) -> bool:
+    """True when *condition* reads one of :data:`VOLUME_FLOW_COLUMNS`.
+
+    Parsed with the condition grammar's own identifier extractor (so a column
+    name inside a string or a call name cannot trigger it); an unparseable
+    condition falls back to a substring test, which can only enable the key —
+    never drop a column a surviving condition needs.
+    """
+    if not isinstance(condition, str) or not condition.strip():
+        return False
+    try:
+        identifiers = template_identifier_columns(condition)
+    except SyntaxError:
+        return any(column in condition for column in VOLUME_FLOW_COLUMNS)
+    return bool(identifiers & set(VOLUME_FLOW_COLUMNS))
+
 # Indicator inclusion probability for random init (avoid all-on/all-off extremes)
 INDICATOR_INIT_PROB = {
     "rsi": 0.6, "macd": 0.6, "bollinger": 0.5, "adx": 0.4, "ema": 0.4,
@@ -328,6 +362,11 @@ CONDITION_INDICATOR_MAP = {
     # every frame, so they carry no indicator requirement.  Declared explicitly
     # so the mapping stays in step with ``RAW_ALWAYS_AVAILABLE_COLUMNS``.
     "volume": [], "high": [], "low": [], "volume_sma": [],
+    # First-class volume/flow columns (audit: "clean indicator columns").  They
+    # are produced on demand by ``compute_all(df, {"volume_flow": {}})``, so a
+    # condition that reads one of them *requires* that config key — sanitisation
+    # drops it otherwise, exactly like `adx` requires the adx gene.
+    **{column: [VOLUME_FLOW_INDICATOR] for column in VOLUME_FLOW_COLUMNS},
 }
 
 # ── P6-D: indicator availability + template ownership ──────────────────
@@ -373,6 +412,9 @@ COLUMN_INDICATOR_OWNER: dict[str, str | None] = {
     "swing_high": "swing_points", "swing_low": "swing_points",
     "dist_to_high_pct": "swing_points", "dist_to_low_pct": "swing_points",
     "swing_range_pct": "swing_points", "frac_close": "frac_diff",
+    # First-class volume/flow columns: produced only when the `volume_flow`
+    # indicator key is on, so they are owned, not raw.
+    **{column: VOLUME_FLOW_INDICATOR for column in VOLUME_FLOW_COLUMNS},
 }
 
 #: Indicator gene → the config ``compute_all`` needs to produce its columns.
@@ -391,6 +433,8 @@ INDICATOR_CONFIG_FOR_COLUMNS: dict[str, dict] = {
     "hurst": {"lookback": 100},
     "swing_points": {"lookback": 5},
     "frac_diff": {"d": 0.4},
+    # The volume/flow column family takes no parameters.
+    VOLUME_FLOW_INDICATOR: {},
 }
 
 #: Every pool template → the columns it reads.  Compact by construction: a
@@ -489,7 +533,8 @@ def audit_template_ownership(pools: dict[str, dict[str, list[str]]] | None = Non
         "entry": CONDITION_POOL, "exit": EXIT_CONDITION_POOL}
     declared = dict(TEMPLATE_REQUIRED_COLUMNS)
     injected = dict(extra or {})
-    all_indicators = set(INDICATOR_NAMES) | set(ALWAYS_AVAILABLE_COLUMNS)
+    all_indicators = (set(INDICATOR_NAMES) | set(ALWAYS_AVAILABLE_COLUMNS)
+                      | {VOLUME_FLOW_INDICATOR})
     problems: list[str] = []
 
     audit_targets: list[tuple[str, str]] = []
@@ -521,8 +566,11 @@ def audit_template_ownership(pools: dict[str, dict[str, list[str]]] | None = Non
             problems.append(f"{where}: column(s) {sorted(unknown)} are "
                             f"not produced by any indicator: "
                             f"{template[:60]}")
-        # The sanitiser must keep the template iff its owners are on.
-        owners = template_owners(template)
+        # The sanitiser must keep the template iff its owners are on.  Owners come
+        # from the columns *this* call resolved (so an injected template is
+        # audited too), not from the pool-only declaration table.
+        owners = {COLUMN_INDICATOR_OWNER[c] for c in columns
+                  if COLUMN_INDICATOR_OWNER.get(c)}
         side = "long"
         for pool_name, sides in pools.items():
             for _side, templates in sides.items():
@@ -953,6 +1001,16 @@ def chromosome_to_strategy(chromosome: dict) -> StrategyConfig:
     # ``'adx > 20' — name 'adx' is not defined``.  The authoritative set is the
     # DECODED ``indicators`` dict, plus the columns ``compute_all`` always adds
     # (``close``/``volume_ratio``/``ema_fast``/``ema_slow``/``sma``).
+    # First-class volume/flow columns: any candidate condition that reads one of
+    # them makes the config ask for the family, so the column and the condition
+    # are one invariant and sanitisation can treat them as owned.  Enabling the
+    # key is additive (it adds columns, it never removes an indicator), so a
+    # chromosome that reads none of them decodes byte-for-byte as before.
+    if any(_condition_reads_volume_flow(c)
+           for side in ("entry_long", "entry_short", "exit_long", "exit_short")
+           for c in (struct.get(side, []) or [])):
+        indicators.setdefault(VOLUME_FLOW_INDICATOR, {})
+
     enabled_set = set(indicators.keys()) | ALWAYS_AVAILABLE_COLUMNS
     if "sma" in indicators:
         enabled_set.add("sma")

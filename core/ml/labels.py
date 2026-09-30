@@ -284,12 +284,22 @@ def create_triple_barrier_label_vol(
                 break
         labels[i] = hit
 
-    result = pd.Series(labels, index=df.index)
-    # The last ``horizon`` rows have no complete forward window and stay ``NA``
-    # in **both** modes: with ``timeout_label`` they are *not* filled (only
-    # genuine timeouts are), and with ``timeout_label = None`` the whole
-    # timeout class is ``NA`` — the pre-P2 docstring claimed the opposite.
-    return result
+    if timeout_label is not None and stop > start:
+        # Genuine timeouts — a bar in ``[start, stop)`` whose barriers were never
+        # touched inside a COMPLETE forward window — take the timeout class.  The
+        # right edge ``[stop, n)`` has no complete window at all and stays ``NA``,
+        # and so does the pre-``max_rows`` prefix.  This is the same contract the
+        # legacy fixed-width path in ``core/ml/features.py`` implements
+        # (``fillna(timeout_label)`` then restore the tail), and it is what the
+        # docstring above — and ``core/ml/predictor.py``'s persisted
+        # ``barrier.distribution.timeout_share`` — has always claimed.  Before the
+        # fix no ``fillna`` happened at all, so this path emitted **no class 2**
+        # and every persisted ``timeout_share`` read ``0.0``.
+        segment = labels[start:stop]
+        labels[start:stop] = np.where(np.isnan(segment),
+                                      float(timeout_label), segment)
+
+    return pd.Series(labels, index=df.index)
 
 
 def class_distribution(labels: pd.Series) -> dict:

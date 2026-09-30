@@ -46,6 +46,16 @@ import pandas as pd
 import numpy as np
 
 
+def _schema_hash(feature_names) -> str:
+    """``sha1(json(list))[:12]`` — the ONE feature-contract hashing rule.
+
+    Both :func:`feature_schema_hash` and the frozen v1 hash go through here, so a
+    contract hash can never be computed two ways (audit D-4).
+    """
+    return hashlib.sha1(json.dumps(list(feature_names)).encode("utf-8")
+                        ).hexdigest()[:12]
+
+
 # ── Canonical feature list (54 features) ────────────────────────────────
 
 DEFAULT_FEATURES: list[str] = [
@@ -96,19 +106,43 @@ DEFAULT_FEATURES: list[str] = [
     "flow_vol_price_corr_20", "flow_vol_centroid_20",
 ]
 
-#: Contract version.  v1 = the 39-column P2 contract (hash ``335e63360104`` for
-#: the exact v1 column list), v2 = v1 + the 15-column volume/flow family above.
-#: A model whose sidecar carries a v1 hash is **refused by name** (see
-#: :data:`FEATURE_SCHEMA_V1_HASH` and
+#: The **15** columns P6-B added on top of the v1 contract (the volume/flow
+#: family).  Named as a set so the frozen v1 contract below can be *recomputed*
+#: by exclusion instead of restated as a literal (audit D-4).
+VOLUME_FLOW_FEATURES: tuple[str, ...] = (
+    "volr_5", "volr_10", "volr_20", "volr_60",
+    "volz_60",
+    "vwap_dev_20", "vwap_dev_session",
+    "flow_close_position_weighted",
+    "obv_slope_10", "ad_slope_10",
+    "flow_cmf_20", "flow_mfi_14", "flow_amihud_20",
+    "flow_vol_price_corr_20", "flow_vol_centroid_20",
+)
+
+#: Contract version.  v1 = the 39-column P2 contract, v2 = v1 + the 15-column
+#: volume/flow family above.  A model whose sidecar carries a v1 hash is
+#: **refused by name** (see :data:`FEATURE_SCHEMA_V1_HASH` and
 #: :func:`feature_schema_mismatch_reason`) rather than silently scored on a
 #: reordered matrix.
 FEATURE_SCHEMA_VERSION = 2
 
+#: The frozen **v1** (39-column P2) contract: :data:`DEFAULT_FEATURES` *without*
+#: the P6-B volume/flow family.  Recomputed by exclusion — never a stale literal
+#: — so it is always the list the frozen hash was taken from.  If a future
+#: contract version adds a column without adding it to
+#: :data:`VOLUME_FLOW_FEATURES`, this list grows and the pinned-hash test
+#: (``tests/test_feature_schema_v1.py``) fails loudly instead of silently
+#: redefining what "v1" means.
+FEATURE_V1_NAMES: tuple[str, ...] = tuple(
+    name for name in DEFAULT_FEATURES if name not in VOLUME_FLOW_FEATURES)
+
 #: The frozen v1 hash — ``feature_schema_hash`` of the 39-column P2 contract, as
-#: persisted by every model trained before P6-B.  Kept as a literal (and not
-#: recomputed, it *cannot* be recomputed once ``DEFAULT_FEATURES`` grows) so the
-#: refusal message can say "this is a v1 model".
-FEATURE_SCHEMA_V1_HASH = "335e63360104"
+#: persisted by every model trained before P6-B.  **Recomputed from
+#: :data:`FEATURE_V1_NAMES`** (audit D-4: the literal ``335e63360104`` was
+#: correct but could not be reproduced from anything in the module, so nothing
+#: could prove the shipped list and the shipped hash agreed) and pinned by the
+#: test above, so it can neither drift nor be mistyped.
+FEATURE_SCHEMA_V1_HASH = _schema_hash(FEATURE_V1_NAMES)
 
 #: The one and only feature contract.  Trainers persist this list in the model
 #: metadata and refuse to score a matrix whose columns differ (item 5).
@@ -288,8 +322,8 @@ class FeatureContractError(RuntimeError):
 
 def feature_schema_hash(feature_names: list[str] | tuple[str, ...] | None = None) -> str:
     """Stable hash of a feature list — stored in model metadata."""
-    names = list(FEATURE_NAMES if feature_names is None else feature_names)
-    return hashlib.sha1(json.dumps(names).encode("utf-8")).hexdigest()[:12]
+    names = FEATURE_NAMES if feature_names is None else feature_names
+    return _schema_hash(names)
 
 
 def feature_schema_label(stored_hash) -> str:
@@ -460,6 +494,103 @@ def _rolling_hurst_bounded(
     return series.ffill()
 
 
+def _nonzero_volume(vol: pd.Series) -> pd.Series:
+    """``vol`` with exact zeros → ``NaN`` (the family's input convention)."""
+    return vol.replace(0.0, np.nan) if (vol == 0).any() else vol
+
+
+def _typical_price(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    """``(high + low + close) / 3`` — the VWAP/MFI price basis."""
+    return (high + low + close) / 3.0
+
+
+def _rvol(volume: pd.Series, window: int = 20) -> pd.Series:
+    """Relative volume ``volume / (rolling_mean(volume, w) + 1e-12)``."""
+    return volume / (volume.rolling(window).mean() + 1e-12)
+
+
+def _volz(volume: pd.Series) -> pd.Series:
+    """Anchored z-score of **log** volume (the ``volz_60`` definition)."""
+    log_vol = np.log(volume.clip(lower=1e-12))
+    centre, scale = _expanding_mad(log_vol)
+    return (log_vol - centre) / (scale.replace(0.0, np.nan) + 1e-12)
+
+
+def _vwap_level(typical: pd.Series, volume: pd.Series,
+                window: int = 20) -> pd.Series:
+    """Rolling VWAP *level*: ``Σ(tp·vol, w) / (Σ(vol, w) + 1e-12)``."""
+    return ((typical * volume).rolling(window).sum()
+            / (volume.rolling(window).sum() + 1e-12))
+
+
+def _obv_line(close: pd.Series, volume: pd.Series) -> pd.Series:
+    """On-Balance Volume level: ``Σ sign(Δclose)·volume``."""
+    direction = np.sign(close.diff(1)).fillna(0.0)
+    return (direction * volume.fillna(0.0)).cumsum()
+
+
+def _ad_line(high: pd.Series, low: pd.Series, close: pd.Series,
+             volume: pd.Series) -> pd.Series:
+    """Accumulation/distribution line: ``Σ CLV·volume``."""
+    money_flow_multiplier = (
+        ((close - low) - (high - close)) / (high - low + 1e-12)
+    ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return (money_flow_multiplier * volume.fillna(0.0)).cumsum()
+
+
+def _mfi(typical: pd.Series, volume: pd.Series,
+         window: int = MFI_WINDOW) -> pd.Series:
+    """Money Flow Index(14), 0–100, on the *typical* price."""
+    raw_flow = typical * volume.fillna(0.0)
+    up_flow = raw_flow.where(typical.diff(1) > 0, 0.0)
+    down_flow = raw_flow.where(typical.diff(1) < 0, 0.0)
+    positive = up_flow.rolling(window).sum()
+    negative = down_flow.rolling(window).sum()
+    money_ratio = positive / (negative + 1e-12)
+    return 100.0 - 100.0 / (1.0 + money_ratio)
+
+
+#: The six first-class **indicator** names for the same series, so the GA
+#: condition grammar (`core/strategy/indicators.compute_all` →
+#: `evaluate_condition`) can read them without restating a formula.  They are the
+#: P6-B family's own columns under readable names: ``rvol`` = ``volr_20``,
+#: ``rvol_z`` = ``volz_60``, ``vwap`` = the rolling VWAP *level* behind
+#: ``vwap_dev_20``, ``mfi`` = ``flow_mfi_14``, ``ad_line`` = the cumulative A/D
+#: line behind ``ad_slope_10``, ``obv_slope`` = ``obv_slope_10``.
+INDICATOR_VOLUME_FLOW_COLUMNS: tuple[str, ...] = (
+    "rvol", "rvol_z", "vwap", "mfi", "ad_line", "obv_slope")
+
+
+def volume_flow_indicator_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """The six :data:`INDICATOR_VOLUME_FLOW_COLUMNS` for a raw OHLCV frame.
+
+    One implementation, shared with the v2 feature family (:func:`_rvol` /
+    :func:`_volz` / :func:`_vwap_level` / :func:`_mfi` / :func:`_ad_line` are the
+    same helpers :func:`_volume_flow_features` calls), so an indicator column can
+    never become a lookalike of the audited feature.  Causal by construction:
+    every window is trailing, nothing is shifted forward.
+    """
+    close = df["close"].astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    raw_vol = df["volume"].astype(float)
+    # The family's own convention, exactly: `volr_*`/`volz_60` are built from the
+    # RAW volume column, the VWAP/MFI/A-D/OBV columns from the zero→NaN series.
+    volume = _nonzero_volume(raw_vol)
+    typical = _typical_price(high, low, close)
+    scale_vol = raw_vol.rolling(VOL_PRICE_WINDOW).mean() + 1e-12
+
+    out = pd.DataFrame(index=df.index)
+    out["rvol"] = _rvol(raw_vol, VOLR_WINDOWS[-2])         # 20 — same as volr_20
+    out["rvol_z"] = _volz(raw_vol)                         # same as volz_60
+    out["vwap"] = _vwap_level(typical, volume, VOL_PRICE_WINDOW)
+    out["mfi"] = _mfi(typical, volume)
+    out["ad_line"] = _ad_line(high, low, close, volume)
+    # The slope (not the level) is the information; the level is a random walk.
+    out["obv_slope"] = (_rolling_slope(_obv_line(close, volume)) / scale_vol)
+    return out
+
+
 def _volume_flow_features(df: pd.DataFrame, close: pd.Series, vol: pd.Series,
                           high: pd.Series, low: pd.Series) -> pd.DataFrame:
     """The 15-column volume/flow family (P6-B, contract v2).
@@ -507,7 +638,10 @@ def _volume_flow_features(df: pd.DataFrame, close: pd.Series, vol: pd.Series,
     ``core.risk.liquidity`` uses).  Both paths are causal.
     """
     out = pd.DataFrame(index=df.index)
-    volume = vol.replace(0.0, np.nan) if (vol == 0).any() else vol
+    # The primitives below are shared with the GA indicator columns
+    # (`volume_flow_indicator_columns`) — one implementation each, so the two
+    # consumers cannot drift apart.
+    volume = _nonzero_volume(vol)
     log_vol = np.log(vol.clip(lower=1e-12))
 
     # Quote (USDT) notional per bar: the real column when the cache has it, the
@@ -519,20 +653,15 @@ def _volume_flow_features(df: pd.DataFrame, close: pd.Series, vol: pd.Series,
 
     # ── relative volume, multi-window ──
     for window in VOLR_WINDOWS:
-        mean_vol = vol.rolling(window).mean()
-        out[f"volr_{window}"] = vol / (mean_vol + 1e-12)
+        out[f"volr_{window}"] = _rvol(vol, window)
 
     # ── anchored volume z-score ──
-    anchor_centre, anchor_scale = _expanding_mad(log_vol)
-    out["volz_60"] = ((log_vol - anchor_centre)
-                      / (anchor_scale.replace(0.0, np.nan) + 1e-12))
+    out["volz_60"] = _volz(vol)
 
     # ── VWAP deviation ──
-    typical = (high + low + close) / 3.0
+    typical = _typical_price(high, low, close)
     pv = typical * volume
-    rolling_pv = pv.rolling(20).sum()
-    rolling_vol = volume.rolling(20).sum()
-    vwap_20 = rolling_pv / (rolling_vol + 1e-12)
+    vwap_20 = _vwap_level(typical, volume, VOL_PRICE_WINDOW)
     out["vwap_dev_20"] = close / (vwap_20 + 1e-12) - 1.0
     expanding_pv = pv.fillna(0.0).cumsum()
     expanding_vol = volume.fillna(0.0).cumsum()
@@ -540,30 +669,21 @@ def _volume_flow_features(df: pd.DataFrame, close: pd.Series, vol: pd.Series,
     out["vwap_dev_session"] = close / (vwap_session + 1e-12) - 1.0
 
     # ── OBV / A-D slopes (not levels) ──
-    direction = np.sign(close.diff(1)).fillna(0.0)
-    obv = (direction * volume.fillna(0.0)).cumsum()
+    obv = _obv_line(close, volume)
     scale_vol = vol.rolling(20).mean() + 1e-12
     out["obv_slope_10"] = _rolling_slope(obv) / scale_vol
 
-    money_flow_multiplier = (
-        ((close - low) - (high - close)) / (high - low + 1e-12)
-    ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    ad_line = (money_flow_multiplier * volume.fillna(0.0)).cumsum()
+    ad_line = _ad_line(high, low, close, volume)
     out["ad_slope_10"] = _rolling_slope(ad_line) / scale_vol
 
     # ── Chaikin money flow ──
-    mfv = money_flow_multiplier * volume.fillna(0.0)
+    mfv = (((close - low) - (high - close)) / (high - low + 1e-12)
+           ).replace([np.inf, -np.inf], np.nan).fillna(0.0) * volume.fillna(0.0)
     out["flow_cmf_20"] = (mfv.rolling(CMF_WINDOW).sum()
                           / (volume.fillna(0.0).rolling(CMF_WINDOW).sum() + 1e-12))
 
     # ── Money Flow Index(14) ──
-    raw_flow = typical * volume.fillna(0.0)
-    up_flow = raw_flow.where(typical.diff(1) > 0, 0.0)
-    down_flow = raw_flow.where(typical.diff(1) < 0, 0.0)
-    positive = up_flow.rolling(MFI_WINDOW).sum()
-    negative = down_flow.rolling(MFI_WINDOW).sum()
-    money_ratio = positive / (negative + 1e-12)
-    out["flow_mfi_14"] = 100.0 - 100.0 / (1.0 + money_ratio)
+    out["flow_mfi_14"] = _mfi(typical, volume)
 
     # ── Amihud illiquidity (|ret| / quote notional), 20-bar mean × 1e6 ──
     abs_ret = close.pct_change(1).abs()
