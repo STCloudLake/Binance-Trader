@@ -84,6 +84,23 @@ class EventDrivenExecutor:
 | < 3 策略 or ML 开启 | Legacy | 分组收益不足以抵消 ML 开销 |
 | 子进程 worker (GA) | Legacy (强制) | 避免多进程复杂化 |
 
+## 数据完整性（两个引擎共用的前提）
+
+两种引擎都直接读 `data/market/<SYMBOL>/<interval>.parquet`，并把帧当作**连续**的 bar 序列。
+实测缺陷：`BTCUSDT/1h.parquet` 有 11 处 > 1.5 h 的日历断口，最大一处 1 484 h
+（2026-07-29 → 2026-09-29），在帧里表现为**一根 +27.63 % 的"bar"**。它的平方会主导任何方差
+估计：未裁剪的 RiskMetrics EWMA（λ=0.94，有效记忆 ≈ 17 根）给出 **5.31 %/bar**，裁剪后为
+**0.52 %/bar**（**10.12×**），按波动率定仓会把每个仓位缩小同样倍数。
+
+因此：
+
+1. `python scripts/check_data_integrity.py [--check-vol]` 逐文件报告 bar 数、应有/实际跨度、
+   断口数与最大断口；**带断口的序列拒绝输出未裁剪波动率**（`REFUSED`），`--strict` 时退出码 1。
+2. 修复：`python scripts/download_history.py --symbols BTCUSDT --intervals 1h \
+   --start <断口前> --end <末尾> --merge`（只经下载器写入缓存）。
+3. 运行时兜底：`RiskManager` 在生成波动率预测前做同一断口检查，命中即返回 `None`
+   —— 定仓退回固定比例，绝不用被拼接污染的序列定价。
+
 ## 性能数据
 
 1年 5-min K线, 5交易对 × 5时间框架:

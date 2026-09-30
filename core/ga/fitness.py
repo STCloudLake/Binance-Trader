@@ -659,6 +659,8 @@ def evaluate_population_batch(
                                 prior_trials=prior_trials)
             results[idx] = {
                 "fitness": stats["fitness"],
+                "fitness_base": stats.get("fitness_base"),
+                "fitness_alpha": stats.get("fitness_alpha"),
                 "sharpe": round(_finite(stats["sharpe"]), 4),
                 "win_rate": round(_finite(stats["win_rate"]), 2),
                 "profit_factor": round(_finite(stats["profit_factor"]), 4),
@@ -809,6 +811,8 @@ def _mp_worker(worker_args: dict) -> list:
                             prior_trials=worker_args.get("prior_trials", 0))
         results.append((idx, {
             "fitness": stats["fitness"],
+            "fitness_base": stats.get("fitness_base"),
+            "fitness_alpha": stats.get("fitness_alpha"),
             "sharpe": round(_finite(stats["sharpe"]), 4),
             "win_rate": round(_finite(stats["win_rate"]), 2),
             "profit_factor": round(_finite(stats["profit_factor"]), 4),

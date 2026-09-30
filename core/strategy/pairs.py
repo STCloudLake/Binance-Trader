@@ -30,6 +30,12 @@ Engle-Granger (1987) two-step, implemented here without statsmodels:
    table: the residual is estimated, which pushes the distribution left.  The
    null distribution is **simulated** here (see :func:`tau_null_distribution`)
    and validated against MacKinnon's published asymptotic values in the tests.
+   The reference must be **the regression the statistic came from**: the
+   default simulated null is the un-augmented one (an approximation, measured at
+   0.007 in tau / ~1 Monte-Carlo step on the 15 m series), and
+   ``engle_granger(..., matched_null=True)`` simulates it with the same AIC lag
+   rule instead.  Both statements are in the docstrings and in doc 11; the
+   approximation is never left implicit.
 
 Kalman time-varying hedge ratio (Tsay ch. 7)::
 
@@ -135,13 +141,50 @@ SIM_SEED = 20240617
 #: finite-sample distribution is very wide, above 2000 it equals the asymptote.
 SIM_MIN_T = 250
 SIM_MAX_T = 2000
+#: Lags the simulated null searches when it mirrors the real test's AIC rule.
+SIM_MAX_LAGS = 8
 
-_NULL_CACHE: dict[tuple[str, int], np.ndarray] = {}
+_NULL_CACHE: dict[tuple[str, int, int], np.ndarray] = {}
 _NULL_CACHE_MAX = 8
 
 
-def _tau_block(kind: str, length: int, paths: int, seed: int) -> np.ndarray:
-    """Simulated tau statistics of one Monte-Carlo block under the null."""
+def _ols_tau_cols(y: np.ndarray, cols: list[np.ndarray]) -> np.ndarray:
+    """``tau`` of the first regressor, per row of a (paths, n) sample.
+
+    ``cols[0]`` is the lagged level whose coefficient's t-ratio is the ADF tau;
+    the remaining columns (constant, augmentation differences) are controls.  The
+    normal equations are solved once per path — the same OLS
+    :func:`adf_regression` runs, vectorised over paths.
+    """
+    k = len(cols)
+    xtx = np.zeros((y.shape[0], k, k))
+    xty = np.zeros((y.shape[0], k))
+    for i, c in enumerate(cols):
+        for j, c2 in enumerate(cols):
+            xtx[:, i, j] = (c * c2).sum(axis=1)
+        xty[:, i] = (c * y).sum(axis=1)
+    beta = np.linalg.solve(xtx, xty[:, :, None])[:, :, 0]
+    resid = y - sum(beta[:, i:i + 1] * cols[i] for i in range(k))
+    dof = y.shape[1] - k
+    s2 = (resid * resid).sum(axis=1) / max(dof, 1)
+    xtx_inv00 = np.linalg.inv(xtx)[:, 0, 0]
+    se = np.sqrt(np.maximum(s2 * xtx_inv00, 0.0))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        tau = np.where(se > 0, beta[:, 0] / se, np.nan)
+    return tau
+
+
+def _tau_block(kind: str, length: int, paths: int, seed: int,
+               max_lags: int = 0, const: bool = False) -> np.ndarray:
+    """Simulated tau statistics of one Monte-Carlo block under the null.
+
+    ``max_lags = 0, const = False`` is the *un-augmented, no-constant* baseline
+    that :func:`_tau_block_simple` has always produced (kept bit-identical for
+    the tests that pin it).  ``max_lags > 0`` mirrors :func:`adf_regression`'s
+    AIC lag search, and ``const`` its ``regression="c"`` branch, so the null can
+    be simulated with **the same regression the real test runs** rather than with
+    an un-augmented approximation of it.
+    """
     rng = np.random.default_rng(seed)
     if kind == "df_c":
         # ADF on a single unit-root series with a constant.
@@ -156,9 +199,7 @@ def _tau_block(kind: str, length: int, paths: int, seed: int) -> np.ndarray:
         s2 = (resid * resid).sum(axis=1) / (length - 3)
         return b / np.sqrt(s2 / ss)
     # "eg_c": Engle-Granger — two *independent* random walks (the null of no
-    # cointegration), OLS on levels, then an ADF **without constant** on the
-    # estimated residual (the residual has zero mean by construction; this is
-    # what ``statsmodels.coint`` does and what MacKinnon's N=2 table indexes).
+    # cointegration), OLS on levels, then an ADF on the estimated residual.
     y = np.cumsum(rng.standard_normal((paths, length)), axis=1)
     x = np.cumsum(rng.standard_normal((paths, length)), axis=1)
     xc = x - x.mean(axis=1, keepdims=True)
@@ -166,12 +207,47 @@ def _tau_block(kind: str, length: int, paths: int, seed: int) -> np.ndarray:
     b = (xc * yc).sum(axis=1) / (xc * xc).sum(axis=1)
     resid = yc - b[:, None] * xc
     de = np.diff(resid, axis=1)
-    r1 = resid[:, :-1]
-    ss = (r1 * r1).sum(axis=1)
-    b2 = (r1 * de).sum(axis=1) / ss
-    r2 = de - b2[:, None] * r1
-    s2 = (r2 * r2).sum(axis=1) / (length - 2)
-    return b2 / np.sqrt(s2 / ss)
+    if max_lags <= 0 and not const:
+        r1 = resid[:, :-1]
+        ss = (r1 * r1).sum(axis=1)
+        b2 = (r1 * de).sum(axis=1) / ss
+        r2 = de - b2[:, None] * r1
+        s2 = (r2 * r2).sum(axis=1) / (length - 2)
+        return b2 / np.sqrt(s2 / ss)
+    # Lag-augmented / constant-included branch: AIC picks the lag per path, like
+    # ``adf_regression``.  The constant is the analogue of that function's
+    # ``regression="c"``; the traded residual ADF itself uses ``"nc"`` because
+    # the residual has zero mean by construction.
+    best_tau = np.full(paths, np.nan)
+    best_aic = np.full(paths, np.inf)
+    n_eff_full = de.shape[1]
+    for lag in range(0, int(max_lags) + 1):
+        cols = [resid[:, lag:-1]]
+        if const:
+            cols.append(np.ones_like(cols[0]))
+        for i in range(1, lag + 1):
+            cols.append(de[:, lag - i:n_eff_full - i])
+        yy = de[:, lag:]
+        if yy.shape[1] < 10:
+            continue
+        tau = _ols_tau_cols(yy, cols)
+        # Same AIC objective as ``adf_regression`` (Gaussian, k = #columns).
+        k = len(cols)
+        xtx = np.zeros((paths, k, k))
+        xty = np.zeros((paths, k))
+        for i, c in enumerate(cols):
+            for j, c2 in enumerate(cols):
+                xtx[:, i, j] = (c * c2).sum(axis=1)
+            xty[:, i] = (c * yy).sum(axis=1)
+        beta = np.linalg.solve(xtx, xty[:, :, None])[:, :, 0]
+        r = yy - sum(beta[:, i:i + 1] * cols[i] for i in range(k))
+        dof = yy.shape[1] - k
+        s2 = (r * r).sum(axis=1) / max(dof, 1)
+        aic = yy.shape[1] * np.log(np.maximum(s2, 1e-300)) + 2.0 * k
+        take = np.isfinite(aic) & (aic < best_aic)
+        best_aic = np.where(take, aic, best_aic)
+        best_tau = np.where(take, tau, best_tau)
+    return best_tau
 
 
 def tau_null_distribution(
@@ -180,6 +256,8 @@ def tau_null_distribution(
     *,
     reps: int = SIM_REPS,
     seed: int = SIM_SEED,
+    max_lags: int = 0,
+    const: bool = False,
 ) -> np.ndarray:
     """Sorted Monte-Carlo draws of the ADF tau statistic under the null.
 
@@ -190,21 +268,40 @@ def tau_null_distribution(
         Plain ADF with a constant on a single unit-root series — used by the
         module's self-test against the Dickey-Fuller/MacKinnon table.
 
+    ``max_lags`` / ``const`` must describe **the regression the tau under test
+    came from** — the module docstring states this contract, and
+    :func:`engle_granger` therefore simulates with ``max_lags=adf["lag"]``.  The
+    default ``max_lags=0, const=False`` is the un-augmented baseline kept for
+    the calibration tests and for callers who explicitly want the approximation
+    (the two differ by ~7e-3 at the 5 % point on a 15 m-length series: −3.370
+    lag-augmented against −3.363 un-augmented).
+
     Deterministic: a fixed seed and chunked simulation (``SIM_BLOCK`` paths at
     a time) give the same array on every machine.  Cached per
-    ``(kind, simulated length)``, bounded to :data:`_NULL_CACHE_MAX` entries.
+    ``(kind, simulated length, max_lags, const)``, bounded to
+    :data:`_NULL_CACHE_MAX` entries.
+
+    Cost is the honest caveat: the lag-augmented branch solves one bounded OLS
+    per candidate lag per path, so it is ~10× the un-augmented one and is only
+    simulated when a caller asks for it (that is why it is not the default for
+    the research scripts' repeated full-sample sweeps).
     """
     if kind not in ("eg_c", "df_c"):
         raise ValueError(f"unknown tau null kind: {kind!r}")
     length = int(min(max(int(n_obs), SIM_MIN_T), SIM_MAX_T))
-    key = (kind, length)
+    lags = int(max(int(max_lags), 0))
+    if lags:
+        lags = int(min(lags, _schwert_max_lags(length)))
+    use_const = bool(const)
+    key = (kind, length, lags, use_const)
     cached = _NULL_CACHE.get(key)
     if cached is not None:
         return cached
     parts = []
     for start in range(0, int(reps), SIM_BLOCK):
         m = min(SIM_BLOCK, int(reps) - start)
-        parts.append(_tau_block(kind, length, m, int(seed) + start))
+        parts.append(_tau_block(kind, length, m, int(seed) + start,
+                                max_lags=lags, const=use_const))
     taus = np.sort(np.concatenate(parts))
     if len(_NULL_CACHE) >= _NULL_CACHE_MAX:
         _NULL_CACHE.clear()
@@ -217,14 +314,16 @@ def admissible_sim_length(n_obs: int) -> int:
     return int(min(max(int(n_obs), SIM_MIN_T), SIM_MAX_T))
 
 
-def tau_pvalue(tau: float, kind: str = "eg_c", n_obs: int = 500) -> float:
+def tau_pvalue(tau: float, kind: str = "eg_c", n_obs: int = 500, *,
+               max_lags: int = 0, const: bool = False) -> float:
     """Left-tail Monte-Carlo p-value of ``tau`` under the simulated null.
 
     ``p = share of simulated taus ≤ tau``, floored/capped at one Monte-Carlo
     resolution step so the value is never exactly 0 or 1 (which would claim
-    more precision than the simulation has).
+    more precision than the simulation has).  ``max_lags`` / ``const`` select
+    the null's regression — see :func:`tau_null_distribution`.
     """
-    taus = tau_null_distribution(kind, n_obs)
+    taus = tau_null_distribution(kind, n_obs, max_lags=max_lags, const=const)
     n = len(taus)
     if not np.isfinite(tau):
         return 1.0
@@ -236,9 +335,12 @@ def tau_critical_values(
     kind: str = "eg_c",
     n_obs: int = 500,
     levels: tuple[float, ...] = (0.01, 0.05, 0.10),
+    *,
+    max_lags: int = 0,
+    const: bool = False,
 ) -> dict[float, float]:
     """Simulated critical values of ``tau`` at the requested significance levels."""
-    taus = tau_null_distribution(kind, n_obs)
+    taus = tau_null_distribution(kind, n_obs, max_lags=max_lags, const=const)
     return {float(lv): float(np.quantile(taus, float(lv))) for lv in levels}
 
 
@@ -360,7 +462,8 @@ def ols_hedge_ratio(y, x) -> dict:
             "r2": float(r2)}
 
 
-def engle_granger(y, x, *, max_lags: int | None = None) -> dict:
+def engle_granger(y, x, *, max_lags: int | None = None,
+                  matched_null: bool = False) -> dict:
     """Engle-Granger test of ``y`` on ``x`` (levels).
 
     Returns the OLS hedge ratio, the residual, its ADF tau and the simulated
@@ -368,6 +471,26 @@ def engle_granger(y, x, *, max_lags: int | None = None) -> dict:
     plan's threshold decision (``p ≤ PAIRS_MAX_ADF_PVALUE``); callers must use
     :func:`pair_guard` — the test alone does not check sample length or the
     half-life.
+
+    ``matched_null`` controls **which null the p-value is read against**, and the
+    default is the cheap one *on purpose*:
+
+    * ``False`` (default) — the un-augmented, no-constant null (no lag
+      augmentation, no deterministic term).  This is an **approximation**: the
+      real statistic below is computed with AIC-selected augmentation lags (lag 1
+      on the 15 m series), while the reference distribution has none.  Measured
+      on the 15 m-length series the approximation moves the 5 % point from
+      −3.370 (matched) to −3.363 (unmatched) — 0.007 in tau, i.e. the p-value
+      moves by ~1 Monte-Carlo step.  The approximation is stated here and in
+      ``docs/core-algorithms/11-pairs-cointegration.md`` rather than implied.
+    * ``True`` — the null is simulated with **the same lag rule the test used**,
+      which is what the module docstring demands.  It costs ~10× the un-augmented
+      simulation (one bounded OLS per candidate lag per path), so it is opt-in for
+      a single decisive test rather than for the research scripts' 30-pair sweeps.
+
+    ``const`` is not exposed: the ADF here is on an OLS residual, whose mean is
+    zero by construction, so ``regression="nc"`` is the correct specification and
+    the null must match it.
     """
     ols = ols_hedge_ratio(y, x)
     yv = pd.Series(y).astype(float)
@@ -376,13 +499,16 @@ def engle_granger(y, x, *, max_lags: int | None = None) -> dict:
     s = spread.to_numpy(dtype=float)
     s = s[np.isfinite(s)]
     adf = adf_regression(s, max_lags=max_lags, regression="nc")
-    p = tau_pvalue(adf["tau"], "eg_c", len(s))
+    null_lags = int(adf["lag"]) if matched_null else 0
+    p = tau_pvalue(adf["tau"], "eg_c", len(s), max_lags=null_lags)
     return {
         "beta": ols["beta"], "alpha": ols["alpha"], "se_beta": ols["se_beta"],
         "r2": ols["r2"], "n_obs": int(len(s)), "adf_tau": adf["tau"],
         "adf_lag": adf["lag"], "p_value": p,
-        "critical_values": tau_critical_values("eg_c", len(s)),
+        "critical_values": tau_critical_values("eg_c", len(s),
+                                               max_lags=null_lags),
         "sim_length": admissible_sim_length(len(s)),
+        "null_matched": bool(matched_null), "null_lags": int(null_lags),
         "is_cointegrated": bool(p <= PAIRS_MAX_ADF_PVALUE),
         "spread": spread,
     }

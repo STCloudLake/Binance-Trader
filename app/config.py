@@ -28,7 +28,9 @@ FEE_TIER_TABLE: list[dict] = [
 BNB_DISCOUNT_FACTOR = 0.75
 BNB_DISCOUNT_PCT = int(round((1.0 - BNB_DISCOUNT_FACTOR) * 100))
 
-#: Fallback half-spread (%) for a symbol that is not listed in the config block.
+#: Fallback **full** bid-ask spread (%) for a symbol not listed in the config
+#: block.  The cost model charges half of it per side (``spread_pct / 2``), the
+#: same convention as ``backtest.cost_model`` — see :func:`sim_cost_quote`.
 DEFAULT_SIM_SPREAD_PCT = 0.02
 
 #: Port the web UI binds to when ``web_port`` is missing or unusable.
@@ -628,7 +630,16 @@ def sim_fee_pct(settings: dict, order_type: str = "market") -> float:
 
 
 def sim_spread_pct(settings: dict, symbol: str) -> float:
-    """Per-side half-spread (%) for ``symbol``."""
+    """**Full** quoted bid-ask spread (%) for ``symbol``.
+
+    ONE meaning, decided in P3's gap-fix pass: the table entry is the *whole*
+    quoted spread (``BTCUSDT: 0.01`` = a 1 bp book), and :func:`sim_cost_quote`
+    charges **half of it per side** — the same convention
+    ``backtest.cost_model.apply_trading_costs`` uses (``spread / 2`` on entry and
+    on exit).  The docstrings and the ``config/config.yaml`` comment used to call
+    this number the *half*-spread, which contradicted the arithmetic; the
+    behaviour was kept and the wording fixed, so no fill price moved.
+    """
     spreads = settings.get("spread_pct") or {}
     return _as_float(spreads.get(str(symbol or "").upper()),
                      _as_float(settings.get("default_spread_pct"),
@@ -640,6 +651,16 @@ def sim_cost_quote(symbol: str, side: str, order_type: str, price: float,
     """Cost model for ONE fill — the single source of truth for sim fills AND
     for ``GET /api/fee/estimate``, so the estimate can never drift from reality.
 
+    ONE meaning for ``spread_pct`` (decided in the P3 gap-fix pass): it is the
+    **full quoted bid-ask spread in percent** — ``BTCUSDT: 0.01`` in
+    ``sim.cost_model.spread_pct`` means a 1 bp book — and the cost model charges
+    **half of it per side**, i.e. the buy fills at the ask and the sell at the
+    bid.  ``backtest.cost_model.apply_trading_costs`` uses exactly the same
+    ``spread / 2`` convention, so the estimate, the sim fill and the backtest
+    cost cannot disagree.  The earlier docstrings called the table entry the
+    *per-side half-spread* while the code divided it by two; the numbering was
+    (and stays) the one below — only the wording changed.
+
     Formula (contract §五之二):
       * buy  (long):  ``fill = price × (1 + (spread/2 + slippage)/100)``
       * sell (short): ``fill = price × (1 − (spread/2 + slippage)/100)``
@@ -649,6 +670,10 @@ def sim_cost_quote(symbol: str, side: str, order_type: str, price: float,
     Spread and slippage apply to **market** orders only: a limit order fills at
     its own limit price and pays the fee alone.  ``slippage_bps`` is basis
     points per side (1 bp = 0.01%), i.e. the same unit as ``spread_pct/2``.
+
+    Worked example (shipped config: VIP0 taker 0.1 %, ``slippage_bps`` 2):
+    BTCUSDT ``spread_pct: 0.01`` → price impact ``0.01/2 + 0.02 = 0.025 %`` per
+    side; ETHUSDT ``spread_pct: 0.02`` → ``0.02/2 + 0.02 = 0.03 %`` per side.
     """
     symbol = str(symbol or "").upper()
     price = float(price or 0.0)

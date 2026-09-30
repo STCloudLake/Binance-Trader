@@ -42,12 +42,24 @@ volatility afterwards, so state ``0`` is always the calm one.
 
 No look-ahead
 -------------
-Both classifiers are **causal**: the tercile thresholds use expanding quantiles
-of the past only, the trend filter is an EMA of the past, and the HMM's
-``forward``/Viterbi decode of bar ``t`` uses bars ``≤ t`` (the *smoothed*
-posterior over the whole sample is reported separately as
-``posterior_smoothed`` and is explicitly **not** tradeable).  Tests assert that
-the smoothed path differs from the filtered one in the expected direction.
+The tercile classifier and the trend filter are **causal**: the tercile
+thresholds use expanding quantiles of the past only, the trend filter is an EMA
+of the past.
+
+The HMM is causal **only in the mode that says so**.  ``hmm_two_state``'s
+default (whole-sample EM) fits ``μ, σ, A`` on every bar including the future, so
+its "filtered" posterior is causal *given the parameters* but the labels are
+not: appending future bars moves σ and can move a Viterbi label before the
+appended region (measured: 2 of 3 synthetic seeds).  Its reported accuracy is
+**in-sample** and is labelled that way in
+``tests/test_p34_audit_fixes.py``/doc 11.  ``hmm_two_state_causal`` (selected
+automatically the moment :data:`REGIME_GATING_ENABLED` is turned on, or by
+``causal=True``) refits the parameters on a documented schedule using only the
+past and decodes each bar with a forward-only pass, so appending bars cannot
+change an earlier label.  The *smoothed* posterior over the whole sample is
+reported separately as ``posterior_smoothed`` and is explicitly **not**
+tradeable.  :func:`gate_regimes` refuses to gate on a table whose HMM labels are
+not causal rather than trusting the caller.
 
 Limitations
 -----------
@@ -86,6 +98,22 @@ HMM_ITER = 50
 HMM_TOL = 1e-6
 #: Minimum bars before any classifier emits a non-default label.
 MIN_REGIME_ROWS = 100
+#: Causal-HMM controls: refit the parameters every N bars on the past only, and
+#: emit no label for the first ``HMM_CAUSAL_WARMUP`` bars (the filtered posterior
+#: has not forgotten its ``pi`` seed before that).  Both are documented warm-up
+#: knobs, not hidden magic: they are reported in the causal fit's return value.
+HMM_CAUSAL_REFIT_EVERY = 250
+HMM_CAUSAL_WARMUP = 250
+#: A refit whose two fitted σ are within this ratio has not found two states —
+#: it has split one distribution in half, and EM on a window with only *calm*
+#: data does exactly that (measured on the synthetic series: σ̂ = 0.00141 /
+#: 0.00178 at t = 250, against a true 0.002 / 0.010).  The filtered posterior is
+#: then two near-identical densities, so a 0.5 % bar reads as "stressed" forever
+#: and the decode collapses to ~0.50 accuracy.  A refit below the ratio is
+#: replaced by a deterministic quantile seed with the ratio imposed (the benign
+#: case — a genuinely homoscedastic window — is unaffected in practice because
+#: such a window has no state to detect).
+HMM_MIN_SIGMA_RATIO = 1.5
 
 VOL_REGIMES: tuple[str, ...] = ("low", "mid", "high")
 TREND_REGIMES: tuple[str, ...] = ("trend_up", "trend_down", "range")
@@ -203,6 +231,7 @@ def hmm_two_state(
     n_iter: int = HMM_ITER,
     tol: float = HMM_TOL,
     max_rows: int = 20000,
+    causal: bool | None = None,
 ) -> dict:
     """Fit a 2-state Gaussian HMM by EM; deterministic, numpy only.
 
@@ -214,7 +243,28 @@ def hmm_two_state(
 
     ``max_rows`` bounds the O(n·k²) recursions: with more rows the **most
     recent** ``max_rows`` bars are fitted, which is what a live consumer needs.
+
+    ``causal`` — read this before using the labels for anything that trades
+        ``False`` (the value this function has always used) fits EM on the
+        **whole** sample, so ``sigma``/``mu``/``A`` see the future and the
+        "filtered" posterior is only causal *given* those parameters: truncating
+        the series to 2000 bars moves σ from 0.00202/0.00968 to 0.00200/0.00973
+        and flips an earlier Viterbi label on 2 of 3 synthetic seeds (measured;
+        see ``tests/test_p34_audit_fixes.py``).  The accuracy reported for this
+        mode is **in-sample** and must be labelled as such.
+        ``True`` delegates to :func:`hmm_two_state_causal`, which refits on a
+        schedule and decodes each bar with a forward-only pass, so a label at bar
+        ``t`` depends only on bars ≤ ``t``.
+        ``None`` (default) resolves to ``REGIME_GATING_ENABLED``: full-sample
+        while gating is off (the shipped default, bit-identical to the previous
+        behaviour), causal the moment a caller turns gating on — a gate can then
+        never consume a label that saw the future without asking for it.
+        :func:`gate_regimes` enforces that contract independently.
     """
+    use_causal = bool(REGIME_GATING_ENABLED) if causal is None else bool(causal)
+    if use_causal:
+        return hmm_two_state_causal(returns, n_iter=n_iter, tol=tol,
+                                    max_rows=max_rows)
     r = pd.Series(returns, dtype=float).dropna()
     if len(r) > int(max_rows):
         r = r.iloc[-int(max_rows):]
@@ -227,43 +277,10 @@ def hmm_two_state(
                 "n_iter": 0, "posterior_filtered": np.full((n, 2), 0.5),
                 "posterior_smoothed": np.full((n, 2), 0.5),
                 "state": pd.Series("unknown", index=idx, dtype=object),
+                "causal": False,
                 "note": f"too few rows ({n} < 50)"}
 
-    q1, q3 = np.quantile(x, [0.25, 0.75])
-    lower = x[x <= q1]
-    upper = x[x >= q3]
-    mu = np.array([float(lower.mean()), float(upper.mean())])
-    sigma = np.array([max(float(lower.std(ddof=0)), 1e-6),
-                      max(float(upper.std(ddof=0)), 1e-6)])
-    A = np.array([[0.95, 0.05], [0.05, 0.95]])
-    pi = np.array([0.5, 0.5])
-    loglik = float("-inf")
-    used = 0
-    for it in range(int(n_iter)):
-        log_b = _emission_logpdf(x, mu, sigma)
-        alpha, beta, ll = _forward_backward(log_b, A, pi)
-        gamma = alpha * beta
-        gamma /= np.maximum(gamma.sum(axis=1, keepdims=True), 1e-300)
-        # xi (expected transitions) for the M-step, using the scaled recursions.
-        b = np.exp(log_b - log_b.max(axis=1, keepdims=True))
-        xi_sum = np.zeros((2, 2))
-        for t in range(n - 1):
-            num = (alpha[t][:, None] * A) * (b[t + 1] * beta[t + 1])[None, :]
-            s = num.sum()
-            xi_sum += num / s if s > 0 else num
-        A_new = xi_sum / np.maximum(xi_sum.sum(axis=1, keepdims=True), 1e-300)
-        pi_new = gamma[0] / max(gamma[0].sum(), 1e-300)
-        w = gamma.sum(axis=0)
-        mu_new = (gamma * x[:, None]).sum(axis=0) / np.maximum(w, 1e-300)
-        var_new = (gamma * (x[:, None] - mu_new[None, :]) ** 2).sum(axis=0) \
-            / np.maximum(w, 1e-300)
-        A, pi, mu = A_new, pi_new, mu_new
-        sigma = np.sqrt(np.maximum(var_new, 1e-12))
-        used = it + 1
-        if abs(ll - loglik) < float(tol):
-            loglik = ll
-            break
-        loglik = ll
+    mu, sigma, A, pi, loglik, used = _hmm_em(x, n_iter=n_iter, tol=tol)
 
     log_b = _emission_logpdf(x, mu, sigma)
     alpha, beta, ll = _forward_backward(log_b, A, pi)
@@ -285,7 +302,264 @@ def hmm_two_state(
         "posterior_filtered": alpha[:, order],
         "posterior_smoothed": gamma,
         "state": pd.Series(np.where(states == 0, "calm", "stressed"), index=r.index),
+        "causal": False,
         "note": "",
+    }
+
+
+def _hmm_em(x: np.ndarray, *, n_iter: int, tol: float,
+            sigma0: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray,
+                                                       np.ndarray, np.ndarray,
+                                                       float, int]:
+    """Baum-Welch EM on one fixed sample → ``(mu, sigma, A, pi, loglik, iters)``.
+
+    Extracted from :func:`hmm_two_state` verbatim: the whole-sample fit calls it
+    once (bit-identical to the previous inline loop) and the causal refit calls
+    it once per refit point on a strictly-past window.  The initialisation is
+    deterministic — μ from the return quartiles, σ from the within-half
+    dispersions, ``A = [[0.95, 0.05], [0.05, 0.95]]`` — so no random seed and no
+    two runs can disagree.  ``sigma0`` overrides only the σ seed, which the
+    causal decoder's minimum-separation fallback uses.
+    """
+    n = x.size
+    q1, q3 = np.quantile(x, [0.25, 0.75])
+    lower = x[x <= q1]
+    upper = x[x >= q3]
+    mu = np.array([float(lower.mean()), float(upper.mean())])
+    if sigma0 is None:
+        sigma = np.array([max(float(lower.std(ddof=0)), 1e-6),
+                          max(float(upper.std(ddof=0)), 1e-6)])
+    else:
+        sigma = np.array([max(float(v), 1e-6) for v in np.asarray(sigma0, dtype=float)])
+    A = np.array([[0.95, 0.05], [0.05, 0.95]])
+    pi = np.array([0.5, 0.5])
+    loglik = float("-inf")
+    used = 0
+    for it in range(int(n_iter)):
+        log_b = _emission_logpdf(x, mu, sigma)
+        alpha, beta, ll = _forward_backward(log_b, A, pi)
+        gamma = alpha * beta
+        gamma /= np.maximum(gamma.sum(axis=1, keepdims=True), 1e-300)
+        # xi (expected transitions) for the M-step.  The sum over t is contracted
+        # in one einsum instead of a per-bar Python loop: same value, and it is
+        # what keeps the causal decoder's per-refit cost affordable.
+        b = np.exp(log_b - log_b.max(axis=1, keepdims=True))
+        num = alpha[:-1, :, None] * A[None, :, :] * (b[1:] * beta[1:])[:, None, :]
+        den = num.sum(axis=(1, 2))
+        safe = np.where(den > 0, den, 1.0)
+        xi_sum = (num / safe[:, None, None]).sum(axis=0)
+        A_new = xi_sum / np.maximum(xi_sum.sum(axis=1, keepdims=True), 1e-300)
+        pi_new = gamma[0] / max(gamma[0].sum(), 1e-300)
+        w = gamma.sum(axis=0)
+        mu_new = (gamma * x[:, None]).sum(axis=0) / np.maximum(w, 1e-300)
+        var_new = (gamma * (x[:, None] - mu_new[None, :]) ** 2).sum(axis=0) \
+            / np.maximum(w, 1e-300)
+        A, pi, mu = A_new, pi_new, mu_new
+        sigma = np.sqrt(np.maximum(var_new, 1e-12))
+        used = it + 1
+        if abs(ll - loglik) < float(tol):
+            loglik = ll
+            break
+        loglik = ll
+    return mu, sigma, A, pi, float(loglik), int(used)
+
+
+def _hmm_forward_only(x: np.ndarray, mu: np.ndarray, sigma: np.ndarray,
+                      A: np.ndarray, pi: np.ndarray) -> np.ndarray:
+    """Forward-only filtered posterior ``P(x_t | r_0..r_t)``, one row per bar.
+
+    The backward pass — and therefore the whole-sample ``gamma`` and the Viterbi
+    path — is dropped on purpose: it is what makes a label at bar ``t`` a
+    function of bars ``> t``.  The recursion is the scaled forward pass of
+    :func:`_forward_backward`, so ``out[t]`` is exactly that function's
+    ``alpha[t]`` and needs ``O(t)`` work per bar.
+    """
+    log_b = _emission_logpdf(x, mu, sigma)
+    b = np.exp(log_b - log_b.max(axis=1, keepdims=True))
+    n, k = b.shape
+    out = np.zeros((n, k))
+    cur = pi * b[0]
+    c = cur.sum() or 1e-300
+    out[0] = cur / c
+    for t in range(1, n):
+        cur = (out[t - 1] @ A) * b[t]
+        c = cur.sum() or 1e-300
+        out[t] = cur / c
+    return out
+
+
+def _hmm_forward_last(x: np.ndarray, params: tuple) -> np.ndarray:
+    """Filtered posterior at the **last** bar, ``P(x_n | r_0..r_n)``.
+
+    The single-bar projection of :func:`_hmm_forward_only`: the recursion starts
+    at the buffer start (the documented burn-in) and the intermediate rows are
+    never materialised, which is all the causal decoder needs and halves the
+    allocation.
+    """
+    mu, sigma, A, pi = params[0], params[1], params[2], params[3]
+    log_b = _emission_logpdf(x, mu, sigma)
+    b = np.exp(log_b - log_b.max(axis=1, keepdims=True))
+    cur = pi * b[0]
+    c = cur.sum() or 1e-300
+    cur = cur / c
+    for t in range(1, b.shape[0]):
+        cur = (cur @ A) * b[t]
+        c = cur.sum() or 1e-300
+        cur = cur / c
+    return cur
+
+
+def _hmm_fit_separated(window: np.ndarray, *, n_iter: int, tol: float,
+                       min_ratio: float = HMM_MIN_SIGMA_RATIO,
+                       ) -> tuple[tuple, bool]:
+    """EM fit that is guaranteed to return two **distinguishable** states.
+
+    Returns ``(params, separated)``.  ``separated`` is ``True`` when the EM fit
+    itself produced ``σ_max/σ_min ≥ min_ratio``; otherwise the fit is redone once
+    from a deterministic quantile seed with the ratio imposed (the seed is
+    :func:`hmm_two_state`'s own initialisation, so this is not a new estimator —
+    only a floor on how far the two states may collapse into each other).
+    """
+    p = _hmm_em(window, n_iter=n_iter, tol=tol)
+    s = np.sort(np.asarray(p[1], dtype=float))
+    if s[0] > 0 and s[1] / s[0] >= float(min_ratio):
+        return p, True
+    q1, q3 = np.quantile(window, [0.25, 0.75])
+    lo = window[window <= q1]
+    hi = window[window >= q3]
+    s_lo = max(float(lo.std(ddof=0)) if lo.size > 1 else 0.0, 1e-9)
+    s_hi = max(s_lo * float(min_ratio), float(hi.std(ddof=0)) if hi.size > 1 else 0.0)
+    p2 = _hmm_em(window, n_iter=n_iter, tol=tol, sigma0=np.array([s_lo, s_hi]))
+    s2 = np.sort(np.asarray(p2[1], dtype=float))
+    if s2[0] > 0 and s2[1] / s2[0] >= float(min_ratio):
+        return p2, False
+    return p, False
+
+
+def hmm_two_state_causal(
+    returns,
+    *,
+    refit_every: int = HMM_CAUSAL_REFIT_EVERY,
+    warmup: int = HMM_CAUSAL_WARMUP,
+    n_iter: int = HMM_ITER,
+    tol: float = HMM_TOL,
+    max_rows: int = 20000,
+    params: tuple | None = None,
+) -> dict:
+    """Causal 2-state HMM labels: parameters only ever see the past.
+
+    Construction (this is the whole causal argument):
+
+    1. **Parameter schedule.** Parameters are refit at bar indices
+       ``warmup, warmup + refit_every, …`` using only ``returns[:t]``; between
+       refits the frozen fit is used.  The fit at index ``t`` therefore depends
+       on bars ``< t`` only.
+    2. **Forward-only decode.** Each bar's filtered posterior comes from the
+       scaled forward recursion run from the **buffer start** (the documented
+       burn-in, see below) up to that bar — no backward pass, no Viterbi, so no
+       future bar can enter any label.  The recursion is advanced **once per
+       refit segment** and the posterior rows for the segment are read off it,
+       instead of restarting the sweep at every bar: within a segment the
+       parameters (and therefore the emission matrix) are frozen, and the
+       recursion is Markov in its own last row, so the two are the same numbers.
+    3. **Burn-in.** The first ``warmup`` bars are ``"unknown"``: the filtered
+       posterior has not forgotten its ``pi`` seed there.  The warm-up is
+       reported in ``warmup`` and ``first_label_index`` rather than hidden.
+
+    The buffer is the model window actually used (the expanding prefix capped at
+    ``max_rows``).  A label is reported only when the buffer has at least 50 bars
+    (:func:`hmm_two_state`'s own minimum), so very short inputs return
+    ``"unknown"``.
+
+    Cost: one EM fit per refit point plus ``refits`` forward sweeps of the buffer
+    (not one per bar), so a 3 000-bar series with the defaults (250-bar refit,
+    250-bar warm-up) is 12 fits + 12 sweeps, measured **0.9 s**.  That is a
+    research/diagnostic cost, not a per-bar one; the live path is
+    :data:`REGIME_DIAGNOSTICS_ENABLED`-gated and off.
+
+    Determinism: same inputs → same labels, bar for bar (no random seed
+    anywhere), and **appending future bars cannot change any earlier label** —
+    that is the property ``tests/test_p34_audit_fixes.py`` asserts.
+    """
+    r = pd.Series(returns, dtype=float).dropna()
+    x_full = r.to_numpy(dtype=float)
+    n = x_full.size
+    limit = int(max(int(max_rows), 50))
+    step = max(int(refit_every), 1)
+    warm = max(int(warmup), 0)
+    if n < 50:
+        return {"states": np.zeros(n, dtype=int), "transition": np.eye(2),
+                "mu": np.zeros(2), "sigma": np.zeros(2), "loglik": float("nan"),
+                "n_iter": 0, "posterior_filtered": np.full((n, 2), 0.5),
+                "posterior_smoothed": np.full((n, 2), 0.5),
+                "state": pd.Series("unknown", index=r.index, dtype=object),
+                "causal": True, "warmup": warm, "first_label_index": None,
+                "refit_every": step, "n_refits": 0,
+                "note": f"too few rows ({n} < 50)"}
+
+    states = np.zeros(n, dtype=int)
+    filtered = np.full((n, 2), 0.5)
+    labels = np.array(["unknown"] * n, dtype=object)
+    n_refits = 0
+    n_degenerate = 0
+    refit_points: list[int] = []
+    fixed_params = params is not None
+    t = 0
+    while t < n:
+        need_fit = params is None or (t >= warm and (t - warm) % step == 0)
+        if need_fit and t >= 50 and not fixed_params:
+            window = x_full[max(0, t - limit):t]
+            if window.size >= 50:
+                params, separated = _hmm_fit_separated(window, n_iter=n_iter, tol=tol)
+                n_refits += 1
+                refit_points.append(int(t))
+                if not separated:
+                    n_degenerate += 1
+        if params is None:
+            t += 1
+            continue
+        # The next bar whose (t - warm) hits the refit grid: the frozen
+        # parameters are valid for [t, end).
+        if t < warm:
+            end = warm
+        else:
+            end = t + step if warm == 0 else warm + ((t - warm) // step + 1) * step
+        end = int(min(max(end, t + 1), n))
+        start = max(0, t - limit)
+        buf = x_full[start:end]
+        mu, sigma, A, pi = params[0], params[1], params[2], params[3]
+        order = np.argsort(sigma)
+        remap = np.zeros(2, dtype=int)
+        remap[order[0]], remap[order[1]] = 0, 1
+        fwd = _hmm_forward_only(buf, mu, sigma, A, pi)
+        for k, tt in enumerate(range(t, end)):
+            post = fwd[k]
+            # Relabel by the fit's own volatility order, so state 0 is the calm
+            # one even across refits where the EM indices could swap.  The
+            # argmax must be taken on the *relabelled* row: taking it before the
+            # permutation and then remapping the index silently inverts the
+            # label (measured as a 0.50-accuracy decode).
+            ordered = post[order]
+            filtered[tt] = ordered
+            state_t = int(np.argmax(ordered))
+            states[tt] = state_t
+            if tt >= warm:
+                labels[tt] = "calm" if state_t == 0 else "stressed"
+        t = end
+
+    first = int(np.argmax(labels != "unknown")) if (labels != "unknown").any() else None
+    return {
+        "states": states, "transition": (params[2] if params else np.eye(2)),
+        "mu": (params[0] if params else np.zeros(2)),
+        "sigma": (params[1] if params else np.zeros(2)),
+        "loglik": float("nan"), "n_iter": int(len(refit_points)),
+        "posterior_filtered": filtered,
+        "posterior_smoothed": np.full((n, 2), np.nan),
+        "state": pd.Series(labels, index=r.index),
+        "causal": True, "warmup": warm, "first_label_index": first,
+        "refit_every": step, "n_refits": int(n_refits),
+        "n_degenerate_fits": int(n_degenerate),
+        "note": "causal: forward-only decode, parameters refit on the past only",
     }
 
 
@@ -299,6 +573,7 @@ def classify_regimes(
     trend_slow: int = TREND_SLOW,
     with_hmm: bool = False,
     hmm_iter: int = HMM_ITER,
+    causal_hmm: bool | None = None,
 ) -> pd.DataFrame:
     """Per-bar regime table: ``vol_regime``, ``trend_regime``, ``regime``, HMM.
 
@@ -306,6 +581,13 @@ def classify_regimes(
     the tape is trending, ``"range_<vol>"`` otherwise, so a gate can say "only
     trade the breakout strategy in ``range_low``".  Time-outs and short samples
     fall back to ``"unknown"`` / ``"range"`` rather than to a guess.
+
+    ``causal_hmm`` is forwarded to :func:`hmm_two_state` (``None`` →
+    :data:`REGIME_GATING_ENABLED`, so the shipped all-off configuration keeps the
+    historical whole-sample fit bit-for-bit while turning gating on switches the
+    HMM to the causal path).  Either way the table records which mode produced
+    its HMM columns in ``out.attrs["causal_hmm"]``, which
+    :func:`gate_regimes` checks before letting a gate consume them.
     """
     close = pd.Series(df["close"], dtype=float)
     logret = np.log(close).diff()
@@ -315,8 +597,16 @@ def classify_regimes(
     out["regime"] = np.where(out["trend_regime"] == "range",
                              "range_" + out["vol_regime"].astype(str),
                              out["trend_regime"])
+    #: The tercile/trend columns are causal by construction (see the module
+    #: docstring).  The flag is False until an HMM column set is added *and*
+    #: that HMM was fitted causally, so a gate reading a table that never had an
+    #: HMM is unaffected while a gate reading future-fitted HMM labels is refused.
+    out.attrs["causal_hmm"] = True
+    out.attrs["hmm_present"] = False
     if with_hmm:
-        fit = hmm_two_state(logret)
+        fit = hmm_two_state(logret, n_iter=hmm_iter, causal=causal_hmm)
+        out.attrs["causal_hmm"] = bool(fit.get("causal"))
+        out.attrs["hmm_present"] = True
         idx = fit["state"].index
         # The HMM drops the leading NaN log-return, so its series is one bar
         # shorter than the frame: reindex rather than assume equal length (a
@@ -427,6 +717,15 @@ def detection_metrics(
             "positive": positive}
 
 
+class NonCausalRegimeError(RuntimeError):
+    """Raised when a gate would consume regime labels that saw the future.
+
+    A refusal, not a warning: a look-ahead label silently gating live trades is
+    the exact failure mode ``tests/test_p34_audit_fixes.py`` exists to prevent,
+    and a log line would not stop it.
+    """
+
+
 @dataclass
 class RegimeGate:
     """Deterministic strategy/parameter gate by regime.
@@ -437,11 +736,21 @@ class RegimeGate:
     :data:`REGIME_GATING_ENABLED` unless a caller overrides it — with gating off,
     :meth:`allows` returns ``True`` for everything, which is the "no live
     behaviour change by default" contract.
+
+    **Causality contract.**  ``allows`` only ever sees a *label string*, so the
+    gate cannot tell where that label came from; :func:`gate_regimes` is the
+    checked entry point.  It inspects ``table.attrs["causal_hmm"]`` (set by
+    :func:`classify_regimes`) and raises :class:`NonCausalRegimeError` when the
+    table carries HMM labels that were fitted on the whole sample.  The
+    ``hmm_state`` / ``hmm_state_smoothed`` columns of a non-causal table are
+    diagnostics only — the *composite* ``regime`` column is causal either way,
+    so a caller that gates on ``regime`` alone is unaffected.
     """
 
     allowed: dict[str, set[str]] = field(default_factory=dict)
     enabled: bool = REGIME_GATING_ENABLED
     default_allow: bool = True
+    require_causal: bool = True
 
     def allows(self, strategy_kind: str, regime: str) -> bool:
         if not self.enabled:
@@ -460,6 +769,44 @@ class RegimeGate:
                         base: float = 1.0, blocked: float = 0.0) -> float:
         """``base`` when allowed, ``blocked`` otherwise — for position sizing."""
         return float(base) if self.allows(strategy_kind, regime) else float(blocked)
+
+    def check_table(self, table) -> None:
+        """Raise unless ``table``'s HMM labels are causal (see the class doc).
+
+        No-op when ``enabled`` is ``False`` (the shipped default, where the gate
+        cannot change behaviour at all) or when ``require_causal`` is ``False``
+        (an explicit opt-out for a research caller that wants the diagnostic
+        labels anyway).
+        """
+        if not self.enabled or not self.require_causal:
+            return
+        attrs = getattr(table, "attrs", {}) or {}
+        if bool(attrs.get("hmm_present", False)) and not bool(
+                attrs.get("causal_hmm", False)):
+            raise NonCausalRegimeError(
+                "refusing to gate on whole-sample (look-ahead) HMM labels: "
+                "rebuild the table with classify_regimes(..., causal_hmm=True) "
+                "or gate on the composite 'regime' column only")
+        return None
+
+    def gate_row(self, table, strategy_kind: str, *, row: int = -1) -> dict:
+        """Checked ``allows`` decision for one row of a regime table."""
+        self.check_table(table)
+        if len(table) == 0:
+            return {"allowed": True, "regime": "unknown", "checked": True}
+        regime = str(table["regime"].iloc[int(row)])
+        return {"allowed": self.allows(strategy_kind, regime),
+                "regime": regime, "checked": True}
+
+
+def gate_regimes(gate: RegimeGate, table, strategy_kind: str) -> dict:
+    """Refuse-or-allow a gate decision on a regime table (checked seam).
+
+    The one call site a live path should use: it applies the causality contract
+    of :meth:`RegimeGate.check_table` and then evaluates the last row, so an
+    operator cannot accidentally gate on labels that saw the future.
+    """
+    return gate.gate_row(table, strategy_kind)
 
 
 #: The one documented default map, used only when a caller opts in.
@@ -481,8 +828,10 @@ def default_gate(enabled: bool = REGIME_GATING_ENABLED) -> RegimeGate:
 __all__ = [
     "REGIME_GATING_ENABLED", "REGIME_DIAGNOSTICS_ENABLED", "VOL_WINDOW",
     "TREND_FAST", "TREND_SLOW", "HMM_ITER", "HMM_TOL", "MIN_REGIME_ROWS",
+    "HMM_CAUSAL_REFIT_EVERY", "HMM_CAUSAL_WARMUP",
     "VOL_REGIMES", "TREND_REGIMES", "STRATEGY_KINDS", "DEFAULT_REGIME_MAP",
     "rolling_volatility", "volatility_terciles", "trend_regimes",
-    "hmm_two_state", "classify_regimes", "classify_last", "regime_persistence",
-    "detection_metrics", "RegimeGate", "default_gate",
+    "hmm_two_state", "hmm_two_state_causal", "classify_regimes", "classify_last",
+    "regime_persistence", "detection_metrics", "RegimeGate", "default_gate",
+    "gate_regimes", "NonCausalRegimeError",
 ]

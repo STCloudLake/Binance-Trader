@@ -16,7 +16,10 @@ backtest:
   # stop-loss / take-profit levels are untouched).  Do not merge the two.
   cost_model:
     enabled: true
-    # Per-symbol spread (%) OVERRIDES.  Resolution order for every pair a run
+    # Per-symbol **full** quoted spread (%) OVERRIDES — the cost model charges
+    # half of it on entry and half on exit (`spread / 2`, see
+    # core/backtest/cost_model.py), the same convention as `sim.cost_model`.
+    # Resolution order for every pair a run
     # actually uses: override (this map, or a value typed in the UI) →
     # live-derived from GET {binance.market_data_host}/api/v3/depth
     # (best bid/ask, cached `live_spread.ttl_seconds`) → `default_spread_pct`.
@@ -201,8 +204,10 @@ sim:
     # Per-side slippage in basis points (1 bp = 0.01%). Only market orders slip;
     # a limit order fills at its own limit price.
     slippage_bps: 2
-    # Per-side half-spread in percent, per symbol. `BTCUSDT: 0.01` means the half
-    # spread is 0.01% of the price. Missing symbol → `default` → 0.02.
+    # FULL quoted bid-ask spread in percent, per symbol — NOT the per-side cost.
+    # `BTCUSDT: 0.01` means a 1 bp book, and the fill model charges half of it on
+    # each side (`spread_pct / 2`), exactly like `backtest.cost_model` below.
+    # Missing symbol → `default` → 0.02 (= a 2 bp book → 1 bp per side).
     spread_pct:
       default: 0.02
       BNBUSDT: 0.03

@@ -8,11 +8,10 @@ from core.backtest.data_feeder import DataFeeder
 from core.backtest.metrics import calculate_metrics
 from core.backtest.engine_hybrid import run_hybrid
 from core.backtest.signal_matrix import NO_MARKET_DATA_MESSAGE
-from core.backtest.cost_model import apply_trading_costs, freeze_run_spreads
+from core.backtest.cost_model import apply_trading_costs
 from core.backtest.trade_book import close_position
 from core.strategy.indicators import compute_all, evaluate_condition
 from core.strategy.evaluation_kernel import (
-    evaluate_entry_conditions,
     evaluate_exit_conditions,
     fuse_signals,
     check_higher_tf_trend,
@@ -279,32 +278,35 @@ class BacktestEngine:
         t0 = time.time()
         if per_genome_ledger is None:
             per_genome_ledger = False
-        t0 = time.time()
+
+        # ── Per-run state, kept in ONE attribute ──
+        # ``self._run_state`` is set at the start of every run and is what the
+        # exit path / cost model read.  A single attribute (rather than several)
+        # keeps a concurrent chunk from seeing another chunk's half-updated
+        # tables: GA's parallel paths run one engine per thread/process, and the
+        # previous per-field writes were a data race during a threaded batch.
+        self._run_state = {"spread_pct": {}, "spread_sources": {},
+                           "run_id": time.monotonic_ns()}
+        _run_id = self._run_state["run_id"]
 
         # ── Cost model: derive the spread for the symbols THIS run uses ──
         # Override → live depth-derived → documented default (cost_model.py).
-        # Resolved once here (cached ~5 min) and pinned on the instance so the
-        # trade loop never does I/O and every symbol of the run gets its own
-        # spread instead of the old "5 hardcoded pairs, else 0.03" guess.
+        # Resolved once here and pinned for the duration of the call so the trade
+        # loop never does I/O and every symbol of the run gets its own spread
+        # instead of the old "5 hardcoded pairs, else 0.03" guess.
+        from core.backtest.cost_model import resolve_spreads as _resolve_spreads
         if use_live_spread:
-            self._run_spread_pct = freeze_run_spreads(
-                symbols, self.config, spread_overrides)
-            from core.backtest.cost_model import resolve_spreads as _resolve_spreads
-            self._run_spread_sources = {
-                sym: entry["source"]
-                for sym, entry in _resolve_spreads(
-                    symbols, self.config, spread_overrides).items()}
+            _resolved = _resolve_spreads(symbols, self.config, spread_overrides)
         else:
             # No network, no "today's book" for a historical window: an unmapped
             # symbol takes the configured default spread and the source is
             # recorded so the run's provenance shows it was not live-derived.
-            from core.backtest.cost_model import resolve_spreads as _resolve_spreads
-            _resolved = _resolve_spreads(
-                symbols, self.config, spread_overrides, use_live=False)
-            self._run_spread_pct = {
-                sym: entry["spread_pct"] for sym, entry in _resolved.items()}
-            self._run_spread_sources = {
-                sym: entry["source"] for sym, entry in _resolved.items()}
+            _resolved = _resolve_spreads(symbols, self.config, spread_overrides,
+                                         use_live=False)
+        self._run_state["spread_pct"] = {
+            sym: entry["spread_pct"] for sym, entry in _resolved.items()}
+        self._run_state["spread_sources"] = {
+            sym: entry["source"] for sym, entry in _resolved.items()}
 
         # ── Engine mode selection ──
         _engine_mode = getattr(self.config, 'backtest_engine_mode', 'auto')
@@ -337,7 +339,8 @@ class BacktestEngine:
             # duration of the call only (restored in `finally`).
             _saved_spreads = getattr(self.config, "backtest_spread_pct", None)
             try:
-                self.config.backtest_spread_pct = dict(self._run_spread_pct)
+                self.config.backtest_spread_pct = dict(
+                    self._run_state.get("spread_pct") or {})
                 return run_hybrid(
                     strategies, symbols, date_start, date_end,
                     self.config, self.strategy_engine.loader,
@@ -729,27 +732,16 @@ class BacktestEngine:
                 balance = new_balance
             return new_balance
 
-        def _conditions_met(df, s_cfg, side: str) -> bool:
-            """Entry conditions for one side, honouring the genome's logic gene.
-
-            ``evaluate_entry_conditions`` is the shared OR kernel and stays the
-            default; a GA chromosome may carry ``condition_logic == "and"``
-            (AND is strictly stricter than OR, so the live/backtest parity
-            contract — which never sets that attribute — is unchanged).
-            """
-            conditions = (getattr(s_cfg, "entry_conditions", None) or {}).get(side, [])
-            if not conditions:
-                return False
-            if str(getattr(s_cfg, "condition_logic", "or")).lower() != "and":
-                return None  # sentinel: caller uses the shared OR kernel
-            for cond in conditions:
-                try:
-                    mask = evaluate_condition(df, cond)
-                except Exception:
-                    return False
-                if not (hasattr(mask, "iloc") and bool(mask.iloc[-1])):
-                    return False
-            return True
+        # ── Entry conditions: ONE evaluator for live, GA and backtest ────
+        # ``StrategyConfig.entry_sides`` is the shared rule (P1.6): it delegates to
+        # the OR kernel for ``condition_logic == "or"`` and requires every
+        # condition for ``"and"``.  This engine used to keep its own inline AND
+        # loop next to the kernel — two implementations of one rule that could
+        # drift (a fix or a clamp applied in one and not the other), and the GA
+        # scored a genome through a different path than the live engine trades it.
+        # The call site is directly below; parity is pinned by
+        # tests/test_gap_fixes.py (identical entry sets on a real cached symbol)
+        # and tests/test_condition_logic.py.
 
         # Per-strategy×symbol results matrix (use YAML config names as keys)
         per_matrix: dict[str, dict[str, dict]] = {}
@@ -1210,13 +1202,11 @@ class BacktestEngine:
                         continue
 
                     # ── Shared Kernel: Entry condition evaluation ──
-                    long_and = _conditions_met(df_primary, strategy, "long")
-                    short_and = _conditions_met(df_primary, strategy, "short")
-                    if long_and is None and short_and is None:
-                        long_active, short_active = evaluate_entry_conditions(
-                            df_primary, strategy.entry_conditions)
-                    else:
-                        long_active, short_active = bool(long_and), bool(short_and)
+                    # One evaluator for every path (live engine, GA scoring and
+                    # this backtest): ``entry_sides`` applies the genome's
+                    # ``condition_logic`` gene itself, so there is no second
+                    # implementation left to drift from it.
+                    long_active, short_active = strategy.entry_sides(df_primary)
 
                     if long_active and short_active:
                         continue
@@ -1478,10 +1468,7 @@ class BacktestEngine:
                 last_ts_bh = pd.Timestamp(equity_curve[-1]["time"])
                 _bh_key = (str(getattr(self.config, "data_dir", "")),
                            tuple(symbols), first_ts, last_ts_bh)
-                _bh_cache = getattr(self, "_buy_hold_cache", None)
-                if _bh_cache is None:
-                    _bh_cache = {}
-                    self._buy_hold_cache = _bh_cache
+                _bh_cache = self._run_state.setdefault("buy_hold_cache", {})
                 if _bh_key in _bh_cache:
                     buy_hold_pct = _bh_cache[_bh_key]
                 else:
@@ -1505,7 +1492,8 @@ class BacktestEngine:
         except Exception as e:  # never let the benchmark break a backtest
             logger.debug(f"Buy&hold benchmark unavailable: {e}")
         metrics["buy_hold_pct"] = round(buy_hold_pct, 4) if buy_hold_pct is not None else None
-        metrics["spread_sources"] = dict(getattr(self, "_run_spread_sources", {}) or {})
+        metrics["spread_sources"] = dict(
+            (getattr(self, "_run_state", {}) or {}).get("spread_sources") or {})
 
         # ── Per-genome ledgers (isolated GA evaluation) ──
         # ``trades`` is append-only and therefore chronological, so slicing it per
@@ -1572,7 +1560,7 @@ class BacktestEngine:
             pos_key, pos, exit_price, ts, reason, trades, balance, positions, per_matrix,
             cost_fn=lambda ep, xp, q, s: apply_trading_costs(
                 ep, xp, q, s, self.config,
-                overrides=getattr(self, "_run_spread_pct", None)),
+                overrides=(getattr(self, "_run_state", {}) or {}).get("spread_pct")),
             events=events,
         )
         if ledger_balances is not None:
@@ -1665,6 +1653,41 @@ class BacktestEngine:
             return None
         return rate if 0.0 < rate < 1.0 else None
 
+    @staticmethod
+    def _ml_matrix_for_model(feature_df: pd.DataFrame, model):
+        """Feature matrix in the *shape the model was fitted with*.
+
+        Root cause of the 1 604 sklearn warnings in the ML path: LightGBM's
+        scikit-learn wrapper exposes ``feature_names_in_`` as soon as it is fitted
+        — ``Column_0…Column_N`` even when it was fitted on a bare ndarray
+        (``lightgbm/sklearn.py``: ``feature_names_in_`` is a property over the
+        booster's names).  Scikit-learn's ``validate_data(..., reset=False)`` then
+        sees "fitted with names, X has none" on **every** ``predict_proba`` and
+        warns — once per bar, i.e. thousands of times per backtest, drowning the
+        real warnings.
+
+        The fix is to make the two ends agree instead of silencing anything:
+
+        * the model reports names (LightGBM, or XGBoost fitted on a DataFrame) →
+          hand it a DataFrame carrying **those exact names**, so a model fitted on
+          the 39-column contract is predicted on the contract's columns;
+        * the model reports no names (XGBoost or a stub fitted on an ndarray) →
+          hand it an array, exactly as before.
+
+        The values and their order are untouched either way, so predictions are
+        numerically identical to the previous (warning-producing) call.
+        """
+        names = getattr(model, "feature_names_in_", None)
+        try:
+            names = None if names is None else [str(n) for n in names]
+        except TypeError:
+            names = None
+        if names and len(names) == feature_df.shape[1]:
+            out = feature_df.copy()
+            out.columns = names
+            return out
+        return feature_df.values.astype(float)
+
     def _train_ml_model(self, df: pd.DataFrame, tf_params: dict = None,
                          feature_list: list[str] | None = None,
                          indicators: dict | None = None,
@@ -1700,7 +1723,12 @@ class BacktestEngine:
             common_idx = feature_df.index.intersection(labels.dropna().index)
             if len(common_idx) < min_samples:
                 return None
-            X = feature_df.loc[common_idx].values.astype(float)
+            # Fit on a **named** frame: the contract's column names travel with
+            # the model (``feature_names_in_``), which is what the predict side
+            # below re-attaches.  The values are the same float64 matrix the
+            # previous ``.values.astype(float)`` produced, in the same order, so
+            # the fitted trees are identical.
+            X = feature_df.loc[common_idx].astype(float)
             y = labels.loc[common_idx].values.astype(int)
 
             n_up = int(y.sum())
@@ -1783,7 +1811,10 @@ class BacktestEngine:
                 full_df=full_df, cache=cache)
             if len(feature_df) == 0:
                 return None
-            X = feature_df.iloc[-1:].values.astype(float)
+            # Names must match what the fit saw, or scikit-learn warns on every
+            # bar and — worse — a model really fitted with another column set is
+            # never told.  See ``_ml_matrix_for_model``.
+            X = self._ml_matrix_for_model(feature_df.iloc[-1:], model)
             proba = model.predict_proba(X)
             if proba.shape[1] >= 2:
                 return {"p_up": float(proba[0][1]), "base_rate": None,

@@ -312,11 +312,15 @@ class GAStrategyEvolver:
 
             # ── Out-of-sample validation (BEFORE publishing) ──
             validation = None
+            # Multiple-testing count for the DSR / gate: this run's
+            # population × generations PLUS every trial earlier runs recorded in
+            # the ledger (`data/ga_trials.json`), so the 24th walk-forward
+            # champion is not treated as if only 450 strategies had been tried.
+            n_trials = (cfg.population_size * max(self._generation, 1)
+                        + int(getattr(self, "_prior_trials", 0)))
             if has_validation:
                 logger.info(f"GA: validating champion on {validation_start}~{date_end}")
                 from core.ga.fitness import evaluate_chromosome
-                n_trials = (cfg.population_size * max(self._generation, 1)
-                            + getattr(self, "_prior_trials", 0))
                 val_result = evaluate_chromosome(
                     self._best_chromosome, symbols,
                     validation_start, date_end,
@@ -365,7 +369,7 @@ class GAStrategyEvolver:
                 "generations": self._generation,
                 "population_size": cfg.population_size,
                 "n_trials": (cfg.population_size * max(self._generation, 1)
-                             + getattr(self, "_prior_trials", 0)),
+                             + int(getattr(self, "_prior_trials", 0))),
                 "prior_trials": int(getattr(self, "_prior_trials", 0)),
                 "fitness_components": {
                     "fitness": train_result.get("fitness"),

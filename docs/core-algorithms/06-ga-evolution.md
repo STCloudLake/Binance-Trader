@@ -47,7 +47,7 @@ INIT → EVALUATE(每基因独立仓位槽位 + 独立分账) → SELECT → CRO
 | 默认 | `"or"` —— 历史行为，P1 之前的 YAML、手写 YAML、AI 生成的 YAML 都不带这个键 |
 | 非法值 | 记一条 `WARNING` 并**回退到 `"or"`**，绝不因为一个陌生值就加载失败 |
 | YAML | 冠军/策略文件里显式写出，例如 `condition_logic: and`；`provenance.condition_logic` 同步记录 |
-| 求值 | `StrategyConfig.entry_sides(df)` 是 schema 侧的唯一入口：`"or"` 直接委托共享内核 `evaluate_entry_conditions`，`"and"` 要求每个条件在**该 bar** 上成立。GA/回测入场路径读**同一个字段**、用**同一条判定**（每个条件在该 bar 成立），因此两种模式语义逐字一致；回测侧那段内联判定仍是重复实现，待其 owner 改为直接调用 `entry_sides`。空条件列表在两种模式下都不激活，避免"无条件入场" |
+| 求值 | `StrategyConfig.entry_sides(df)` 是**唯一**入场结构求值器：`"or"` 直接委托共享内核 `evaluate_entry_conditions`，`"and"` 要求每个条件在**该 bar** 上成立。GA 打分与线上交易都走它（`core/strategy/engine.py:246` 线上、`core/backtest/engine.py:1209` 回测/GA 打分），回测侧原有的内联 AND 循环已在 P3/P4 收尾中删除，因此不存在第二份实现可供漂移。空条件列表在两种模式下都不激活，避免"无条件入场"。**残留（不在本阶段写权限内）**：向量化的混合引擎 `core/backtest/signal_matrix.py:285` 仍只做 OR，未读 `condition_logic`；因此 `condition_logic: and` 的冠军在 hybrid 模式下会被按 OR 评估 |
 
 为什么必须是字段：P1 落地时 `StrategyConfig` 还没有这个字段，解码器只能用
 `object.__setattr__(config, "condition_logic", ...)` 把基因挂在实例上。于是 GA 打分时 AND
@@ -56,6 +56,16 @@ INIT → EVALUATE(每基因独立仓位槽位 + 独立分账) → SELECT → CRO
 要消除的"评分 ≠ 发布"）。现在基因走普通字段赋值进入 YAML，线上 `StrategyEngine._evaluate`
 与 GA 评估读同一个字段、应用同一条 AND/OR 判定，该分叉不再存在（`object.__setattr__`
 已从 `core/ga/**` 全部移除）。
+
+**单一求值器（P3/P4 收尾）**：`core/backtest/engine.py` 曾在此之外保留一份内联 AND 循环
+（遍历条件、逐条 `evaluate_condition`），与共享内核构成"一条规则、两份实现"。该循环已删除，
+回测入场路径直接调用 `strategy.entry_sides(df_primary)` —— 与线上 `StrategyEngine._evaluate`
+**字面同一行调用**。等价性以真实缓存数据（BTCUSDT 1h，AND/OR 各两个基因组）逐条比对：
+`tests/test_gap_fixes.py::test_legacy_inline_and_rule_equals_entry_sides_on_real_data`（旧内联
+规则与 `entry_sides` 逐 bar 相等）与 `test_backtest_entry_path_calls_the_shared_evaluator`
+（引擎确实调用该 helper，且每一笔成交都落在共享规则判定活跃的 bar 上）在改动前后给出
+**完全相同的成交条目集合与逐 bar 信号集合**（40/0/0/40 笔；244/300/0/300 个信号 bar）。
+注意 hybrid 的向量化路径（`core/backtest/signal_matrix.py`）仍只实现 OR，见上表"残留"一行。
 
 回归测试 `tests/test_condition_logic.py`：
 
