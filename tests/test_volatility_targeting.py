@@ -83,22 +83,50 @@ def test_short_series_returns_zero_not_nan():
 def test_ewma_is_causal_and_clips_data_splice_outliers():
     """The forecast must use past returns only, and survive a cache seam.
 
-    The shipped BTC cache contains a **data splice** — one "bar" spanning a
-    two-month calendar gap with a ``+27.6 %`` log return.  Unclipped, the
-    RiskMetrics recursion (effective memory ``1/(1-0.94) ≈ 17`` bars) reports
-    ``5.47 %/bar`` instead of ``0.44 %``, a 12x overstatement that would shrink
-    every position by that factor.
-    """
-    from core.ml.volatility import clip_outliers, ewma_vol, log_returns
+    A calendar gap in the cached series splices two months into a single "bar"
+    with a ``+27.6 %`` log return.  Unclipped, the RiskMetrics recursion
+    (effective memory ``1/(1-0.94) ≈ 17`` bars) reports **6.7690 %/bar** on the
+    injected draw below against **0.7553 %/bar** clipped — **8.96x**.  The ratio
+    is data/window dependent, not a constant: the same injected bar in the real
+    500-bar tail gives 6.7674 vs 0.4994 %/bar (13.55x), and the historical real
+    splice in ``docs/core-algorithms/10-volatility-targeting.md`` measured 9.81x.
 
-    r = log_returns(_btc()["close"].values)
-    assert r.max() > 0.2, "the splice this test guards against disappeared"
-    clipped = clip_outliers(r)
+    The splice is **injected synthetically** here instead of being read out of
+    ``data/market/BTCUSDT/1h.parquet``: the contract under test is "a spliced
+    observation must not reach the estimator", and a test that needs the shipped
+    cache to *contain* a data defect stops guarding anything the moment the
+    defect is repaired (the BTCUSDT 1h gap was refetched and merged, which is
+    exactly the change that used to break this test).  The real cache is still
+    used, but only to re-assert the contract on live-shaped returns.
+    """
+    from core.ml.volatility import clip_outliers, ewma_vol, log_returns, to_pct
+
+    rng = np.random.default_rng(SEED)
+    calm = rng.normal(0.0, 0.004, 2000)
+    #: One injected jump, at the tail where the EWMA actually looks for it.
+    splice = np.concatenate([calm[:1999], np.array([0.276])])
+    assert splice.max() > 0.2, "the synthetic splice disappeared from the test"
+
+    clipped = clip_outliers(splice)
     assert clipped.max() < 0.1
-    assert abs(clipped).max() < abs(r).max()
+    assert abs(clipped).max() < abs(splice).max()
+
+    # The contract in numbers: one spliced bar must not be allowed to dominate
+    # the forecast the position sizer reads.  (All ``*_pct`` values are %/bar;
+    # the calm series is 0.4 %/bar by construction.)
+    unclipped_pct = to_pct(ewma_vol(splice, window=0, outlier_sigma=0.0))
+    clipped_pct = to_pct(ewma_vol(splice, window=0))
+    assert clipped_pct < 1.0, clipped_pct
+    assert unclipped_pct > 5.0 * clipped_pct, (unclipped_pct, clipped_pct)
+
+    # The same contract on whatever the shipped 1h cache currently holds —
+    # passes with or without a splice present (skipped when data/ is absent).
+    real = log_returns(_btc()["close"].values)
+    assert abs(clip_outliers(real)).max() < 0.1
+
     # Causal: appending a violent move must not change the *previous* forecast.
-    head = ewma_vol(r[:1000], window=0)
-    tail_only = ewma_vol(np.concatenate([r[:1000], np.array([0.5, -0.5])]), window=2)
+    head = ewma_vol(calm[:1000], window=0)
+    tail_only = ewma_vol(np.concatenate([calm[:1000], np.array([0.5, -0.5])]), window=2)
     assert tail_only != pytest.approx(head, rel=1e-9)
 
 

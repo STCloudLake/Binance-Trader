@@ -11,7 +11,11 @@ from loguru import logger
 
 from core.strategy.indicators import compute_all, evaluate_condition
 from core.strategy.evaluation_kernel import build_entry_signals
-from core.strategy.loader import StrategyConfig
+from core.strategy.loader import (
+    CONDITION_LOGIC_AND,
+    CONDITION_LOGIC_OR,
+    StrategyConfig,
+)
 from core.market_data.provider import DEFAULT_TIMEFRAME, interval_minutes
 
 
@@ -278,22 +282,56 @@ class SignalMatrixBuilder:
                 config_hash = self.grouper._config_hash(s)
 
                 # ── Entry signals — MUST use the shared kernel semantics ──
-                # (OR conditions + weighted fusion + regime-aware threshold + HTF
-                # alignment). The previous AND-logic implementation made the
-                # vectorized engine behave differently from live trading, which is
-                # exactly the divergence the equivalence gate test guards against.
-                def _or_conditions(side: str):
+                # (entry structure + weighted fusion + regime-aware threshold + HTF
+                # alignment). Two earlier versions of this loop made the vectorized
+                # engine behave differently from live trading, which is exactly the
+                # divergence the equivalence gate tests guard against: it was
+                # AND-only, then OR-only. An OR-only fold additionally *ignored*
+                # ``condition_logic``, so a champion evolved with "and" was scored
+                # under OR here while the legacy engine and the live path — both of
+                # which call ``StrategyConfig.entry_sides`` — traded it under AND.
+                #
+                # Duplication note: the OR/AND fold below is the vectorized form of
+                # the rule in ``StrategyConfig.entry_sides`` (the single evaluator
+                # for the live path and the legacy engine). The *predicate* is not
+                # duplicated — both call ``evaluate_condition`` from
+                # ``core.strategy.indicators`` on the same ``compute_all`` frame;
+                # only the per-side combination of the resulting masks is
+                # re-expressed with pandas. ``tests/test_hybrid_condition_logic.py``
+                # pins the two bar-for-bar on real cached data, so the fold cannot
+                # drift from ``entry_sides`` without failing loudly.
+                use_and = (str(getattr(s, "condition_logic", CONDITION_LOGIC_OR)).lower()
+                           == CONDITION_LOGIC_AND)
+
+                def _active_conditions(side: str):
+                    conditions = list(s.entry_conditions.get(side, []))
+                    if not conditions:
+                        # Empty list is inactive in both modes (matching
+                        # ``entry_sides``), so a malformed strategy cannot enter
+                        # unconditionally.
+                        return None
                     series = None
-                    for cond_str in s.entry_conditions.get(side, []):
+                    for cond_str in conditions:
                         result = condition_results.get(cond_str, {}).get((config_hash, primary_tf))
                         if result is None:
+                            # A condition with no evaluated mask cannot be shown to
+                            # hold at any bar: AND must fail closed (side inactive),
+                            # which is what ``entry_sides`` does when a condition
+                            # yields no boolean mask. OR keeps skipping it.
+                            if use_and:
+                                return pd.Series(False, index=timestamps, dtype=bool)
                             continue
                         aligned = result.reindex(timestamps, fill_value=False).astype(bool)
-                        series = aligned if series is None else (series | aligned)
+                        if series is None:
+                            series = aligned
+                        elif use_and:
+                            series = series & aligned
+                        else:
+                            series = series | aligned
                     return series
 
-                long_active = _or_conditions("long")
-                short_active = _or_conditions("short")
+                long_active = _active_conditions("long")
+                short_active = _active_conditions("short")
 
                 if long_active is not None or short_active is not None:
                     htf_frames = []

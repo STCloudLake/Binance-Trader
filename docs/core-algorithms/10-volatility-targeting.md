@@ -51,15 +51,59 @@ P2 的实测结论是**收益方向不可预测**：真实缓存 BTC/ETH 1h 上�
 * 止损宽度：`stop_pct = clip(stop_vol_multiple × forecast_vol_pct, stop_min_pct, stop_max_pct)`；
   barrier 宽度是**分数**（`0.004` = 0.4 %），由 `barrier_vol_multiple × vol%/100` 得到。
 
-### 数据质量：缓存的接缝（实测，必须剪裁）
+### 数据质量：缓存的接缝（剪裁是**防御性**措施）
 
-`data/market/BTCUSDT/1h.parquet` 有 8 846 根、11 处 >1.5 h 的空洞，
-**最大空洞 1 484 小时**：2026-07-29 → 2026-09-29 被当作"一根 bar"，
-产生一个 `+27.63 %` 的对数收益（正常 bar 中位绝对值 0.19 %）。
-EWMA 的**有效记忆只有 `1/(1−λ) ≈ 16.7` 根**，不剪裁时该异常值直接成为未来
-17 根的预测：实测 **5.47 %/bar**，而剪裁后为 **0.52 %/bar**，相差 **10.5×**。
+> **数据快照**：`data/market/BTCUSDT/1h.parquet` 由运行中的服务持续追加。
+> 2026-09-30 复核：**11 675 根**（2025-06-03 → 2026-09-30），接缝**已被数据
+> 供应商修复**——`|最大对数收益| = 0.0494`，且在 `DEFAULT_WINDOW = 500` 的尾窗上
+> 未剪裁 / 剪裁 == **1.000×**（命令见下）。因此 §3.2 的表是"接缝仍存在时"的历史
+> 记录，剪裁代码保留为**防御性**措施，而不是当前数据必需的修复。
+
+历史缺陷（**已修复；在当前缓存上不可复现**）：8 846 根切片曾有 11 处 >1.5 h 的空洞，
+最大 **1 484 小时**（2026-07-29 → 2026-09-29 被当作"一根 bar"，产生一个
+`+27.63 %` 的对数收益；正常 bar 中位绝对值 0.19 %）。EWMA 的**有效记忆只有
+`1/(1−λ) ≈ 16.7` 根**，不剪裁时该异常值直接成为未来 17 根的预测：当时实测
+**5.3056 %/bar** 对剪裁后 **0.5242 %/bar**（**9.81×**；早期文档写的 10.5× 是拿
+剪裁后的 0.52 去除未剪裁的 5.47，属单位/口径混用）。这一行**不可在当前缓存上
+复现**（接缝已被供应商修复），只作为历史对照保留。
+
+**剪裁有效性的证据 = 注入式对照（合成，且窗口相关——不是当前缓存的属性）**：
+往平静序列尾部注入**一条** `+0.276` 的对数收益：
+
+| 注入对象 | 未剪裁 %/bar | 剪裁后 %/bar | 比值 |
+|---|---|---|---|
+| 合成 2 000 根（σ = 0.4 %/bar，seed 20250930） | **6.7690** | **0.7553** | **8.96×** |
+| 真实 500 根尾窗（覆盖 `r[-1]`） | 6.7674 | 0.4994 | 13.55× |
+
+```python
+# 复现（当前修订实测；*_pct 单位是 %/bar，即已乘 100）
+import numpy as np, pandas as pd
+from core.ml.volatility import ewma_vol, log_returns, to_pct
+rng = np.random.default_rng(20250930)
+calm = rng.normal(0.0, 0.004, 2000)
+s = np.concatenate([calm[:1999], np.array([0.276])])      # 注入的接缝
+to_pct(ewma_vol(s, window=0, outlier_sigma=0.0))          # 6.7690
+to_pct(ewma_vol(s, window=0))                             # 0.7553 -> 8.96x
+r = log_returns(pd.read_parquet("data/market/BTCUSDT/1h.parquet")["close"].values)
+rr = r[-500:].copy(); rr[-1] = 0.276                      # 真实尾窗 + 注入
+to_pct(ewma_vol(rr, window=0, outlier_sigma=0.0))         # 6.7674
+to_pct(ewma_vol(rr, window=0))                            # 0.4994 -> 13.55x
+# 当前缓存上的同一测量（无注入）：剪裁是 no-op
+tail = r[-500:]
+to_pct(ewma_vol(tail, window=0))                          # 0.303674
+to_pct(ewma_vol(tail, window=0, outlier_sigma=0.0))       # 0.303674（相对差 2.7e-6）
+```
+
 因此所有估计量先用 `clip_outliers`（`±6 × 1.4826 × MAD`，可关）做 Winsorize；
 用 MAD 而不是标准差，因为要被防的正是会污染后者的量。
+
+**剪裁必须对同一根 bar 稳定**：早期实现每次调用都用"当前窗口"重算 MAD，窗口滑动时
+限值跟着动，实测在 8 344 个连续 500 根窗口里有 **8 343 个**的 Winsor 限值发生
+变化（被剪裁值的最大 |Δ| ≈ 4.8e-2），即一根陈旧异常值可能被**重新放回**估计量，
+α_t 因此非单调。现在用 `build_anchor(returns)` **对整个序列只算一次**中心与尺度
+（同一 `median` / `1.4826·MAD` 配方，因此在全序列上输出与旧实现逐位相同），
+然后把 `AnchorMAD` 传给 `clip_outliers` / `ewma_variance` / `ewma_vol`：同一根
+bar 在任何包含它的窗口里被剪裁到同一个值，且**永远不会被解除剪裁**。
 
 ## 3. 本项目实现
 
@@ -87,17 +131,36 @@ realized_garman_klass, garch11)`；输入可以是收益序列**或** OHLCV Data
 `VolForecaster` 是给实时逐 bar 路径用的记忆化包装：按 `(symbol, interval)`
 缓存，只有**最新 bar 变化**时才重算（`_on_kline` 每 tick 都会重建特征矩阵）。
 
-### 3.2 实测：预报汇总（BTCUSDT 1h，8 846 根，window = 500）
+### 3.2 实测：预报汇总（BTCUSDT 1h，**8 846 根切片**，window = 500）
+
+> "当前值"是**窗口相关的**：EWMA 的 clip 锚随传入窗口变化，因此同一份数据在
+> window = 500 与 window = 400 下给出不同末值（实测 **0.524216 %/bar** 对
+> **0.524062 %/bar**）。下表全部是 **window = 500（`DEFAULT_WINDOW`）** 的值。
+> 传入 `build_anchor(全部收益)` 后两种写法一致（锚固定，见 §2）。
 
 | 方法 | 当前值 %/bar | 年化 % | 滚动均值 %/bar | 滚动 std | ms/次 |
 |---|---|---|---|---|---|
-| **ewma（默认）** | 0.5242 | 49.06 | 0.3969 | 0.1666 | **0.131** |
+| **ewma（默认）** | 0.5242 | 49.06 | 0.3969 | 0.1666 | **0.20** |
 | realized_cc | 1.3224 | 123.77 | 0.4316 | 0.1147 | 0.053 |
 | realized_parkinson | 1.2551 | 117.47 | 0.4534 | 0.1473 | 0.082 |
 | realized_garman_klass | 1.4601 | 136.66 | 0.4606 | 0.1618 | 0.087 |
-| garch11 | 0.3745 | 35.06 | 0.3707 | 0.2299 | 2.212 |
+| garch11 | **0.4455** | 41.71 | 0.3707 | 0.2299 | **≈240–490** |
 
-（滚动统计 = 从第 500 根起每 25 根重算一次。）
+（滚动统计 = 从第 500 根起每 25 根重算一次。`ms/次` 一列**不是**旧的 IGARCH 网格版
+`2.2 ms`：那是**无优化器网格回退**的成本（≈3 ms，见下），当前 `garch11` 走
+自由 ω 的 MLE，实测见下。garch11 现在是**自由 ω 的
+GARCH(1,1) MLE**：ω ≈ 2.96e-7（分数²）、α ≈ 0.0667、β ≈ 0.9199，持久性 ≈ 0.9866，
+`0.5·ΣLL ≈ −225.9`。
+**成本（当前修订实测；复现命令见 §3.3 末）**：默认 `ewma` 路径
+`forecast_vol(df)` = **0.20 ms/bar**（11 675 根 frame，20 次均值；模块 docstring 在
+500 根窗口上记 0.27 ms）——在 2 ms 预算内；`garch11` 在默认 `window = 500` 上
+**0.24–0.49 s/次**（本机本次 0.24/0.25/0.23 s，模块 docstring 记 ≈0.49 s），
+`window = 0`（整段历史 11 674 根）**6.2–6.4 s/次**——比 2 ms 预算高 2–3 个数量级，
+因此 `garch11` 是 **opt-in**，默认实时路径是 EWMA。
+2026-09-30 在增长后的 **11 674 根**缓存上复核：α ≈ 0.252、β ≈ 0.144、
+预报 0.2995 %/bar 对 EWMA 0.3037 %/bar，比值 0.986——两种数据快照下预报都与
+EWMA 同量级，没有退化；两种快照的参数差异本身就说明**GARCH 参数是窗口/样本
+相关的**，引用时必须带上样本。）
 
 高/低波动窗口（按 200 根一块的 realized vol 排序，取两端）：
 
@@ -115,37 +178,82 @@ realized_garman_klass, garch11)`；输入可以是收益序列**或** OHLCV Data
   **0.8720**（近 500 根）—— 当前处于偏高波动体制；该量**无量纲**，可直接做
   风险阈值/熔断的门限。
 
-### 3.3 GARCH(1,1)：为什么是"单位持续性 + 混合"这一版
+### 3.3 GARCH(1,1)：从"单位持续性 + 混合"改为**自由 ω 的 MLE**（审计纠正）
+
+> **本节曾被审计推翻（第 3 项缺陷），以下是重测后的正确版本。** 旧版声称自由 ω
+> 的三参数 MLE **无界**、且"Nelder-Mead / L-BFGS-B / SLSQP 全部奔向 `ω=0, β=0`
+> 角落并拒绝合成数据的真实参数"。在本文的 500 根窗口上重测：三个优化器**全部
+> 收敛到同一片参数区**（ω ≈ 0.0027 %²、α ≈ 0.067、β ≈ 0.920，
+> `0.5·ΣLL ≈ −225.9`，相互差 < 1e-4），并在 4 000 根合成 GARCH(1,1)
+> （真值 ω=0.10 %²、α=0.12、β=0.80）上恢复到 **ω ≈ 0.110、α ≈ 0.105、β ≈ 0.801**。
+> 也就是说：**MLE 不是病态的，旧文档的理由是错的**。
+
+被推翻的还有两处数字口径：旧文档引用的两个"角落"数值（`1.8e4` / `3.6e5`）是某个量
+的**求和**，而代码把它定义为**逐观测均值**（`_garch11_avg_ll` 返回
+`mean(0.5(log v + x²/v))`）。按同一实现在当前 11 674 根缓存上重算（未剪裁、%²）：
+
+```python
+import numpy as np, pandas as pd
+from core.ml.volatility import _garch11_avg_ll, log_returns
+x = log_returns(pd.read_parquet("data/market/BTCUSDT/1h.parquet")["close"].values) * 100.0
+x2, var_s = x * x, float(np.var(x, ddof=1))
+_garch11_avg_ll(x2, var_s, 1.0, 0.0)      # 91.1936   <- 网格角落 α=1, β=0
+_garch11_avg_ll(x2, var_s, 0.001, 0.0)    # 2004.18
+```
+
+这两个数（**91.19 / 2 004.18**，随样本变化）描述的是**网格版 IGARCH**
+（`α = 1, β = 0`，`x²/v` 无下界）的角落，而不是 MLE 的输出——良定拟合不会落到那里。
+
+现在 `garch11_params` 的路径：
+
+1. **主路径**：自由 ω 的 GARCH(1,1) 高斯 MLE，参数箱
+   `ω ∈ (0, 10V]`、`α, β ≥ 0`、`α + β ≤ 0.999`，先做一次**方差目标化**
+   （`ω = V(1−α−β)`）粗网格扫描，再从该点做 Nelder-Mead 精修；拟合在
+   `z = x/sd(x)` 上做，避免参数箱随单位变化（未归一化时同一模型在 %² 与
+   分数² 两种单位下会落到不同盆地）。
+2. **回退路径**：优化器不可用/失败时退回 **IGARCH 网格**（`α = 1−β`、`ω = 0`，
+   0.01 步长、无优化器、≈2 ms）。这条回退是**诚实且便宜**的，也是
+   `GARCH_FIT_WEIGHT = 0.5` 混合存在的原因：网格在本文缓存上会落到
+   `α=1, β=0` 的**常数方差角落**，纯一步预报等于"最后一根收益平方"
+   （= `to_pct(abs(r[-1]))`；8 846 根切片上 0.00076 %/bar，**随切片变化**——当前
+   11 675 根切片上同一命令给 0.0722 %/bar），混合把输出限制在拟合一步方差与 EWMA 水平之间，
+   使**任何**退化参数组合都不会产生退化**预报**。
+
+**局限（诚实说明）**：单位持续性版本无法表达波动率均值回复；自由 ω 版本可以，
+但代价是 **0.24–0.49 s/次**（默认 `window = 500`；整段历史 `window = 0` 为
+**6.2–6.4 s/次**，含粗网格 + Nelder-Mead），因此 `garch11` 仍只用于研究/汇报，
+默认实时路径是 EWMA。`omega/(1-alpha-beta)` 对回退分支是 **0/0**
+（`ω = 0` 且 `α+β = 1`），该分支下"长期方差"就是当前水平，`garch11_params` 用
+`fitted=False` 标注它。
+
+```python
+# 成本复现（当前修订，本机本次；perf_counter）
+import time, pandas as pd
+from core.ml.volatility import (forecast_vol, garch11_forecast, garch11_params,
+                                log_returns)
+df = pd.read_parquet("data/market/BTCUSDT/1h.parquet")
+r = log_returns(df["close"].values)                  # 11 674 根
+def per_call(fn, n=5):
+    fn(); t0 = time.perf_counter()
+    for _ in range(n):
+        fn()
+    return (time.perf_counter() - t0) / n
+per_call(lambda: forecast_vol(df), n=20)             # 0.20 ms/bar（默认路径，预算 2 ms）
+per_call(lambda: garch11_params(r), n=3)             # 0.24 s（默认 window=500）
+per_call(lambda: garch11_forecast(r), n=3)           # 0.25 s
+per_call(lambda: forecast_vol(df, method="garch11"), n=3)   # 0.23 s
+per_call(lambda: garch11_params(r, window=0), n=3)   # 6.4 s（整段历史 11 674 根）
+```
+
+**另修一个单位错误**：`_garch11_variance` 曾把"分数² 的 ω"加进"百分² 的递归"，
+且用**未剪裁**的收益去跑**已剪裁数据**拟合出来的参数，实测把预报推到
+**7.0× / 9.6× EWMA**；修正后 500 根窗口上预报 0.4455 %/bar 对 EWMA 0.5242 %/bar
+（比值 0.85）。
 
 `arch` **未安装**，且**故意没有**加进 `requirements.txt`：为一个可选估计量引入
-重型编译依赖，而它跑在逐 bar 路径上。因此 `garch_backend()` 运行时探测
-（返回 `"arch"`/`"scipy"`，本机实测 **`scipy`**），两条路径都在 `garch11_params`
-里实现并记录在返回值 `backend` 字段。
-
-实现过程中三种"更直觉"的写法都被实测否决，理由保留在代码 docstring 与测试里：
-
-1. **自由 ω 的三参数 MLE**（有解析梯度）：Gaussian 似然**无界** ——
-   `ω=0, β=0` 时 `v_t = α x²_{t-1}`，一根接近 0 的收益就把 `log v_t → −inf`。
-   Nelder-Mead / L-BFGS-B / SLSQP（解析与数值梯度都试过）**全部**奔向该角落，
-   并拒绝合成数据的真实参数。（解析梯度本身是对的，已用"沿负梯度走一步必须
-   降低目标函数"这条契约固定下来；有限差分在这里反而不可靠，因为目标是分段的。）
-2. **只做方差目标化（`ω = V(1−α−β)`）的二维网格**：没有消除病态，因为
-   `x_{t-1}` 极小时滤波仍会塌到方差下限 —— 合成数据上似然偏好
-   `(α, β) = (0.001, 0)`，均值 **1.8e4**（下限本身成了最优解）。
-3. **绝对方差下限**（`1e-9`）：同样让下限成为最优解（均值 **3.6e5**）。
-   最终用**相对下限** `var_s × 1e-4`。
-
-最终版：**单位持续性** IGARCH，`ω = 0, α + β = 1`，只在 `β ∈ [0, 0.99]`
-（步长 0.01）上按高斯似然选最优，**无优化器**（确定性、不会发散、向量化后
-**2.2 ms/次**）。预报再与 EWMA 水平按 `GARCH_FIT_WEIGHT = 0.5` 混合
-（`arch` 包的 `forecast(horizon=1)` 默认也是 `0.5σ²_{t+1} + 0.5σ²_t`）——
-这是必需的：在本文这条 500 根窗口上网格拟合落在 `α=1, β=0` 的**常数方差角落**，
-纯一步预报会等于"最后一根收益的平方"（实测量级偏低 5.5×），混合后
-`0.3745 %/bar` 与 EWMA `0.5242 %/bar` 同量级，退化参数不会产生退化预报。
-
-**局限（诚实说明）**：单位持续性意味着该估计量**无法表达波动率均值回复**，
-长期预测等于当前水平；它也不用做方向；`garch11` 的 2.2 ms/次适合研究/汇报，
-默认实时路径用 EWMA。
+重型编译依赖，而它跑在逐 bar 路径上。`garch_backend()` 运行时探测
+（本机实测返回 **`"scipy"`**），`garch11_params` 的返回值用 `backend` 字段记录
+实际跑了哪条路径。
 
 ### 3.4 接线位置
 
@@ -161,8 +269,32 @@ realized_garman_klass, garch11)`；输入可以是收益序列**或** OHLCV Data
 | `core/executor/executor.py:vol_stop_ctx` | 开仓时给出 `{vol_pct, stop_pct}`；预测由 `set_forecast_vol_pct` 推入 | 返回 `{}` |
 | `core/ml/labels.py:barrier_widths(vol_pct=...)` | 用预报替代 ATR 代理 | `None` → ATR 路径不变 |
 
+> **缓存边界（审计第 8 项）**：`VolForecaster._cache` 现在**有上界**
+> `MAX_FORECAST_CACHE_ENTRIES = 64`（LRU 淘汰：命中会把键移到队尾，因此每根 bar
+> 都读的活跃 symbol 不会被一次性 symbol 挤掉）；实测 500 个不同键后缓存长度恒为 64。
+> `OrderExecutor._forecast_vol_cache`（`core/executor/executor.py`，**不在本次写入
+> 范围**）仍只靠 300 s TTL 与"已推送 symbol 数"约束：键来自配置的币种集合，
+> 不再推送的 symbol 不会被任何读取触发过期。这是**已登记待办**，不是活跃泄漏
+> （`tests/test_p34_audit_fixes.py::test_executor_forecast_cache_size_is_reported_not_fixed`
+> 记录该边界）。
+
 `labels.py` 的 `vol_pct` 是**分数**（与 `min_pct`/`max_pct` 同单位），
 percent↔fraction 的换算只在 `PositionSizer.barrier_widths_pct` 里做一次。
+
+> **⚠️ 三个 `barrier_*` 配置项当前是 inert（审计发现的第 5 项缺陷，尚未接线）**：
+> `risk.vol_targeting.barrier_vol_multiple` / `barrier_min_pct` / `barrier_max_pct`
+> 的唯一读取者是 `PositionSizer.barrier_widths_pct`，而**没有任何生产代码调用它**
+> （`core/` 全树搜索只有定义处与注释；`tests/test_p34_audit_fixes.py`
+> 用一条 tripwire 测试固定这一点，`position_sizer.barrier_widths_pct` 的 docstring
+> 也标注了）。实盘 label 路径的宽度来自
+> `ml.barrier_atr_period` / `ml.barrier_atr_multiple` / `ml.barrier_min_pct` /
+> `ml.barrier_max_pct`（`MLPredictor._barrier_params`）。因此**运维改这三个键现在
+> 不会产生任何效果**。接线需要改 `core/ml/predictor.py`（不在本次写入范围）：
+> 在 `_barrier_params` 里用 `executor`/`risk` 的同一条预报覆盖 ATR 宽度，
+> 或让 `manager.py` 的 `resolve_forecast_vol_pct` 结果流到 label 构建处。
+> 已接线的实盘部分只有**止损/移动止损宽度**与**仓位 scale**（`manager.py` 的
+> `resolve_forecast_vol_pct` 现在会读 `executor.vol_stop_ctx` 的 `vol_pct`，
+> 因此 `executor.set_forecast_vol_pct` 不再是死代码）。
 
 ## 4. 实测效果
 
@@ -213,8 +345,9 @@ percent↔fraction 的换算只在 `PositionSizer.barrier_widths_pct` 里做一�
    点估计；真实取舍应看预测-实现回归的 `R²`，未做。
 4. **1 484 小时的数据接缝**是数据供应商问题，剪裁只是防御；缓存重新抓取后
    应复查 `DEFAULT_OUTLIER_SIGMA` 是否需要收紧。
-5. GARCH 未做均值回复（见 §3.3），且未做 Student-t / EGARCH；若要用它做
-   多日风险预算，需要先换成带 `arch` 的路径。
+5. 自由 ω 的 GARCH 能表达均值回复（`ω/(1−α−β)` 即长期方差），但**回退的 IGARCH
+   网格不能**（见 §3.3），且两者都未做 Student-t / EGARCH；若要用它做多日风险预算，
+   需要先换成带 `arch` 的路径。
 
 ## 相关研究
 

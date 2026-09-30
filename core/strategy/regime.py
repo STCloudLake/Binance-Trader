@@ -52,14 +52,26 @@ its "filtered" posterior is causal *given the parameters* but the labels are
 not: appending future bars moves σ and can move a Viterbi label before the
 appended region (measured: 2 of 3 synthetic seeds).  Its reported accuracy is
 **in-sample** and is labelled that way in
-``tests/test_p34_audit_fixes.py``/doc 11.  ``hmm_two_state_causal`` (selected
-automatically the moment :data:`REGIME_GATING_ENABLED` is turned on, or by
-``causal=True``) refits the parameters on a documented schedule using only the
-past and decodes each bar with a forward-only pass, so appending bars cannot
-change an earlier label.  The *smoothed* posterior over the whole sample is
-reported separately as ``posterior_smoothed`` and is explicitly **not**
-tradeable.  :func:`gate_regimes` refuses to gate on a table whose HMM labels are
-not causal rather than trusting the caller.
+``tests/test_p34_audit_fixes.py``/doc 11.
+
+**Two accuracies, and the 99.9 % one is the in-sample one.**  On the structure
+this module's docs advertise — 3000 bars, true σ 0.002/0.010, change points at
+1000 and 2000 — the whole-sample Viterbi decodes at **0.9987** (the figure the
+docs quote as "≈99.9 %"), but its parameters saw the very regime it is being
+scored on, so that number is a fit diagnostic and not tradeable.  The causal
+path is the honest number: **0.758–0.815** (out of sample; seeds 5/7/11 of the
+generator in ``tests/test_p34_audit_fixes.py``, which also pins it), at a
+detection latency of 5–145 bars at the first change point and 24–27 at the
+second.  The two are different quantities and only the second is a live claim.
+
+``hmm_two_state_causal`` (selected automatically the moment
+:data:`REGIME_GATING_ENABLED` is turned on, or by ``causal=True``) refits the
+parameters on a documented schedule using only the past and decodes each bar
+with a forward-only pass, so appending bars cannot change an earlier label.  The
+*smoothed* posterior over the whole sample is reported separately as
+``posterior_smoothed`` and is explicitly **not** tradeable.
+:func:`gate_regimes` refuses to gate on a table whose HMM labels are not causal
+rather than trusting the caller.
 
 Limitations
 -----------
@@ -251,7 +263,9 @@ def hmm_two_state(
         the series to 2000 bars moves σ from 0.00202/0.00968 to 0.00200/0.00973
         and flips an earlier Viterbi label on 2 of 3 synthetic seeds (measured;
         see ``tests/test_p34_audit_fixes.py``).  The accuracy reported for this
-        mode is **in-sample** and must be labelled as such.
+        mode is **in-sample** — the 0.9987/"≈99.9 %" figure in the module
+        docstring — and must be labelled as such; the causal path's out-of-sample
+        accuracy on the same synthetic structure is 0.758–0.815.
         ``True`` delegates to :func:`hmm_two_state_causal`, which refits on a
         schedule and decodes each bar with a forward-only pass, so a label at bar
         ``t`` depends only on bars ≤ ``t``.
@@ -471,15 +485,27 @@ def hmm_two_state_causal(
     (:func:`hmm_two_state`'s own minimum), so very short inputs return
     ``"unknown"``.
 
+    **Index mapping.**  Buffer row ``j`` is bar ``start + j`` and the segment's
+    bars ``t … end-1`` are buffer rows ``t - start … end-1 - start``, so the
+    label for bar ``tt`` is ``fwd[tt - start]``; ``lag_bars`` in the return value
+    is that fixed offset (``0``).  The pre-fix code read ``fwd[k]`` for the k-th
+    row of the segment, which labelled bar ``tt`` with the posterior of
+    ``tt - (t - start)`` — lag 0, then 250, 500, … 2500 as the buffer refilled.
+    Measured on the advertised synthetic structure, that turned a 0.758 decode
+    into **0.156** (and 0.52 under the verifier's draw): a coin flip, and on some
+    draws worse, because the label described a bar up to 2500 bars old.
+
     Cost: one EM fit per refit point plus ``refits`` forward sweeps of the buffer
     (not one per bar), so a 3 000-bar series with the defaults (250-bar refit,
-    250-bar warm-up) is 12 fits + 12 sweeps, measured **0.9 s**.  That is a
+    250-bar warm-up) is 12 fits + 12 sweeps, measured **2.0–4.5 s** on this
+    checkout (the EM fit dominates; scipy is not involved).  That is a
     research/diagnostic cost, not a per-bar one; the live path is
     :data:`REGIME_DIAGNOSTICS_ENABLED`-gated and off.
 
     Determinism: same inputs → same labels, bar for bar (no random seed
     anywhere), and **appending future bars cannot change any earlier label** —
-    that is the property ``tests/test_p34_audit_fixes.py`` asserts.
+    that is the property ``tests/test_p34_audit_fixes.py`` asserts, together with
+    the index mapping and the accuracy recovery on the synthetic structure.
     """
     r = pd.Series(returns, dtype=float).dropna()
     x_full = r.to_numpy(dtype=float)
@@ -494,7 +520,7 @@ def hmm_two_state_causal(
                 "posterior_smoothed": np.full((n, 2), 0.5),
                 "state": pd.Series("unknown", index=r.index, dtype=object),
                 "causal": True, "warmup": warm, "first_label_index": None,
-                "refit_every": step, "n_refits": 0,
+                "refit_every": step, "n_refits": 0, "lag_bars": 0,
                 "note": f"too few rows ({n} < 50)"}
 
     states = np.zeros(n, dtype=int)
@@ -529,11 +555,21 @@ def hmm_two_state_causal(
         buf = x_full[start:end]
         mu, sigma, A, pi = params[0], params[1], params[2], params[3]
         order = np.argsort(sigma)
-        remap = np.zeros(2, dtype=int)
-        remap[order[0]], remap[order[1]] = 0, 1
         fwd = _hmm_forward_only(buf, mu, sigma, A, pi)
+        # Index mapping (the defect this line fixes).  ``fwd[j]`` is the filtered
+        # posterior of buffer row ``j``, and buffer row ``j`` is bar
+        # ``start + j``; the segment's rows are bars ``t … end-1``, i.e. buffer
+        # rows ``t - start … end-1 - start``.  Reading ``fwd[k]`` for the k-th row
+        # of the *segment* therefore emitted the posterior of bar
+        # ``start + k = tt - (t - start)`` — the label for bar ``tt`` was the
+        # posterior of bar ``tt - lag`` with ``lag = t - start`` (0 on the warm-up
+        # segment, then 250, 500, … as the buffer filled to ``max_rows``).  On the
+        # advertised synthetic structure (3000 bars, σ 0.002/0.010, change points
+        # 1000/2000) that lag turned a 0.76-accuracy decode into 0.16–0.52, i.e.
+        # worse than a coin flip.  ``tt - start`` is the mapping that labels the
+        # bar being decoded.
         for k, tt in enumerate(range(t, end)):
-            post = fwd[k]
+            post = fwd[tt - start]
             # Relabel by the fit's own volatility order, so state 0 is the calm
             # one even across refits where the EM indices could swap.  The
             # argmax must be taken on the *relabelled* row: taking it before the
@@ -559,6 +595,12 @@ def hmm_two_state_causal(
         "causal": True, "warmup": warm, "first_label_index": first,
         "refit_every": step, "n_refits": int(n_refits),
         "n_degenerate_fits": int(n_degenerate),
+        #: Fixed label-vs-bar offset: ``0`` because the emitted posterior for bar
+        #: ``tt`` is the filtered posterior of bar ``tt`` (buffer row
+        #: ``tt - start``), not of an earlier row.  Reported so the buffer/lag
+        #: bookkeeping is checkable from the return value instead of inferred
+        #: from the code — the pre-fix value was ``t - start``, i.e. 0…2500.
+        "lag_bars": 0,
         "note": "causal: forward-only decode, parameters refit on the past only",
     }
 

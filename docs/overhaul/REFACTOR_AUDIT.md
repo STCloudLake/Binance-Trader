@@ -10,6 +10,12 @@
 > - **已完成**：§4.1 全部条目、§4.2 全部 6 项、§五 全部 2 项 —— 见各节内联的 `✅ 已完成` 标记与证据。
 > - **本文不再维护**：新的清理项请以 `README.md` §11.3 与 `docs/overhaul/CHANGELOG.md` 为准。
 >
+> **算法升级（P1 GA / P2 ML / P3 波动率 / P4 能力 / gap fixes）的当前状态与实测证据**：见
+> [ALGO_UPGRADE_EVIDENCE.md](ALGO_UPGRADE_EVIDENCE.md)。该文档在 `2751bbb` 工作树上复测了发布审计项：
+> 路由基线 **118 → 118（ADDED 0 / REMOVED 0，文件逐字节不变）**、`compileall` 退出码 0、
+> 缓存 **25/29** 文件仍带 >1.5×bar 日历缺口，并列出仍未闭环项（杠杆与评估口径不一致、缓存缺口、
+> 路由基线无自动化回归门；hybrid 引擎 `condition_logic` 在 `2751bbb` 上仍开放，测量期间由并行改动关闭、待提交）。
+>
 > 本轮收敛的核验基线：测试 **606 passed / 0 failed**、`python -m compileall -q app core web db scripts` 退出码 0、
 > 路由基线 **118 条**（拆分时 97 条）、账本恒等式在生产库上 `delta = 0.000000`（`python scripts/audit_db.py`）。
 

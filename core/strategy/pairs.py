@@ -179,11 +179,11 @@ def _tau_block(kind: str, length: int, paths: int, seed: int,
     """Simulated tau statistics of one Monte-Carlo block under the null.
 
     ``max_lags = 0, const = False`` is the *un-augmented, no-constant* baseline
-    that :func:`_tau_block_simple` has always produced (kept bit-identical for
-    the tests that pin it).  ``max_lags > 0`` mirrors :func:`adf_regression`'s
-    AIC lag search, and ``const`` its ``regression="c"`` branch, so the null can
-    be simulated with **the same regression the real test runs** rather than with
-    an un-augmented approximation of it.
+    this function has always produced (kept bit-identical for the tests that pin
+    it).  ``max_lags > 0`` mirrors :func:`adf_regression`'s AIC lag search, and
+    ``const`` its ``regression="c"`` branch, so the null can be simulated with
+    **the same regression the real test runs** rather than with an un-augmented
+    approximation of it.
     """
     rng = np.random.default_rng(seed)
     if kind == "df_c":

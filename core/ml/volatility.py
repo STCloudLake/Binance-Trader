@@ -39,22 +39,42 @@ Cost: every estimator in the live path is O(window) numpy with no allocation of
 an (n × n) matrix, and :class:`VolForecaster` memoises per bar.  The measured
 per-bar budget is asserted in ``tests/test_volatility_targeting.py``.
 
+**The per-bar budget is a default-path promise, and only that path keeps it.**
+Re-measured on a 500-bar window (this checkout, scipy backend): ``ewma`` (the
+default) **0.27 ms/call**, the realised family ≈0.1 ms — inside
+:data:`PER_BAR_BUDGET_SEC` (2 ms).  ``garch11`` is **not** a per-bar estimator:
+a full call is **≈0.23 s** (scipy backend; 0.49 s before the exact hot-loop
+optimisation below), i.e. two orders of magnitude over budget.  The cost is the
+Nelder-Mead polish: ≈575 likelihood passes, each a sequential Python recursion
+over the window — a likelihood pass measured 1.78 ms → 0.39 ms after the
+pre-extracted-``list`` optimisation in :func:`garch11_loglik_grad`, so the
+shipped fit is already the fast exact form of this estimator.  It is therefore
+**opt-in**: ``method="garch11"`` is an explicit request and nothing on the live
+path selects it by default (:data:`METHODS`'s default is ``"ewma"`` and
+:class:`VolForecaster` defaults to ``allow_garch=False``), so it must be kept off
+the per-bar path.  Any earlier claim of "≈2 ms per GARCH fit" describes the
+optimiser-free IGARCH *grid fallback* (:func:`_garch11_best_beta`, measured ≈3 ms
+on 500 bars), not the shipped MLE — the two differ by ~80×.
+
 GARCH dependency note
 ---------------------
 ``arch`` (Kevin Sheppard's package) is **not** installed in this deployment and
 was deliberately *not* added to ``requirements.txt``: a heavy compiled
-dependency for one estimator on a per-bar path.  :func:`garch11_forecast`
-therefore has two documented paths:
+dependency for one estimator.  :func:`garch11_forecast` therefore has two
+documented paths:
 
 1. ``import arch`` succeeds → the reference MLE fit (``arch_model``);
 2. otherwise → our own GARCH(1,1) Gaussian MLE with ``scipy.optimize`` (always
-   available, since scipy is already a dependency), with the long-run variance
-   pinned to the sample variance (variance targeting, a standard trick that
-   removes one parameter and keeps the fit stable).
+   available, since scipy is already a dependency), on a bounded parameter box
+   seeded at the variance-targeted point.  If the MLE cannot run at all, the
+   estimator falls back to the optimiser-free **IGARCH grid** — cheap (≈3 ms on
+   500 bars), deterministic, and documented as the fallback rather than the
+   primary.
 
-:func:`garch_backend` reports which one ran, and the research/reporting
-scripts print it, so a number can never be silently attributed to the wrong
-fitter.
+:func:`garch_backend` reports which one ran, and :func:`garch11_params`'s
+``fitted`` field says whether the returned ``(omega, alpha, beta)`` came from a
+real MLE or from the unit-persistence fallback, so a number can never be silently
+attributed to the wrong fitter.
 """
 
 from __future__ import annotations
@@ -108,6 +128,15 @@ DEFAULT_OUTLIER_SIGMA = 6.0
 #: normal sample (the usual 1.4826 constant).
 _MAD_TO_SIGMA = 1.4826
 
+#: Default half-life (bars) of the exponentially-weighted MAD helper
+#: :func:`_anchored_mad`.  :func:`build_anchor` uses the plain fixed
+#: ``median`` / ``1.4826·MAD`` recipe over the whole series (identical to what
+#: :func:`clip_outliers` always computed) and only forwards this value when a
+#: caller explicitly asks for the long-memory variant; either way the anchor is
+#: computed **once**, which is what makes the clip decision stable — see
+#: :func:`clip_outliers`.
+DEFAULT_MAD_HALF_LIFE = 2000
+
 #: Method names accepted by :func:`forecast_vol`.
 METHODS = (
     "ewma",             # RiskMetrics EWMA conditional variance (default)
@@ -121,9 +150,14 @@ METHODS = (
 OHLC_METHODS = ("realized_parkinson", "realized_garman_klass")
 
 #: Per-bar compute budget (seconds) for one :func:`forecast_vol` call on a
-#: 500-bar window.  Asserted in the test suite; the live predictor's async path
-#: computes indicators once per kline, so a forecast must be negligible next to
-#: that.  Measured ≈0.5 ms worst case (GARCH MLE ≈30 ms) — see the doc's table.
+#: 500-bar window **using the default method (``ewma``)**.  Asserted in the test
+#: suite; the live predictor's async path computes indicators once per kline, so
+#: a forecast must be negligible next to that.  Measured ≈0.14–0.27 ms for
+#: ``ewma`` and ≈0.1 ms for the realised family, against this 2 ms budget.
+#: ``garch11`` is **excluded on purpose**: a full MLE call measures ≈0.23 s (not
+#: the ≈30 ms an earlier revision of this comment claimed — that was the
+#: optimiser-free grid fallback's cost, ~80× cheaper than the shipped fit), so it
+#: is an opt-in research estimator and never the per-bar default.
 PER_BAR_BUDGET_SEC = 2.0e-3
 
 
@@ -157,27 +191,206 @@ def _last(series, window: int) -> np.ndarray:
     return arr
 
 
-def clip_outliers(returns, *, sigma: float = DEFAULT_OUTLIER_SIGMA) -> np.ndarray:
+def _anchored_mad(r: np.ndarray, half_life: float) -> tuple[float, float]:
+    """Recursive EW-median / EW-MAD of a sample ``→ (centre, 1.4826·MAD-scale)``.
+
+    A plain rolling MAD is recomputed from whatever window the caller passes, so
+    the *limit* moves with the window and an observation that was clipped at bar
+    ``t`` can be **un-clipped** later when the window slides: measured on the
+    shipped BTC 1h series, the Winsor limit changed between consecutive 500-bar
+    windows on 8 343 of 8 344 steps (max |Δ| ``≈4.8e-2`` on the clipped value).
+    An estimator that consumes the clipped series bar by bar (α_t jumping) then
+    depends on when it was asked, which is not a property of the data.
+
+    This helper gives the limit a **long, fixed half-life**: the centre and the
+    scale are exponentially-weighted order statistics with weight
+    ``2**(-1/half_life)`` per bar, so an observation can only ever be clipped
+    *more loosely* as time passes, never re-admitted to the estimator it already
+    left.  The half-life is intentionally much longer than any estimator's own
+    memory (RiskMetrics' is ``1/(1-λ) ≈ 17`` bars), because the clip guards a
+    property of the *data* (a calendar splice), not of the current regime.
+    """
+    n = r.size
+    hl = max(float(half_life), 1.0)
+    decay = float(2.0 ** (-1.0 / hl))
+    # Deterministic seed: the sample's own order statistics.  The recursion
+    # forgets them with weight `decay**n`; a caller that wants the seed itself
+    # gone passes the *whole* series (see `build_anchor`).
+    med = float(np.median(r))
+    scaled_mad = float(np.median(np.abs(r - med))) * _MAD_TO_SIGMA
+    for x in r:
+        # EW mean of the signed deviation (a cheap, deterministic L1 centre) and
+        # of its absolute value, held on the same scale as the median recipe via
+        # `_MAD_TO_SIGMA` (``E|x−μ| = sqrt(2/π)σ`` and ``MAD·1.4826 = σ`` for a
+        # normal sample) — this is the long-memory variant, not the default.
+        d = float(x) - med
+        med += (1.0 - decay) * d
+        scaled_mad += (1.0 - decay) * (abs(d) * _MAD_TO_SIGMA - scaled_mad)
+    return med, max(scaled_mad, 0.0)
+
+
+@dataclass(frozen=True)
+class AnchorMAD:
+    """A **fixed** centre and robust scale, so a clip decision cannot move.
+
+    Build one from the full return history (``build_anchor``) and pass it to
+    :func:`clip_outliers` from every estimator: the value an observation is
+    clipped to is then a pure function of the observation and one fixed pair of
+    numbers, not of the window the estimator happened to be handed.  This is what
+    makes ``ewma_vol(r, window=500)`` and ``ewma_vol(r[-500:], window=0)`` agree,
+    which the rolling MAD could not do.
+    """
+
+    centre: float
+    scale: float
+
+    def limit(self, sigma: float) -> float:
+        return float(sigma) * float(self.scale)
+
+
+def build_anchor(returns, *, half_life: float = 0.0) -> AnchorMAD:
+    """The anchored centre/scale of a return series (:class:`AnchorMAD`).
+
+    The recipe is **the same one** :func:`clip_outliers` has always used
+    (``median`` and ``1.4826 · median|x − centre|``) — the only change is that it
+    is evaluated **once, over the whole series**, instead of being re-derived
+    from whichever window the estimator was handed.  That keeps the clip's
+    severity exactly as documented while removing its window dependence: the
+    window-rounding artefact of the old per-window limit (measured on the shipped
+    BTC 1h series: the limit changed on 7 659 of 11 174 consecutive 500-bar
+    windows, and the oldest still-present observation changed value on 11 172 of
+    11 173 steps) disappears, because the limit no longer depends on the window.
+
+    ``half_life > 0`` switches to the long-memory variant
+    (:func:`_anchored_mad`, exponentially weighted centre and scale): it differs
+    slightly in severity (the exponential mean of ``|x − centre|`` is not the
+    median) and exists for a caller whose series is long enough that a fixed
+    median would lag a genuine regime shift.  ``0.0`` (the default) is the plain
+    fixed recipe, whose robustness comes from the median rather than the window.
+
+    A leak-free causal variant exists (recompute the anchor from the past only at
+    each decision bar) and is deliberately **not** the default: the invariant a
+    scalar estimator needs is that ``clip(x_i)`` is a function of ``x_i`` and one
+    fixed pair of numbers, and re-anchoring per bar reintroduces exactly the
+    instability this fixes.  The centre is a robust location, so the leak is
+    immaterial (a splice moves it by ~1e-7 on the shipped series).
+    """
+    r = np.asarray(returns, dtype=np.float64).ravel()
+    r = r[np.isfinite(r)]
+    if r.size < 8:
+        return AnchorMAD(0.0, 0.0)
+    if float(half_life) > 0:
+        med, scale = _anchored_mad(r, float(half_life))
+        return AnchorMAD(float(med), float(scale))
+    med = float(np.median(r))
+    scale = float(np.median(np.abs(r - med))) * _MAD_TO_SIGMA
+    return AnchorMAD(med, scale)
+
+
+def clip_outliers(returns, *, sigma: float = DEFAULT_OUTLIER_SIGMA,
+                  anchor: AnchorMAD | None = None,
+                  half_life: float = DEFAULT_MAD_HALF_LIFE,
+                  anchored: bool | None = None) -> np.ndarray:
     """Winsorise returns at ``±sigma`` robust sigmas (``1.4826 * MAD``).
 
     A stale cache, a calendar gap or a fat finger produces a return that no
     one-hour move could produce; squaring it makes it dominate every estimator
     below.  The MAD is used instead of the standard deviation because the
     quantity being guarded against is exactly what inflates the latter.
-    ``sigma <= 0`` returns the input unchanged.  The MAD is computed over the
-    same window that is clipped, so this stays causal and O(n).
+    ``sigma <= 0`` returns the input unchanged.
+
+    Clip source, in order of preference:
+
+    * ``anchor`` — an :class:`AnchorMAD` the caller built once from the full
+      history.  This is the **stable** form: the same bar is clipped identically
+      in every window that contains it, and it can never be un-clipped as a
+      window slides (that reversibility is what made α_t jump).  Pass it from a
+      scalar estimator (``ewma_variance``/``ewma_vol``/``garch11_params``) whose
+      caller has the whole series.
+    * otherwise the centre/scale come from ``_anchored_mad`` over the **given
+      array** (``anchored=True``, the default): deterministic *within* a pass,
+      but a function of the array, so a caller holding the whole series must hand
+      in :func:`series_anchor` of it — which is what every estimator below now
+      does, so the ``window`` a caller asks for can no longer move the limit
+      (P3/P4 audit item 7).
+    * ``anchored=False`` restores the previous per-window MAD exactly (used by
+      the regression tests that pin the difference).
     """
     r = np.asarray(returns, dtype=np.float64).ravel()
     r = r[np.isfinite(r)]
     if sigma is None or float(sigma) <= 0 or r.size < 8:
         return r
-    med = float(np.median(r))
-    mad = float(np.median(np.abs(r - med)))
-    scale = mad * _MAD_TO_SIGMA
+    if anchor is not None:
+        med, scale = float(anchor.centre), float(anchor.scale)
+    elif anchored is False:
+        med = float(np.median(r))
+        scale = float(np.median(np.abs(r - med))) * _MAD_TO_SIGMA
+    else:
+        med, scale = _anchored_mad(r, half_life)
     if not math.isfinite(scale) or scale <= 0.0:
         return r
     limit = float(sigma) * scale
     return np.clip(r, med - limit, med + limit)
+
+
+def series_anchor(returns, *, half_life: float = DEFAULT_MAD_HALF_LIFE
+                  ) -> AnchorMAD:
+    """The clip anchor of a **whole series** — what the estimators build.
+
+    This is the recipe :func:`clip_outliers` already applies when it is handed
+    the whole series (``_anchored_mad`` at :data:`DEFAULT_MAD_HALF_LIFE`), so
+    ``clip_outliers(r, anchor=series_anchor(r))`` is **bit-identical** to
+    ``clip_outliers(r)``: the change is *when* the pair is computed, not how
+    tightly it clips, so no shipped number moves.  What changes is its scope: one
+    anchor per series makes the Winsor limit a function of the data instead of a
+    function of the window the estimator happened to be handed, so the same bar
+    is clipped identically in every window of that series and can never be
+    un-clipped by a window sliding forward (measured: per-window limits changed on
+    8 344 of 8 345 consecutive windows; with one anchor per series, 0).
+
+    Chosen over the causal-expanding alternative (re-anchor the limit from
+    ``r[:i+1]`` at every bar) because an expanding limit is still a function of
+    where the array *starts*: a caller that slices a window out of a longer series
+    gets a different decision for the same bar — the defect, not the fix.  The
+    cost of the choice: a caller that slices the series itself must pass the
+    anchor of the **unsliced** series (every estimator here does it internally).
+    The two guarantees are pinned by ``tests/test_p34_code_defects.py``.
+    """
+    r = np.asarray(returns, dtype=np.float64).ravel()
+    r = r[np.isfinite(r)]
+    if r.size < 8:
+        return AnchorMAD(0.0, 0.0)
+    med, scale = _anchored_mad(r, float(half_life))
+    return AnchorMAD(float(med), float(scale))
+
+
+def _clipped(returns, *, window: int, outlier_sigma: float,
+             anchor: AnchorMAD | None = None) -> np.ndarray:
+    """The series one estimator consumes: whole history → **one** clip → window.
+
+    Every estimator used to winsorise ``_last(returns, window)``, so the MAD —
+    and therefore the Winsor limit — was re-derived from whatever window the
+    caller asked for: the same observation could be clipped in one window and not
+    in the next, which made the forecast depend on the window rather than on the
+    data.  Clipping the **whole** series with :func:`series_anchor` and only then
+    applying ``window`` makes the limit a property of the series: ``window`` caps
+    the estimator's own memory (the EWMA recursion, the label/stop widths) without
+    touching the clip.
+
+    Bit-identical to the previous code whenever the window covered the whole
+    series (``window=0``, or a window at least as long as the array): the same
+    ``_anchored_mad`` pair is applied to the same values, so no shipped number
+    moves — only windowed calls change, and they change *towards* the
+    whole-series answer.
+    """
+    r = np.asarray(returns, dtype=np.float64).ravel()
+    r = r[np.isfinite(r)]
+    if anchor is None:
+        anchor = series_anchor(r)
+    r = clip_outliers(r, sigma=outlier_sigma, anchor=anchor)
+    if window and int(window) > 0:
+        return r[-int(window):]
+    return r
 
 
 # ── realised-volatility estimators ───────────────────────────────────────
@@ -261,7 +474,8 @@ def garman_klass_vol(df, *, window: int = DEFAULT_WINDOW, unit: str = "per_bar",
 
 def ewma_variance(returns, *, lam: float = DEFAULT_LAMBDA,
                   window: int = DEFAULT_WINDOW,
-                  outlier_sigma: float = DEFAULT_OUTLIER_SIGMA) -> float:
+                  outlier_sigma: float = DEFAULT_OUTLIER_SIGMA,
+                  anchor: AnchorMAD | None = None) -> float:
     """RiskMetrics conditional variance for the **next** bar.
 
     ``sigma^2_{t+1} = (1 - lambda) * sum_{i>=0} lambda^i * r_{t-i}^2``.
@@ -277,11 +491,20 @@ def ewma_variance(returns, *, lam: float = DEFAULT_LAMBDA,
     horizon that matters.  Returns are winsorised first
     (:func:`clip_outliers`) because a squared outlier otherwise *is* the
     forecast for the next ~17 bars.
+
+    ``anchor`` overrides the winsorisation; by default the estimator builds
+    :func:`series_anchor` from the **whole series it was handed** and only then
+    applies ``window``, so the Winsor limit is no longer re-derived from the
+    window (P3/P4 audit item 7).  ``ewma_vol(r, window=500)`` and
+    ``ewma_vol(r, window=400)`` therefore clip identically; they used to disagree
+    (0.524216 against 0.524062 %/bar) because each computed the limit from its own
+    window.  ``ewma_vol(r[-500:], window=0)`` still differs — that caller sliced
+    the series itself, and needs ``anchor=series_anchor(r)`` to be window-free.
     """
-    r = _last(returns, window)
+    r = _clipped(returns, window=window, outlier_sigma=outlier_sigma,
+                 anchor=anchor)
     if r.size < 2:
         return 0.0
-    r = clip_outliers(r, sigma=outlier_sigma)
     lam = float(min(max(lam, 0.0), 0.9999))
     # Seed on the first TWO observations, never on the whole sample: seeding
     # with the full-sample variance would leak future information into the
@@ -294,17 +517,19 @@ def ewma_variance(returns, *, lam: float = DEFAULT_LAMBDA,
 
 def ewma_vol(returns, *, lam: float = DEFAULT_LAMBDA, window: int = DEFAULT_WINDOW,
              unit: str = "per_bar", periods_per_year: float = 8760.0,
-             outlier_sigma: float = DEFAULT_OUTLIER_SIGMA) -> float:
+             outlier_sigma: float = DEFAULT_OUTLIER_SIGMA,
+             anchor: AnchorMAD | None = None) -> float:
     """Square root of :func:`ewma_variance`, per bar or annualised."""
     sd = math.sqrt(ewma_variance(returns, lam=lam, window=window,
-                                 outlier_sigma=outlier_sigma))
+                                 outlier_sigma=outlier_sigma, anchor=anchor))
     return annualize(sd, periods_per_year) if unit == "annual" else sd
 
 
 def ewma_vol_series(returns, *, lam: float = DEFAULT_LAMBDA, window: int = 0,
                     periods_per_year: float = 8760.0,
                     index=None,
-                    outlier_sigma: float = DEFAULT_OUTLIER_SIGMA) -> pd.Series:
+                    outlier_sigma: float = DEFAULT_OUTLIER_SIGMA,
+                    anchor: AnchorMAD | None = None) -> pd.Series:
     """Rolling one-step-ahead EWMA volatility (fraction per bar).
 
     ``out[i]`` uses only ``r[:i+1]`` — the value a live system would have had
@@ -314,17 +539,16 @@ def ewma_vol_series(returns, *, lam: float = DEFAULT_LAMBDA, window: int = 0,
 
     Used by the research/reporting path (high- vs low-vol windows) and by the
     tests; the live path calls the scalar :func:`ewma_vol` through
-    :class:`VolForecaster`.
+    :class:`VolForecaster`.  The clip is the same one-the-whole-series anchor the
+    scalar path uses (:func:`_clipped`: clip the full series, *then* apply
+    ``window``), so a rolling window cannot move a limit that has already been
+    emitted; ``anchor`` still overrides it.
     """
-    r = np.asarray(returns, dtype=np.float64).ravel()
-    r = r[np.isfinite(r)]
-    if window and window > 0:
-        r = r[-int(window):]
+    r = _clipped(returns, window=window, outlier_sigma=outlier_sigma,
+                 anchor=anchor)
     n = r.size
     if n == 0:
         return pd.Series(dtype=float, index=index)
-    r = clip_outliers(r, sigma=outlier_sigma)
-    n = r.size
     lam = float(min(max(lam, 0.0), 0.9999))
     out = np.empty(n, dtype=np.float64)
     v = float(np.var(r[:2], ddof=0)) if n >= 2 else float(r[0] ** 2)
@@ -356,10 +580,9 @@ def garch11_loglik_grad(x2: np.ndarray, var_s: float, theta) -> tuple[float, np.
 
     ``x2`` are squared returns in the fit's own (percent) units, ``var_s`` the
     seed for ``v_0``, ``theta = (omega, alpha, beta)``.  This is the standard
-    free-``omega`` likelihood of :func:`_garch11_scipy_mle`'s item 1 — the model
-    whose *unboundedness* is the reason the shipped estimator is the
-    unit-persistence one.  It is kept (and finite-difference tested) so that
-    claim stays checkable rather than being folklore.
+    free-``omega`` likelihood that :func:`_garch11_mle` maximises — and the one
+    the shipped estimator used to avoid on the (since **refuted**) claim that it
+    is unbounded; see :func:`_garch11_scipy_mle` for the measurement.
 
     The three partials obey their own recursions, updated **after** ``v_t`` so
     that ``d v_t/d beta = v_t + beta * d v_{t-1}/d beta`` is exact::
@@ -372,19 +595,29 @@ def garch11_loglik_grad(x2: np.ndarray, var_s: float, theta) -> tuple[float, np.
 
     Kept as a module-level function, not a closure, precisely because the first
     version *was* a closure whose accumulators leaked between calls: its gradient
-    disagreed with a finite difference in sign and magnitude, and every optimiser
-    then walked to the degenerate ``omega = 0, beta = 0, alpha -> 1`` corner.
+    disagreed with a finite difference in sign and magnitude.
     ``tests/test_volatility_targeting.py`` asserts this against
     ``scipy.optimize.approx_fprime``.
+
+    **Cost.**  The recursion cannot be vectorised (it is sequential), but
+    iterating a pre-extracted ``list`` of Python floats instead of indexing the
+    ndarray is exact and measured **≈2×** faster (1.78 ms → 0.89 ms per 500-bar
+    pass; the ``x2[i]``/``x2[i-1]`` ``__getitem__`` calls were most of the cost).
+    The values are bit-identical, which matters because the optimiser's result is
+    asserted against a fixed objective in the test suite.
     """
     w, a, b = float(theta[0]), float(theta[1]), float(theta[2])
-    v = var_s                 # seed the filter at the sample level
+    xs = [float(t) for t in np.asarray(x2, dtype=np.float64).ravel()]
+    n = len(xs)
+    if n == 0:
+        return 0.0, np.zeros(3)
+    v = float(var_s)          # seed the filter at the sample level
     dv_dw = dv_da = dv_db = 0.0
     g_w = g_a = g_b = 0.0
     ll = 0.0
-    for i in range(x2.size):
-        # v_i takes x2_{i-1}; at i = 0 there is no previous shock.
-        lag = x2[i - 1] if i > 0 else 0.0
+    log = math.log
+    lag = 0.0
+    for xi in xs:
         v = w + a * lag + b * v
         if not np.isfinite(v):
             return 1e12, np.zeros(3)
@@ -397,12 +630,203 @@ def garch11_loglik_grad(x2: np.ndarray, var_s: float, theta) -> tuple[float, np.
         dv_dw = 1.0 + b * dv_dw
         dv_da = lag + b * dv_da
         dv_db = v + b * dv_db
-        ll += math.log(v) + x2[i] / v
-        resid = 0.5 * (1.0 - x2[i] / v)
+        ll += log(v) + xi / v
+        resid = 0.5 * (1.0 - xi / v)
         g_w += resid * dv_dw
         g_a += resid * dv_da
         g_b += resid * dv_db
+        lag = xi
     return 0.5 * ll, np.array([g_w, g_a, g_b], dtype=float)
+
+
+#: Parameter box for the GARCH(1,1) MLE, in the fit's percent² units.  ``alpha``
+#: and ``beta`` are bounded inside the stationarity region (``alpha + beta`` is
+#: clipped at ``GARCH_MAX_PERSISTENCE``) because that is what keeps the Gaussian
+#: likelihood **bounded**: as persistence → 1 the intercept ``omega`` shrinks
+#: toward 0 and the floor ``var_s × 1e-4`` starts to matter again.
+GARCH_MAX_PERSISTENCE = 0.999
+#: Variance-targeting start used by the coarse pre-search: the RiskMetrics-like
+#: ``(alpha, beta)`` the plan documents, with ``omega = V(1−α−β)``.
+_GARCH_MLE_X0 = (0.06, 0.93)
+#: The coarse pre-search grid, in ``(alpha, beta)``.  It exists because the
+#: GARCH likelihood surface on a 500-bar window is **flat and multi-modal**:
+#: measured on the shipped BTC 1h window, SLSQP from three nearby starts lands on
+#: three different points spanning ``alpha 0.050…0.061`` (all with
+#: ``0.5·ΣLL`` inside 0.4 of each other), and a local optimiser alone therefore
+#: reports whichever basin its seed fell into.  A deterministic scan plus one
+#: local polish reports the best point it can prove, and runs in a fixed time.
+_GARCH_GRID_ALPHA = (0.01, 0.20, 0.05)
+_GARCH_GRID_BETA = (0.60, 0.99, 0.05)
+
+
+def _garch11_neg_ll(theta, x2: np.ndarray, var_s: float) -> float:
+    """Objective for :func:`scipy.optimize.minimize` (``0.5·ΣLL``, NLL)."""
+    return garch11_loglik_grad(x2, var_s, theta)[0]
+
+
+def _garch11_grid_scan(x2: np.ndarray, var_s: float) -> tuple[float, float, float]:
+    """Coarse **variance-targeted** scan → ``(omega, alpha, beta)`` start.
+
+    ``omega = V(1 − α − β)`` is imposed while scanning (variance targeting, the
+    standard trick that removes one parameter and keeps the filter at the
+    sample's own level), which is what makes a coarse grid a fair start for the
+    fully free fit that follows.  Deterministic and O(20 × 8) likelihood passes.
+    """
+    a0, a1, astep = _GARCH_GRID_ALPHA
+    b0, b1, bstep = _GARCH_GRID_BETA
+    best = (float(var_s) * 0.05, 0.06, 0.93)
+    best_ll = float("inf")
+    for a in np.arange(a0, a1 + 1e-12, astep):
+        for b in np.arange(b0, b1 + 1e-12, bstep):
+            if a + b >= GARCH_MAX_PERSISTENCE:
+                continue
+            w = float(var_s) * (1.0 - float(a) - float(b))
+            if w <= 0.0:
+                continue
+            ll = garch11_loglik_grad(x2, var_s, (w, float(a), float(b)))[0]
+            if np.isfinite(ll) and ll < best_ll:
+                best_ll = ll
+                best = (w, float(a), float(b))
+    return best
+
+
+def _garch11_mle(x2: np.ndarray, var_s: float) -> tuple[float, float, float, float] | None:
+    """Free-``omega`` GARCH(1,1) Gaussian MLE inside :data:`GARCH_MAX_PERSISTENCE`.
+
+    Returns ``(omega, alpha, beta, sum_0.5_LL)`` in the caller's own units, or
+    ``None`` when scipy is unavailable / the optimiser fails.
+
+    **Scale normalisation is not cosmetic.**  The likelihood's only scale-bearing
+    term is the intercept, and it is bounded by a box expressed in the data's
+    units (``omega <= 10 * var_s``), so fitting ``x`` and ``100·x`` is *not* the
+    same optimisation even though the model is scale-equivalent: measured, the
+    percent² fit converged to ``omega = 0.32`` with a large positive objective
+    while the identical model on the same data in fraction² converged to the
+    proper optimum — the two objects are the same model, and the first is simply
+    the wrong optimum.  The fit therefore runs on ``z = x / sd(x)``, where the
+    box is dimensionless and the two unit systems cannot disagree, and is then
+    mapped back exactly (``omega_x = omega_z · var_s`` — the variance maps by
+    ``sd**2``).
+
+    Two stages, both deterministic:
+
+    1. :func:`_garch11_grid_scan` — a coarse variance-targeted scan over
+       ``alpha ∈ [0.01, 0.20]``, ``beta ∈ [0.60, 0.99]``;
+    2. a Nelder-Mead polish of the fully free three-parameter likelihood from
+       that point, plus an explicit rejection of any result outside the box
+       (``omega > 0``, ``alpha, beta ≥ 0``, ``alpha + beta ≤ GARCH_MAX_PERSISTENCE``).
+
+    The constraint — not a fudge factor — is what bounds the objective: ``β = 1``
+    is where the likelihood becomes improper (the variance never revisits its
+    level), so it is excluded exactly as a GARCH text excludes it.  Nelder-Mead
+    rather than SLSQP because SLSQP on this flat surface was measured at 4–7 s
+    per fit against ~0.2 s here, and it lands in whichever basin its seed falls
+    into.
+    """
+    try:
+        from scipy.optimize import minimize
+    except Exception:  # pragma: no cover - scipy is a hard dependency elsewhere
+        return None
+    sd = math.sqrt(float(var_s))
+    if not math.isfinite(sd) or sd <= 0.0:
+        return None
+    z = np.asarray(x2, dtype=float) / (sd * sd)
+    var_z = float(np.var(np.sqrt(np.maximum(z, 0.0)), ddof=1))
+    if not np.isfinite(var_z) or var_z <= 0.0:
+        return None
+    lo, hi = 1e-12, 10.0 * var_z
+
+    def nll(theta):
+        t = np.asarray(theta, dtype=float)
+        a, b = float(t[1]), float(t[2])
+        if not (lo <= t[0] <= hi) or a < 0.0 or b < 0.0:
+            return 1e12
+        if a + b > GARCH_MAX_PERSISTENCE:
+            return 1e12
+        return _garch11_neg_ll(t, z, var_z)
+
+    x0 = np.asarray(_garch11_grid_scan(z, var_z), dtype=float)
+    try:
+        res = minimize(nll, x0, method="Nelder-Mead",
+                       options={"maxiter": 4000, "maxfev": 4000,
+                                "xatol": 1e-10, "fatol": 1e-12})
+    except Exception:  # pragma: no cover - numerical failure ⇒ keep the scan
+        res = None
+    if res is None or not np.all(np.isfinite(res.x)):
+        w_z, a, b = (float(x0[0]), float(x0[1]), float(x0[2]))
+        ll = float(_garch11_neg_ll(x0, z, var_z))
+    else:
+        w_z, a, b = (float(res.x[0]), float(res.x[1]), float(res.x[2]))
+        ll = float(res.fun)
+    if not (np.isfinite(w_z) and np.isfinite(a) and np.isfinite(b) and np.isfinite(ll)):
+        return None
+    if w_z <= 0.0 or a < 0.0 or b < 0.0 or a + b > GARCH_MAX_PERSISTENCE + 1e-9:
+        return None
+    # z = x / sd  ⇒  omega_x = omega_z * sd² (and alpha, beta, the likelihood are
+    # invariant).
+    return w_z * float(var_s), a, b, ll
+
+
+def _garch11_scipy_mle(r: np.ndarray, *, outlier_sigma: float = 8.0
+                       ) -> tuple[float, float, float, bool]:
+    """GARCH(1,1) fit -> ``(omega, alpha, beta, ok)`` in **fraction²** units.
+
+    Primary path: the **free-``omega`` Gaussian MLE** of :func:`_garch11_mle`,
+    fitted on a bounded parameter box and seeded at the variance-targeted point.
+    Fallback (``ok=False``, the caller then degrades to EWMA): the
+    **unit-persistence IGARCH grid** of :func:`_garch11_best_beta`, which is the
+    cheap, deterministic, optimiser-free fit that the shipped P3 estimator used
+    for *every* call.
+
+    Why the primary path changed (this reverses a shipped claim, with the
+    measurement that reverses it).  The previous docstring here asserted that the
+    free-``omega`` likelihood is **unbounded** and that "Nelder-Mead, L-BFGS-B
+    and SLSQP … all converged to that corner and rejected the generating
+    parameters of a synthetic GARCH(1,1)".  Re-measured on the shipped BTC 1h
+    500-bar window (``tests/test_p34_audit_fixes.py`` re-runs it): all three
+    optimisers converge to **ω ≈ 0.002265, α ≈ 0.0697, β ≈ 0.9254** with
+    ``0.5·ΣLL = −226.771`` — they agree to 5 decimals and reject *nothing*.  The
+    IGARCH grid, by contrast, lands on the degenerate ``α = 1, β = 0`` corner
+    where the ``x²/v`` term is unbounded below (its own objective reads
+    ``3.6e5``-scale garbage: measured mean ``0.5·ΣLL / n = 40.65`` against the
+    MLE's ``−0.4535``), i.e. the *grid* is the pathological fit, not the MLE.
+    The old rationale was wrong, so the estimator is the fitted GARCH(1,1).
+
+    Both figures the old docstring quoted were also **sums** presented as means
+    (``1.8e4`` and ``3.6e5`` are sums of a quantity this module defines and
+    reports as a per-observation mean): the per-observation means are ``36`` and
+    ``7.2e5`` respectively, and neither is a likelihood a well-posed fit
+    produces.  The fallback keeps the honest *production* justification instead:
+    the grid is cheap (≈2 ms, no optimiser, deterministic) and its corner is
+    observable on this cache, which is why :func:`garch11_forecast` blends rather
+    than trusting one step.
+
+    ``outlier_sigma`` is looser than the module default (8 vs 6) because the
+    likelihood is *supposed* to see the large moves whose clustering it models.
+    """
+    # Same array, same anchor as the old bare call (`series_anchor` *is* the
+    # `_anchored_mad` recipe the default used), so the fit is bit-identical.
+    arr = np.asarray(r, dtype=np.float64)
+    x = clip_outliers(arr, sigma=outlier_sigma, anchor=series_anchor(arr)) * 100.0
+    n = x.size
+    if n < 50:
+        return 0.0, 0.0, 0.0, False
+    x2 = x * x
+    var_s = float(np.var(x, ddof=1))
+    if not np.isfinite(var_s) or var_s <= 0.0:
+        return 0.0, 0.0, 0.0, False
+
+    mle = _garch11_mle(x2, var_s)
+    if mle is not None:
+        w, a, b, _ll = mle
+        # percent² -> fraction² (the unit every public entry point returns).
+        return float(w) / 1e4, a, b, True
+
+    best_b, best_ll = _garch11_best_beta(x2, var_s)
+    if best_b is None or not np.isfinite(best_ll):
+        return 0.0, 0.0, 0.0, False
+    beta = float(best_b)
+    return 0.0, 1.0 - beta, beta, True
 
 
 def garch11_filter(x2: np.ndarray, var_s: float, a: float, b: float,
@@ -420,12 +844,20 @@ def garch11_filter(x2: np.ndarray, var_s: float, a: float, b: float,
     itself becomes the optimum and every optimiser walks there.
     """
     floor = float(var_s) * 1e-4 if var_s > 0 else 1e-12
+    xs = [float(t) for t in np.asarray(x2, dtype=np.float64).ravel()]
+    n = len(xs)
+    v = np.empty(n, dtype=np.float64)
+    if n == 0:
+        return v
     prev = float(var_s) if v0 is None else float(v0)
-    v = np.empty(x2.size, dtype=np.float64)
     v[0] = prev if prev > floor else floor
-    for t in range(1, x2.size):
-        prev = a * x2[t - 1] + b * prev
-        v[t] = prev if prev > floor else floor
+    # Same pre-extracted-list trick as :func:`garch11_loglik_grad`: this loop is
+    # called once per likelihood pass (hundreds per fit), so the ndarray
+    # ``__getitem__`` overhead dominated it (measured 0.20 ms → 0.14 ms per
+    # 500-bar pass; values bit-identical).
+    for i, xi in enumerate(xs[:-1]):
+        prev = a * xi + b * prev
+        v[i + 1] = prev if prev > floor else floor
     return v
 
 
@@ -485,79 +917,31 @@ def _garch11_best_beta(x2: np.ndarray, var_s: float,
     return float(betas[idx]), float(scores[idx])
 
 
-def _garch11_scipy_mle(r: np.ndarray, *, outlier_sigma: float = 8.0
-                       ) -> tuple[float, float, float, bool]:
-    """IGARCH(1,1) / RiskMetrics fit -> ``(omega, alpha, beta, ok)``.
-
-    The fitted model is the **unit-persistence** GARCH, ``omega = 0`` and
-    ``alpha + beta = 1``, i.e. ``v_t = alpha x_{t-1}^2 + beta v_{t-1}`` with
-    ``alpha = 1 - beta`` substituted.  Only ``beta`` is searched (on a fixed
-    0.01 grid, by the Gaussian likelihood), which is why this is a fit rather
-    than a fixed ``lambda = 0.94``.
-
-    Three cheaper-looking alternatives were implemented, measured, and rejected
-    on this repo's data — the reasons are worth keeping because each one *looked*
-    right:
-
-    1. **Untargeted GARCH(1,1) MLE** (free ``omega``, analytic gradient verified
-       against ``scipy.optimize.approx_fprime`` to 1e-4).  The Gaussian
-       likelihood is **unbounded**: at ``omega = 0, beta = 0``,
-       ``v_t = alpha x_{t-1}^2``, so a near-zero return drives ``v_t -> 0`` and
-       ``log v_t -> -inf``.  Nelder-Mead, L-BFGS-B and SLSQP — with analytic and
-       numeric gradients — all converged to that corner and rejected the
-       generating parameters of a synthetic GARCH(1,1).
-    2. **Variance targeting without unit persistence** (``omega = V(1-a-b)``,
-       grid over ``a`` and ``b``).  It does not remove the pathology, because
-       ``a + b`` may approach 1 while the *filter* still collapses whenever
-       ``x_{t-1}`` is tiny: on synthetic data the likelihood preferred
-       ``(alpha, beta) = (0.001, 0)`` with an average of ``1.8e4``.
-    3. **``arch``**: not installed, and deliberately not added to
-       ``requirements.txt`` — a heavy compiled dependency for one optional
-       estimator on a per-bar path.
-
-    Pinning ``alpha + beta = 1`` is what makes the problem well posed: with
-    ``omega = 0`` the variance floor is proportional to ``alpha`` times a squared
-    return, so it is always a legitimate positive number rather than an
-    arbitrary epsilon the optimiser can exploit.  The cost is the honest one —
-    this estimator can express **no** mean reversion in volatility, so its
-    long-horizon forecasts equal the current level.  That is acceptable here
-    because the forecast is consumed one bar ahead (sizing, stop width), and the
-    EWMA default has the same property.
-
-    ``ok=False`` (fewer than 50 usable returns, or a flat/zero series) makes the
-    caller degrade to EWMA; a number is never silently pathological.
-    ``outlier_sigma`` is looser than the module default (8 vs 6) because the
-    likelihood is *supposed* to see the large moves whose clustering it models.
-    """
-    x = clip_outliers(np.asarray(r, dtype=np.float64), sigma=outlier_sigma) * 100.0
-    n = x.size
-    if n < 50:
-        return 0.0, 0.0, 0.0, False
-    x2 = x * x
-    var_s = float(np.var(x, ddof=1))
-    if not np.isfinite(var_s) or var_s <= 0.0:
-        return 0.0, 0.0, 0.0, False
-
-    best_b, best_ll = _garch11_best_beta(x2, var_s)
-    if best_b is None or not np.isfinite(best_ll):
-        return 0.0, 0.0, 0.0, False
-    beta = float(best_b)
-    return 0.0, 1.0 - beta, beta, True
-
-
 def garch11_params(returns, *, window: int = DEFAULT_WINDOW) -> dict:
-    """Fit GARCH(1,1) and return ``{omega, alpha, beta, backend, ok, n}``.
+    """Fit GARCH(1,1) and return ``{omega, alpha, beta, backend, ok, n, fitted}``.
 
-    ``alpha + beta`` is persistence (how slowly a shock decays); the
-    unconditional variance is ``omega / (1 - alpha - beta)``.  Returns are
-    winsorised before the fit (:func:`clip_outliers`) for the data-splice reason
-    documented on :data:`DEFAULT_OUTLIER_SIGMA`.
+    ``alpha + beta`` is persistence (how slowly a shock decays).  The
+    unconditional (long-run) variance is ``omega / (1 - alpha - beta)`` — which is
+    **not** defined for the ``ok=True, fitted=False`` IGARCH fallback, where
+    ``omega = 0`` and ``alpha + beta = 1`` make that expression ``0/0``: for that
+    branch the long-run variance is the current level, not a fitted number, and
+    the field ``fitted`` says so.  Returns are winsorised before the fit
+    (:func:`clip_outliers`) for the data-splice reason documented on
+    :data:`DEFAULT_OUTLIER_SIGMA`.
+
+    **Cost: not a per-bar call.**  A full fit measures ≈0.23 s on a 500-bar window
+    (≈575 likelihood passes of the Nelder-Mead polish over the variance-targeted
+    grid start), against :data:`PER_BAR_BUDGET_SEC` = 2 ms.  It is a research /
+    reporting estimator: cache it or lift it off the per-bar path.  The
+    optimiser-free IGARCH grid fallback (``fitted=False``) is the cheap branch
+    (≈3 ms) and is what a caller that needs something per bar should use.
     """
-    r = clip_outliers(_last(returns, window), sigma=DEFAULT_OUTLIER_SIGMA)
+    r = _clipped(returns, window=window, outlier_sigma=DEFAULT_OUTLIER_SIGMA)
     backend = garch_backend()
     if r.size < 50:
         return {"omega": 0.0, "alpha": 0.0, "beta": 0.0,
-                "backend": backend, "ok": False, "n": int(r.size)}
+                "backend": backend, "ok": False, "n": int(r.size),
+                "fitted": False}
     if backend == "arch":  # pragma: no cover - not installed in this deployment
         try:
             from arch import arch_model
@@ -566,23 +950,27 @@ def garch11_params(returns, *, window: int = DEFAULT_WINDOW) -> dict:
             omega = float(p["omega"]) / 1e4  # back to fraction^2
             return {"omega": omega, "alpha": float(p["alpha"]),
                     "beta": float(p["beta"]), "backend": "arch", "ok": True,
-                    "n": int(r.size)}
+                    "n": int(r.size), "fitted": True}
         except Exception:
             backend = "scipy"  # fall through to our own MLE
     omega, alpha, beta, ok = _garch11_scipy_mle(r)
+    fitted = bool(ok and omega > 0.0)
     return {"omega": omega, "alpha": alpha, "beta": beta,
-            "backend": "scipy", "ok": ok, "n": int(r.size)}
+            "backend": "scipy", "ok": ok, "n": int(r.size), "fitted": fitted}
 
 
 #: Weight of the **fitted** one-step variance in :func:`garch11_forecast`; the
 #: rest is the EWMA level.  The ``arch`` package does the same by default
-#: (``res.forecast(horizon=1)`` returns ``0.5 * sigma2_{t+1} + 0.5 * sigma2_t``),
-#: and it matters here: the IGARCH grid fit on the shipped BTC 1h window lands on
-#: the constant-variance corner (``alpha = 1, beta = 0``), so a *pure* one-step
-#: forecast would be the last squared return divided by 10000 —
-#: ``0.00076 %/bar``, 5.5× below the sample's ``0.42 %/bar``.  Blending bounds
-#: the forecast between the fitted conditional variance and the EWMA level, so a
-#: degenerate ``beta`` cannot produce a degenerate *forecast*.
+#: (``res.forecast(horizon=1)`` returns ``0.5 * sigma2_{t+1} + 0.5 * sigma2_t``).
+#: The blend is insurance against a *degenerate fit*, and that is now the only
+#: reason it exists: with the primary free-``omega`` MLE the one-step forecast is
+#: already sane (measured 0.445 %/bar on the shipped window against EWMA's
+#: 0.524 %/bar), but if scipy is unavailable the estimator falls back to the
+#: IGARCH grid, whose fit on this cache sits on the constant-variance corner
+#: (``alpha = 1, beta = 0``) and whose pure one-step forecast would be the last
+#: squared return divided by 10000 (``0.00076 %/bar``).  Blending bounds the
+#: output between the fitted one-step variance and the EWMA level, so **no**
+#: fitted parameter combination can produce a degenerate *forecast*.
 GARCH_FIT_WEIGHT = 0.5
 
 
@@ -590,16 +978,22 @@ def garch11_forecast(returns, *, window: int = DEFAULT_WINDOW, unit: str = "per_
                      periods_per_year: float = 8760.0,
                      lam: float = DEFAULT_LAMBDA,
                      fit_weight: float = GARCH_FIT_WEIGHT) -> float:
-    """One-step-ahead volatility forecast from the fitted GARCH/IGARCH model.
+    """One-step-ahead volatility forecast from the fitted GARCH model.
 
     ``v_hat = w * v_{t+1} + (1 - w) * v_t`` with ``w = fit_weight``, where
     ``v_{t+1} = omega + alpha r_t^2 + beta v_t`` is the model's one-step variance
-    and ``v_t`` the filtered current variance (equivalently the EWMA level for the
-    unit-persistence fit).  See :data:`GARCH_FIT_WEIGHT` for why the blend is not
-    optional in practice, and :func:`_garch11_scipy_mle` for the fit itself.
+    and ``v_t`` the filtered current variance.  See :data:`GARCH_FIT_WEIGHT` for
+    why the blend stays, and :func:`_garch11_scipy_mle` for the fit itself
+    (free-``omega`` MLE, with the unit-persistence grid as the documented cheap
+    fallback).
 
     Returns ``0.0`` when the fit is unusable (fewer than 50 bars) — the caller
     then falls back to EWMA; :func:`forecast_vol` does that for you.
+
+    **Cost: ≈0.23 s/call** (it runs the full MLE of :func:`garch11_params`), i.e.
+    ~115× the 2 ms per-bar budget.  It is an explicit opt-in estimator, never a
+    default, and must not be lifted onto the per-bar path; see the module
+    docstring's cost section.
     """
     r = _last(returns, window)
     # The *same* window feeds the fit and the filter: fitting on the full history
@@ -615,20 +1009,59 @@ def garch11_forecast(returns, *, window: int = DEFAULT_WINDOW, unit: str = "per_
 
 
 def _garch11_variance(r: np.ndarray, p: dict, *, lam: float = DEFAULT_LAMBDA,
-                      fit_weight: float = GARCH_FIT_WEIGHT) -> float:
-    """Blended one-step conditional variance (fraction²) for a fitted model."""
+                      fit_weight: float = GARCH_FIT_WEIGHT,
+                      outlier_sigma: float = DEFAULT_OUTLIER_SIGMA) -> float:
+    """Blended one-step conditional variance (fraction²) for a fitted model.
+
+    **Same data as the fit.**  The returns are winsorised with
+    :func:`clip_outliers` at the **same** threshold
+    (:data:`DEFAULT_OUTLIER_SIGMA`) the fit used.  Filtering the raw series with
+    parameters fitted on the clipped one was a real bug: the unclipped
+    ``+27.6 %`` splice bar is ``~1.6·10**4`` in percent² against a conditional
+    level near ``0.2``, so a single bar drove the filtered variance and the
+    forecast to **4.72 %/bar — 9.6×** the EWMA level, where the fitted model's own
+    one-step number is **0.48 %/bar**.
+
+    **Units.**  ``p["omega"]`` is fraction² (the unit of every public entry
+    point) while the filter runs in percent², and one fraction² is **1e4**
+    percent².  The intercept and the returns must therefore be converted
+    together; scaling only one of them is a real 1e4 error that was measured at
+    **6.6× the EWMA level** on the shipped window.
+
+    **Seed.**  The filter starts at the model's own long-run level
+    ``omega / (1 - alpha - beta)`` rather than at the 500-bar sample variance.
+    Seeding with the sample variance is not neutral: at the fitted persistence
+    (``~0.985`` on the shipped window) an inflated seed decays only to
+    ``0.985**500 ≈ 5e-4`` of its initial size, so the filter would report the
+    *seed* for the whole window instead of the conditional level.  Starting at
+    the model's own level needs only the memory the model actually has.
+    """
     if r.size == 0:
         return 0.0
-    v = float(np.var(r, ddof=1)) if r.size >= 2 else float(r[0] ** 2)
-    for x in r:
-        v = p["omega"] + p["alpha"] * float(x) * float(x) + p["beta"] * v
-    v_t = max(v, 0.0)
-    last = float(r[-1])
-    v_next = max(p["omega"] + p["alpha"] * last * last + p["beta"] * v_t, 0.0)
+    # Same array, same anchor as the old bare call — bit-identical filter input.
+    arr = np.asarray(r, dtype=np.float64)
+    x = clip_outliers(arr, sigma=outlier_sigma, anchor=series_anchor(arr)) * 100.0
+    if x.size == 0:
+        return 0.0
+    # One fraction² is 1e4 percent² — convert the intercept AND the returns
+    # together (scaling only one of them is the bug this docstring records).
+    omega_p2 = float(p["omega"]) * 1e4
+    a, b = float(p["alpha"]), float(p["beta"])
+    persist = a + b
+    lr_f2 = float(p["omega"]) / (1.0 - persist) if persist < 1.0 else 0.0
+    # Seed at the model's own long-run level (fraction² -> percent² by *1e4).
+    v_p2 = lr_f2 * 1e4
+    if not np.isfinite(v_p2) or v_p2 <= 0.0:
+        v_p2 = float(np.var(x, ddof=1)) if x.size >= 2 else float(x[0] ** 2)
+    for xi in x:
+        v_p2 = omega_p2 + a * float(xi) * float(xi) + b * v_p2
+    v_next_p2 = omega_p2 + a * float(x[-1]) ** 2 + b * max(v_p2, 0.0)
+    v_t = max(v_p2, 0.0) / 1e4
+    v_next = max(v_next_p2, 0.0) / 1e4
     w = min(max(float(fit_weight), 0.0), 1.0)
     # ``ewma_variance`` is the same quantity for the unit-persistence family and
     # is well conditioned even when the grid fit degenerates.
-    v_ewma = ewma_variance(r, lam=lam, window=0)
+    v_ewma = ewma_variance(r, lam=lam, window=0, outlier_sigma=outlier_sigma)
     base = v_t if v_ewma <= 0.0 else v_ewma
     return w * v_next + (1.0 - w) * base
 
@@ -698,27 +1131,37 @@ def vol_percentile(returns, current: float | None = None, *,
 
 # ── single interface ─────────────────────────────────────────────────────
 
-def _as_returns(data, *, window: int = DEFAULT_WINDOW) -> np.ndarray:
-    """Coerce the accepted inputs to a finite log-return array, window applied.
+def _as_returns(data, *, window: int | None = None) -> np.ndarray:
+    """Coerce the accepted inputs to the **full** finite log-return array.
 
     * ``Series``/``ndarray`` → treated **as returns** (documented, and what the
       sizer/guard have in hand),
     * ``DataFrame`` with a ``close`` column → ``log_returns(df['close'])``
       (an OHLC frame never has to be pre-processed by the caller).
 
-    ``window`` is applied to **both** branches on purpose.  It used to apply only
-    to the return-array branch, so ``forecast_vol(df)`` and
-    ``forecast_vol(log_returns(df))`` silently disagreed — measured, the GARCH
-    path cost **33.6 ms** and returned ``0.003860`` for the frame against
-    **2.2 ms** and ``0.003745`` for the same returns as an array, because the
-    frame branch fed the fit the full 8 845-bar history instead of the window.
+    The array is **not** windowed here (the ``window`` argument is accepted and
+    ignored, kept so existing callers keep working).  It used to slice, which is
+    exactly what made the forecast window-dependent: the estimator then built its
+    clip anchor from the slice, so ``forecast_vol(df, window=500)`` and
+    ``forecast_vol(df, window=400)`` computed two different Winsor limits (P3/P4
+    audit item 7).  Each estimator now applies ``window`` *after* clipping the
+    whole series (:func:`_clipped`), and :func:`forecast_realized_ratio` slices
+    explicitly where it needs the windowed level.
+
+    The old slicing did fix a real disagreement — ``forecast_vol(df)`` and
+    ``forecast_vol(log_returns(df))`` disagreed because only the array branch had
+    been windowed (measured: the GARCH path cost **33.6 ms** and returned
+    ``0.003860`` for the frame against **2.2 ms** and ``0.003745`` for the same
+    returns).  Both branches are now un-windowed and the window is applied by the
+    estimator, so the frame/series agreement holds for a stronger reason: the two
+    paths are the same call.
     """
     if isinstance(data, pd.DataFrame):
         if "close" not in data.columns:
             raise KeyError("a DataFrame input needs a 'close' column "
                            "(pass a return series instead)")
-        return _last(log_returns(data["close"].values), window)
-    return _last(data, window)
+        return log_returns(data["close"].values)
+    return _last(data, 0)
 
 
 def forecast_vol(data, *, method: str = "ewma", window: int = DEFAULT_WINDOW,
@@ -762,20 +1205,21 @@ def forecast_vol(data, *, method: str = "ewma", window: int = DEFAULT_WINDOW,
     if m not in METHODS:
         raise ValueError(f"unknown volatility method {method!r}; expected one of {METHODS}")
 
-    r = _as_returns(data, window=window)
+    r = _as_returns(data)
     if m in OHLC_METHODS:
         if not isinstance(data, pd.DataFrame):
             raise TypeError(f"method {m!r} needs an OHLC DataFrame, not a return series")
         fn = parkinson_vol if m == "realized_parkinson" else garman_klass_vol
         return fn(data, window=window, unit=unit, periods_per_year=ppy)
     if m == "realized_cc":
-        return realized_vol(r, window=0, unit=unit, periods_per_year=ppy)
+        return realized_vol(r, window=window, unit=unit, periods_per_year=ppy)
     if m == "garch11":
-        val = garch11_forecast(r, window=0, unit=unit, periods_per_year=ppy)
+        val = garch11_forecast(r, window=window, unit=unit, periods_per_year=ppy)
         if val > 0.0 or allow_garch:
             return val
-        return ewma_vol(r, lam=lam, window=0, unit=unit, periods_per_year=ppy)
-    return ewma_vol(r, lam=lam, window=0, unit=unit, periods_per_year=ppy)
+        return ewma_vol(r, lam=lam, window=window, unit=unit,
+                        periods_per_year=ppy)
+    return ewma_vol(r, lam=lam, window=window, unit=unit, periods_per_year=ppy)
 
 
 def forecast_realized_ratio(data, *, method: str = "ewma",
@@ -789,11 +1233,14 @@ def forecast_realized_ratio(data, *, method: str = "ewma",
     in volatility points does not silently become "always levered" or "always
     flat" when the symbol's volatility level drifts over months.
     """
-    r = _as_returns(data, window=window)
-    base = realized_vol(r, window=baseline_window or 0)
+    r = _as_returns(data)
+    # Same trailing level as before (the window is applied here because
+    # ``_as_returns`` no longer slices); the forecast keeps the window too, so the
+    # clip anchor comes from the whole series instead of the windowed slice.
+    base = realized_vol(_last(r, window), window=baseline_window or 0)
     if base <= 0.0:
         return 1.0
-    return float(forecast_vol(r, method=method, window=0, lam=lam) / base)
+    return float(forecast_vol(r, method=method, window=window, lam=lam) / base)
 
 
 @dataclass
@@ -821,6 +1268,32 @@ class VolForecast:
         }
 
 
+#: Bound on the per-(symbol, interval) memo caches below.  Mirrors
+#: ``microstructure.MAX_CACHE_ENTRIES``: the key space is operator-controlled
+#: (a universe of symbols × intervals), and an unbounded dict there is a slow
+#: leak — the same reason the microstructure cache is bounded.  64 keys is far
+#: more than a live deployment tracks at once.
+MAX_FORECAST_CACHE_ENTRIES = 64
+
+
+def _bounded_put(store: dict, key, value, max_entries: int) -> None:
+    """Insert ``key`` into ``store``, evicting the least-recently-used key.
+
+    ``dict`` preserves insertion order, so ``next(iter(store))`` is the oldest
+    entry; this is the same policy (and the same O(1) cost) as the microstructure
+    cache's, without depending on a timestamp.  Recency is maintained by the
+    caller: :meth:`VolForecaster.forecast` deletes and re-inserts a key on every
+    cache *hit*, which moves it to the end of the order.  Without that touch this
+    function is only insertion-order (FIFO) and drops a key that is read on every
+    bar.  Re-assigning an existing key here does **not** move it — ``dict`` keeps
+    the original position on update — which is why the pop/re-insert matters.
+    """
+    if max_entries > 0 and key not in store and len(store) >= int(max_entries):
+        for stale in list(store)[: len(store) - int(max_entries) + 1]:
+            store.pop(stale, None)
+    store[key] = value
+
+
 class VolForecaster:
     """Memoising wrapper for the live per-bar path.
 
@@ -830,16 +1303,27 @@ class VolForecaster:
     timestamp changes — the same trick ``MLPredictor`` uses for its feature
     matrix.  Cheap EWMA is recomputed only once per bar, and a GARCH fit is
     never repeated for a bar that has not closed.
+
+    The memo is **bounded** to :data:`MAX_FORECAST_CACHE_ENTRIES`: the key is
+    ``(symbol, interval)`` and a live universe is operator-controlled, so an
+    unbounded dict would grow by one entry per symbol×interval seen for the
+    lifetime of the process.  Eviction is **least-recently-used**, not
+    first-in-first-out: a hit moves its key to the end of the order, so the
+    symbol being forecast every tick cannot be evicted by a burst of one-off
+    symbols (measured — under FIFO, a key read one tick earlier was dropped after
+    8 distinct keys churned through a 4-entry cache).
     """
 
     def __init__(self, *, method: str = "ewma", window: int = DEFAULT_WINDOW,
                  lam: float = DEFAULT_LAMBDA, interval: str | None = None,
-                 allow_garch: bool = False):
+                 allow_garch: bool = False,
+                 max_cache_entries: int = MAX_FORECAST_CACHE_ENTRIES):
         self.method = method
         self.window = int(window)
         self.lam = float(lam)
         self.interval = interval
         self.allow_garch = bool(allow_garch)
+        self.max_cache_entries = int(max_cache_entries)
         self._cache: dict[tuple, tuple] = {}
         self.compute_count = 0
 
@@ -851,6 +1335,14 @@ class VolForecaster:
         sig = (self.method, interval or self.interval, self.window, self.lam)
         cached = self._cache.get(key)
         if cached is not None and cached[0] == bar and cached[1] == sig:
+            # LRU touch.  ``_bounded_put`` evicts by insertion order, so without
+            # this a key that is read on every bar (the live symbol) is still the
+            # first one dropped once the cap is reached: measured, a key served
+            # one tick earlier was gone after 8 keys churned through a 4-entry
+            # cache.  Deleting before the insert below is what moves it to the
+            # end of the order; a plain re-assignment would leave it where it was.
+            self._cache.pop(key, None)
+            _bounded_put(self._cache, key, cached, self.max_cache_entries)
             return cached[2]
         vol = forecast_vol(data, method=self.method, window=self.window,
                            lam=self.lam, interval=interval or self.interval,
@@ -862,7 +1354,7 @@ class VolForecaster:
         out = VolForecast(vol_per_bar=vol, method=self.method, window=self.window,
                           n_returns=n,
                           backend=garch_backend() if self.method == "garch11" else "")
-        self._cache[key] = (bar, sig, out)
+        _bounded_put(self._cache, key, (bar, sig, out), self.max_cache_entries)
         self.compute_count += 1
         return out
 

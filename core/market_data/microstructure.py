@@ -490,35 +490,54 @@ class MicrostructureCache:
     """Bounded TTL cache of **computed** feature dicts (never raw payloads).
 
     ``now`` is injectable so the TTL logic is testable without sleeping.
+
+    **Point-in-time safety.**  A cache keyed only on ``symbol`` is a look-ahead
+    bug the moment a caller passes ``as_of_ms``: ``fetch_features(sym,
+    as_of_ms=t−1h)`` would be answered with the payload stamped ``t`` (measured:
+    the stale payload's ``as_of_ms`` was returned unchanged).  The key is
+    therefore ``(symbol, as_of_ms)``, so a point-in-time request can only ever
+    hit a payload computed for the **same** decision timestamp; a stale entry is
+    simply a miss and a fresh fetch.  ``as_of_ms=None`` keys as ``None`` — the
+    live "now" case, which is the only shape that was ever safe to share.
     """
 
     def __init__(self, ttl_secs: float = MICROSTRUCTURE_CACHE_TTL_SECS,
                  max_entries: int = MAX_CACHE_ENTRIES):
         self.ttl_secs = float(ttl_secs)
         self.max_entries = int(max_entries)
-        self._store: dict[str, tuple[float, dict]] = {}
+        self._store: dict[tuple, tuple[float, dict]] = {}
 
-    def put(self, symbol: str, features: dict, *, now: float | None = None) -> None:
+    @staticmethod
+    def _key(symbol: str, as_of_ms: float | None) -> tuple:
+        """``(symbol, as_of_ms)`` — the point-in-time identity of a payload."""
+        return (str(symbol), None if as_of_ms is None else float(as_of_ms))
+
+    def put(self, symbol: str, features: dict, *, now: float | None = None,
+            as_of_ms: float | None = None) -> None:
         now = time.time() if now is None else float(now)
-        if len(self._store) >= self.max_entries and symbol not in self._store:
+        key = self._key(symbol, as_of_ms)
+        if len(self._store) >= self.max_entries and key not in self._store:
             oldest = min(self._store, key=lambda k: self._store[k][0])
             self._store.pop(oldest, None)
-        self._store[str(symbol)] = (now, dict(features))
+        self._store[key] = (now, dict(features))
 
-    def get(self, symbol: str, *, now: float | None = None) -> dict | None:
+    def get(self, symbol: str, *, now: float | None = None,
+            as_of_ms: float | None = None) -> dict | None:
         now = time.time() if now is None else float(now)
-        row = self._store.get(str(symbol))
+        key = self._key(symbol, as_of_ms)
+        row = self._store.get(key)
         if row is None:
             return None
         stamp, features = row
         if now - stamp > self.ttl_secs:
-            self._store.pop(str(symbol), None)
+            self._store.pop(key, None)
             return None
         return dict(features)
 
-    def age(self, symbol: str, *, now: float | None = None) -> float | None:
+    def age(self, symbol: str, *, now: float | None = None,
+            as_of_ms: float | None = None) -> float | None:
         now = time.time() if now is None else float(now)
-        row = self._store.get(str(symbol))
+        row = self._store.get(self._key(symbol, as_of_ms))
         return None if row is None else float(now - row[0])
 
     def clear(self) -> None:
@@ -536,6 +555,7 @@ async def fetch_features(
     depth_limit: int = MAX_DEPTH_LEVELS,
     trades_limit: int = 100,
     as_of_ms: float | None = None,
+    use_cache: bool = True,
 ) -> dict | None:
     """Fetch a depth+trades snapshot and return its features (or ``None``).
 
@@ -545,10 +565,17 @@ async def fetch_features(
     transport failure returns ``None`` with ``last_error`` set: a missing
     microstructure snapshot must degrade to "no features", never to a crash of
     the signal path.
+
+    ``as_of_ms`` is the **decision** time and is part of the cache identity via
+    :meth:`MicrostructureCache._key`: a point-in-time request never receives a
+    payload computed for a different ``as_of_ms``.  ``use_cache=False`` bypasses
+    the cache entirely (both read and write) for a caller that needs a guaranteed
+    fresh snapshot — the explicit escape hatch, equivalent to the old behaviour
+    of a `symbol`-only key that this method deliberately no longer offers.
     """
     now_ms = float(as_of_ms) if as_of_ms is not None else time.time() * 1000.0
-    if cache is not None:
-        cached = cache.get(symbol)
+    if cache is not None and use_cache:
+        cached = cache.get(symbol, as_of_ms=as_of_ms)
         if cached is not None:
             return cached
     try:
@@ -564,8 +591,8 @@ async def fetch_features(
                              depth_limit=depth_limit, trades_limit=trades_limit)
     feats["symbol"] = symbol
     feats["source"] = "snapshot"
-    if cache is not None:
-        cache.put(symbol, feats)
+    if cache is not None and use_cache:
+        cache.put(symbol, feats, as_of_ms=as_of_ms)
     return feats
 
 

@@ -207,9 +207,67 @@ class VolTargetingConfig(BaseModel):
     stop_vol_multiple: float = 3.0
     stop_min_pct: float = 0.5
     stop_max_pct: float = 6.0
+    # ── RESERVED (P3/P4 audit defect 5) ──────────────────────────────────
+    #: **Inert.**  The only reader of the three ``barrier_*`` keys is
+    #: :meth:`core.risk.position_sizer.PositionSizer.barrier_widths_pct`, and no
+    #: production code calls it: the live triple-barrier widths come from
+    #: ``ml.barrier_atr_period`` / ``ml.barrier_atr_multiple`` /
+    #: ``ml.barrier_min_pct`` / ``ml.barrier_max_pct`` via
+    #: :meth:`core.ml.predictor.MLPredictor._barrier_params`.  Setting one of
+    #: these keys therefore changes nothing, which is why a non-default value now
+    #: raises a startup WARNING instead of being silently ignored — see
+    #: :func:`inert_barrier_key_warnings`.  Wiring it needs
+    #: ``core/ml/predictor.py`` (or the manager's resolved forecast) and is
+    #: outside this change's write scope.
     barrier_vol_multiple: float = 1.0
     barrier_min_pct: float = 0.004
     barrier_max_pct: float = 0.06
+
+
+def inert_barrier_key_warnings(vt) -> list[str]:
+    """One WARNING per **non-default reserved** ``risk.vol_targeting.barrier_*`` key.
+
+    ``barrier_vol_multiple`` / ``barrier_min_pct`` / ``barrier_max_pct`` are read
+    only by :meth:`core.risk.position_sizer.PositionSizer.barrier_widths_pct`,
+    which has no production caller (P3/P4 audit defect 5): the live label path
+    builds its widths from ``ml.barrier_atr_period`` / ``ml.barrier_atr_multiple``
+    / ``ml.barrier_min_pct`` / ``ml.barrier_max_pct``
+    (:meth:`core.ml.predictor.MLPredictor._barrier_params`).  A non-default value
+    of a reserved key is therefore a no-op — and a no-op the operator *believes*
+    is active is worse than a documented gap, so ``Config.load`` logs these once
+    at startup rather than leaving the silent no-op.
+
+    ``[]`` for the shipped defaults (the default path stays silent) and for
+    ``vt is None``.
+    """
+    if vt is None:
+        return []
+    out: list[str] = []
+    for key, default in RESERVED_BARRIER_KEYS.items():
+        try:
+            value = float(getattr(vt, key, default))
+        except (TypeError, ValueError):
+            continue
+        if value != value:            # NaN: already flagged by the model's loader
+            continue
+        if value == float(default):
+            continue
+        out.append(
+            f"risk.vol_targeting.{key}={value:g} has NO effect: the key is "
+            f"RESERVED (default {float(default):g}) and is read only by "
+            f"PositionSizer.barrier_widths_pct, which no production code calls. "
+            f"Live triple-barrier widths come from ml.barrier_atr_period / "
+            f"ml.barrier_atr_multiple / ml.barrier_min_pct / ml.barrier_max_pct "
+            f"(MLPredictor._barrier_params) — set those instead.")
+    return out
+
+
+#: The reserved keys and the shipped defaults they are compared against.
+RESERVED_BARRIER_KEYS: dict[str, float] = {
+    "barrier_vol_multiple": VolTargetingConfig().barrier_vol_multiple,
+    "barrier_min_pct": VolTargetingConfig().barrier_min_pct,
+    "barrier_max_pct": VolTargetingConfig().barrier_max_pct,
+}
 
 
 class Config:
@@ -484,6 +542,13 @@ class Config:
         # Exposed for callers that only have `config` in hand (PositionSizer,
         # PositionGuard) without importing the model.
         self.vol_targeting = vt
+        # P3/P4 audit defect 5: the reserved `barrier_*` keys are inert.  Say so
+        # once, at startup, instead of letting an operator believe a configured
+        # barrier width is in force (see `inert_barrier_key_warnings`).  `_load`
+        # runs at most once per process (`Config` is a singleton guarded by
+        # `_loaded`), so this is a genuinely one-time warning.
+        for _msg in inert_barrier_key_warnings(vt):
+            logger.warning(_msg)
 
         self.db_path = str(PROJECT_ROOT / "data" / "binance_trader.db")
         self.data_dir = str(PROJECT_ROOT / "data")

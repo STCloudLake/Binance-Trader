@@ -175,8 +175,17 @@ risk:
     stop_vol_multiple: 3.0
     stop_min_pct: 0.5
     stop_max_pct: 6.0
-    # Triple-barrier widths (core/ml/labels.py) driven by the same forecast when
-    # enabled, in place of the ATR-scaled default.
+    # ── RESERVED / CURRENTLY INERT (P3/P4 audit defect 5) ────────────────
+    # Triple-barrier widths driven by the forecast.  These three keys are the
+    # only input of PositionSizer.barrier_widths_pct, which NO production code
+    # calls: the live label path takes its widths from the `ml.barrier_atr_period`
+    # / `ml.barrier_atr_multiple` / `ml.barrier_min_pct` / `ml.barrier_max_pct`
+    # keys (MLPredictor._barrier_params).  Setting a non-default value here
+    # changes nothing and now logs a startup WARNING saying so (see
+    # app/config.py:inert_barrier_key_warnings) instead of being silently
+    # ignored.  Wiring them needs core/ml/predictor.py (or the manager's resolved
+    # forecast), outside this change's write scope — do NOT document these as
+    # effective until that lands.
     barrier_vol_multiple: 1.0
     barrier_min_pct: 0.004
     barrier_max_pct: 0.06

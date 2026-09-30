@@ -138,6 +138,27 @@ class PositionSizer:
         ``width = barrier_vol_multiple × forecast_pct / 100``, and the default
         multiple of 1.0 at BTC's 0.45 %/bar gives a 0.45 % barrier — i.e. roughly
         one forecast sigma, inside the ATR-scaled default's clamp.
+
+        .. warning::
+           **This hook has no production caller, so
+           ``risk.vol_targeting.barrier_*`` is currently inert** (P3/P4 audit
+           defect 5).  The live label path builds its widths from
+           ``ml.barrier_atr_period`` / ``ml.barrier_atr_multiple`` /
+           ``ml.barrier_min_pct`` / ``ml.barrier_max_pct`` via
+           ``core.ml.predictor.MLPredictor._barrier_params`` and never calls
+           this method, so an operator who sets ``barrier_vol_multiple`` today
+           changes nothing.  Wiring it means passing the resolved forecast into
+           the predictor's ``barrier_widths(vol_pct=…)`` call (that file is
+           outside this change's scope).  ``tests/test_p34_audit_fixes.py::
+           test_barrier_widths_hook_has_no_production_caller`` is the tripwire:
+           it fails the moment a caller appears, so this comment cannot go stale
+           silently.
+
+           The three keys are therefore **reserved**, and a non-default value is
+           no longer silent: ``app.config.inert_barrier_key_warnings`` makes
+           ``Config.load`` log a startup WARNING naming the key and the
+           ``ml.barrier_*`` keys that do take effect
+           (``tests/test_p34_code_defects.py`` pins both halves).
         """
         if not self.vol_targeting_enabled():
             return None
