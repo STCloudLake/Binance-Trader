@@ -836,17 +836,25 @@ def test_vol_forecaster_cache_keeps_recently_used_entries():
 def test_per_bar_budget_holds_for_the_default_path_and_garch_is_opt_in():
     """The documented per-bar budget is a *default-path* promise.
 
-    Re-measured on the frozen revision: the default ``ewma`` path costs
-    **≈1.5 ms/call** (budget ``PER_BAR_BUDGET_SEC`` = 2 ms) — ``ewma_variance`` is
-    a per-bar Python recursion, so the earlier ~0.2 ms figure belongs to an older
-    (vectorised) implementation; the realised family is 0.06–0.09 ms.  The free-ω
-    GARCH MLE costs ≈0.18–0.19 s/call on a 500-bar window (≈4.1 s on the full
-    11 674-bar history) — two to three orders of magnitude over budget, so it
-    cannot be the default and the docs must not quote the grid fallback's ~2.2 ms
-    for it.  This test pins both halves: the default path meets the budget, and
-    the expensive path is opt-in rather than silently reachable from the per-bar
-    method list.  Timings use the minimum of a few batches, which is robust to a
-    loaded machine (a single 20-call batch was measured at 2.06 ms under load).
+    Re-measured on the frozen revision, the budget is a promise about the shape
+    the live path actually hands in — this test's ``_btc(600)`` frame — where the
+    default ``ewma`` path costs **≈0.15–0.16 ms/call**, ~13× inside
+    ``PER_BAR_BUDGET_SEC`` = 2 ms (``ewma_variance`` is a per-bar Python
+    recursion, so the earlier ~0.2 ms figure belongs to an older, vectorised
+    implementation).  The shape that *does* approach the budget is the
+    whole-history one: all 11 676 returns of the cached frame at the default
+    ``window=500`` cost **≈1.5 ms/call**, ~92 % of it the O(history) clip anchor
+    ``series_anchor`` rather than ``ewma_variance`` — and the live risk path
+    passes ≤600 bars, so that shape is not the budgeted one.  The realised family
+    is 0.02–0.05 ms.  The free-ω GARCH MLE costs ≈0.12–0.14 s/call on a 500-bar
+    window (≈3.7–3.9 s on the full 11 676-return history, ``window=0``) — two to
+    three orders of magnitude over budget, so it cannot be the default and the
+    docs must not quote the grid fallback's ~2.2 ms for it.  This test pins both
+    halves: the default path meets the budget, and the expensive path is opt-in
+    rather than silently reachable from the per-bar method list.  Timings use the
+    minimum of a few batches, which is robust to a loaded machine (a single
+    20-call batch of the whole-history shape was measured at 2.06 ms under load;
+    the 600-bar frame stayed ≤0.62 ms even then).
     """
     import time
 
@@ -881,9 +889,11 @@ def test_per_bar_budget_holds_for_the_default_path_and_garch_is_opt_in():
         cost = per_call_seconds(lambda m=method: forecast_vol(df, method=m))
         assert cost < PER_BAR_BUDGET_SEC, (method, cost)
     # The expensive path is opt-in.  Its cost is data-dependent (measured
-    # 0.12–0.49 s on 500-bar windows: the Nelder-Mead polish exits early on a
-    # flat synthetic surface and runs ~575 likelihood passes on real BTC), so the
-    # assertion is a cost *ordering* against the default path, not a constant.
+    # 0.12–0.14 s on 500-bar windows: the Nelder-Mead polish runs ≈320
+    # likelihood passes on the shipped window — the older "~575" is ~1.8× high —
+    # and 264–343 passes on synthetic 500-bar windows over seeds
+    # 5/7/11/20250930), so the assertion is a cost *ordering* against the default
+    # path, not a constant.
     if BTC_1H.exists():
         from core.ml.volatility import garch11_forecast, log_returns
         rr = log_returns(df["close"].values)[-500:]

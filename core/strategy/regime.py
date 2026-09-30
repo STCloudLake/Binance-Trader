@@ -581,9 +581,14 @@ def hmm_two_state_causal(
             post = fwd[tt - start]
             # Relabel by the fit's own volatility order, so state 0 is the calm
             # one even across refits where the EM indices could swap.  The
-            # argmax must be taken on the *relabelled* row: taking it before the
-            # permutation and then remapping the index silently inverts the
-            # label (measured as a 0.50-accuracy decode).
+            # permutation is what makes the index mean "calm": the EM index is
+            # arbitrary across refits, so decoding on the raw row — ``argmax``
+            # with *no* permutation — inverts the label (measured 0.17–0.22 on
+            # seeds 5/7/11; 0.2234 on seed 5, worse than a coin flip).  Taking
+            # the argmax *before* the permutation and remapping the index is not
+            # a failure mode: it is algebraically the same operation
+            # (``argmax(post[order]) == argsort(order)[argmax(post)]``, verified
+            # bar-for-bar on those seeds) and decodes identically (0.758–0.815).
             ordered = post[order]
             filtered[tt] = ordered
             state_t = int(np.argmax(ordered))

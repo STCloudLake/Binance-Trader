@@ -154,7 +154,10 @@ def test_per_bar_compute_budget():
     The live predictor computes indicators once per kline, so a forecast has to
     be negligible next to that.  Budget is ``PER_BAR_BUDGET_SEC`` (2 ms) for the
     EWMA/realised family; ``garch11`` is documented as research-only and its
-    cost is bounded separately (measured ~12 ms) so a regression is still caught.
+    cost is bounded separately (measured ≈0.12 s on this test's 500-bar window —
+    the 600-row frame at the default ``window=500`` — and ≈3.7–3.9 s when handed
+    the whole 11 676-return cache with ``window=0``) so a regression is still
+    caught.
     """
     from core.ml.volatility import (METHODS, PER_BAR_BUDGET_SEC, forecast_vol)
 

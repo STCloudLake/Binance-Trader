@@ -283,9 +283,10 @@ Kalman β 的漂移（首尾各 10% 均值之差 / 平均 |β|）为 0.061–0.3
 > 复现：`python -m pytest tests/test_p34_audit_fixes.py -q -k "causal_hmm"`（断言
 > `0.3 < acc < 0.95`、`in-sample > 0.95`、`oos < in-sample − 0.2`）；逐 seed 数字用
 > `_synth(seed=s)`（该测试文件的构造）+ `detection_metrics` 复算。
-> 因果路径耗时实测 **≈3.4–3.8 s / 3 000 bar**（12 次 EM 拟合 + 12 次前向扫描）；
-> `core/strategy/regime.py` 的 docstring 写"≈18–21 s"，那是旧实现/旧机器的数字，
-> 本页以重测值为准（该 docstring 待改）。
+> 因果路径耗时实测 **≈2.30–2.52 s / 3 000 bar**（12 次 EM 拟合 + 12 次前向扫描，
+> seed 5/7/11 分别 2.52 / 2.28 / 2.37 s）；`core/strategy/regime.py` 的模块 docstring
+> 已经是**同一量级**（写 **≈2.3–2.6 s**，并注明旧的 "≈18–21 s" 不复现），本页与之一致，
+> 无需再改该 docstring。
 
 同种子重跑逐位一致（`regime_deterministic = true`）；HMM 估计的持续性
 `P(stay) = 0.999`，分段数 3、平均段长 999.7 bar。**平滑后验只作诊断**，
