@@ -97,6 +97,17 @@ P2 硬门（`enabled:false`）：`OOS AUC 0.5342 <= 0.55; net expectancy -0.1822
 
 `scripts/regen_route_baseline.py` 用**临时 DB + 临时 config 目录**构建应用（绝不打开生产库），枚举每个 `APIRoute` 的 method+path 与 `WebSocketRoute`，排序后按既有格式（indent=1、CRLF、无尾换行）写回；有 REMOVED 时退出 1。`--check` 只报告不落盘。
 
+## 6.1 后续工作：P6（成交量 / 资金流）规划
+
+P6 的目标、阶段划分与量化验收标准已冻结于
+[`P6_VOLUME_PLAN.md`](P6_VOLUME_PLAN.md)：**P6-A**（参与率上限 + 冲击成本，已完成，提交 `b49883b`）、
+**P6-B**（量能特征契约 v2 + 缓存 `quote_volume`/`trade_count` 扩展 + 重跑 ML 门）、
+**P6-C**（美元棒/量钟采样与量能广度，离线实验）、**P6-D**（GA 量能条件模板/过滤与仓位基因 + 可执行性进入适应度）、
+**P6-E**（逐阶段独立审计与发布）。§7 中"成交量利用不足"由 P6-B 接手；
+`docs/core-algorithms/13-volume-liquidity-costs.md` 是 P6-A 的详细文档。
+规划所依据的实测现状：39 列契约中量能占 5 列、GA 量能模板 3 条、P4 盘口 19 项特征默认关、
+缓存只有 `open/high/low/close/volume`（无 quote volume）。
+
 ## 7. 尚未闭环（not yet closed）
 
 1. **hybrid 引擎的 `condition_logic`（已关闭）**：在基线提交 `2751bbb` 上 `git show 2751bbb:core/backtest/signal_matrix.py | grep -c condition_logic` = **0**，即向量化混合引擎当时仍只做 OR，`condition_logic: and` 的冠军在该模式下会被按 OR 评估（标量内核 `StrategyConfig.entry_sides` 已一致）。该项在测量期间由并行改动关闭，并**已随 `beda096` 提交**（`git log --oneline -1 -- core/backtest/signal_matrix.py` = `beda096`，工作树干净）：`signal_matrix.py` 读取 `condition_logic` 并区分 AND/OR，`tests/test_hybrid_condition_logic.py` 收集 **4** 项。原文写的"尚未提交，且不在本次写权限内"是当时的运行态，现已过期。
