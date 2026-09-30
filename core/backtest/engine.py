@@ -381,6 +381,10 @@ class BacktestEngine:
         if "1h" not in intervals:
             intervals.append("1h")  # ML training uses 1h
 
+        #: The run's strategy configs, for `_ml_feature_contract` (the preload
+        #: verification needs each strategy's `ml.features` subset — audit F4).
+        self._current_strategies = list(strategy_configs)
+
         # Load historical data
         cache_dir = str(Path(self.config.data_dir) / "market")
         feeder = DataFeeder(cache_dir, symbols, intervals, date_start, date_end)
@@ -526,6 +530,15 @@ class BacktestEngine:
                 ml_engine = "lightgbm"
 
         # ── Skip training: preload cached models from disk ──
+        # Audit F4: this used to `MLTrainer.load_model(path)` straight off disk,
+        # with **no gate verdict and no `*_meta.json` / feature-schema check** — so
+        # a pickle that the live path would refuse was scored by the backtest, and
+        # the claim "no path can use an un-gated model" was false.  Every artefact
+        # (LightGBM pickle, TFT, PatchTST) now goes through
+        # :meth:`_verify_ml_model_sidecar`, which is the same verification
+        # `MLPredictor.load_model` applies: sidecar present → gate verdict present
+        # → `gate.allowed` → feature names equal the contract → schema hash equal.
+        # Whatever fails is refused and logged, never loaded.
         if skip_ml_training:
             from core.ml.trainer import MLTrainer as _MLTrainer
             _disk_trainer = _MLTrainer(str(self.config.data_dir))
@@ -536,19 +549,37 @@ class BacktestEngine:
                 for sym in symbols:
                     key = f"{strategy.name}|{sym}"
                     if ml_engine == "tft" and tft_trainer is not None:
-                        model = tft_trainer.load(sym, strategy.name)
-                        if model is not None:
-                            ml_models[key] = model
+                        tft_path = tft_trainer.models_dir / f"{sym}_{strategy.name}_tft.pt"
+                        ok, reason = self._verify_ml_model_sidecar(
+                            f"{sym}_{strategy.name}", tft_path, "tft")
+                        if ok:
+                            model = tft_trainer.load(sym, strategy.name)
+                            if model is not None:
+                                ml_models[key] = model
+                        else:
+                            self._refuse_preloaded_ml(sym, strategy.name, tft_path, reason)
                     elif ml_engine == "patchtst" and patchtst_trainer is not None:
-                        model = patchtst_trainer.load(sym, strategy.name)
-                        if model is not None:
-                            ml_models[key] = model
+                        pt_path = (patchtst_trainer.models_dir
+                                   / f"{sym}_{strategy.name}_patchtst.pt")
+                        ok, reason = self._verify_ml_model_sidecar(
+                            f"{sym}_{strategy.name}", pt_path, "patchtst")
+                        if ok:
+                            model = patchtst_trainer.load(sym, strategy.name)
+                            if model is not None:
+                                ml_models[key] = model
+                        else:
+                            self._refuse_preloaded_ml(sym, strategy.name, pt_path, reason)
                     else:
                         pkl_path = models_dir / f"{sym}_{strategy.name}_binary.pkl"
                         if pkl_path.exists():
-                            model = _disk_trainer.load_model(str(pkl_path))
-                            if model is not None:
-                                ml_models[key] = model
+                            ok, reason = self._verify_ml_model_sidecar(
+                                f"{sym}_{strategy.name}", pkl_path, "binary")
+                            if ok:
+                                model = _disk_trainer.load_model(str(pkl_path))
+                                if model is not None:
+                                    ml_models[key] = model
+                            else:
+                                self._refuse_preloaded_ml(sym, strategy.name, pkl_path, reason)
             preloaded = len(ml_models)
             if preloaded > 0:
                 logger.info(f"Preloaded {preloaded} cached ML models from disk")
@@ -1667,6 +1698,96 @@ class BacktestEngine:
         except (TypeError, ValueError):
             return None
         return rate if 0.0 < rate < 1.0 else None
+
+    # ── audit F4: an artefact may only be used if its sidecar proves the gate ──
+
+    def _ml_feature_contract(self, strategy_name: str) -> list[str]:
+        """Feature contract for ``strategy_name`` — ``ml.feature_list`` or canonical."""
+        explicit = getattr(self.config, "ml_feature_list", None)
+        if explicit:
+            return [str(c) for c in explicit]
+        for strategy in (self._current_strategies or []):
+            if getattr(strategy, "name", None) != strategy_name:
+                continue
+            ml = getattr(strategy, "ml_config", None)
+            features = getattr(ml, "features", None) if ml is not None else None
+            if features:
+                return [str(c) for c in features]
+        return list(FEATURE_NAMES)
+
+    def _verify_ml_model_sidecar(self, stem: str, model_path,
+                                 model_type: str = "binary") -> tuple[bool, str]:
+        """``(ok, reason)`` for a **preloaded** model artefact (audit F4).
+
+        The verification is deliberately the same five steps
+        ``core.ml.predictor.MLPredictor.load_model`` performs on the live path, so
+        "web backtest routes the preload through the same verification the
+        predictor uses" is a fact about the code and not a claim:
+
+        1. a ``*_meta.json`` sidecar exists next to the pickle (its absence is a
+           refusal, because the gate verdict cannot be reconstructed),
+        2. the sidecar carries a ``gate`` verdict,
+        3. ``gate["allowed"]`` is true — i.e. the model really passed
+           :func:`core.ml.credibility.credibility_gate` when it was trained,
+        4. the sidecar's ``feature_names`` equal the contract the engine will score
+           with (positional scoring on a different contract is silent corruption),
+        5. the sidecar's ``feature_schema_hash`` matches
+           :func:`core.ml.features.feature_schema_hash` of that contract.
+
+        It deliberately does **not** instantiate a predictor (no market-data
+        provider exists at this point in a backtest) and deliberately does not
+        re-run the gate: the numbers it would need are not persisted, and the
+        persisted verdict is what the live path trusts too.
+        """
+        from pathlib import Path as _Path
+        path = _Path(model_path)
+        if not path.exists():
+            return False, f"no artefact at {path.name}"
+        meta_path = path.with_name(path.stem + "_meta.json")
+        if not meta_path.exists():
+            return False, ("no metadata sidecar (*_meta.json) — cannot verify the "
+                           "OOS gate")
+        import json
+        try:
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                meta = json.load(fh)
+        except Exception as e:
+            return False, f"metadata sidecar unreadable ({e})"
+        if not isinstance(meta, dict):
+            return False, "metadata sidecar is not an object"
+        gate = meta.get("gate") or {}
+        if not gate:
+            return False, "metadata has no gate verdict"
+        if not gate.get("allowed"):
+            return False, f"gate refused the model: {gate.get('reason', 'gate failed')}"
+        try:
+            from core.ml.features import feature_schema_hash
+            strategy_name = stem.split("_", 1)[1] if "_" in stem else stem
+            expected = self._ml_feature_contract(strategy_name)
+            names = list(meta.get("feature_names") or [])
+            if names != list(expected):
+                have = set(expected)
+                missing = [c for c in names if c not in have]
+                extra = [c for c in expected if c not in set(names)]
+                return False, (f"feature contract mismatch: sidecar has {len(names)} "
+                               f"features, engine scores {len(expected)} "
+                               f"(missing_from_engine={missing[:4]} "
+                               f"extra_in_engine={extra[:4]})")
+            stored = meta.get("feature_schema_hash")
+            current = feature_schema_hash(expected)
+            if stored and str(stored) != current:
+                return False, (f"feature schema hash mismatch: sidecar {stored} vs "
+                               f"engine {current}")
+        except Exception as e:
+            return False, f"feature contract could not be verified ({e})"
+        return True, "verified"
+
+    @staticmethod
+    def _refuse_preloaded_ml(symbol: str, strategy_name: str, path, reason: str) -> None:
+        """One first-class log line per refused preload — never a silent skip."""
+        logger.warning(
+            f"ML preload REFUSED {symbol}/{strategy_name} ({getattr(path, 'name', path)}): "
+            f"{reason}")
 
     @staticmethod
     def _ml_matrix_for_model(feature_df: pd.DataFrame, model):

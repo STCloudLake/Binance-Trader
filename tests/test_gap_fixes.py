@@ -251,6 +251,14 @@ def test_live_kline_stream_is_the_last_resort_forecast_source(tmp_path):
     ``start()`` subscribes the handler; while the switch is off nothing is
     buffered (zero cost, nothing changes); with it on, closed candles alone are
     enough to produce a forecast — no market-data provider, no per-signal scan.
+
+    Audit F1 changed the buffer's shape: it keeps ``(close_time, close)`` so the
+    splice guard can run on the live series, and a candle with **no** ``close_time``
+    is refused (the guard cannot be applied to a timestamp-less series) instead of
+    being indexed 0, 1, 2…  Production always sets ``close_time`` (Binance ``k.T``
+    in ``provider._handle_ws_message``, ``df.index[-2]`` in the ``app/main.py``
+    REST poll), so the candles below carry it and the refusal is exercised
+    separately in ``tests/test_final_audit_fixes.py``.
     """
     from app.event_bus import EventBus, Event, EventType
 
@@ -265,17 +273,21 @@ def test_live_kline_stream_is_the_last_resort_forecast_source(tmp_path):
         for i in range(10):
             asyncio.run(rm._on_kline(Event(EventType.MARKET_KLINE, {
                 "symbol": "BTCUSDT", "interval": "1h",
-                "candle": {"close": 100.0 + i}})))
+                "candle": {"close_time": 1_767_225_600_000 + i * 3_600_000,
+                           "close": 100.0 + i}})))
         assert rm._kline_history == {}
         assert bus._subscribers[EventType.MARKET_KLINE] == [rm._on_kline]
 
         cfg.risk_vol_targeting.enabled = True
         rng = np.random.default_rng(11)
         price = 100.0
-        for _ in range(120):
+        start_ms = int(pd.Timestamp("2026-01-01", tz="UTC").timestamp() * 1000)
+        for i in range(120):
             price *= float(np.exp(rng.normal(0.0, 0.004)))
             asyncio.run(rm._on_kline(Event(EventType.MARKET_KLINE, {
-                "symbol": "BTCUSDT", "interval": "1h", "candle": {"close": price}})))
+                "symbol": "BTCUSDT", "interval": "1h",
+                "candle": {"close_time": start_ms + i * 3_600_000,
+                           "close": price}})))
         vol = asyncio.run(rm.forecast_vol_pct("BTCUSDT", "1h"))
         assert vol is not None and 0.0 < vol < 5.0
         assert rm._market_data is None, "no REST source was needed"

@@ -566,6 +566,11 @@ class MLPredictor:
             "min_net_expectancy": float(getattr(cfg, "ml_gate_net_expectancy_min", 0.0)),
             "min_trades": int(getattr(cfg, "ml_gate_min_trades", 100)),
             "min_t_stat": float(getattr(cfg, "ml_gate_min_t_stat", 2.0)),
+            # Audit F3/F5: `ml.gate_min_psr` was loaded and read nowhere (the gate
+            # hard-coded GATE_MIN_PSR), so the key is wired through here — and the
+            # `min_psr` kwarg now reaches `credibility_gate` via
+            # `gate_from_evaluation` instead of being silently dropped.
+            "min_psr": float(getattr(cfg, "ml_gate_min_psr", 0.95)),
             "min_oos": max(int(getattr(cfg, "ml_min_oos_rows", 100)), contract_floor),
         }
 

@@ -309,7 +309,9 @@ def freeze_run_spreads(symbols, config=None, overrides=None, **kwargs) -> dict:
 # ----------------------------------------------------------------------
 def apply_trading_costs(entry_price: float, exit_price: float, qty: float,
                         symbol: str, config, overrides=None,
-                        spread_pct: float | None = None) -> float:
+                        spread_pct: float | None = None, *,
+                        recent_quote_volume: float | None = None,
+                        impact_pct_override: float | None = None) -> float:
     """Calculate total round-trip trading cost for a position.
 
     Components:
@@ -317,6 +319,7 @@ def apply_trading_costs(entry_price: float, exit_price: float, qty: float,
       - Taker fee on exit notional
       - Half-spread slippage on entry (buy at ask, sell at bid)
       - Half-spread slippage on exit
+      - **Market impact** on entry and on exit (P6-A, off by default)
 
     The spread (%) comes from :func:`resolve_spread_pct` — explicit override →
     live depth-derived → documented default — unless the caller pins it via
@@ -333,6 +336,32 @@ def apply_trading_costs(entry_price: float, exit_price: float, qty: float,
         config: Config instance with backtest_cost_enabled etc.
         overrides: Optional per-symbol spread map (%) for this run.
         spread_pct: Optional pre-resolved spread (%) — skips resolution.
+        recent_quote_volume: Quote (USDT) notional traded over the recent window
+            — e.g. ``core.risk.liquidity.recent_quote_volume`` over the signal's
+            ``risk.liquidity.lookback_bars``.  **Optional**: ``None`` (the
+            default, and what every pre-P6 caller passes by omission) means "the
+            window is unknown", and then the impact term contributes exactly
+            ``0.0``.  This is the injection point that keeps this module free of
+            market-data I/O.
+        impact_pct_override: Pre-computed round-trip impact in **percent of
+            entry notional**, for a caller that already priced participation
+            (e.g. a report recomputing one trade).  Wins over
+            ``recent_quote_volume`` when both are given.
+
+    Impact (P6-A)
+    -------------
+    ``impact_pct = k · participation**e`` per side, in percent of that side's
+    notional (``participation`` is the fraction of ``recent_quote_volume``:
+    ``0.01`` = 1 %), charged on entry AND on exit, with ``k`` =
+    ``risk.liquidity.impact_k`` (default ``0.0``) and ``e`` =
+    ``risk.liquidity.impact_exponent`` (default ``0.5``, the square-root law:
+    Almgren & Chriss 2000; Grinold & Kahn ch. 16).  See
+    :func:`core.risk.liquidity.impact_pct` for the units and
+    ``docs/core-algorithms/13-volume-liquidity-costs.md`` for measured examples.
+
+    **The ``k <= 0`` (or no-volume) path short-circuits to the legacy sum**, so
+    the shipped default is bit-identical to the pre-P6 cost — the identity is
+    pinned by ``tests/test_liquidity.py::test_impact_k_zero_is_bit_identical``.
     """
     if not getattr(config, 'backtest_cost_enabled', True):
         return 0.0
@@ -353,4 +382,105 @@ def apply_trading_costs(entry_price: float, exit_price: float, qty: float,
     entry_spread = entry_notional * (spread / 2.0)
     exit_spread = exit_notional * (spread / 2.0)
 
-    return entry_fee + exit_fee + entry_spread + exit_spread
+    legacy = entry_fee + exit_fee + entry_spread + exit_spread
+
+    # ── Market impact (P6-A) — OPT-IN, and a no-op on every shipped path ──
+    if impact_pct_override is not None:
+        override = _to_float(impact_pct_override)
+        if override is None or override <= 0.0:
+            return legacy
+        return legacy + entry_notional * (override / 100.0)
+
+    k, exponent = _liquidity_impact_params(config)
+    if k <= 0.0 or recent_quote_volume is None:
+        return legacy
+
+    volume = _to_float(recent_quote_volume)
+    if volume is None or volume <= 0.0:
+        return legacy
+    from core.risk.liquidity import total_impact_usdt
+
+    return legacy + total_impact_usdt(entry_notional, exit_notional, volume,
+                                      k, exponent)
+
+
+def _liquidity_impact_params(config) -> tuple[float, float]:
+    """``(impact_k, impact_exponent)`` from ``risk.liquidity``; ``(0.0, 0.5)`` if absent.
+
+    A duck-typed config object without the block is treated as impact-off, which
+    is what every pre-P6 config double and every test double is.
+    """
+    from core.risk.liquidity import (DEFAULT_IMPACT_EXPONENT, DEFAULT_IMPACT_K,
+                                     resolve_liquidity_config)
+
+    block = resolve_liquidity_config(config)
+    if block is None:
+        return DEFAULT_IMPACT_K, DEFAULT_IMPACT_EXPONENT
+    k = _to_float(getattr(block, "impact_k", DEFAULT_IMPACT_K))
+    exponent = _to_float(getattr(block, "impact_exponent", DEFAULT_IMPACT_EXPONENT))
+    return (DEFAULT_IMPACT_K if k is None else k,
+            DEFAULT_IMPACT_EXPONENT if exponent is None else exponent)
+
+
+def impact_cost_usdt(entry_notional: float, exit_notional: float,
+                     recent_quote_volume: float, k: float,
+                     exponent: float = 0.5) -> float:
+    """USDT impact charge for one closed trade (both sides) — thin re-export.
+
+    Lives in :mod:`core.risk.liquidity` (the maths module); this wrapper exists so
+    a backtest report can name a cost-model function without importing the risk
+    package, and so ``tests/test_liquidity.py`` can compare the cost model's
+    number with the helper's directly.  ``0.0`` when the term is off
+    (``k <= 0``), the window is unknown, or the notional is non-positive.
+    """
+    if k is None or _to_float(k) is None or float(k) <= 0.0:
+        return 0.0
+    volume = _to_float(recent_quote_volume)
+    if volume is None or volume <= 0.0:
+        return 0.0
+    from core.risk.liquidity import total_impact_usdt
+
+    return total_impact_usdt(entry_notional, exit_notional, volume, k, exponent)
+
+
+def total_costs_with_impact(entry_price: float, exit_price: float, qty: float,
+                            symbol: str, config, overrides=None,
+                            spread_pct: float | None = None, *,
+                            recent_quote_volume: float | None = None) -> dict:
+    """Split one trade's costs into the reported components — fees, spread, impact.
+
+    ``{"fees_usdt", "spread_usdt", "impact_usdt", "total_usdt", "impact_pct",
+    "recent_quote_volume", "impact_k"}``.  A backtest report should show
+    ``impact_usdt`` next to the other two rather than silently folding it in:
+    the whole point of P6-A is that a large size's cost is *visible*
+    (``docs/core-algorithms/13-volume-liquidity-costs.md`` §4).  Pure arithmetic
+    over :func:`apply_trading_costs`, so it cannot drift from what the run paid.
+    """
+    legacy = apply_trading_costs(entry_price, exit_price, qty, symbol, config,
+                                overrides, spread_pct)
+    total = apply_trading_costs(entry_price, exit_price, qty, symbol, config,
+                                overrides, spread_pct,
+                                recent_quote_volume=recent_quote_volume)
+    entry_notional = float(qty) * float(entry_price)
+    exit_notional = float(qty) * float(exit_price)
+    fee_pct = (_to_float(getattr(config, 'backtest_taker_fee_pct', 0.04)) or 0.0) / 100.0
+    if spread_pct is None:
+        spread_pct, _source = resolve_spread_pct(symbol, config, overrides)
+    spread = _to_float(spread_pct)
+    if spread is None or spread < 0:
+        spread = default_spread_pct(config)
+    fees = (entry_notional + exit_notional) * fee_pct
+    spread_cost = (entry_notional + exit_notional) * (spread / 200.0)
+    impact = max(0.0, total - legacy)
+    k, _exponent = _liquidity_impact_params(config)
+    return {
+        "fees_usdt": fees,
+        "spread_usdt": spread_cost,
+        "impact_usdt": impact,
+        "total_usdt": total,
+        "legacy_usdt": legacy,
+        "impact_pct": (impact / entry_notional * 100.0) if entry_notional > 0 else 0.0,
+        "recent_quote_volume": _to_float(recent_quote_volume),
+        "impact_k": k,
+    }
+

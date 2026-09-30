@@ -86,9 +86,13 @@ ml:
   # `credibility_gate` via `MLPredictor._gate_config()`.
   gate_auc_min: 0.55
   gate_net_expectancy_min: 0.0
-  # Significance floor (audit P2 #3): a candidate must show at least this many
-  # OUTER trades AND either t > gate_min_t_stat or PSR >= gate_min_psr.  The
-  # audited "best" candidates had 27 trades / t=1.28 (BTC) and 77 / t=0.30
+  # Significance floor (audit P2 #3, tightened by audit F3): a candidate must show
+  # at least this many OUTER trades AND **both** t > gate_min_t_stat **and**
+  # PSR >= gate_min_psr.  As an `or` the PSR floor was equivalent to t >= 1.645
+  # under normality (PSR is the one-sided normal probability), which silently
+  # weakened the 2.0 t floor; both keys are read by `MLPredictor._gate_config()`.
+  # A missing t or PSR is a REFUSAL ("no significance evidence"), never a pass.
+  # The audited "best" candidates had 27 trades / t=1.28 (BTC) and 77 / t=0.30
   # (ETH), so both are refused on this alone.
   gate_min_trades: 100
   gate_min_t_stat: 2.0
@@ -189,6 +193,38 @@ risk:
     barrier_vol_multiple: 1.0
     barrier_min_pct: 0.004
     barrier_max_pct: 0.06
+  # ── Volume-aware execution realism (P6-A) ──────────────────────────────
+  # docs/core-algorithms/13-volume-liquidity-costs.md.  Volume is used here for
+  # COST and CAPACITY, never for direction: a fill that is large relative to the
+  # recent traded notional pays market impact, and an order that is a large
+  # fraction of that notional cannot fill at the quoted price at all.
+  #
+  # SAFE DEFAULT: `enabled: false` and `impact_k: 0`.  With those two values
+  # NOTHING changes — PositionSizer never calls the participation hook, and
+  # core/backtest/cost_model.apply_trading_costs keeps the audited
+  # `fees + spread/2` arithmetic bit-for-bit.  Both identities are pinned by
+  # tests/test_liquidity.py.
+  liquidity:
+    # Master switch for the participation cap in PositionSizer (sizing path).
+    enabled: false
+    # Participation ceiling, in PERCENT of the lookback window's quote volume.
+    # 1.0 = an order may be at most 1 % of what the market traded in the window.
+    # The cap can only SHRINK a position; the hard caps stay authoritative.
+    max_participation_pct: 1.0
+    # Bars of quote volume that window covers (most recent bars, per interval).
+    lookback_bars: 20
+    # Market-impact law (core/backtest/cost_model.py):
+    #   impact_pct = impact_k * participation ** impact_exponent   [% of notional]
+    # `participation` is the FRACTION of recent quote volume (0.01 = 1 %) and the
+    # result is charged per side, on entry and on exit.
+    # 0.0 = the impact term is off (pre-P6 cost model, bit-identical results).
+    # ILLUSTRATIVE, NOT CALIBRATED: see the doc's limitations section.  Raise it
+    # only from a measured impact study, and state the venue/window it came from.
+    impact_k: 0.0
+    impact_exponent: 0.5
+    # Optional per-symbol partial overrides; `default` (or `*`) covers the rest.
+    # Example: {BTCUSDT: {max_participation_pct: 2.0}}
+    per_symbol: {}
 satellite_position:
   capital_pct: 0.3
   max_symbols: 10

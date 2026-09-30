@@ -2,7 +2,7 @@ import os
 import yaml
 from pathlib import Path
 from typing import Any, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from loguru import logger
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -270,6 +270,113 @@ RESERVED_BARRIER_KEYS: dict[str, float] = {
 }
 
 
+class LiquidityConfig(BaseModel):
+    """Volume-aware execution realism (P6-A) — ``risk.liquidity`` in YAML.
+
+    Science: the highest-value use of volume in this project is **cost and
+    capacity**, not direction (Kyle 1985; Almgren & Chriss 2000; Grinold & Kahn
+    ch. 16).  A fill that is large relative to the recent traded notional pays
+    market impact, and an order that is a large fraction of that notional cannot
+    be filled at the quoted price at all.  Both facts are risk controls that need
+    no forecast — see ``core/risk/liquidity.py`` and
+    ``docs/core-algorithms/13-volume-liquidity-costs.md``.
+
+    **SAFE DEFAULT: ``enabled = False`` and ``impact_k = 0.0``.**  With those two
+    values nothing changes anywhere: :meth:`PositionSizer.calculate_position_size`
+    does not call the participation hook at all, and
+    :func:`core.backtest.cost_model.apply_trading_costs` short-circuits to the
+    pre-P6 ``fees + spread/2`` arithmetic, so both are bit-identical to the
+    audited numbers.  ``tests/test_liquidity.py`` pins both identities.
+
+    Units:
+
+    * ``max_participation_pct`` — **percent** of the lookback window's quote
+      volume (``1.0`` = at most 1 % of what the market traded);
+    * ``lookback_bars`` — bars of quote volume that window covers;
+    * ``impact_k`` — dimensionless coefficient of the square-root impact law
+      ``impact_pct = k · participation**impact_exponent``; ``0.0`` disables the
+      term.  **Illustrative, not calibrated** — see the docs' limitations;
+    * ``impact_exponent`` — the law's exponent (``0.5`` = square root);
+    * ``per_symbol`` — optional ``{"BTCUSDT": {"max_participation_pct": 2.0}}``
+      partial overrides (``default`` / ``*`` covers every other symbol), merged
+      over the top-level values by
+      :func:`core.risk.liquidity.liquidity_for_symbol`.
+    """
+
+    enabled: bool = False
+    max_participation_pct: float = 1.0
+    lookback_bars: int = 20
+    impact_k: float = 0.0
+    impact_exponent: float = 0.5
+    per_symbol: dict = Field(default_factory=dict)
+
+
+def liquidity_key_warnings(lc) -> list[str]:
+    """Startup WARNINGs for a nonsensical ``risk.liquidity`` block.
+
+    Returns ``[]`` for the shipped defaults (the default path stays silent).
+    Every message names the key and the value actually used, because a silently
+    clamped risk control is worse than a refused one — the P3/P4 audit's "inert
+    config key" defect in reverse.
+    """
+    if lc is None:
+        return []
+    out: list[str] = []
+    if lc.max_participation_pct <= 0.0:
+        out.append(f"risk.liquidity.max_participation_pct={lc.max_participation_pct:g} "
+                   f"must be > 0 — participation cap DISABLED")
+        lc.enabled = False
+    elif lc.max_participation_pct > 100.0:
+        out.append(f"risk.liquidity.max_participation_pct={lc.max_participation_pct:g} "
+                   f"> 100 % is not a capacity limit — clamped to 100")
+        lc.max_participation_pct = 100.0
+    if lc.lookback_bars < 1:
+        out.append(f"risk.liquidity.lookback_bars={lc.lookback_bars} must be >= 1 "
+                   f"— using 1")
+        lc.lookback_bars = 1
+    if lc.impact_k < 0.0:
+        out.append(f"risk.liquidity.impact_k={lc.impact_k:g} is negative — using 0 "
+                   f"(no impact term)")
+        lc.impact_k = 0.0
+    if lc.impact_exponent <= 0.0:
+        out.append(f"risk.liquidity.impact_exponent={lc.impact_exponent:g} must be "
+                   f"> 0 — using 0.5 (square root)")
+        lc.impact_exponent = 0.5
+    if not isinstance(lc.per_symbol, dict):
+        out.append("risk.liquidity.per_symbol must be a mapping of SYMBOL -> "
+                   "{partial keys} — ignored")
+        lc.per_symbol = {}
+    else:
+        for symbol, entry in list(lc.per_symbol.items()):
+            if not isinstance(entry, dict):
+                out.append(f"risk.liquidity.per_symbol.{symbol} must be a mapping — "
+                           f"ignored")
+                del lc.per_symbol[symbol]
+                continue
+            unknown = [k for k in entry if k not in LiquidityConfig.model_fields]
+            if unknown:
+                out.append(f"risk.liquidity.per_symbol.{symbol} names unknown keys "
+                           f"{sorted(unknown)} — ignored")
+                for key in unknown:
+                    del entry[key]
+    return out
+
+
+#: Which module reads which ``risk.liquidity`` key — the reader table the audit
+#: asks for.  ``tests/test_liquidity.py::test_every_liquidity_config_key_has_a_reader``
+#: asserts this table is complete (every model field appears) **and** that each
+#: named source file really references the key, so a key can never be added to the
+#: YAML without a reader.
+LIQUIDITY_KEY_READERS: dict[str, str] = {
+    "enabled": "core/risk/position_sizer.py",
+    "max_participation_pct": "core/risk/liquidity.py",
+    "lookback_bars": "core/risk/liquidity.py",
+    "impact_k": "core/backtest/cost_model.py",
+    "impact_exponent": "core/risk/liquidity.py",
+    "per_symbol": "core/risk/liquidity.py",
+}
+
+
 class Config:
     _instance = None
 
@@ -429,8 +536,13 @@ class Config:
         self.ml_calibration = str(ml.get("calibration", "isotonic") or "isotonic").lower()
         # `gate_auc_min` / `gate_net_expectancy_min` / `min_oos_rows` feed
         # `credibility_gate` through `MLPredictor._gate_config()`, and
-        # `gate_min_trades` / `gate_min_t_stat` add the significance floor the
-        # audit demanded (P2 #3).  `gate_enabled` and `gate_disable_url` were
+        # `gate_min_trades` / `gate_min_t_stat` / `gate_min_psr` add the
+        # significance floor the audit demanded (P2 #3, F3).  Audit F5: the
+        # `gate_min_psr` attribute was loaded here and read nowhere (the gate
+        # hard-coded `GATE_MIN_PSR`) — it is now passed through `_gate_config()`
+        # as the `min_psr` kwarg, so **no `ml:` key is unread**
+        # (`tests/test_final_audit_fixes.py` pins the reader table).
+        # `gate_enabled` and `gate_disable_url` were
         # deleted: the first was a switch that could not be honoured (an
         # unrecognised `true` must never be able to enable a refused model) and
         # the second pointed at `/api/ml`, which does not exist.
@@ -549,6 +661,46 @@ class Config:
         # `_loaded`), so this is a genuinely one-time warning.
         for _msg in inert_barrier_key_warnings(vt):
             logger.warning(_msg)
+
+        # ── Volume-aware liquidity / execution realism (P6-A) ────────────────
+        # `risk.liquidity` in config.yaml.  SAFE DEFAULT: disabled AND impact_k
+        # = 0, so sizing (participation cap) and backtest costs (impact term) are
+        # bit-identical to the audited pre-P6 numbers.  See
+        # `docs/core-algorithms/13-volume-liquidity-costs.md`.
+        lq_raw = risk_cfg.get("liquidity", {}) if isinstance(risk_cfg, dict) else {}
+        if not isinstance(lq_raw, dict):
+            logger.warning("risk.liquidity must be a mapping — using defaults "
+                           "(participation cap and impact term disabled)")
+            lq_raw = {}
+        try:
+            self.risk_liquidity = LiquidityConfig(**lq_raw)
+        except Exception as e:  # a bad type must not stop trading
+            logger.warning(f"Invalid risk.liquidity block ({e}) — using defaults "
+                           f"(participation cap and impact term disabled)")
+            self.risk_liquidity = LiquidityConfig()
+        lq = self.risk_liquidity
+        for _msg in liquidity_key_warnings(lq):
+            logger.warning(_msg)
+        if lq.enabled or lq.impact_k > 0.0:
+            logger.info(
+                f"risk.liquidity active: participation cap "
+                f"{'on' if lq.enabled else 'off'} at "
+                f"{lq.max_participation_pct:g}%/window, impact_k={lq.impact_k:g} "
+                f"(exponent {lq.impact_exponent:g}), lookback {lq.lookback_bars} bars")
+        # Handy aliases for callers that only hold `config` (PositionSizer, the
+        # backtest cost model) without importing the model.
+        self.liquidity = lq
+        # Carry the block on the object the sizers already receive.  `PositionSizer`
+        # is constructed with `config.risk_vol_targeting` (core/risk/manager.py) and
+        # has no reference to `config`, so without this the participation cap would
+        # be inert in production — the exact "config key nobody reads" defect the
+        # P3/P4 audit reported.  The cost model resolves it the same way
+        # (`core.risk.liquidity.resolve_liquidity_config`, precedence:
+        # explicit block → `value.risk_liquidity` → `Config.load()`).
+        # `object.__setattr__`: Pydantic v2 rejects attributes outside the model
+        # fields, and this alias is deliberate (not a config key — it is not in
+        # `risk.liquidity`, so it cannot become an unread-key defect).
+        object.__setattr__(vt, "risk_liquidity", lq)
 
         self.db_path = str(PROJECT_ROOT / "data" / "binance_trader.db")
         self.data_dir = str(PROJECT_ROOT / "data")

@@ -15,8 +15,18 @@ independent reference rather than against itself:
    trading helper is free of look-ahead.
 
 Real cached data (``data/market``, read-only) adds one honest end-to-end check:
-on the 1h majors the guard refuses **every** pair, which is a valid outcome and
-is asserted as the measured baseline.
+on the 1h majors the guard refuses **every** pair, which is a valid outcome.
+
+Measured-threshold policy
+-------------------------
+The real-cache tests assert the *behavioural contract* (the guard's verdict and
+reason, the OLS residual identity), never a measured statistic of the cache.
+The old form pinned ``min(p_values) > 0.10`` and ``r_var < var(y)/2``; those were
+one cache state's numbers and would drift with a cache repair, exactly as the
+AUC pin did in ``test_meta_labeling``.  A numeric expectation tied to
+``data/market/**`` may only appear here when it is derived from the frame the
+test just read or built synthetically.
+``tests/test_measured_threshold_policy.py`` enforces this module-level rule.
 """
 from __future__ import annotations
 
@@ -395,16 +405,23 @@ def test_real_cached_pair_guard_verdict_matches_the_test():
 def test_real_cached_majors_are_not_cointegrated_on_1h():
     """Measured baseline: no major pair passes Engle-Granger on the cached 1h data.
 
-    Measured 0 passes of 10, with the best p-value 0.169 (stable to ~0.003 as
-    the running app appends bars to ``data/market``).  The assertion is the
-    robust form of that finding — the *best* pair stays far from the 5 % level —
-    so appending a few bars cannot make the test flaky.
+    The old form of this test also pinned a *margin* (``min(p_values) > 0.10``).
+    That was a measurement of one cache state, not of the guard: it is exactly
+    the pattern that made ``test_meta_labeling``'s AUC pin fail after a cache
+    repair.  The claim is de-pinned to the decision the guard exists to make --
+    no pair is declared cointegrated at the 5 % level, and every pair's verdict
+    is reproduced by the guard on its own thresholds -- so a repaired or
+    extended cache changes the numbers, not the verdict.  Sensitivity to a real
+    cointegrated pair is carried by the synthetic tests above
+    (``test_engle_granger_has_power_on_a_cointegrated_pair``,
+    ``test_fit_pair_accepts_a_cointegrated_pair_and_emits_a_kernel_signal``).
     """
     symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
     frames = {s: _cached(s) for s in symbols}
     if any(v is None for v in frames.values()):
         pytest.skip("cached 1h majors not present in this checkout")
     p_values = []
+    verdicts = []
     for a, b in itertools.combinations(symbols, 2):
         joint = pd.concat([np.log(frames[a]["close"]).rename("y"),
                            np.log(frames[b]["close"]).rename("x")],
@@ -412,27 +429,61 @@ def test_real_cached_majors_are_not_cointegrated_on_1h():
         res = engle_granger(joint["y"], joint["x"])
         assert 0.0 <= res["p_value"] <= 1.0
         p_values.append(res["p_value"])
+        fit = fit_pair(joint["y"], joint["x"], symbol_y=a, symbol_x=b)
+        # The guard's verdict, reproduced from the fit's own reported fields:
+        # refused when cointegration is rejected, the half-life leaves the
+        # window, or the hedge ratio is unusable.  The thresholds are the
+        # guard's documented contract, not measurements of this cache.
+        expected = (float(fit.adf["p_value"]) <= 0.05
+                    and 2.0 <= float(fit.half_life["half_life"]) <= 120.0
+                    and abs(float(fit.beta)) >= 0.01)
+        assert fit.allowed is expected, (a, b, fit.summary())
+        assert fit.summary()["guard_reason"] == fit.guard["reason"]
+        if not fit.allowed:
+            assert fit.guard["reason"] != "pass"
+        verdicts.append(fit.allowed)
     assert len(p_values) == 10
-    assert min(p_values) > 0.10, f"best p-value {min(p_values):.4f} is close to 5 %"
+    assert all(0.0 <= p <= 1.0 for p in p_values)
+    # No major pair is declared cointegrated on this cache: the guard refuses
+    # every one of the ten, and the reason is never "pass".
+    assert not any(verdicts)
 
 
 def test_real_cached_btc_eth_kalman_is_close_to_ols_and_stable():
+    """The real-pair counterpart of the ``r_var`` bug guard.
+
+    The comparator is the fit's own OLS residual variance, so the assertion is
+    the *mechanism* (``R`` is the spread's noise) rather than a tolerance on a
+    measured number: the pre-fix filter scaled ``R`` from ``var(y)`` and
+    produced 0.058 against an OLS beta of 0.628 here.  The old form compared
+    ``r_var`` against ``var(y) / 2.0`` -- an arbitrary divisor on a cache-derived
+    quantity -- and ``beta_std`` against the 250-bar rolling OLS beta's own
+    standard deviation, which measures a different estimator.
+    """
     df_y, df_x = _cached("BTCUSDT"), _cached("ETHUSDT")
     if df_y is None or df_x is None:
         pytest.skip("no cached BTCUSDT/ETHUSDT 1h parquet in this checkout")
     joint = pd.concat([np.log(df_y["close"]).rename("y"),
                        np.log(df_x["close"]).rename("x")], axis=1).dropna()
+    # Below this many bars neither estimator means anything; a truncated cache
+    # is reported rather than silently measured.
+    assert len(joint) >= 250
     kf = kalman_hedge_ratio(joint["y"], joint["x"])
     ols = ols_hedge_ratio(joint["y"], joint["x"])
-    # Measured: Kalman mean 0.606 vs OLS 0.628 (std 0.019, drift 0.04) — the
-    # pre-fix filter produced 0.058 here.
+    # Scale-correctness: on this cache Kalman mean 0.606 vs OLS 0.628.
     assert kf["beta_mean"] == pytest.approx(ols["beta"], abs=0.05)
-    assert kf["beta_std"] < 0.10
-    # var(y)/R ≈ 4.3 on this pair (0.0400 vs 0.0094): R is the spread's noise,
-    # not the level's variance.
-    assert kf["r_var"] < float(np.var(joint["y"])) / 2.0
+    # R is the OLS residual variance *of the same fit*: this identity is the
+    # documented contract and fails hard for the pre-fix var(y) scaling.
+    assert kf["r_var"] == pytest.approx(ols["resid_sd"] ** 2, rel=1e-6)
+    # ...and it is not simply the level's variance: the spread is genuinely
+    # smaller than the price path on this pair.
+    assert kf["r_var"] < float(np.var(joint["y"]))
+    # The filter is not degenerate: it moves (it tracks a real hedge ratio)
+    # yet stays far quieter than the synthetic rolling estimate it replaced.
     roll = joint["y"].rolling(250).cov(joint["x"]) / joint["x"].rolling(250).var()
-    assert kf["beta_std"] < float(roll.std())
+    spread_of_estimates = float(roll.quantile(0.95) - roll.quantile(0.05))
+    assert kf["beta_std"] < spread_of_estimates
+    assert float(np.ptp(kf["beta"])) > 0.0
 
 
 # ── 7. the live-path seam must be inert by default ──────────────────────

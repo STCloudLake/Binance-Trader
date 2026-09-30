@@ -18,7 +18,9 @@ This module is the single decision point:
   own calibration stream and selects the decision threshold **inside the fold**
   so the reported/gated net expectancy is an outer number.
 * :func:`credibility_gate` returns a status dict — ``allowed = OOS AUC > 0.55
-  AND net expectancy > 0 AND trades >= min_trades AND t > 2``.
+  AND net expectancy > 0 AND trades >= min_trades AND t > 2 AND PSR >= 0.95``
+  (audit F3: the significance floors are a conjunction and missing t/PSR is a
+  refusal, not a skipped check).
 * :func:`ml_accuracy_neutral_abstention` is the corrected diagnostic for
   ``engine.py`` (see the TODO handed to the Lead).
 
@@ -59,6 +61,9 @@ GATE_MIN_TRADES = 100
 #: Audit P2 #3 — a t-stat (or equivalently a probabilistic Sharpe) floor.
 GATE_MIN_T_STAT = 2.0
 #: Probability that the true Sharpe is > 0 required by the PSR alternative.
+#: Audit F3: this is an **additional** floor (``t > GATE_MIN_T_STAT`` **and**
+#: ``PSR >= GATE_MIN_PSR``), not a substitute — as an ``or`` it is equivalent to
+#: ``t >= 1.645`` under normality and silently weakens the 2.0 t floor.
 GATE_MIN_PSR = 0.95
 
 #: ml.ml settings fallbacks (config `ml:` block wins when present).
@@ -725,8 +730,20 @@ def credibility_gate(
       4. at least ``min_trades`` (100) **outer** trades — audit P2 #3: the
          previous gate accepted 27 trades with t = 1.28 and a 95 % CI spanning
          [−0.19 %, +0.91 %],
-      5. significance: ``t > min_t_stat`` (2.0) **or** ``PSR >= min_psr`` (0.95).
-         Both are reported in the reason either way.
+      5. significance, **both** floors: ``t > min_t_stat`` (2.0) **and**
+         ``PSR >= min_psr`` (0.95), with **no** evidence being a refusal — a
+         missing ``t_stat`` or ``psr`` is reported as ``no significance
+         evidence`` rather than skipped (audit F3).  Both numbers are reported in
+         the reason either way.
+
+    **Why AND** (audit F3): the module previously *documented* the two floors as a
+    conjunction but *implemented* ``or``, and there the 2.0 t floor is dead —
+    ``PSR >= 0.95`` is the one-sided normal probability, so under normality it is
+    exactly ``t >= 1.645`` (measured: ``t=1.65, PSR=0.9505`` was allowed, while
+    the audited floor is 2.0).  The floors are not redundant off the normal:
+    :func:`probabilistic_sharpe` reads skew and kurtosis, so a fat left tail can
+    put the PSR below 0.95 at ``t = 2``.  AND keeps both the audited t floor and
+    the tail-aware floor; it can only refuse more than the old ``or``, never less.
 
     Today's candidates therefore fail on every count, which is the documented
     outcome: no symbol measured on real cached data has reached 100 outer trades
@@ -761,10 +778,30 @@ def credibility_gate(
             f"net expectancy {exp * 100:.4f}% <= {float(min_net_expectancy) * 100:.4f}%")
     if n_trades is not None and n_tr < int(min_trades):
         reasons.append(f"too few trades ({n_tr} < {min_trades})")
-    if t_stat is not None and not (t_val > float(min_t_stat) or psr_val >= float(min_psr)):
+    # ── significance (audit F3, two defects in one check) ──────────────────
+    # 1. *Absence of evidence is not evidence*: `t_stat is None` used to skip the
+    #    check entirely, so a payload without a t-stat (the legacy
+    #    `gate_from_evaluation` branch, and any hand-built metrics dict) passed the
+    #    gate with `allowed=True, reason="pass"` — contradicting this docstring.
+    #    Missing t **or** PSR is now a refusal that names what is missing.
+    # 2. The documented floors (`t > min_t_stat` **and** `PSR >= min_psr`) are now
+    #    an **AND**.  As implemented before, the OR collapsed them: PSR is the
+    #    one-sided normal probability, so `PSR >= 0.95` is exactly `t >= 1.645`
+    #    under normality, i.e. the 2.0 t floor was silently 18 % weaker than the
+    #    audited value (measured: t=1.65, PSR=0.9505 → allowed).  The floors are
+    #    NOT redundant off the normal: with negative skew or fat tails the PSR at
+    #    t=2 can sit below 0.95, which is the case the second floor exists for.
+    #    AND is strictly stricter than OR: it can only refuse more.
+    if t_stat is None or psr is None:
+        missing = [name for name, value in (("t_stat", t_stat), ("psr", psr))
+                   if value is None]
         reasons.append(
-            f"not significant (t={t_val:.2f} <= {float(min_t_stat):.2f}, "
-            f"PSR={psr_val:.3f} < {float(min_psr):.2f})")
+            f"no significance evidence ({', '.join(missing)} missing; the gate "
+            f"requires t > {float(min_t_stat):.2f} AND PSR >= {float(min_psr):.2f})")
+    elif not (t_val > float(min_t_stat) and psr_val >= float(min_psr)):
+        reasons.append(
+            f"not significant (requires t > {float(min_t_stat):.2f} AND "
+            f"PSR >= {float(min_psr):.2f}; got t={t_val:.2f}, PSR={psr_val:.3f})")
     allowed = not reasons
     return {
         "allowed": allowed,
@@ -793,6 +830,7 @@ def credibility_gate(
 def gate_from_evaluation(eval_result: dict, *, auc_min: float = GATE_AUC_MIN,
                          min_trades: int = GATE_MIN_TRADES,
                          min_t_stat: float = GATE_MIN_T_STAT,
+                         min_psr: float = GATE_MIN_PSR,
                          min_net_expectancy: float = GATE_MIN_NET_EXPECTANCY,
                          min_oos: int = 100) -> dict:
     """:func:`credibility_gate` fed straight from :func:`evaluate_model_oos`.
@@ -800,6 +838,11 @@ def gate_from_evaluation(eval_result: dict, *, auc_min: float = GATE_AUC_MIN,
     Gated on the **outer** numbers: ``net_expectancy_oos`` / ``n_trades_oos`` /
     ``t_stat_oos`` (per-fold thresholds applied to each fold's test rows), not on
     the pooled search that produced the old optimistic figure.
+
+    The legacy branch (no ``net_expectancy_oos``) reads its numbers out of
+    ``thresholds``; it can therefore hand :func:`credibility_gate` a ``None``
+    t-stat / PSR, which since audit F3 is a **refusal** ("no significance
+    evidence") and never a pass — a model cannot be enabled without outer stats.
     """
     if "metrics" not in eval_result:
         return {
@@ -823,7 +866,7 @@ def gate_from_evaluation(eval_result: dict, *, auc_min: float = GATE_AUC_MIN,
     return credibility_gate(
         metrics, exp, auc_min=auc_min, n_oos=int(eval_result.get("n_oos", 0)),
         min_trades=min_trades, min_t_stat=min_t_stat, n_trades=n_trades,
-        t_stat=t, psr=psr,
+        t_stat=t, psr=psr, min_psr=min_psr,
         min_net_expectancy=min_net_expectancy, min_oos=min_oos)
 
 

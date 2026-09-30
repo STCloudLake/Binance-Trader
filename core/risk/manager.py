@@ -36,6 +36,37 @@ _INTERVAL_HOURS: dict[str, float] = {
 }
 
 
+def _frame_close_time(value):
+    """``close_time`` (ms epoch or datetime-like) → ``pd.Timestamp`` or ``None``.
+
+    ``None`` means "no usable timestamp", which the kline buffer treats as a
+    refusal — never as "index this series with 0, 1, 2…" (audit F1: a RangeIndex
+    made the splice guard compare ``1 - 0 = 1`` "seconds" and always pass).
+    """
+    if value is None:
+        return None
+    try:
+        import pandas as pd
+        if isinstance(value, pd.Timestamp):
+            return value
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            ms = float(value)
+            # Binance sends milliseconds; a seconds value would land in 1970.
+            if abs(ms) < 1e11:
+                return None
+            return pd.Timestamp(ms, unit="ms", tz="UTC")
+        ts = pd.Timestamp(value)
+    except Exception:
+        return None
+    if ts is None or pd.isna(ts):
+        return None
+    # Production mixes aware (WS ms epoch) and naive (test/parquet) stamps.
+    # Comparing aware to naive raises in pandas; UTC-tagging the naive ones (they
+    # are already UTC: `close_time` is the exchange's UTC bar close) makes a mixed
+    # buffer representable and keeps the gap arithmetic meaningful.
+    return ts.tz_localize("UTC") if ts.tzinfo is None else ts
+
+
 def _series_has_gap(index, interval: str, max_bars: float = _VOL_MAX_GAP_BARS) -> bool:
     """True when ``index`` (datetimes) carries a gap beyond ``max_bars`` bars.
 
@@ -98,6 +129,7 @@ class RiskManager:
         self._vol_cache: dict[tuple[str, str], tuple[float, float]] = {}
         self._kline_history: dict[tuple[str, str], deque] = {}
         self._last_splice_warning: float = 0.0
+        self._last_timestamp_warning: float = 0.0
 
     def wire_executor(self, executor):
         """Receive executor reference for accurate position valuation."""
@@ -138,12 +170,19 @@ class RiskManager:
     # ── volatility-targeted sizing (Phase P3 gap fix) ────────────────────
 
     async def _on_kline(self, event: Event):
-        """Keep a short close-price history per ``(symbol, interval)``.
+        """Keep a short ``(close_time, close)`` history per ``(symbol, interval)``.
 
         This is the live source the sizing path can always reach without a new
         component reference: the market-data provider already publishes every
         closed candle, and a deque append is free.  While the switch is off the
         handler returns immediately, so nothing is buffered and nothing changes.
+
+        **A candle without a usable ``close_time`` is refused** (audit F1): the
+        buffer is now timestamp-indexed so the splice guard can see a hidden
+        calendar hole, and a close that carries no time cannot be guarded.  Both
+        production publishers (``provider._handle_ws_message``,
+        ``app/main.py`` REST poll) set ``close_time`` from Binance's ``k.T``, so
+        the refusal only affects synthetic callers.
         """
         if not self.sizer.vol_targeting_enabled():
             return
@@ -159,11 +198,20 @@ class RiskManager:
             return
         if not math.isfinite(value) or value <= 0.0:
             return
+        close_time = _frame_close_time(candle.get("close_time"))
+        if close_time is None:
+            if self._should_warn_missing_times():
+                from loguru import logger
+                logger.warning(
+                    "RiskManager: refusing a MARKET_KLINE candle without a usable "
+                    "close_time — the volatility splice guard cannot verify a "
+                    "buffer with no timestamps; the bar is not buffered")
+            return
         key = (str(symbol), str(data.get("interval") or _DEFAULT_VOL_INTERVAL))
         history = self._kline_history.get(key)
         if history is None:
             history = self._kline_history[key] = deque(maxlen=_VOL_HISTORY_BARS)
-        history.append(value)
+        history.append((close_time, value))
 
     def _should_warn_splice(self) -> bool:
         """Cheap bound on a warning that would otherwise fire on every signal."""
@@ -173,11 +221,57 @@ class RiskManager:
         self._last_splice_warning = now
         return True
 
-    def _recent_closes(self, symbol: str, interval: str):
+    def _should_warn_missing_times(self) -> bool:
+        """Same TTL bound for the "no close_time" refusal."""
+        now = time.monotonic()
+        if now - self._last_timestamp_warning < _VOL_CACHE_TTL_SEC:
+            return False
+        self._last_timestamp_warning = now
+        return True
+
+    def _recent_bars(self, symbol: str, interval: str):
+        """Buffered ``(close_time, close)`` pairs, or ``None`` when unusable.
+
+        All-or-nothing on purpose: a single un-timestamped bar means the gap
+        check cannot be trusted for the series, and the audit's rule is to refuse
+        the buffer path rather than silently skip the guard.
+        """
         history = self._kline_history.get((str(symbol), str(interval)))
         if not history or len(history) < 3:
             return None
-        return list(history)
+        bars = list(history)
+        if any(ts is None for ts, _ in bars):
+            if self._should_warn_missing_times():
+                from loguru import logger
+                logger.warning(
+                    f"RiskManager: refusing the buffered volatility series for "
+                    f"{symbol} {interval} — {sum(1 for ts, _ in bars if ts is None)} "
+                    f"of {len(bars)} bars carry no close_time, so the splice guard "
+                    f"cannot be applied (sizing falls back to the fixed fraction)")
+            return None
+        return bars
+
+    def _buffered_frame(self, symbol: str, interval: str):
+        """DatetimeIndexed ``close`` frame from the live kline buffer, or ``None``.
+
+        The index is the whole point (audit F1): with the old
+        ``pd.DataFrame({"close": closes})`` the index was a ``RangeIndex``, so
+        ``_series_has_gap`` subtracted consecutive integers (``1 - 0`` "seconds")
+        and the guard could never fire.  A ``None`` return is a refusal, not a
+        licence to fall through to an unguarded frame.
+        """
+        bars = self._recent_bars(symbol, interval)
+        if not bars:
+            return None
+        try:
+            import pandas as pd
+            index = pd.DatetimeIndex([ts for ts, _ in bars])
+            return pd.DataFrame({"close": [c for _, c in bars]}, index=index)
+        except Exception as e:
+            from loguru import logger
+            logger.warning(f"RiskManager: buffered vol frame failed for {symbol} "
+                           f"{interval}: {e}")
+            return None
 
     async def _history_frame(self, symbol: str, interval: str):
         """Recent OHLC frame for ``symbol`` from the injected market-data source."""
@@ -203,6 +297,12 @@ class RiskManager:
         fraction: refusing to size from corrupt data is deliberately the *safer*
         fallback, not an error.
 
+        The gap guard runs on both sources: the injected market-data frame (a
+        ``DatetimeIndex`` from the provider) and the live kline buffer, which is
+        timestamp-indexed for exactly this reason (audit F1).  A buffered series
+        that cannot be timestamped is **refused** here rather than estimated
+        without the guard.
+
         Cost: one TTL-cached estimate per ``(symbol, interval)`` — at most a few
         hundred closes through the O(window) EWMA, never a full-history scan.
         """
@@ -219,13 +319,13 @@ class RiskManager:
         frame = await self._history_frame(str(symbol), tf)
         from loguru import logger
         if frame is None or len(frame) < 3:
-            closes = self._recent_closes(str(symbol), tf)
-            if closes is None:
-                return None
-            try:
-                import pandas as pd
-                frame = pd.DataFrame({"close": closes})
-            except Exception:
+            # Audit F1: the fallback used to be built from bare floats, giving a
+            # RangeIndex that made ``_series_has_gap`` inert.  It is now built from
+            # ``(close_time, close)`` pairs and **refused** when the buffer cannot
+            # supply timestamps — refusing is the safer fallback (fixed fraction),
+            # silently skipping the guard is not.
+            frame = self._buffered_frame(str(symbol), tf)
+            if frame is None:
                 return None
         if _series_has_gap(frame.index, tf):
             if self._should_warn_splice():

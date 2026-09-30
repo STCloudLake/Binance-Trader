@@ -144,6 +144,10 @@ def p2_evaluation(symbol: str, interval: str, X: pd.DataFrame, ind: pd.DataFrame
             "min_net_expectancy": float(getattr(config, "ml_gate_net_expectancy_min", 0.0)),
             "min_trades": int(getattr(config, "ml_gate_min_trades", 100)),
             "min_t_stat": float(getattr(config, "ml_gate_min_t_stat", 2.0)),
+            # Audit F3/F5: the PSR floor was previously not passed at all, so this
+            # measurement script gated on the hard-coded default while
+            # `ml.gate_min_psr` was loaded and unread.
+            "min_psr": float(getattr(config, "ml_gate_min_psr", 0.95)),
             "min_oos": int(getattr(config, "ml_min_oos_rows", 100)),
         }
     calibration = str(getattr(config, "ml_calibration", "isotonic") or "isotonic") \

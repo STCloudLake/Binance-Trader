@@ -20,6 +20,18 @@ What it reports (per ``<symbol>/<interval>.parquet``)
   missing bars,
 * the number of gaps beyond the threshold, and the largest gap (hours + the
   timestamp it precedes),
+* **rows beyond one per bar** (``duplicate_bar_rows``): the same bar stored under
+  both timestamp conventions this cache can hold (bar-*open* and Binance
+  ``close_time``, ``open + length - 1 ms``).  Measured on the live
+  ``data/market/BTCUSDT/1h.parquet`` at revision ``0542e02``: 11 677 rows, of
+  which 55 are such duplicates (8 767 open-aligned + 2 910 ``:59:59.999`` rows).
+  The count uses the declared bar length (``core.market_data.ohlcv_cache.bar_keys``
+  — the rule ``scripts/download_history.py --merge`` and the cache's write path
+  both apply), **never** timestamp proximity: the 54 one-millisecond-adjacent pairs
+  in that file are the close of hour ``H-1`` beside the open of hour ``H``, i.e.
+  two different bars.  It is reported, not enforced: ``--strict`` still exits
+  non-zero only for calendar gaps, so a mixed-convention cache cannot break an
+  existing CI gate,
 * the RiskMetrics EWMA vol per bar, **clipped** (the production default) next to
   the un-clipped number — the pair that exposes the overstatement.
 
@@ -51,6 +63,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.config import Config  # noqa: E402
+from core.market_data.ohlcv_cache import bar_keys  # noqa: E402
 from core.market_data.universe import MARKET_CACHE_SUBDIR  # noqa: E402
 
 #: Bar length in hours per interval label (the cache uses Binance spot labels).
@@ -69,6 +82,20 @@ def interval_hours(interval: str) -> float | None:
     return INTERVAL_HOURS.get(str(interval).strip())
 
 
+def duplicate_bar_rows(df: pd.DataFrame, interval: str) -> int:
+    """Rows beyond one per bar — the same bar under the two timestamp conventions.
+
+    ``0`` when the label has no bar grid (unknown timeframe) or every bar appears
+    once.  The key is the declared bar length, so the close of hour ``H-1`` and the
+    open of hour ``H`` — 1 ms apart, two different bars — are never counted
+    together (see :mod:`core.market_data.ohlcv_cache`).
+    """
+    keys = bar_keys(df.index, interval)
+    if keys is None:
+        return 0
+    return int(len(df) - keys.nunique())
+
+
 def gap_report(df: pd.DataFrame, interval: str,
                threshold_bars: float = DEFAULT_GAP_THRESHOLD_BARS) -> dict:
     """Structure of one cached frame: span, missing bars and gap statistics.
@@ -78,13 +105,20 @@ def gap_report(df: pd.DataFrame, interval: str,
     no gaps.  ``expected`` is the bar count a contiguous series would have
     (``span / bar + 1``); ``missing = expected − actual`` — the two disagree only
     when the series is spliced, which is the defect this module measures.
+    ``duplicate_bar_rows`` counts rows that are a *second* copy of a bar
+    (``flagged`` stays reserved for calendar gaps).
     """
     out = {
         "bars": int(len(df)), "first": None, "last": None, "span_hours": 0.0,
         "expected": int(len(df)), "missing": 0, "gaps": [], "gap_count": 0,
         "largest_gap_hours": 0.0, "largest_gap_at": None,
         "threshold_hours": None, "flagged": False, "interval_hours": None,
+        "duplicate_bar_rows": 0,
     }
+    try:
+        out["duplicate_bar_rows"] = duplicate_bar_rows(df, interval)
+    except Exception:  # a frame the key rule cannot read is itself a finding
+        out["duplicate_bar_rows"] = 0
     bar = interval_hours(interval)
     out["interval_hours"] = bar
     if bar is None or bar <= 0 or len(df) < 2:
@@ -207,11 +241,12 @@ def main(argv=None) -> int:
     print()
 
     header = (f"{'symbol':<10} {'tf':<4} {'bars':>7} {'span_h':>9} {'expected':>9} "
-              f"{'missing':>8} {'gaps':>5} {'largest_h':>10}  flag")
+              f"{'missing':>8} {'gaps':>5} {'largest_h':>10} {'twin':>5}  flag")
     print(header)
     print("-" * len(header))
 
     flagged_total = 0
+    twin_total = 0
     vol_rows: list[tuple[str, str, dict, dict]] = []
     for symbol, interval, path in files:
         try:
@@ -226,9 +261,15 @@ def main(argv=None) -> int:
             flag = "?tf"
         if rep["flagged"]:
             flagged_total += 1
+        if rep["duplicate_bar_rows"]:
+            twin_total += 1
         print(f"{symbol:<10} {interval:<4} {rep['bars']:>7} "
               f"{rep['span_hours']:>9.1f} {rep['expected']:>9} {rep['missing']:>8} "
-              f"{rep['gap_count']:>5} {rep['largest_gap_hours']:>10.1f}  {flag}")
+              f"{rep['gap_count']:>5} {rep['largest_gap_hours']:>10.1f} "
+              f"{rep['duplicate_bar_rows']:>5}  {flag}")
+        if rep["duplicate_bar_rows"]:
+            print(f"{'':<10} {'':<4}   {rep['duplicate_bar_rows']} row(s) repeat a bar "
+                  f"already stored under the other timestamp convention")
         for at, hours in rep["gaps"][:5]:
             print(f"{'':<10} {'':<4}   gap {hours:>9.1f} h before {at}")
         if args.check_vol:
@@ -267,6 +308,11 @@ def main(argv=None) -> int:
     else:
         print(f"RESULT: all {len(files)} file(s) contiguous at "
               f"{args.threshold_bars} x bar length.")
+    if twin_total:
+        # Reported, deliberately not part of --strict (see the module docstring).
+        print(f"NOTE: {twin_total}/{len(files)} file(s) store a bar twice under the "
+              f"two timestamp conventions (col 'twin'); the cache's interval-aware "
+              f"write path collapses them on its next flush.")
     return 1 if (args.strict and flagged_total) else 0
 
 

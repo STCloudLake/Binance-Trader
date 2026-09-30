@@ -778,7 +778,26 @@ class MetaLabeler:
 
 
 def default_meta_cost_pct(config=None, *, symbol: str = "BTCUSDT") -> float:
-    """Round-trip cost (%) for the primary trade, from the sim cost model."""
+    """Round-trip cost (%) for the primary trade, from the sim cost model.
+
+    The point of this helper is that the meta path cannot charge a cheaper cost
+    than the fills pay, so ``config=None`` **resolves the active configuration**
+    (``app.config.Config.load()``, the same object the executor uses) instead of
+    falling through to :func:`core.ml.credibility.cost_pct_for`'s hard-coded
+    fallbacks.  Measured before this fix: ``default_meta_cost_pct(None,
+    "ETHUSDT")`` returned **0.14 %** (the fallback defaults: 0.04 % fee + 0.01 %
+    half spread + 2 bp slippage) while the sim cost a fill actually pays is
+    **0.26 %**; ``docs/core-algorithms/12``'s "same source as fills" claim was
+    therefore only true when a config object was passed.  Now it is true by
+    construction.  If even the active config cannot be loaded the cost falls back
+    to the documented defaults (never to a fabricated cheaper number).
+    """
+    if config is None:
+        try:
+            from app.config import Config
+            config = Config.load()
+        except Exception:
+            config = None
     return float(cost_pct_for(config, symbol=symbol, order_type="market"))
 
 

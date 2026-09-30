@@ -11,7 +11,19 @@ The claims under test:
   genuinely refuses a noise meta-model — the labeler is then **inert**
   (``take=False``), not "small";
 * real cached BTC/ETH 1h data refuses every tested primary rule, which is a
-  valid outcome and is asserted as the measured baseline.
+  valid outcome.
+
+Measured-threshold policy
+-------------------------
+The real-cache test below asserts **gate semantics against the response's own
+fields** (``allowed``/``reason`` vs the gate's reported numbers), never a
+measured statistic.  Earlier it pinned ``auc <= 0.55``; the cache was repaired
+and the same, still-correct behaviour measured AUC 0.5866 while the gate kept
+refusing, which failed the test.  The behavioural claim is unchanged: the
+candidate is refused, and the reason names the criterion that refused it.  A
+numeric expectation tied to ``data/market/**`` may only appear here when it is
+derived from the frame the test just read or built synthetically.
+``tests/test_measured_threshold_policy.py`` enforces this module-level rule.
 """
 from __future__ import annotations
 
@@ -20,6 +32,9 @@ import pandas as pd
 import pytest
 
 from core.ml.calibration import ProbabilityCalibrator
+from core.ml.credibility import (
+    GATE_AUC_MIN, GATE_MIN_NET_EXPECTANCY, GATE_MIN_TRADES,
+)
 from core.ml.meta import (
     META_MAX_SIZE_MULTIPLIER, META_MIN_TRADES, META_SIZE_FLOOR, MetaDecision,
     MetaLabeler, breakeven_hit_rate, build_meta_dataset, evaluate_meta_oos,
@@ -173,7 +188,10 @@ def test_meta_evaluation_uses_purged_folds_and_reports_the_metric_table():
     assert len(seen) == len(np.unique(seen)) == res["n_oos"]
     summary = meta_summary(res)
     assert summary["gate_allowed"] is True
-    assert summary["auc"] > 0.55
+    # The AUC floor is the gate's own configured constant, not a measured value:
+    # this dataset is synthetic, and the expectation is read from the response's
+    # gate rather than written into the test.
+    assert summary["auc"] > meta_gate(res)["auc_min"]
     assert summary["net_expectancy_oos"] > 0
     assert summary["n_trades_oos"] >= META_MIN_TRADES
 
@@ -186,7 +204,9 @@ def test_meta_gate_refuses_a_noise_model():
     assert gate["allowed"] is False
     assert gate["enabled"] is False
     assert "AUC" in gate["reason"] or "expectancy" in gate["reason"]
-    assert res["metrics"]["auc"] <= 0.55
+    # The noise model fails the gate's own AUC criterion.  Synthetic data, and
+    # the threshold is read from the gate rather than written into the test.
+    assert gate["auc"] <= gate["auc_min"]
 
 
 def test_meta_gate_refuses_positive_looking_but_insignificant_results():
@@ -308,12 +328,42 @@ def test_calibrator_is_still_the_one_the_gate_uses():
 
 # ── real cached data (read-only; skipped when the cache is absent) ──────
 
-def test_real_primary_rules_are_refused_by_the_meta_gate():
-    """Measured baseline on BTCUSDT 1h: every primary rule fails the meta gate.
+def _gate_refusal_criteria(gate: dict) -> set[str]:
+    """The criteria the gate's *own* reported numbers say must have refused.
 
-    The evaluation runs on the last 3 000 cached bars so the suite stays fast;
-    the published numbers (docs/core-algorithms/12) come from the full 8 845-bar
-    sample, and both agree on the verdict.
+    The inequality set of the gate that produced ``gate`` -- an AUC at or below
+    ``auc_min``, a net expectancy not above ``net_expectancy_min``, fewer than
+    ``min_trades``, or significance short of **both** floors (``min_t_stat`` and
+    ``min_psr``) -- reconstructed from its response, never from the fixture.
+    Every threshold is read from the response, so the set is independent of which
+    cache state produced it.
+    """
+    min_psr = float(gate.get("min_psr") or 0.95)
+    criteria: set[str] = set()
+    if not (float(gate["auc"]) > float(gate["auc_min"])):
+        criteria.add("auc")
+    if not (float(gate["net_expectancy"]) > float(gate["net_expectancy_min"])):
+        criteria.add("expectancy")
+    if gate.get("n_trades") is not None and int(gate["n_trades"]) < int(gate["min_trades"]):
+        criteria.add("trades")
+    if gate.get("t_stat") is None or gate.get("psr") is None:
+        criteria.add("significance")
+    elif not (float(gate["t_stat"]) > float(gate["min_t_stat"])
+              and float(gate["psr"]) >= min_psr):
+        criteria.add("significance")
+    return criteria
+
+
+def test_real_primary_rules_are_refused_by_the_meta_gate():
+    """Every tested primary rule is refused **by the gate**, on this cache.
+
+    The evaluation runs on the last 3 000 cached bars so the suite stays fast.
+    Nothing here pins a measured value: the refusal is asserted through the
+    response's own ``allowed``/``reason``/gate fields, so a repaired or extended
+    cache changes only which criterion refuses the candidate, not the verdict.
+    ``rsi_meanrev`` on the 11 677-bar cache measures AUC 0.5866 (above
+    ``GATE_AUC_MIN``) and is refused on expectancy, trades and significance;
+    on the repaired cache it measures AUC 0.5067 and is refused on AUC too.
     """
     try:
         raw = pd.read_parquet("data/market/BTCUSDT/1h.parquet")
@@ -324,7 +374,7 @@ def test_real_primary_rules_are_refused_by_the_meta_gate():
 
     df = compute_all(raw.tail(3000), dict(REQUIRED_INDICATORS))
     X = compute_features(df)
-    verdicts = []
+    evaluated = []
     for name, (long_c, short_c) in {
         "rsi_meanrev": (["rsi < 35"], ["rsi > 65"]),
         "bb_breakout": (["close > bollinger_upper"],
@@ -339,15 +389,102 @@ def test_real_primary_rules_are_refused_by_the_meta_gate():
                                 min_trades=50)
         assert "error" not in res, res.get("folds")
         gate = meta_gate(res)
-        # Measured: AUC <= 0.517 and net expectancy <= 0 on every rule.
-        assert res["metrics"]["auc"] <= 0.55
+        # The gate reports the same statistic the evaluation measured, and it
+        # reports the thresholds it was configured with.
+        assert gate["auc"] == pytest.approx(res["metrics"]["auc"])
+        assert gate["auc_min"] == pytest.approx(GATE_AUC_MIN)
+        assert gate["net_expectancy"] == pytest.approx(res["net_expectancy_oos"])
+        assert gate["min_trades"] == GATE_MIN_TRADES
+        assert gate["net_expectancy_min"] == pytest.approx(GATE_MIN_NET_EXPECTANCY)
+        assert gate["n_oos"] == res["n_oos"]
+        # The behavioural claim: refused, inert, and the refusal is not vacuous.
         assert gate["allowed"] is False
         assert gate["enabled"] is False
-        verdicts.append((name, res["metrics"]["auc"], res["net_expectancy_oos"]))
-    assert verdicts, "no primary rule produced enough labelled trades"
+        assert gate["reason"] and gate["reason"] != "pass"
+        # ...and the reason names the criterion its own numbers failed.
+        failing = _gate_refusal_criteria(gate)
+        assert failing, (f"{name}: the gate refused but none of its reported "
+                         f"numbers fails: {gate}")
+        reason = gate["reason"]
+        named = set()
+        if "AUC" in reason:
+            named.add("auc")
+        if "expectancy" in reason:
+            named.add("expectancy")
+        if "trades" in reason:
+            named.add("trades")
+        if "significant" in reason or "PSR" in reason:
+            named.add("significance")
+        assert named == failing, (
+            f"{name}: the reason names {sorted(named) or 'nothing'} but the "
+            f"gate's numbers fail {sorted(failing)}: {reason!r}")
+        # ...and the reason quotes the gate's own number for each failing
+        # criterion, so it cannot be quoting a hard-coded statistic.
+        if "auc" in failing:
+            assert f"{float(gate['auc']):.4f}" in reason
+        if "expectancy" in failing:
+            assert f"{float(gate['net_expectancy']) * 100:.4f}" in reason
+        if "trades" in failing:
+            assert f"{int(gate['n_trades'])}" in reason
+        if "significance" in failing and gate.get("t_stat") is not None:
+            assert f"{float(gate['t_stat']):.2f}" in reason
+        evaluated.append((name, res, gate))
+
+    assert evaluated, "no primary rule produced enough labelled trades"
+    for name, res, gate in evaluated:
+        # The decision is what a caller receives: an evaluation that failed its
+        # gate leaves the labeler inert rather than "small".
+        lab = MetaLabeler()
+        lab.gate = gate
+        lab.threshold = res.get("threshold")
+        assert lab.enabled is False
+        assert lab.decide(1.0, side=+1).take is False
+
+    # Positive control: nothing here refuses unconditionally.  With the gate's
+    # own thresholds relaxed below the same response's numbers, the *same*
+    # candidate passes and the labeler becomes active -- so the refusal above is
+    # the gate's decision, not a hard-coded verdict.
+    name, res, _ = evaluated[0]
+    permissive = meta_gate(res, auc_min=0.0, min_net_expectancy=-float("inf"),
+                           min_trades=0, min_t_stat=-float("inf"),
+                           min_psr=-float("inf"))
+    assert permissive["allowed"] is True, (name, permissive)
+    assert permissive["reason"] == "pass"
     lab = MetaLabeler()
-    lab.gate = {"allowed": False}
-    assert lab.enabled is False
+    lab.gate = permissive
+    lab.threshold = res.get("threshold")
+    assert lab.enabled is True
+    assert lab.decide(1.0, side=+1).take is True
+
+
+def test_gate_auc_boundary_is_refused_at_the_constant_not_at_a_measured_value():
+    """The AUC criterion flips exactly at the configured ``auc_min``.
+
+    Built from synthetic numbers, so it holds on any cache state: the same
+    candidate is refused at the constant the gate was given and accepted one AUC
+    step above it.  This is what the real-cache test used to assert with a
+    hard-coded ``0.55``, expressed without a measured statistic and with the
+    other floors satisfied so the AUC criterion is the one under test.
+    """
+    from core.ml.credibility import credibility_gate
+
+    passing_floors = dict(net_expectancy_value=0.01, n_oos=500, n_trades=500,
+                          t_stat=5.0, psr=0.99)
+
+    below = credibility_gate({"auc": GATE_AUC_MIN - 0.01, "n": 500},
+                             **passing_floors)
+    assert below["allowed"] is False
+    assert "AUC" in below["reason"]
+
+    at_threshold = credibility_gate({"auc": GATE_AUC_MIN, "n": 500},
+                                    **passing_floors)
+    assert at_threshold["allowed"] is False
+    assert "AUC" in at_threshold["reason"]
+
+    above = credibility_gate({"auc": GATE_AUC_MIN + 0.01, "n": 500},
+                             **passing_floors)
+    assert above["allowed"] is True
+    assert above["reason"] == "pass"
 
 
 # ── the live-path seam must be inert by default ─────────────────────────

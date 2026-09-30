@@ -619,7 +619,12 @@ def register(app: FastAPI, ctx) -> None:
                "--end", date_end.strip(),
                # Frozen CLI contract: --data-dir is the *root* data dir; the
                # script itself writes <data-dir>/market/<SYMBOL>/<interval>.parquet.
-               "--data-dir", str(_data_dir(config))]
+               "--data-dir", str(_data_dir(config)),
+               # --merge: union with the existing file one row per bar instead of
+               # replacing it.  Without it a narrow re-download truncates a longer
+               # cached parquet (the store's merge-on-write protects the runtime
+               # flush path, not this subprocess).
+               "--merge"]
 
         def _run_download():
             # stdout/stderr go to a temp file (not a pipe): no reader thread, no

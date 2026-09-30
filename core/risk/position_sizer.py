@@ -45,13 +45,30 @@ Every entry point short-circuits when ``risk.vol_targeting.enabled`` is false
 
 This is deliberate: P3 must not change live behaviour until an operator opts in,
 and ``tests/test_volatility_targeting.py`` pins the identity.
+
+Volume-aware capacity (P6-A)
+----------------------------
+The same "spend the information on risk, not direction" rule applies to volume.
+:meth:`PositionSizer.apply_participation_cap` refuses or shrinks a notional that
+exceeds ``risk.liquidity.max_participation_pct`` of the recent traded quote
+volume (``core.risk.liquidity``), and it is called from
+:meth:`calculate_position_size` **only** when ``risk.liquidity.enabled`` is true —
+the shipped default is ``false``, so the sizing arithmetic is bit-identical and
+``tests/test_liquidity.py::test_participation_disabled_is_bit_identical`` pins
+it.  The cap can only ever *shrink*: it is applied after ``max_position_size_pct``
+/ the capital-pool split / the vol-targeting ceiling, so those hard caps stay
+authoritative.
 """
 
 from __future__ import annotations
 
+import logging
 import math
 
 from app.config import SoftRiskParams, HardRiskLimits
+from core.risk import liquidity as _liquidity
+
+_log = logging.getLogger(__name__)
 
 
 def _f(value, default: float = 0.0) -> float:
@@ -66,7 +83,7 @@ def _f(value, default: float = 0.0) -> float:
 class PositionSizer:
     def __init__(self, hard_limits: HardRiskLimits, soft_params: SoftRiskParams,
                  core_capital_pct: float = 0.7, satellite_capital_pct: float = 0.3,
-                 vol_targeting=None):
+                 vol_targeting=None, liquidity=None):
         self.hard = hard_limits
         self.soft = soft_params
         self.core_capital_pct = core_capital_pct
@@ -74,6 +91,11 @@ class PositionSizer:
         # ``None`` is the documented fallback: with no config object the sizer
         # behaves exactly like the pre-P3 class (every vol hook returns "off").
         self.vol_targeting = vol_targeting
+        # P6-A: ``risk.liquidity``.  ``None`` → resolved from ``vol_targeting``'s
+        # owner when that looks like a config, else the shipped block (disabled);
+        # ``resolve_liquidity_config`` never raises, so a missing block behaves
+        # like ``enabled: false``.
+        self.liquidity = liquidity
 
     # ── volatility hooks ────────────────────────────────────────────────
 
@@ -174,12 +196,82 @@ class PositionSizer:
         w = float(min(max(width, lo), max(hi, lo)))
         return w, w
 
+    # ── volume/liquidity capacity hooks (P6-A) ──────────────────────────
+
+    def liquidity_config(self, symbol: str = ""):
+        """Effective ``risk.liquidity`` block for ``symbol`` (``None`` = not configured).
+
+        Resolution is delegated to :func:`core.risk.liquidity.resolve_liquidity_config`
+        so a caller can pass a config, a bare ``risk.liquidity`` block, or nothing
+        at all: the explicit ``liquidity=`` constructor argument wins, then a
+        ``risk_liquidity`` attribute on ``vol_targeting`` (which in production is
+        ``app.config.Config.risk_vol_targeting``, so the sizer finds the live
+        block without any new plumbing), then the shipped defaults.
+        """
+        block = self.liquidity
+        if block is None:
+            block = _liquidity.resolve_liquidity_config(self.vol_targeting)
+        if block is None:
+            return None
+        return _liquidity.liquidity_for_symbol(block, symbol)
+
+    def participation_cap_enabled(self, symbol: str = "") -> bool:
+        """True only when a ``risk.liquidity`` block is present **and** enabled."""
+        block = self.liquidity_config(symbol)
+        return bool(block is not None and getattr(block, "enabled", False))
+
+    def apply_participation_cap(self, risk_amount: float, recent_quote_volume,
+                                symbol: str = "") -> tuple[float, str]:
+        """Shrink ``risk_amount`` to the participation ceiling; never grow it.
+
+        Returns ``(capped_risk_amount, reason)``.  While
+        ``risk.liquidity.enabled`` is false this is a pure pass-through that does
+        **not** touch the number (``("disabled: …", risk_amount)`` returned
+        unchanged), which is what makes the off-path bit-identical.  When it is
+        on, the notional is capped at ``max_participation_pct`` % of the window
+        and the reason (``ok`` / ``capped`` / ``no_volume``) is logged at **debug**
+        level so an operator can see *why* a size was reduced without a log line
+        per signal at info level.
+
+        ``recent_quote_volume`` may be a number, a bar frame, or a callable — it
+        is passed straight to :func:`core.risk.liquidity.recent_quote_volume`.
+        """
+        block = self.liquidity_config(symbol)
+        if block is None or not getattr(block, "enabled", False):
+            return risk_amount, "disabled: risk.liquidity.enabled is false"
+        volume = recent_quote_volume
+        if callable(volume):
+            volume = _liquidity.recent_quote_volume(
+                lookback_bars=int(getattr(block, "lookback_bars",
+                                          _liquidity.DEFAULT_LOOKBACK_BARS)),
+                provider=volume)
+        elif not isinstance(volume, (int, float)) or isinstance(volume, bool):
+            volume = _liquidity.recent_quote_volume(
+                volume,
+                lookback_bars=int(getattr(block, "lookback_bars",
+                                          _liquidity.DEFAULT_LOOKBACK_BARS)))
+        allowed, reason = _liquidity.cap_notional(
+            risk_amount, volume,
+            float(getattr(block, "max_participation_pct",
+                          _liquidity.DEFAULT_MAX_PARTICIPATION_PCT)))
+        # The cap may only shrink.  A mis-sized call must not be able to *raise*
+        # the notional above what the hard caps already allowed.
+        if allowed > risk_amount:
+            return risk_amount, f"{reason} (ignored: cap would GROW the notional)"
+        if allowed != risk_amount:
+            _log.debug(
+                "participation cap %s: notional %.4f -> %.4f (%s)",
+                symbol or "-", risk_amount, allowed, reason)
+        return allowed, reason
+
     # ── sizing ──────────────────────────────────────────────────────────
 
     def calculate_position_size(self, account_balance: float, current_price: float,
                                  position_type: str = "satellite",
                                  volatility_expanding: bool = False,
-                                 forecast_vol_pct: float | None = None
+                                 forecast_vol_pct: float | None = None,
+                                 recent_quote_volume=None,
+                                 symbol: str = ""
                                  ) -> tuple[float, float]:
         """Calculate position size with optional volatility-based adjustment.
 
@@ -194,6 +286,14 @@ class PositionSizer:
         volatility is.  With no forecast (or with the switch off) the arithmetic
         below is byte-for-byte the legacy calculation.
 
+        Volume-aware capacity (P6-A) is the **last** step: when
+        ``risk.liquidity.enabled`` is true and ``recent_quote_volume`` is
+        supplied, :meth:`apply_participation_cap` shrinks the notional to at most
+        ``max_participation_pct`` % of the recent traded quote volume.  It can
+        only shrink, and with the shipped default (``enabled: false``) the hook
+        is never called at all — passing ``recent_quote_volume`` while the switch
+        is off changes nothing (pinned by ``tests/test_liquidity.py``).
+
         Args:
             account_balance: Current account balance in USDT.
             current_price: Entry price of the asset.
@@ -202,6 +302,11 @@ class PositionSizer:
                 reduce position size.
             forecast_vol_pct: Forecast conditional volatility, percent of price
                 per bar (e.g. ``0.45``).  None → fixed-fraction fallback.
+            recent_quote_volume: Recent traded quote (USDT) notional — a number,
+                a bar frame, or a callable.  None → participation cap is skipped
+                (documented: an unmeasured window cannot cap anything).
+            symbol: Pair name, used for per-symbol ``risk.liquidity`` overrides
+                and for the debug log.
 
         Returns:
             (quantity, risk_amount_usdt) tuple.
@@ -230,6 +335,11 @@ class PositionSizer:
             vt_cap = self._vol_notional_cap(account_balance)
             if vt_cap is not None:
                 risk_per_trade = min(risk_per_trade, vt_cap)
+
+        # ── Participation cap (P6-A) — last, and shrink-only ──
+        if recent_quote_volume is not None and self.participation_cap_enabled(symbol):
+            risk_per_trade, _reason = self.apply_participation_cap(
+                risk_per_trade, recent_quote_volume, symbol)
 
         quantity = risk_per_trade / current_price if current_price > 0 else 0
         return quantity, risk_per_trade

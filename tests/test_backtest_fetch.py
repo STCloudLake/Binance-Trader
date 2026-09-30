@@ -225,6 +225,8 @@ def test_subprocess_invocation_contract(trader_client, fake_download, market_dir
         "--end", "2026-02-01",
         # --data-dir is the ROOT data dir; the CLI appends market/<symbol>/...
         "--data-dir", str(market_dir.parent),
+        # --merge: a narrow fetch must union with (never replace) a longer cache.
+        "--merge",
     ]
     assert call["kwargs"]["cwd"] == str(repo_root)
     # `shell` is never passed, i.e. it keeps its default of False.

@@ -179,11 +179,13 @@ def test_gate_refuses_too_few_oos_rows():
 
 def test_gate_passes_a_model_with_real_signal_and_positive_expectancy():
     from core.ml.credibility import credibility_gate
+    # Audit F3: the significance evidence is now mandatory (`or` → `and`, and a
+    # missing t/PSR is a refusal), so a passing payload must carry both numbers.
     status = credibility_gate(
         {"auc": 0.70, "accuracy": 0.62, "majority_accuracy": 0.5,
          "brier": 0.21, "log_loss": 0.64, "n": 3000, "base_rate": 0.5,
          "cost_pct": 0.13},
-        0.0032, n_oos=3000)
+        0.0032, n_oos=3000, n_trades=300, t_stat=2.6, psr=0.99)
     assert status["allowed"] is True
     assert status["enabled"] is True
     assert status["reason"] == "pass"
@@ -712,11 +714,12 @@ def test_gate_requires_a_significance_floor():
         {"auc": 0.62, "n": 3000, "base_rate": 0.5, "cost_pct": 0.26},
         0.003, n_oos=3000, n_trades=250, t_stat=2.6, psr=0.995)
     assert ok["allowed"] is True and ok["enabled"] is True
-    # t = 2.0 exactly is not "> 2"; PSR can substitute for it.
+    # Audit F3 changed this case from OR to AND: t = 2.0 exactly is not "> 2" and
+    # PSR is no longer a substitute for the t floor, so this now refuses.
     edge = credibility_gate(
         {"auc": 0.62, "n": 3000, "cost_pct": 0.26},
         0.003, n_oos=3000, n_trades=250, t_stat=2.0, psr=0.975)
-    assert edge["allowed"] is True
+    assert edge["allowed"] is False
     edge2 = credibility_gate(
         {"auc": 0.62, "n": 3000, "cost_pct": 0.26},
         0.003, n_oos=3000, n_trades=250, t_stat=2.0, psr=0.30)
