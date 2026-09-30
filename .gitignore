@@ -86,3 +86,6 @@ run_logs/
 *.db.pre_restore
 *.db-wal
 *.db-journal
+
+# Runtime state (DB, caches, downloaded history, GA artefacts) — all subpaths
+data/
