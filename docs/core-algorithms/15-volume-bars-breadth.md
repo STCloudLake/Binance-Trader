@@ -23,7 +23,7 @@
 > of its 697 719-minute span, the largest 61.8 days). Once the returns that span
 > those holes are removed from **both** samplings by one shared rule, activity
 > sampling shows a lower excess kurtosis in all 12 cells and a
-> block-bootstrap-supported reduction in 8 of them (all six at 4 000 bars, e.g.
+> block-bootstrap-supported reduction in 10 of them (all six at 4 000 bars, e.g.
 > BTCUSDT −5.56, 95 % CI [−7.36, −3.72]). That is a property of *this cache's
 > holes*, not a licence to switch clocks, and it changes no gate verdict.
 >
@@ -209,8 +209,9 @@ both bootstrap intervals excluding 0, 400 circular-block draws, seed 0);
 **Reading.** As-is, the point estimates flip sign across symbols and every
 interval is an order of magnitude wider than the point estimate: the literal
 criterion passes nowhere at 4 000 bars. After removing the hole-spanning
-returns, the direction is negative in **12 of 12** cells and the interval
-excludes 0 in 8 of them — a real effect *on this cache*, produced by the two
+returns, the direction is negative in **12 of 12** cells (6 of 6 here, 6 of 6 at
+500 target bars) and the interval excludes 0 in **10 of 12** (all six here, four
+of six at 500 bars) — a real effect *on this cache*, produced by the two
 multi-week holes rather than by anything about how the clock partitions a
 continuous market. Anyone quoting "dollar bars give thinner tails" from this
 repository must quote the hole-excluded table and this caveat with it.
@@ -224,9 +225,11 @@ SOLUSDT dollar bars, Δexkurt −36.84 [−52.03, −0.63], ΔJB −25 901
 [−51 596, −4] (`claim_supported: true`). It is the cell where the dollar series
 happens to contain **0** hole-spanning returns while the time control contains
 11 — i.e. the plan's criterion is met exactly where the hole exclusion is
-implicitly applied to one side. With the exclusion applied to both, SOLUSDT
-dollar at 500 bars gives −2.04 [−3.71, −0.23] and ETHUSDT dollar gives
-−0.75 [−2.20, +0.29] (not supported at this resolution).
+implicitly applied to one side. With the exclusion applied to both samplings the
+same cell still supports a reduction (−2.04 [−3.71, −0.23]) while ETHUSDT dollar
+bars do not at this resolution (−0.75 [−2.20, +0.29]); across the two
+resolutions the hole-excluded criterion is supported in **10 of 12** cells and
+the direction is negative in **12 of 12**.
 
 ---
 
