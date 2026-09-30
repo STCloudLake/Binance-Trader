@@ -21,8 +21,11 @@ switches off) is untouched:
   it read skew/kurtosis, which made the gate's ``AND`` exactly ``t > 2``.
 * **R5** — a sidecar with ``gate.allowed`` and matching feature names but **no**
   ``feature_schema_hash`` was accepted by both preload paths.
-* **R6** — the evidence index was not re-pinned (doc-only; asserted by the file's
-  own header/content).
+* **R6** — the evidence index was not re-pinned.  That guard has since been
+  replaced (§11 R2): it used to assert a *fixed* hash list while only checking
+  that ``git rev-parse HEAD`` was truthy, so it passed five commits behind; it
+  now recomputes the chain from the worktree (see
+  ``test_evidence_index_reports_the_current_revision_and_a_current_chain``).
 * **R7** — ``core.ml.credibility.__all__`` exported the undefined ``signed_score``,
   so ``from core.ml.credibility import *`` raised.
 
@@ -35,6 +38,9 @@ import asyncio
 import json
 import math
 import pickle
+import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +48,14 @@ import pandas as pd
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
+
+#: The plan-freeze commit the evidence index's chain table starts from; the same
+#: range the document's own reproduction command uses.
+EVIDENCE_BASELINE = "f1f6a4c"
+
+
+def _evidence_doc() -> Path:
+    return REPO / "docs" / "overhaul" / "ALGO_UPGRADE_EVIDENCE.md"
 
 
 @pytest.fixture(autouse=True)
@@ -593,27 +607,137 @@ def test_engine_preload_accepts_a_complete_sidecar(tmp_path):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# R6 — the evidence index is re-pinned (doc assertions)
+# R6/R2 — the evidence index is pinned to the revision under audit
 # ══════════════════════════════════════════════════════════════════════
 
-def test_evidence_index_is_repinned_to_the_current_revision():
-    """R6: the header, the commit list and the twin claim must be current."""
-    import subprocess
+def _git(args, *, cwd: Path = REPO):
+    """Run one git command from the worktree; ``None`` when git cannot run.
 
-    text = (REPO / "docs" / "overhaul"
-            / "ALGO_UPGRADE_EVIDENCE.md").read_text(encoding="utf-8")
-    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO,
-                          capture_output=True, text=True, check=True).stdout.strip()
-    assert head, "git HEAD must be readable"
-    assert "`b49883b`" in text, "the header must pin the current baseline"
-    assert "基线提交**: 本次审计 `fe11ccf`" not in text
+    ``None`` means *git is not usable here* (not installed, or this checkout was
+    copied without ``.git``) -- never "the command failed", which is a defect the
+    guard must report rather than swallow.
+    """
+    try:
+        proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True,
+                              text=True, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip()
+
+
+def _git_is_installed() -> bool:
+    """True when a ``git`` executable is on PATH."""
+    return shutil.which("git") is not None
+
+
+def _git_or_fail(args) -> str:
+    value = _git(args)
+    if value is None:
+        if _git_is_installed():
+            pytest.fail(
+                f"git is installed but cannot read this worktree "
+                f"('git {' '.join(args)}' failed): the evidence guard needs the "
+                "commit history, so an unreadable checkout is a failure rather "
+                "than a skip")
+        pytest.fail("git is not installed, yet the worktree is not readable "
+                    "either; the evidence guard cannot recompute the revision")
+    return value
+
+
+def _commit_chain(text: str) -> list[str]:
+    """The hash of every row of the document's chain table, in table order."""
+    rows = re.findall(r"^\|\s*`([0-9a-f]{7,40})`\s*\|", text, re.MULTILINE)
+    if not rows:
+        pytest.fail("the evidence index has no commit-chain table")
+    return rows
+
+
+def test_evidence_index_reports_the_current_revision_and_a_current_chain():
+    """R2/R1: the evidence index must track the revision under audit.
+
+    The previous guard ran ``git rev-parse HEAD`` and then asserted only that it
+    was *truthy* before requiring a fixed list of hashes ending at ``b49883b``.
+    That is the mechanism that let the document go stale three times: the guard
+    passed at HEAD ``5f50771`` while the index was five commits behind, because
+    the assertion never mentioned the revision it was supposed to be checking.
+
+    Both facts are recomputed from the worktree at run time -- the current HEAD
+    must appear somewhere in the document (either as the audited revision in the
+    header or as the newest row of the chain), and the chain table must have
+    exactly ``git rev-list --count f1f6a4c^..HEAD`` rows -- so a stale index
+    fails here instead of five commits later.
+
+    Run against a deliberately rolled-back copy of the document, this test
+    fails; it is never skipped to make that copy pass.  ``pytest.skip`` happens
+    in exactly one situation: ``git`` is **not installed at all**, so no
+    revision can be computed anywhere.  A checkout that simply has no ``.git``
+    while ``git`` *is* on PATH -- a copy of the tree -- is a **failure**, not a
+    skip: silently passing there is how a stale index stayed green.
+    """
+    if _git(["rev-parse", "--is-inside-work-tree"]) is None \
+            and not _git_is_installed():
+        pytest.skip("git is not installed: the evidence index's revision "
+                    "cannot be recomputed on this machine")
+
+    head = _git_or_fail(["rev-parse", "HEAD"])
+    text = _evidence_doc().read_text(encoding="utf-8")
+
+    chain = _commit_chain(text)
+    expected = int(_git_or_fail(
+        ["rev-list", "--count", f"{EVIDENCE_BASELINE}^..HEAD"]))
+
+    # ── 1. the chain table matches the repository, row for row ───────────
+    if len(chain) != expected:
+        pytest.fail(
+            f"the evidence index's commit chain has {len(chain)} row(s) but "
+            f"`git rev-list --count {EVIDENCE_BASELINE}^..HEAD` = {expected}: "
+            f"missing={sorted(set(_git_or_fail(['log', '--format=%h',
+                                               f'{EVIDENCE_BASELINE}^..HEAD'])
+                                   .split()) - set(chain))}, "
+            f"table={chain}")
+
+    # ── 2. the audited revision is named in the document ─────────────────
+    hashes = set(re.findall(r"`([0-9a-f]{7,40})`", text))
+    short = head[:7]
+    if short not in hashes:
+        pytest.fail(
+            f"the evidence index is stale: it never names the current HEAD "
+            f"{short} ({head}). State the audited revision explicitly -- either "
+            f"the header's 基线提交 or the newest row of the chain table -- and, "
+            f"when the document's own edits are doc-only, say so (the audited "
+            f"code revision is then the newest commit that touched code, not "
+            f"this doc-only commit)")
+
+    # ── 3. the chain starts at the plan freeze, with no gaps ─────────────
+    assert chain[0].startswith(EVIDENCE_BASELINE), (
+        f"the chain table must start at the plan freeze {EVIDENCE_BASELINE}; "
+        f"it starts at {chain[0]}")
+    recorded = set(_git_or_fail(
+        ["log", "--format=%h", f"{EVIDENCE_BASELINE}^..HEAD"]).split())
+    missing = recorded - set(chain)
+    if missing:
+        pytest.fail(f"the chain table omits {len(missing)} commit(s) of "
+                    f"{EVIDENCE_BASELINE}^..HEAD: {sorted(missing)}")
+
+    # ── 4. the stale "uncommitted" claims are gone ───────────────────────
+    # These are the concrete strings the stale index carried, including §9's
+    # "全部数字均为本轮实测；未提交" for work that had already landed in
+    # `828e375`.  A semantic "no landed commit is called uncommitted" scan is
+    # not attempted: the document legitimately *quotes* old states while
+    # correcting them (§9 R6 records that the header said "最终审计（未提交）",
+    # and §11 R1 quotes it again), and a regex cannot tell a quote from a claim.
+    assert "全部数字均为本轮实测；未提交" not in text, (
+        "the §9 header still calls landed work '未提交'; it landed in 828e375")
     assert "| 最终审计（未提交） |" not in text, (
         "the stale commit-list row must be gone")
-    for commit in ("f1f6a4c", "4791369", "a9e549e", "2751bbb", "beda096",
-                   "fa028be", "fe11ccf", "0542e02", "b49883b"):
-        assert f"`{commit}`" in text, f"{commit} missing from the commit list"
+    assert "新证据文件：`tests/test_reaudit_fixes.py`。全部数字均为该轮实测；未提交" \
+        not in text, "the §9 archive is still described as uncommitted"
     assert "55 个 `twin` 已由并行缓存修复合并" not in text, (
         "the false twin claim must be corrected")
+    assert "基线提交**: 本次审计 `fe11ccf`" not in text, (
+        "the header must no longer pin the superseded audit revision")
     assert "tests/test_reaudit_fixes.py" in text
 
 

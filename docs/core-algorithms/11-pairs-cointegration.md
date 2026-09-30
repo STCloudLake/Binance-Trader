@@ -108,7 +108,7 @@ z ≥ +2.0 → 做空价差（空 y、多 βx）      z ≤ −2.0 → 做多价
 | z-score / 状态机 / PnL | `rolling_zscore`, `pairs_positions`, `spread_returns`, `pair_trades` |
 | 与信号核对接 | `PairsSignal.to_kernel_input()` → `evaluation_kernel.fuse_signals(indicator_signal=…, ml_enabled=False)` |
 | 引擎集成缝 | `core/strategy/engine.py::StrategyEngine.wire_pairs_provider`（`P4_PAIRS_SIGNALS_ENABLED = False`） |
-| 测试 | `tests/test_pairs.py`（25 条） |
+| 测试 | `tests/test_pairs.py`（28 条 = 25 个 `def` + 3 个 `async def`，`pytest --collect-only` 末行实测） |
 
 ## 实测数字
 

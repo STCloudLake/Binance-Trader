@@ -1,6 +1,6 @@
 # 算法升级证据索引（P1 GA / P2 ML / P3 波动率 / P4 新能力 / gap fixes / 复核修复）
 
-**状态**: 证据已归档（本次实测，非引用） · **生成**: 2026-09-30 · **基线提交**: `1a452ce`（本文件所在的 HEAD；`1a452ce` = `09125bd` + 闭环审计 D1 + LOW 1–6 修复，均在**同一提交**内落地，见 §10）
+**状态**: 证据已归档（本次实测，非引用） · **生成**: 2026-09-30 · **审计 revision**: `5f50771`（本节 §11 的残留收口轮；本文档自身的编辑**只动文档**，不是被审计代码的一部分，故下一条给出代码 revision） · **上一轮审计 revision**: `1a452ce`（§0 表、§6、§9–§10 的全部数字都来自该 revision；`1a452ce` = `09125bd` + 闭环审计 D1 + LOW 1–6 修复，均在同一提交内落地） · **提交链**: `git log --oneline f1f6a4c^..HEAD`（见 §8 提交清单，**13** 行）
 **工作树**: 本轮闭环修复（已提交为 `1a452ce`）由单一代理写入；改动文件为 `core/risk/manager.py`（D1/LOW-6：bar-key 折叠 + 非时间索引拒绝 + 覆盖范围说明）、`scripts/check_data_integrity.py`（同一折叠）、`core/market_data/ohlcv_cache.py`（LOW-5 注释）、`core/ml/credibility.py`（LOW-3 实测值）、`core/risk/position_guard.py`（R1 实测值）、`docs/core-algorithms/13-volume-liquidity-costs.md`（LOW-2）、本文件（LOW-4）、`README.md`（LOW-1）、`tests/test_residual_closure.py`（新）+ `tests/test_final_audit_fixes.py` / `tests/test_gap_fixes.py` / `tests/test_reaudit_fixes.py` / `tests/test_cache_durability.py` / `tests/test_measured_threshold_policy.py`（随行为/注册表同步）。上一轮（`b49883b` 工作树，后续提交为 `828e375`）的复核修复见 §9，改动文件为 `core/risk/position_guard.py`、`core/ml/credibility.py`、`core/ml/meta.py`、`core/backtest/engine.py`（仅 preload 校验）、`core/ml/predictor.py`（仅同侧车校验）、`core/market_data/ohlcv_cache.py` + `core/market_data/provider.py`（仅惰性去重/flush）、`docs/core-algorithms/13-*.md`、本文件、新增 `tests/test_reaudit_fixes.py`。`data/models/` 仍为 15 个 `.pkl` / **0 个 `_meta.json`**。
 **对应计划**: [`ALGO_UPGRADE_PLAN.md`](ALGO_UPGRADE_PLAN.md)（P1–P4 验收标准） · **审计快照**: [`REFACTOR_AUDIT.md`](REFACTOR_AUDIT.md)
 
@@ -15,7 +15,8 @@
 | gap fixes | `2751bbb` | 实盘波动率定仓接线、成本语义统一、单一入场求值器 | 开关关闭时两侧均 240.0 USDT（balance 10 000）；BTC 成交 50 012.5000 / 往返 0.25005%；四个 AND/OR 基因入场数一致 40/0/0/40；sklearn 警告 1 602 → 0 | `tests/test_gap_fixes.py`（12） | `python -m pytest tests/test_gap_fixes.py -q` |
 | 发布审计 | `2751bbb` | 路由/测试/编译/数据完整性 | 路由 118→118，ADDED 0 / REMOVED 0；全量测试复跑 919 passed / 1 skipped / 0 failed；`compileall` 退出 0；缓存 `25/29` 文件带 gap | `scripts/regen_route_baseline.py`（新）· `scripts/check_data_integrity.py` | 见 §6 |
 | **最终独立审计**（历史快照） | **`fe11ccf`→`b49883b`** | 审计的每条 H/M 缺陷已修或已量化上报 | 该次实测：全量测试 **1040 passed / 0 failed**（227.3 s，退出码 0）；`compileall` 退出 0；缓存 **24/29** 文件带 gap、**twin 0/29**（`BTCUSDT/1h` 已实测去重，见 §6 与 §9 R3）；`data/models` 15 `.pkl` / 0 `_meta.json`；F1/F3/F4/F5 的 before→after 见 §8，本轮复核 1–7 的 before→after 见 §9 | **新** `tests/test_final_audit_fixes.py`（13 项）+ **新** `tests/test_reaudit_fixes.py` | `python -m pytest tests/test_final_audit_fixes.py tests/test_reaudit_fixes.py -q` |
-| **闭环审计 + 本轮修复** | **`828e375`→`1a452ce`** | 复核 7 项残留 + 闭环审计 D1/LOW 1–6 全部关闭（1 项 MEDIUM 行为修复、1 项 MEDIUM 运行态上报、6 项 LOW 过期数字；D1/LOW 修复与"过期数字复核"同在 `1a452ce` 内） | 全量测试 **1070 passed / 0 failed**（见 §6；本轮两次运行实测）；`compileall` 退出 0；缓存 **24/29** 文件带 gap、`twin` **0/29**（`BTCUSDT/1h` 的形状见 §6 —— 行数/sha/mtime 随实盘写入变化，故不再钉住）；D1/LOW 的 before→after 见 §10 | **新** `tests/test_residual_closure.py`（13 项） | `python scripts/check_data_integrity.py` · `python scripts/check_data_integrity.py --symbols BTCUSDT --intervals 1h` |
+| **闭环审计 + 本轮修复** | **`828e375`→`1a452ce`** | 复核 7 项残留 + 闭环审计 D1/LOW 1–6 全部关闭（1 项 MEDIUM 行为修复、1 项 MEDIUM 运行态上报、6 项 LOW 过期数字；D1/LOW 修复与"过期数字复核"同在 `1a452ce` 内） | 全量测试 **1070 passed / 0 failed**（当轮历史快照，见 §6；该轮两次运行实测）；`compileall` 退出 0；缓存 **24/29** 文件带 gap、`twin` **0/29**（`BTCUSDT/1h` 的形状见 §6 —— 行数/sha/mtime 随实盘写入变化，故不再钉住）；D1/LOW 的 before→after 见 §10 | **新** `tests/test_residual_closure.py`（13 项） | `python scripts/check_data_integrity.py` · `python scripts/check_data_integrity.py --symbols BTCUSDT --intervals 1h` |
+| **残留收口**（当前） | **`1a452ce`→`5f50771`** | 独立裁决轮的 5 项残留（R1 文档钉错 revision、R2 守卫不可能失败、R3 measured-pin 的 skip 豁免过宽、R4 一项未交付的实盘深度前提、R5 doc 11 计数）全部关闭；**运行态代码未改**，改动仅 `tests/` + 本文件 | 全量测试 **1073 passed / 0 failed**（`216.61 s`，退出码 0；`--collect-only` **1073**）；`compileall` 退出 0；R2 守卫已实测"故意回滚文档即失败"；R3 三模块实验 2 问题/0 问题/3 问题；R4 上界由当次窗口推导（实测 `share=0.0111 < bound=0.0117`，绑定的不再是 "BTC 1h 很深" 这一实盘前提）。逐条见 §11 | `tests/test_reaudit_fixes.py`（R2 守卫）· `tests/test_measured_threshold_policy.py`（R3）· `tests/test_liquidity.py`（R4） | `python -m pytest tests/test_reaudit_fixes.py tests/test_measured_threshold_policy.py tests/test_liquidity.py -q` |
 
 ---
 
@@ -89,7 +90,7 @@ P2 硬门（`enabled:false`）：`OOS AUC 0.5342 <= 0.55; net expectancy -0.1822
 | 项 | 命令 | 结果 |
 |---|---|---|
 | 路由基线 | `python scripts/regen_route_baseline.py` | 旧 118 → 新 118；**ADDED 0 / REMOVED 0**；`docs/overhaul/route-baseline.json` 与提交版本**逐字节相同**（`git diff` 为空）。P1–P4 未新增也未删除任何 `APIRoute`/`WebSocketRoute` |
-| 全量测试 | `python -m pytest tests/ -q -p no:cacheprovider` | **闭环审计末轮（`1a452ce`，当前）：`1070 passed / 0 failed`**，连续 **3** 次全绿（`221.15 s` / `220.94 s` / `218.41 s`，退出码均 0）；第 3 次是在运行中的实盘进程**重写了 `data/market/XRPUSDT/1m.parquet` 之后**跑的（该文件 18:16:08 被改写，其 20 根 1m 窗口从 2 395 029.65 变为 **227.03** USDT），仍全绿 —— 即"套件在缓存被改写时保持绿色"是本轮实测而非推断；`--collect-only` 末行 **1070 tests collected**；`tests/test_residual_closure.py` **13** 项、`tests/test_liquidity.py` **25** 项、`tests/test_microstructure.py` **20** 项。此前各次为历史快照：闭环审计首轮（`09125bd`+工作树）**1067 passed / 0 failed**（218.91 s / 215.91 s，退出码 0），连续两次一致。最终独立审计（`fe11ccf`+工作树）两次全量运行 **1040 passed / 0 failed**（470 s，退出码 0）与 **1039 passed / 1 failed**（314 s）。唯一的失败 `tests/test_ml_credibility.py::test_feature_pipeline_cost_is_bounded` 是**负载/计算预算敏感**断言（`elapsed < 3.0 s`；单独运行为 `1 passed in 0.90s`），与修复文件无关。同一工作树的**首次**运行为 `1022 passed, 3 failed`（242 s），3 个失败**均不在修复文件内**——`tests/test_measured_threshold_policy.py`（2 项）与 `tests/test_meta_labeling.py::test_real_primary_rules_are_refused_by_the_meta_gate`——三者随后修好，复跑即 `41 passed`。基线（`2751bbb`）：`919 passed, 1 skipped, 0 failed`（375 s） |
+| 全量测试 | `python -m pytest tests/ -q -p no:cacheprovider` | **残留收口轮（`5f50771`）：`1073 passed / 0 failed`**（`216.61 s`，退出码 0；该次运行里唯一失败是 §11 R2 的新守卫按设计抓出的本文件链长过期，修文档后复跑全绿，见 §11）；`--collect-only` 末行 **1073 tests collected**（本轮新增 3 项：`test_measured_threshold_policy.py` 2 项 + `test_liquidity.py` 1 项）。**闭环审计末轮（`1a452ce`，历史快照）：`1070 passed / 0 failed`**，连续 **3** 次全绿（`221.15 s` / `220.94 s` / `218.41 s`，退出码均 0）；第 3 次是在运行中的实盘进程**重写了 `data/market/XRPUSDT/1m.parquet` 之后**跑的（该文件 18:16:08 被改写，其 20 根 1m 窗口从 2 395 029.65 变为 **227.03** USDT），仍全绿 —— 即"套件在缓存被改写时保持绿色"是当轮实测而非推断；`tests/test_residual_closure.py` **13** 项、`tests/test_liquidity.py` 当轮 **25** 项（本轮 26 项）、`tests/test_microstructure.py` **20** 项。此前各次为历史快照：闭环审计首轮（`09125bd`+工作树）**1067 passed / 0 failed**（218.91 s / 215.91 s，退出码 0），连续两次一致。最终独立审计（`fe11ccf`+工作树）两次全量运行 **1040 passed / 0 failed**（470 s，退出码 0）与 **1039 passed / 1 failed**（314 s）。唯一的失败 `tests/test_ml_credibility.py::test_feature_pipeline_cost_is_bounded` 是**负载/计算预算敏感**断言（`elapsed < 3.0 s`；单独运行为 `1 passed in 0.90s`），与修复文件无关。同一工作树的**首次**运行为 `1022 passed, 3 failed`（242 s），3 个失败**均不在修复文件内**——`tests/test_measured_threshold_policy.py`（2 项）与 `tests/test_meta_labeling.py::test_real_primary_rules_are_refused_by_the_meta_gate`——三者随后修好，复跑即 `41 passed`。基线（`2751bbb`）：`919 passed, 1 skipped, 0 failed`（375 s） |
 | 编译 | `python -m compileall -q app core web db scripts tools` | 退出码 **0** |
 | 数据完整性 | `python scripts/check_data_integrity.py` | **闭环审计实测：`09125bd` 原样 = 25/29**（close 口径尾行 `BTCUSDT 1h …06:00:00 → …07:59:59.999` 被按原始时间戳差值误判为 1.99997 h 缺口 / missing 1，见 §10 D1）→ **D1 修复后 = 24/29**，该 5 个干净文件为 `ADAUSDT/1h`、`BTCUSDT/1d`、`BTCUSDT/1h`、`USDCUSDT/5m`、`ZECUSDT/5m`；`twin` 列 **0/29**（无 NOTE 行）。`BTCUSDT/1h` 的**形状**（不是内容指纹 —— 正在运行的实盘进程会不断重写该文件）：**11 625 行 / 11 625 bar 键 / 0 twin 行 / `missing`=0**，相邻差在**原始**与**bar 键**两种口径下**都**是 3 600.0 s（即 D1 的 close 口径尾行现在不存在；测量时刻 **2026-09-30 17:28**，sha256_16 `9864a654df75c32c`、mtime 17:28:14 —— 这两个值是**当次**读数，下一次实盘写入即失效，故本文件不再把它们当作主张）。⚠️ **本行曾写"`BTCUSDT/1h` 的 55 个 `twin` 已合并"，那是错的**（复核发现 3）：当时 `check_data_integrity` 报 **1/29** 文件带 twin，实测该文件为 **11 678 行 / 11 623 棵 bar / 55 棵重复 / 110 行 twin**。根因是 `flush_all` 只重写 **dirty** 键，永不追加的文件永远不会被去重。已在 §9 R3 修复并实测（当时 **11 623 行 / 0 twin**，文件 sha256 前缀 `0543b03d1ed8c3ff` —— 该值属于当时的内容，此后实盘又写入过 close 口径尾行、又把它换掉），`twin` 至今保持 **0** |
 | 模型产物 | `Get-ChildItem data/models` | **15 个 `.pkl`、0 个 `_meta.json`** —— 修复前 `skip_ml_training` 会把 15 个未过门的模型全部加载；修复后全部被拒绝（见 §8 F4） |
@@ -123,9 +124,9 @@ P2 硬门（`enabled:false`）：`OOS AUC 0.5342 <= 0.55; net expectancy -0.1822
 
 **连带影响的既有测试（均为"旧行为被钉住"，随修复同步更正，非放宽）**：`tests/test_ml_credibility.py::test_gate_passes_a_model_with_real_signal_and_positive_expectancy`（补 `n_trades/t_stat/psr`）、`::test_gate_requires_a_significance_floor`（`t=2.0 & PSR=0.975` 由放行改为拒绝）、`tests/test_gap_fixes.py::test_live_kline_stream_is_the_last_resort_forecast_source`（candle 补 `close_time`，与两个生产发布者一致）。
 
-### 提交清单（截至 `1a452ce`）
+### 提交清单（截至 `5f50771`）
 
-`git log --oneline` 自计划冻结起的**完整**提交列表（本文件所在 HEAD = `1a452ce`；命令 `git log --oneline f1f6a4c^..HEAD`，**12** 行）：
+`git log --oneline` 自计划冻结起的**完整**提交列表（审计 revision = `5f50771`；命令 `git log --oneline f1f6a4c^..HEAD`，**13** 行）
 
 | 提交 | 说明 |
 |---|---|
@@ -140,11 +141,12 @@ P2 硬门（`enabled:false`）：`OOS AUC 0.5342 <= 0.55; net expectancy -0.1822
 | `b49883b` | 关闭最终审计缺陷、修复数据路径缺口、加入成交量感知的执行现实性（`tests/test_final_audit_fixes.py` 13 项） |
 | `828e375` | 关闭复核 7 项残留（guard 绕过、文档数字、twin bars、PSR），新增 `tests/test_reaudit_fixes.py` |
 | `09125bd` | README 测试数字更正（693 → 1055 passed） |
-| `1a452ce` | **当前基线（本文件所在 HEAD）**：bar-key 折叠先于缺口检测（D1）、非时间索引拒绝（LOW-6）、确定性实盘用例、末轮文档/数字更正；新增 `tests/test_residual_closure.py`，见 §10 |
+| `1a452ce` | 闭环审计基线：bar-key 折叠先于缺口检测（D1）、非时间索引拒绝（LOW-6）、确定性实盘用例、末轮文档/数字更正；新增 `tests/test_residual_closure.py`，见 §10 |
+| `5f50771` | **当前 revision**：§11 的 5 项残留收口（evidence 守卫改钉运行期 HEAD/链长、measured-pin 的 skip 豁免改为"跳过必须支配函数体"、`test_liquidity` 容量上界改为按当次窗口推导、doc 11 计数 25→28）。**改动全部在 `tests/` 与本文件，未触碰任何运行态代码**，故"被审计代码 revision"仍为 `1a452ce`，而本文档自身的编辑是 doc-only |
 
 ## 9. 复核修复（`b49883b` 工作树）——7 项发现的 before/after
 
-新证据文件：`tests/test_reaudit_fixes.py`。全部数字均为本轮实测；未提交（本节即其归档）。
+新证据文件：`tests/test_reaudit_fixes.py`。全部数字均为该轮实测；该轮改动已随 `828e375` 落地（本节即其归档）。
 
 | 编号 | 缺陷（修复前实测） | 修复 | 修复后实测 |
 |---|---|---|---|
@@ -153,7 +155,7 @@ P2 硬门（`enabled:false`）：`OOS AUC 0.5342 <= 0.55; net expectancy -0.1822
 | **R3** (MED) | §6 原写 `BTCUSDT/1h` 的 55 个 twin "已合并"是**假**：`check_data_integrity` 报 **1/29** 文件带 twin，实盘文件 **11 678 行 / 11 623 棵 bar / 55 棵重复 / 110 行 twin**。根因：`flush_all` 只重写 **dirty** 键 | `core/market_data/ohlcv_cache.py`：新增 `_frame_hash` + `_canonical_write`（内容哈希判"写是否会改变文件"）与 `OHLVCache.dedupe`；`flush_all` 在 dirty 键之后对**所有已加载键**做一次去重，仅在内容真的改变时落盘 | 实盘 `data/market/BTCUSDT/1h.parquet`：**11 678 → 11 623 行**，`twin_bars` **55 → 0**，`twin_rows` **110 → 0**，bar 键集合**完全相同**（11623），55 棵冲突 bar 全部保留**较新**的那一行；`check_data_integrity` 该行转 **ok**、`twin` 列 **0**、"1/29 files store a bar twice"提示消失。第二次 flush **不写盘**（`dedupe → False`），文件 **字节完全相同**（sha256 `0543b03d1ed8c3ff`）。**闭环审计复测（当时文件）**：**11 624 行 / 11 624 bar 键 / 0 twin 行**（该 sha `0543b03d1ed8c3ff` 与行数属于当时的内容，此后实盘又写入过 §10 D1 的 close 口径尾行、又把它换掉）。**末轮复测（`1a452ce`，测量时刻 2026-09-30 17:28）**：**11 625 行 / 11 625 bar 键 / 0 twin 行**，原始与 bar 键相邻差全为 3 600.0 s —— 这些是**当次**读数（sha256_16 `9864a654df75c32c`、mtime 17:28:14），实盘继续交易即变，不作为主张 |
 | **R4** (LOW) | `core/ml/credibility.py:246-259` 是 `Φ(mean/se)`、**不读**偏度/峰度，而 `:743-746` 与 `core/ml/meta.py:47` 及文档 §8 声称它读——AND 因此**恰好等价于 `t > 2`** | 选择**实现** Prado 的修正公式：`SE_adj = sd·√((1 − γ₃·SR + (γ₄−1)/4·SR²)/(n−1))`，`returns` 作为可选参数（缺省/样本不足/矩非有限时退化为正态近似）；`net_trade_stats` 与 `_signed_net_stats` 把净收益序列传入；docstring/doc 改为**真**陈述 | 正态样本 `t=2.0000` → PSR **0.9772498680518209**（本行曾写 `0.9773`；旧式即同一数值 `0.9772`，逐位不变）；厚左尾 10 个 −40σ 异常值、`t=2.000000` → **0.9479777894541446 < 0.95 → 门拒绝**（同序列旧式报 0.9772）；同形状 `t=3` → **0.9869562688374416（本行曾误写 `0.9864`）→ 放行**。`tests/test_ml_credibility.py::test_probabilistic_sharpe_matches_the_normal_approximation` 的 6 条断言全部仍然通过（`returns=None` 走同一公式） |
 | **R5** (LOW) | `core/backtest/engine.py:1778` 的 `if stored and …` 与 `core/ml/predictor.py:672` 接受**缺 `feature_schema_hash`** 的侧车（审计 e2e 因此加载了 7 个产物中的 2 个） | 两处均改为**要求存在**：engine 返回 `False, "feature schema hash missing: …"`；predictor 抛 `FeatureContractError("… carries no feature schema hash …")`（与既有的 mismatch 异常同类） | 缺 hash 的侧车：engine **拒绝**并给出含 `feature schema hash missing` 的理由，predictor **抛异常**；完整侧车（`gate.allowed` + 契约名 + 正确 hash）**照常加载**；本仓库 `data/models` 15 个无侧车 `.pkl` 仍全部拒绝 |
-| **R6** (LOW) | 本文件头仍写基线 `fe11ccf`、提交列表缺 `b49883b`、结尾写"最终审计（未提交）" | 头部改钉 `b49883b` 并列出工作树为本轮修复；提交清单补齐到 `b49883b`（含 `b49883b` 一行）；`data/models` 现状、全量测试数字、twin 行全部按本轮实测重写 | 当时的本文件（`git rev-parse HEAD` = `b49883b98a33354e83b0362fbd1c6eaca97a2ed8`）。**闭环审计再钉**：`git rev-parse HEAD` = `1a452cefdce041a74df5441028f363ef1e870913`，提交清单已补齐 `828e375` + `09125bd` + `1a452ce`（见上方"提交清单"表，`git log --oneline f1f6a4c^..HEAD` 共 **12** 行） |
+| **R6** (LOW) | 本文件头仍写基线 `fe11ccf`、提交列表缺 `b49883b`、结尾写"最终审计（未提交）" | 头部改钉 `b49883b` 并列出工作树为本轮修复；提交清单补齐到 `b49883b`（含 `b49883b` 一行）；`data/models` 现状、全量测试数字、twin 行全部按本轮实测重写 | 当时的本文件（`git rev-parse HEAD` = `b49883b98a33354e83b0362fbd1c6eaca97a2ed8`）。**闭环审计再钉**：`git rev-parse HEAD` = `1a452cefdce041a74df5441028f363ef1e870913`，提交清单已补齐 `828e375` + `09125bd` + `1a452ce`。**残留收口轮再钉（§11）**：提交清单已补齐到 `5f50771`（`git log --oneline f1f6a4c^..HEAD` 共 **13** 行，由运行期断言 `len(chain) == git rev-list --count` 常驻校验） |
 | **R7** (LOW) | `core/ml/credibility.py:939` 的 `__all__` 导出未定义的 `signed_score`，`from core.ml.credibility import *` 抛 `AttributeError` | 移除该条目（`signed_score` 属于 `core.ml.calibration`，无生产调用者从 credibility 导入它——已 grep 全仓库确认），并加注释说明 | 星号导入**成功**；`[n for n in credibility.__all__ if not hasattr(credibility, n)] == []`；`tests/test_reaudit_fixes.py::test_star_import_of_credibility_resolves` 常驻钉住 |
 
 **默认配置不变**：波动率目标化关闭、`risk.liquidity` 关闭、ML 关闭、P4 全部开关关闭时为逐位不变；vol targeting 打开但序列有缺口时，止损回落到文档化的固定规则。
@@ -169,7 +171,7 @@ P2 硬门（`enabled:false`）：`OOS AUC 0.5342 <= 0.55; net expectancy -0.1822
 | **L1** (LOW) | `README.md` 的 790/800/803/812/889 行仍用 `693` / `8 failed, 658 passed, 1 skipped` | 改为本轮实测值；干净克隆两个口径分别实测并标注 | §10.1 前提说明整段重写（见 `README.md` §10.1） |
 | **L2** (LOW) | `docs/core-algorithms/13-volume-liquidity-costs.md` 的回溯窗口归属错误：`+178.8965` 被写成"≈ 7.1×10⁵ USDT 窗口"，`0.8288` 被写成"属于 ≈ 729.2 M 窗口，距 750.66 M 有 3 %" | 用代码反解并逐项重测，删除猜测性归属 | `total_impact_usdt` 反解：`+178.8965` → **71 576.03 USDT**（7.16×10⁴，比原主张小一个数量级）；`+894.4824` → **2 863.04 USDT**；`0.8288` 恰在表内 750,661,812.73 USDT 窗口复现为 **0.828812**，而 729.2 M 窗口给 **0.840920** |
 | **L3** (LOW) | `core/ml/credibility.py:279` docstring 写 corrected PSR = `0.937`（`:803`、`:856` 同） | 三处改为实测值 | `net_trade_stats(_fat_left_returns())`（`t_stat=2.0000000000000004`）：corrected PSR **0.9479777894541446**（≈ `0.94798`，本文件曾写 ≈ `0.9480`，四舍五入无误）、正态近似 **0.9772498680518209**（≈ `0.97725`，曾写 ≈ `0.9772`）。同形状 `target_t=3.0`（`t_stat=2.9999999999999996`）：corrected PSR **0.9869562688374416**（曾误写 `0.9864`），正态近似 **0.9986501019683699** |
-| **L4** (LOW) | 本文件 `:17`/`:91`/`:93`/`:148`/`:150`/`:153` 与提交清单过期（缺 `828e375`、`09125bd`；测试数 1040；缺口数 24/29；twin 行/sha；`0.41803165815`） | 全部按当前 revision 重钉，历史数字标注为历史快照 | 见本文件 §0 表、§6、§7、§9 R1/R3/R6 与上方提交清单。**末轮再钉（`1a452ce`）**：`git log --oneline f1f6a4c^..HEAD` = **12** 行；全量 **1070 passed / 0 failed**（见 §6）；本文件头、提交清单、`R6` 行、`D1/D2/L3/L5` 行的 revision 与数字均已更新 |
+| **L4** (LOW) | 本文件 `:17`/`:91`/`:93`/`:148`/`:150`/`:153` 与提交清单过期（缺 `828e375`、`09125bd`；测试数 1040；缺口数 24/29；twin 行/sha；`0.41803165815`） | 全部按当前 revision 重钉，历史数字标注为历史快照 | 见本文件 §0 表、§6、§7、§9 R1/R3/R6 与上方提交清单。**末轮再钉（`1a452ce`）**：`git log --oneline f1f6a4c^..HEAD` = **12** 行；全量 **1070 passed / 0 failed**。**残留收口轮再钉（`5f50771`，§11）**：该守卫本身已改为运行期断言（链长 = `git rev-list --count`、HEAD 必须在文内），本节"12 行 / 1070"随之成为历史快照 |
 | **L5** (LOW) | `core/market_data/ohlcv_cache.py:277` 注释称实盘 1h 缓存有"54 个 1 毫秒邻居" | 该数字属 revision `0542e02` 的历史快照，按当前实测改写 | 当时实测（**历史**）：`pairs=11623`、**min delta = 3600.0 s**、`Δ ≤ 1 ms` 的相邻对数 = **0**、唯一非 1 h 差值为 **7199.999 s**（即 D1 的 2 h − 1 ms 口径差）。本轮复测（`1a452ce`，测量时刻 2026-09-30 17:28）：`pairs=11625`、**min delta = max delta = 3600.0 s**、**不存在任何非 1 h 差值**——那个 7199.999 s 的口径差随 close 口径尾行一起从文件里消失了 |
 | **L6** (LOW) | `_series_has_gap` 对非 datetime 索引吞掉异常并返回 **False**（"无缺口"），一旦调用方传入非时间索引即等于关掉闸门（审计 F1 的失效模式） | 不可读的索引一律**拒绝**（返回 True）；未知 interval 仍保持惰性（False） | `pd.RangeIndex(300)` / `Float64Index` / object 字符串 / tz 混合 → **True**；`"7h"` 未知 interval → 仍 **False**；空/少于 3 根的合法日期索引 → **False**；`PositionGuard` 收到 RangeIndex 帧 → 预测 **None** |
 
@@ -181,5 +183,45 @@ P2 硬门（`enabled:false`）：`OOS AUC 0.5342 <= 0.55; net expectancy -0.1822
 2. **+27.63 % 拼接与 close 口径尾行在实盘文件里都已不存在**（`core/risk/manager.py` 的 `_VOL_MAX_GAP_BARS` 注释、`scripts/check_data_integrity.py::gap_report` docstring 均已标注为历史）。测量时刻 2026-09-30 17:28：原始最大相邻步 **1.0 h**，`clipped == unclipped = 0.3003 %/bar`（**1.00×**，`python scripts/check_data_integrity.py --check-vol --symbols BTCUSDT --intervals 1h`）。缺陷机制本身仍真实，由重建帧/合成帧钉住（`tests/test_gap_fixes.py`、`tests/test_residual_closure.py`）。
 3. **`tests/test_microstructure.py` 的改写用例是纯 stub**：所有 20 项都在测试内构造 Binance 形状的快照，**没有任何用例端到端地跑真实 provider**。这消除了一类实时时序抖动（见该用例 docstring），代价是真实 provider 的接线不再有测试覆盖；该限制已写进该用例的 docstring。
 4. **运行中的进程不是修复的探针**：PID 22352 启动于 17:22:53、加载的是当前代码，但 `risk.vol_targeting.enabled: false`，D1 的闸门在实盘进程里不会被走到（见 §10 D2）。
+
+## 11. 残留收口（`5f50771`）——独立裁决的 5 项
+
+新证据：`tests/test_reaudit_fixes.py`（R1/R2 守卫重写）、`tests/test_measured_threshold_policy.py`（R3，+2 项自测）、`tests/test_liquidity.py`（R4，+1 项合成分支）。**本轮没有改动任何运行态代码**（`app/`、`core/`、`web/`、`db/`、`scripts/`、`tools/` 全部未动），所以被审计的**代码** revision 仍是 `1a452ce`；本文件自身的编辑是 **doc-only**，`tests/` 的改动是 test-only。
+
+| 编号 | 残留 | 修复 | 修复后实测 |
+|---|---|---|---|
+| **R1** (LOW) | 本索引把"本文件所在的 HEAD"写成 `1a452ce`（实际 HEAD 已是 `5f50771`）、提交清单 **12** 行而 `git rev-list --count f1f6a4c^..HEAD` = **13**、§9 仍把已随 `828e375` 落地的工作写成"未提交" | 头部改为钉**审计 revision** `5f50771` 并显式区分"上一轮审计 revision `1a452ce`"与"本文档编辑是 doc-only"；提交清单补 `5f50771` 一行（13 行）；§9 的"未提交"改为"已随 `828e375` 落地" | `git log --oneline f1f6a4c^..HEAD` = **13** 行、链长由 R2 守卫运行期断言；头/§8/§9/§10 L4 全部改钉 `5f50771` |
+| **R2** (MED) | `tests/test_reaudit_fixes.py:599-617` 的守卫把 `git rev-parse HEAD` 存进变量后只断言其**真值**，再接一个以 `b49883b` 结尾的**固定列表**——文档落后 5 个提交时它照样 `1 passed`，这正是过期反复出现三次的机制 | 守卫改为运行期断言：①链长 == `git rev-list --count f1f6a4c^..HEAD`；②当前 HEAD 短 hash 必须出现在文档中；③链首为 `f1f6a4c` 且无缺行；④链内已落地提交不得仍被写成"未提交"。失败信息给出缺失提交集合与表内容 | 见 §11.1：故意把文档副本回滚到 `1a452ce` 的链（12 行、不含 `5f50771`）→ 守卫 **失败**；当前 revision → **通过**。`.git` 缺失但 `git` 可用 → **失败**（不是 skip）；仅当 `git` 完全不可用时才 skip，且 docstring 写明 |
+| **R3** (LOW) | `tests/test_measured_threshold_policy.py:382-383` 只要函数体出现 `pytest.skip(` 就整体豁免：同一模块带 measured pin（`assert auc <= 0.5866`）**无 skip = 有非法字面量**、**加一个 guard-clause skip = 0 个问题**（裁决轮在只做字面量检查的文件上量到 2 个问题） | 豁免条件改为"skip 必须**支配**函数体"：函数第一条语句必须是 `pytest.skip(...)` 或"守卫式 `if ...: pytest.skip(...)`"（`_skip_dominates_the_body` / `_is_early_skip_guard` / `_ends_in_a_skip`），且该语句之前不得有可达 `assert`；写在读取之后的 guard clause、或断言之后的 late skip 都不再豁免 | 见 §11.2 的三模块实验（构造按 `test_meta_labeling.py` 的**决策 + 字面量**双重强制，故每条命中 3 个问题）：无 skip = **3** 问题（如旧）；真·skip 支配 = **0** 问题（豁免仍有效）；"skip + live pin" 旧规则 **0** 问题 → 新规则 **3** 问题（`measured-pin` 命中 `8.588e8`）。收紧后扫描真实 `LIVE_CACHE_TEST_FILES` 又抓出 1 处被旧豁免掩盖的 pin（`test_pairs.py::test_real_cached_pair_guard_verdict_matches_the_test` 的 `120.0`），已改为引用守卫自身的常量 `PAIRS_MIN/MAX_HALF_LIFE`、`PAIRS_MAX_ADF_PVALUE`，行为不变 |
+| **R4** (LOW) | `tests/test_liquidity.py:558` 的 `(impacted - legacy)/legacy < 0.05  # BTC 1h is deep` 是一个**实盘前提**：它要求当次 BTC 1h 20 根窗口 ≥ ~4.0e7 USDT（4.294e7 过、3.435e7 挂） | 上界改为**由本次真正读到的窗口推导**：`bound = 2·impact_pct(participation(max_notional, volume)/100, 0.5)·max_notional/legacy_total`；"任何窗口都成立"的不变量（`impacted > legacy`、off-path 逐位相同、参与度恒等式）保留；并新增**确定性合成分支**测试 | 见 §11.3：当次窗口 `volume=850 315 320.33`、`max_notional=871.6695`、`share=0.0111 < bound=0.0117`；合成分支用 1e5/4e5 两个窗口证明 `impact_usdt == 2·side_pct·notional` 且窗口深 4 倍时 share 恰好减半 |
+| **R5** (LOW) | `docs/core-algorithms/11-pairs-cointegration.md:111` 写 `tests/test_pairs.py`（25 条），实际 `--collect-only` 收 **28** 条（25 个同步 + 3 个 `async def`） | 改为 **28**（同文件另两处 per-file 计数 `tests/test_microstructure.py`（20）、`tests/test_regime.py`（14）已按 `--collect-only` 复核，未变） | `pytest tests/test_pairs.py --collect-only -q` 末行 **28 tests collected**；同文档 `test_microstructure.py` 20、`test_regime.py` 14 一致 |
+
+### 11.1 R2 的"故意过期即失败"证明
+
+把**文档副本**（仓库文件不动）的链表最后一行 `5f50771` 删掉、并把头部改回 `1a452ce`，指向该副本运行守卫：
+
+```
+E   pytest.fail: the evidence index's commit chain has 12 row(s) but
+    `git rev-list --count f1f6a4c^..HEAD` = 13:
+    missing=['5f50771'], table=[...12 rows...]
+```
+
+同理，只把链表补到 13 行而**不**写入 `5f50771`（首条断言之外的情形）会命中第二条断言（"never names the current HEAD `5f50771`"）。对未改动的仓库文档运行守卫为 **1 passed**（见 §6 全量）。
+
+### 11.2 R3 的三模块实验（同一份 scanner）
+
+| 合成模块 | 形态 | 修复前旧豁免 | 修复后 |
+|---|---|---|---|
+| 模块 1 | 无 `pytest.skip`，`assert auc <= 0.5866` | 3 个问题 | **3 个问题**（`no-decision` + `no-derived` + `measured-pin`） |
+| 模块 2 | 首条语句即 `if not have_cache: pytest.skip(...)`，其后断言 | 0 个问题 | **0 个问题**（真·skip 支配，仍豁免） |
+| 模块 3 | 先读缓存、`if volume <= 0: pytest.skip(...)`，再 `assert volume == 8.588e8` | **0 个问题**（旧豁免的漏洞） | **3 个问题**（`no-decision` + `no-derived` + `measured-pin`，点名 `8.588e8`） |
+
+（模块按 `test_meta_labeling.py` 强制，即决策 + 字面量两条规则都跑，所以每条命中 3 个问题；裁决轮在只做字面量检查的模块上量到的对应数字是 2。）旧规则的复现口径就是被替换掉的那一行 `re.search(r"pytest\.skip\s*\(", body_src)`：模块 3 命中即 `continue`，3 个问题全部消失。
+
+### 11.3 R4 的推导上界与合成分支
+
+当次实测（`data/market/BTCUSDT/1h.parquet`，实盘在写，故为当次读数）：窗口 **850 315 320.33 USDT**、采样最大名义 **871.6695 USDT**、`legacy_total=75.6031`、`impacted_total=76.4423`、`share=0.011100`、推导上界 **0.011673** —— 旧断言 `share < 0.05` 之所以"看起来安全"，只是因为窗口恰好很深；改为推导上界后，窗口变浅时上界随之上升，测试不再依赖"BTC 1h 很深"这一实盘前提。合成分支（1e5 与 4e5）：`share` 0.7896 / 0.3948，恰为 2× 关系（平方根律），且 `impact_usdt == 2·side_pct/100·notional`。
+
+**复现命令**：`python -m pytest tests/test_reaudit_fixes.py tests/test_measured_threshold_policy.py tests/test_liquidity.py tests/test_pairs.py -q -p no:cacheprovider`；`python -m pytest tests/ --collect-only -q -p no:cacheprovider`；`git log --oneline f1f6a4c^..HEAD`。
 
 

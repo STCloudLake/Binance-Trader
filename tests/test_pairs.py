@@ -37,7 +37,8 @@ import pandas as pd
 import pytest
 
 from core.strategy.pairs import (
-    PAIRS_MAX_LOOKBACK, PAIRS_MIN_LOOKBACK, PAIRS_Z_ENTRY, PairFit,
+    PAIRS_MAX_ADF_PVALUE, PAIRS_MAX_HALF_LIFE, PAIRS_MAX_LOOKBACK,
+    PAIRS_MIN_HALF_LIFE, PAIRS_MIN_LOOKBACK, PAIRS_Z_ENTRY, PairFit,
     PairsSignal, admissible_sim_length, adf_regression, default_leg_cost_pct,
     engle_granger, fit_pair, kalman_hedge_ratio, log_spread_notional,
     lookback_from_half_life, ols_hedge_ratio, ou_half_life, pair_guard,
@@ -394,9 +395,12 @@ def test_real_cached_pair_guard_verdict_matches_the_test():
     fit = fit_pair(joint["y"], joint["x"], symbol_y="BTCUSDT", symbol_x="ETHUSDT")
     summary = fit.summary()
     # Measured on this cache: p = 0.4502, half-life 1200 bars (OLS spread) ->
-    # refused on BOTH counts.  The assertion is the *logic*, not the data.
-    assert fit.allowed == (fit.adf["p_value"] <= 0.05
-                           and 2.0 <= fit.half_life["half_life"] <= 120.0)
+    # refused on BOTH counts.  The assertion is the *logic*, not the data: the
+    # thresholds are the guard's own constants (the same ones ``pair_guard``
+    # reads), so a cache repair moves the numbers without moving the logic.
+    assert fit.allowed == (fit.adf["p_value"] <= PAIRS_MAX_ADF_PVALUE
+                           and PAIRS_MIN_HALF_LIFE <= fit.half_life["half_life"]
+                           <= PAIRS_MAX_HALF_LIFE)
     assert 0.0 <= fit.adf["p_value"] <= 1.0
     assert summary["guard_reason"] == fit.guard["reason"]
     assert statsmodels_adf_tau(fit.adf["spread"], regression="nc") in (None,) or True
@@ -434,8 +438,9 @@ def test_real_cached_majors_are_not_cointegrated_on_1h():
         # refused when cointegration is rejected, the half-life leaves the
         # window, or the hedge ratio is unusable.  The thresholds are the
         # guard's documented contract, not measurements of this cache.
-        expected = (float(fit.adf["p_value"]) <= 0.05
-                    and 2.0 <= float(fit.half_life["half_life"]) <= 120.0
+        expected = (float(fit.adf["p_value"]) <= PAIRS_MAX_ADF_PVALUE
+                    and PAIRS_MIN_HALF_LIFE <= float(fit.half_life["half_life"])
+                    <= PAIRS_MAX_HALF_LIFE
                     and abs(float(fit.beta)) >= 0.01)
         assert fit.allowed is expected, (a, b, fit.summary())
         assert fit.summary()["guard_reason"] == fit.guard["reason"]

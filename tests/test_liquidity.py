@@ -526,9 +526,21 @@ def test_cost_model_real_run_comparison_is_bit_identical_at_k_zero():
     computed with the shipped defaults (``impact_k`` 0) and with the term
     explicitly disabled, and the two totals must be identical — the required
     "compare pre/post on the same run" check.
+
+    The ``k = 0.5`` half is bounded by a quantity **derived from the window this
+    test actually read** (``max(entry, exit) notional / legacy_total`` is exactly
+    the legacy cost per unit of notional, so multiplying it by ``impact_pct`` for
+    this window gives the share the impact term can add).  It used to assert
+    ``share < 0.05`` labelled "BTC 1h is deep", which silently required the live
+    20-bar window to stay above ~4.0e7 USDT (it passes at 4.294e7 and fails at
+    3.435e7): a live-data premise, not a property of the code.  The invariants
+    that survive any window are ``impacted > legacy`` and the impact identity,
+    pinned on a synthetic window by
+    :func:`test_impact_share_is_bounded_by_the_window_it_was_measured_on`.
     """
     from core.backtest.cost_model import apply_trading_costs
-    from core.risk.liquidity import recent_quote_volume
+    from core.risk.liquidity import impact_pct, participation_pct, \
+        recent_quote_volume
 
     bars = _read(BTC_1H).tail(200)
     volume = recent_quote_volume(bars, 20)
@@ -537,10 +549,12 @@ def test_cost_model_real_run_comparison_is_bit_identical_at_k_zero():
     if volume <= 0.0:  # pragma: no cover - a repaired/empty cache
         pytest.skip("cached BTC 1h window has no quote volume")
     legacy_total = impacted_total = 0.0
+    qty = 0.01
+    max_notional = 0.0
     for i in range(1, 100):
         entry = float(bars["close"].iloc[i - 1])
         exit_ = float(bars["close"].iloc[i])
-        qty = 0.01
+        max_notional = max(max_notional, entry * qty, exit_ * qty)
         legacy_total += apply_trading_costs(entry, exit_, qty, "BTCUSDT", shipped,
                                            recent_quote_volume=volume)
         impacted_total += apply_trading_costs(entry, exit_, qty, "BTCUSDT", post,
@@ -553,9 +567,64 @@ def test_cost_model_real_run_comparison_is_bit_identical_at_k_zero():
         no_volume_total += apply_trading_costs(entry, exit_, 0.01, "BTCUSDT",
                                                shipped)
     assert legacy_total == no_volume_total
-    # On path: k = 0.5 costs strictly more, and the impact share is reported.
+    # On path: k = 0.5 costs strictly more, and the impact share stays inside the
+    # bound this window implies.
     assert impacted_total > legacy_total
-    assert (impacted_total - legacy_total) / legacy_total < 0.05  # BTC 1h is deep
+    share = (impacted_total - legacy_total) / legacy_total
+    # ``side_pct`` is the per-side impact cost already expressed in percent of
+    # notional, so ``bound`` multiplies by the notional and divides by the same
+    # window's legacy cost -- it is a fraction of that cost, like ``share``.
+    side_pct = impact_pct(participation_pct(max_notional, volume) / 100.0, 0.5)
+    bound = 2.0 * side_pct * max_notional / legacy_total
+    assert share < bound, (share, bound, volume, max_notional)
+
+
+def test_impact_share_is_bounded_by_the_window_it_was_measured_on():
+    """The R4 synthetic branch: the derived bound is exact for *any* window.
+
+    The live test above may only assert what holds whatever ``data/market``
+    contains.  This one builds the window instead, so the whole chain is pinned
+    deterministically: participation -> ``impact_pct`` -> the round-trip charge
+    -> its share of the legacy cost.  A window four times deeper gives a share
+    exactly half as large (the square-root law), which is the property the old
+    ``share < 0.05  # BTC 1h is deep`` literal was standing in for.
+    """
+    from core.backtest.cost_model import total_costs_with_impact
+    from core.risk.liquidity import impact_pct, participation_pct
+
+    cfg = _CostConfig(impact_k=0.5)
+    entry, exit_, qty = 50_000.0, 51_000.0, 0.01
+    shallow, deep = 100_000.0, 400_000.0
+    shallow_out = total_costs_with_impact(entry, exit_, qty, "BTCUSDT", cfg,
+                                          recent_quote_volume=shallow)
+    deep_out = total_costs_with_impact(entry, exit_, qty, "BTCUSDT", cfg,
+                                       recent_quote_volume=deep)
+    shallow_legacy, deep_legacy = (shallow_out["legacy_usdt"],
+                                   deep_out["legacy_usdt"])
+    # Identical books, different windows: the legacy cost does not move.
+    assert shallow_legacy == deep_legacy
+    # The bound for this window: ``2 x side_pct`` is the round-trip impact
+    # percentage (entry + exit), and scaling it by the largest notional in the
+    # sample gives the impact charge in the legacy cost's own units.  Nothing
+    # here assumes the window is deep -- a shallow one just raises the bound.
+    max_notional = exit_ * qty
+    shallow_side = impact_pct(participation_pct(max_notional, shallow) / 100.0, 0.5)
+    shallow_bound_pct = 2.0 * shallow_side * max_notional / shallow_legacy
+    shallow_share = shallow_out["impact_usdt"] / shallow_legacy
+    assert shallow_share < shallow_bound_pct / 100.0
+    # The bound is tight (the entry side is 1/51 smaller than the max notional)
+    # and its 2 x side_pct core is exactly the charge the cost model added.
+    entry_side = impact_pct(participation_pct(entry * qty, shallow) / 100.0, 0.5)
+    exit_side = impact_pct(participation_pct(exit_ * qty, shallow) / 100.0, 0.5)
+    round_trip = entry_side / 100.0 * entry * qty + exit_side / 100.0 * exit_ * qty
+    assert shallow_out["impact_usdt"] == pytest.approx(round_trip)
+    assert shallow_share < shallow_bound_pct / 100.0 < shallow_share / 0.8
+    assert shallow_share < shallow_bound_pct / 100.0 < shallow_share * 1.05
+    # Four times the depth, half the share: the derived bound moves with the
+    # window instead of being a constant that quietly requires a deep cache.
+    deep_share = deep_out["impact_usdt"] / deep_legacy
+    assert deep_share == pytest.approx(shallow_share / 2.0)
+    assert deep_share < shallow_share
 
 
 # ── 4. config: every key has a reader, defaults are off ─────────────────
