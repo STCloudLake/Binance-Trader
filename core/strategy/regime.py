@@ -260,9 +260,11 @@ def hmm_two_state(
         ``False`` (the value this function has always used) fits EM on the
         **whole** sample, so ``sigma``/``mu``/``A`` see the future and the
         "filtered" posterior is only causal *given* those parameters: truncating
-        the series to 2000 bars moves σ from 0.00202/0.00968 to 0.00200/0.00973
+        the series to 2000 bars moves σ from 0.00202/0.00968 to 0.00199/0.00968
         and flips an earlier Viterbi label on 2 of 3 synthetic seeds (measured;
-        see ``tests/test_p34_audit_fixes.py``).  The accuracy reported for this
+        see ``tests/test_p34_audit_fixes.py``; the truncated pair used to be
+        quoted as 0.00200/0.00973, which re-measures to 0.00199/0.00968 on this
+        checkout).  The accuracy reported for this
         mode is **in-sample** — the 0.9987/"≈99.9 %" figure in the module
         docstring — and must be labelled as such; the causal path's out-of-sample
         accuracy on the same synthetic structure is 0.758–0.815.
@@ -492,13 +494,20 @@ def hmm_two_state_causal(
     row of the segment, which labelled bar ``tt`` with the posterior of
     ``tt - (t - start)`` — lag 0, then 250, 500, … 2500 as the buffer refilled.
     Measured on the advertised synthetic structure, that turned a 0.758 decode
-    into **0.156** (and 0.52 under the verifier's draw): a coin flip, and on some
-    draws worse, because the label described a bar up to 2500 bars old.
+    into **0.52–0.56** on seeds 5/7/11 of the generator in
+    ``tests/test_p34_audit_fixes.py`` — no better than the verifier's draw — and
+    on some draws worse, because the label described a bar up to 2500 bars old.
+    (An earlier revision of this docstring quoted 0.156 for the same defect; that
+    figure does not reproduce on any of those three seeds.)
 
     Cost: one EM fit per refit point plus ``refits`` forward sweeps of the buffer
     (not one per bar), so a 3 000-bar series with the defaults (250-bar refit,
-    250-bar warm-up) is 12 fits + 12 sweeps, measured **2.0–4.5 s** on this
-    checkout (the EM fit dominates; scipy is not involved).  That is a
+    250-bar warm-up) is 12 fits + 12 sweeps, measured **≈2.3–2.6 s** on this
+    checkout (seeds 5/7/11 of the generator in ``tests/test_p34_audit_fixes.py``;
+    the EM fit dominates and the figure is machine-dependent — the older
+    "2.0–4.5 s" band brackets it, and the "≈18–21 s" quoted in
+    ``docs/core-algorithms/11-pairs-cointegration.md`` is not in this file and
+    does not reproduce).  That is a
     research/diagnostic cost, not a per-bar one; the live path is
     :data:`REGIME_DIAGNOSTICS_ENABLED`-gated and off.
 

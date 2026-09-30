@@ -7,6 +7,13 @@ reads::
       index  : close_time (datetime64, UTC — one row per closed candle)
       columns: open, high, low, close, volume   (float64)
 
+``--merge`` unions with the existing file **one row per bar**: a bar already
+present under the other timestamp convention (bar-*open* rather than this
+script's close time — see :func:`bar_open_keys`) is updated in place instead of
+being appended a second time.  Rows this script downloads keep the
+``close_time`` index above; a legacy row it does not re-download keeps its own
+stamp, so no stored value or label is rewritten.
+
 Data comes from the public mainnet mirror (``config.market_data_host`` /
 ``--data-host``), **never** ``api.binance.com`` — that host is unreachable from
 this deployment and testnet only carries a handful of pairs.
@@ -28,6 +35,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -46,6 +54,28 @@ VALID_INTERVALS = [
 
 #: Pause between pages so a long range does not trip the exchange rate limit.
 PAGE_SLEEP_S = 0.12
+
+#: Bar length in nanoseconds per accepted label, used to derive a bar's **open**
+#: key from either timestamp convention a cache can hold.  ``1M`` is absent on
+#: purpose: calendar months have no fixed length and are floored to the month
+#: start instead (see :func:`bar_open_keys`).
+INTERVAL_LENGTH_NS = {
+    "1s": 1_000_000_000,
+    "1m": 60_000_000_000,
+    "3m": 180_000_000_000,
+    "5m": 300_000_000_000,
+    "15m": 900_000_000_000,
+    "30m": 1_800_000_000_000,
+    "1h": 3_600_000_000_000,
+    "2h": 7_200_000_000_000,
+    "4h": 14_400_000_000_000,
+    "6h": 21_600_000_000_000,
+    "8h": 28_800_000_000_000,
+    "12h": 43_200_000_000_000,
+    "1d": 86_400_000_000_000,
+    "3d": 259_200_000_000_000,
+    "1w": 604_800_000_000_000,
+}
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -85,6 +115,97 @@ def parse_day(value: str, *, end_of_day: bool) -> int:
     if end_of_day:
         day = day + timedelta(days=1) - timedelta(milliseconds=1)
     return int(day.timestamp() * 1000)
+
+
+def _fold_to_bar(stamps: np.ndarray, base: int, step: int, tol: int) -> np.ndarray:
+    """Fold int64 ns ``stamps`` onto one key per bar, anchored at ``base``.
+
+    The two conventions are exactly ``step - 1 ms`` apart, so relative to any
+    anchor the stamps of a bar land either on the anchor's own grid or 1 ms past
+    it.  A stamp a full bar minus 1 ms past the grid is that bar's close time; a
+    stamp 1 ms past the grid is the *open* of the bar whose close is on the grid.
+    Both fold onto their bar's key.  Grouping never depends on which convention
+    the anchor itself uses — only the absolute value of the key does.
+    """
+    off = step - tol
+    res = (stamps - base) % step
+    shift = np.where(res >= step - tol, off,
+                     np.where((res >= tol) & (res < 2 * tol), -off, 0))
+    return stamps - shift
+
+
+def bar_open_keys(index, interval: str, *, reference=None) -> pd.DatetimeIndex:
+    """One key per **bar** for every stamp, whichever convention wrote it.
+
+    Two conventions coexist in the caches this script merges:
+
+    * the one this script writes — Binance's ``close_time``, i.e.
+      ``open + length - 1 ms`` (``1h`` → ``…:59:59.999``), and
+    * bar-*open* stamps left by an earlier writer (``1h`` → exact hours).
+
+    Measured on the repaired ``data/market/BTCUSDT/1h.parquet`` at revision
+    ``fa028be``: 8 767 open-aligned rows plus 2 910 ``:59:59.999`` rows, i.e.
+    **55** bars present under both conventions.  A "timestamps 1 ms apart are
+    duplicates" rule is wrong here: the 54 one-millisecond-adjacent pairs in that
+    file are all the *close* of hour ``H-1`` (``…(H-1):59:59.999``) next to the
+    *open* of hour ``H`` (``…H:00:00``) — two different bars — so folding on
+    proximity would delete live rows.  The declared bar length is the only sound
+    basis, which is what this function uses.
+
+    ``1M`` has no fixed length and is floored to the month start.  Every other
+    accepted label is folded by :func:`_fold_to_bar`; the keys then group the
+    rows correctly whatever the anchor convention is.  ``reference``, if given,
+    must be a **close-time** stamp (the convention this script writes): it only
+    sets the grid's origin, so the returned keys are true bar-open times — a
+    constant offset that cannot change grouping.
+
+    The keys are for grouping in :func:`merge_bars` only: the surviving row keeps
+    its own stamp, so the documented ``close_time`` index is preserved and no
+    stored value changes.
+    """
+    idx = pd.DatetimeIndex(index)
+    if idx.size == 0:
+        return idx
+    if interval == "1M":
+        return pd.DatetimeIndex(idx.to_period("M").to_timestamp())
+    step = INTERVAL_LENGTH_NS.get(str(interval))
+    if not step or step <= 1_000_000:
+        return idx  # unknown label: group on the raw stamp
+    tol = 1_000_000  # the two conventions differ by exactly 1 ms
+    keys = _fold_to_bar(idx.asi8.astype(np.int64), int(idx[0].value), step, tol)
+    if reference is not None:
+        ref_ns = int(pd.Timestamp(reference).value)
+        ref_key = _fold_to_bar(np.array([ref_ns], dtype=np.int64),
+                               int(idx[0].value), step, tol)[0]
+        keys = keys - (int(ref_key) - (ref_ns - (step - tol)))
+    return pd.DatetimeIndex(keys)
+
+
+def merge_bars(old: pd.DataFrame, new: pd.DataFrame, interval: str) -> pd.DataFrame:
+    """Union two cache frames with **one row per bar**, sorted by the index.
+
+    Replaces the previous exact-timestamp union (``~df.index.duplicated``), which
+    only removed a duplicate when both rows carried the *same* stamp: a bar
+    stored once as a bar-open stamp and once as this script's close stamp
+    survived as two rows, so a second ``--merge`` (or a repair that mixed the
+    conventions) grew the file instead of updating it.  Rows are grouped by the
+    derived :func:`bar_open_keys`; rows from ``new`` win a conflict — it is the
+    fresher download, which preserves the old ``keep="last"`` intent (and makes a
+    second merge idempotent) — and every non-conflicting row keeps its own stamp.
+    """
+    parts = []
+    for src, frame in enumerate((old, new)):
+        part = frame.copy()
+        part["_src"] = src
+        parts.append(part)
+    combined = pd.concat(parts)
+    ref = new.index[0] if len(new) else None
+    # Assign the int64 keys (a plain ndarray): assigning an Index would be an
+    # align-by-label operation, and the derived keys deliberately repeat.
+    combined["_bar"] = bar_open_keys(combined.index, interval, reference=ref).asi8
+    combined = combined.sort_values(["_bar", "_src"], kind="stable")
+    combined = combined[~combined["_bar"].duplicated(keep="last")]
+    return combined.drop(columns=["_src", "_bar"]).sort_index()
 
 
 async def download_interval(client: MarketDataClient, symbol: str, interval: str,
@@ -139,8 +260,7 @@ async def download_interval(client: MarketDataClient, symbol: str, interval: str
         try:
             old = pd.read_parquet(path)
             old.index = pd.to_datetime(old.index)
-            df = pd.concat([old, df])
-            df = df[~df.index.duplicated(keep="last")].sort_index()
+            df = merge_bars(old, df, interval)
         except Exception as e:
             print(f"      {symbol} {interval}: could not merge ({e}); overwriting")
     df.to_parquet(path)

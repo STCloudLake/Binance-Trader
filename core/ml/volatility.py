@@ -36,25 +36,36 @@ Every quantity here is a **fraction of price per bar**, never a percent:
   knobs are percent-typed).
 
 Cost: every estimator in the live path is O(window) numpy with no allocation of
-an (n × n) matrix, and :class:`VolForecaster` memoises per bar.  The measured
-per-bar budget is asserted in ``tests/test_volatility_targeting.py``.
+an (n × n) matrix, except the clip anchor, which is O(history) by design (see
+below).  The measured per-bar budget is asserted in
+``tests/test_volatility_targeting.py``.
 
 **The per-bar budget is a default-path promise, and only that path keeps it.**
-Re-measured on a 500-bar window (this checkout, scipy backend): ``ewma`` (the
-default) **0.27 ms/call**, the realised family ≈0.1 ms — inside
-:data:`PER_BAR_BUDGET_SEC` (2 ms).  ``garch11`` is **not** a per-bar estimator:
-a full call is **≈0.23 s** (scipy backend; 0.49 s before the exact hot-loop
-optimisation below), i.e. two orders of magnitude over budget.  The cost is the
-Nelder-Mead polish: ≈575 likelihood passes, each a sequential Python recursion
-over the window — a likelihood pass measured 1.78 ms → 0.39 ms after the
-pre-extracted-``list`` optimisation in :func:`garch11_loglik_grad`, so the
-shipped fit is already the fast exact form of this estimator.  It is therefore
-**opt-in**: ``method="garch11"`` is an explicit request and nothing on the live
-path selects it by default (:data:`METHODS`'s default is ``"ewma"`` and
-:class:`VolForecaster` defaults to ``allow_garch=False``), so it must be kept off
-the per-bar path.  Any earlier claim of "≈2 ms per GARCH fit" describes the
-optimiser-free IGARCH *grid fallback* (:func:`_garch11_best_beta`, measured ≈3 ms
-on 500 bars), not the shipped MLE — the two differ by ~80×.
+Re-measured on this checkout (Python 3.12 / numpy 2.3, median of 100–250 timed
+calls): ``ewma`` (the default) **≈0.14 ms/call on a 500-bar window** and
+**≈0.15–0.16 ms on the 600-row frame the live risk path hands in**
+(``RiskManager._VOL_HISTORY_BARS`` / ``PositionGuard._VOL_HISTORY_LIMIT``), the
+realised family **≈0.01 ms** — ~13× inside :data:`PER_BAR_BUDGET_SEC` (2 ms).  The
+older "0.27 ms" is 2× the measured value.  The one shape that *does* approach the
+budget is a caller that hands in the **whole** cached history (11 676 bars,
+``window=500``): **≈1.4–1.5 ms**, ~92 % of it the whole-series clip anchor
+:func:`series_anchor` — O(len(data)), not O(window), and reachable through the
+market-data provider's whole-frame fallback rather than the normal live input.
+``garch11`` is **not** a per-bar estimator: a full call measures **≈0.13 s on the
+shipped BTC 1h 500-bar window** and **≈0.21 s on a synthetic 500-bar window** (the
+Nelder-Mead polish is data-dependent), i.e. two orders of magnitude over budget;
+handed the whole 11 676-bar cache (``window=0``) it costs **≈3.7 s**.  The cost is
+that polish: **316** likelihood passes on the shipped window and **509** on a
+synthetic one (so the older "≈575" is high), each a sequential Python recursion
+over the window — a 500-bar likelihood pass measures **≈0.39 ms** now (the
+indexed-ndarray form it replaced measured ≈1.78 ms), so the shipped fit is already
+the fast exact form of this estimator.  It is therefore **opt-in**:
+``method="garch11"`` is an explicit request and nothing on the live path selects
+it by default (:data:`METHODS`'s default is ``"ewma"`` and :class:`VolForecaster`
+defaults to ``allow_garch=False``), so it must be kept off the per-bar path.  Any
+earlier claim of "≈2 ms per GARCH fit" describes the optimiser-free IGARCH *grid
+fallback* (:func:`_garch11_best_beta`, re-measured **≈1.5 ms** on 500 bars), not
+the shipped MLE — the two differ by ~100×.
 
 GARCH dependency note
 ---------------------
@@ -67,7 +78,7 @@ documented paths:
 2. otherwise → our own GARCH(1,1) Gaussian MLE with ``scipy.optimize`` (always
    available, since scipy is already a dependency), on a bounded parameter box
    seeded at the variance-targeted point.  If the MLE cannot run at all, the
-   estimator falls back to the optimiser-free **IGARCH grid** — cheap (≈3 ms on
+   estimator falls back to the optimiser-free **IGARCH grid** — cheap (≈1.5 ms on
    500 bars), deterministic, and documented as the fallback rather than the
    primary.
 
@@ -116,12 +127,19 @@ PERIODS_PER_YEAR: dict[str, float] = {
 
 #: Return-clipping threshold in robust sigmas (``k * 1.4826 * MAD``) applied
 #: before any squared return enters an estimator.  Justification is measured,
-#: not theoretical: the shipped cache carries a **data splice** — the BTC 1h
-#: frame jumps 2026-07-29 → 2026-09-29 inside one "bar", i.e. a single
-#: ``+27.63 %`` log return that is a calendar gap, not a one-hour move.  An
-#: unclipped RiskMetrics recursion (effective window ``1/(1-λ) = 16.7`` bars)
-#: then reports 5.47 %/bar instead of 0.44 %, a 12× overstatement that would
-#: shrink every position by the same factor.  ``0`` disables clipping.
+#: not theoretical.  The original witness was a **data splice** in the shipped
+#: cache (the BTC 1h frame jumped 2026-07-29 → 2026-09-29 inside one "bar", a
+#: single ``+27.63 %`` log return that was a calendar gap, not a one-hour move),
+#: and that witness has since been **repaired by the vendor**: re-measured at
+#: revision ``fa028be`` the cache has 11 677 rows, **no gap wider than 61 min**
+#: and a maximum ``|log return|`` of 4.94 %, so the clip is inert on the shipped
+#: series (last 500 bars: 0.289976 %/bar clipped against 0.289977 %/bar
+#: unclipped).  The default stays because the *mechanism* is measured: injecting
+#: a ``+0.2763`` bar into the same window takes the unclipped RiskMetrics
+#: recursion (effective window ``1/(1-λ) = 16.7`` bars) to 4.98 %/bar against
+#: 0.40 %/bar clipped — a 12.3× overstatement that would shrink every position by
+#: the same factor — and a corrupted download or a new listing gap can recreate
+#: it at any time.  ``0`` disables clipping.
 DEFAULT_OUTLIER_SIGMA = 6.0
 
 #: ``1 / Phi^{-1}(0.75)`` — makes the MAD a consistent scale estimate for a
@@ -129,12 +147,13 @@ DEFAULT_OUTLIER_SIGMA = 6.0
 _MAD_TO_SIGMA = 1.4826
 
 #: Default half-life (bars) of the exponentially-weighted MAD helper
-#: :func:`_anchored_mad`.  :func:`build_anchor` uses the plain fixed
-#: ``median`` / ``1.4826·MAD`` recipe over the whole series (identical to what
-#: :func:`clip_outliers` always computed) and only forwards this value when a
-#: caller explicitly asks for the long-memory variant; either way the anchor is
-#: computed **once**, which is what makes the clip decision stable — see
-#: :func:`clip_outliers`.
+#: :func:`_anchored_mad` — the recipe the estimators actually use through
+#: :func:`series_anchor`.  :func:`build_anchor`'s ``half_life=0`` default is the
+#: *plain* fixed ``median`` / ``1.4826·MAD`` recipe instead (the pre-fix
+#: per-window limit, still reachable as ``clip_outliers(..., anchored=False)``),
+#: and it only forwards this value when a caller explicitly asks for the
+#: long-memory variant; either way the anchor is computed **once**, which is what
+#: makes the clip decision stable — see :func:`clip_outliers`.
 DEFAULT_MAD_HALF_LIFE = 2000
 
 #: Method names accepted by :func:`forecast_vol`.
@@ -151,13 +170,20 @@ OHLC_METHODS = ("realized_parkinson", "realized_garman_klass")
 
 #: Per-bar compute budget (seconds) for one :func:`forecast_vol` call on a
 #: 500-bar window **using the default method (``ewma``)**.  Asserted in the test
-#: suite; the live predictor's async path computes indicators once per kline, so
-#: a forecast must be negligible next to that.  Measured ≈0.14–0.27 ms for
-#: ``ewma`` and ≈0.1 ms for the realised family, against this 2 ms budget.
-#: ``garch11`` is **excluded on purpose**: a full MLE call measures ≈0.23 s (not
-#: the ≈30 ms an earlier revision of this comment claimed — that was the
-#: optimiser-free grid fallback's cost, ~80× cheaper than the shipped fit), so it
-#: is an opt-in research estimator and never the per-bar default.
+#: suite; the live risk path hands in at most 600 bars
+#: (``RiskManager._VOL_HISTORY_BARS`` / ``PositionGuard._VOL_HISTORY_LIMIT``) and
+#: caches the result, so a forecast must be negligible next to the per-kline
+#: indicator work.  Re-measured on this checkout: **≈0.14 ms** for ``ewma`` on a
+#: 500-bar window (≈0.15–0.16 ms on the 600-row live frame) and **≈0.01 ms** for
+#: the realised family, against this 2 ms budget — the older
+#: "0.14–0.27 ms / ≈0.1 ms" pair is 2–10× high.  The one shape that approaches the
+#: budget is a caller handing in the **whole** cached history (11 676 bars,
+#: ``window=500``): ≈1.4–1.5 ms, ~92 % of it the O(history) clip anchor.
+#: ``garch11`` is **excluded on purpose**: a full MLE call measures ≈0.13 s on the
+#: shipped 500-bar window and ≈0.21 s on a synthetic one (not the ≈30 ms an
+#: earlier revision of this comment claimed — that was the optimiser-free grid
+#: fallback's cost, ~100× cheaper than the shipped fit), so it is an opt-in
+#: research estimator and never the per-bar default.
 PER_BAR_BUDGET_SEC = 2.0e-3
 
 
@@ -197,9 +223,12 @@ def _anchored_mad(r: np.ndarray, half_life: float) -> tuple[float, float]:
     A plain rolling MAD is recomputed from whatever window the caller passes, so
     the *limit* moves with the window and an observation that was clipped at bar
     ``t`` can be **un-clipped** later when the window slides: measured on the
-    shipped BTC 1h series, the Winsor limit changed between consecutive 500-bar
-    windows on 8 343 of 8 344 steps (max |Δ| ``≈4.8e-2`` on the clipped value).
-    An estimator that consumes the clipped series bar by bar (α_t jumping) then
+    shipped BTC 1h series (11 676 returns at revision ``fa028be``), the Winsor
+    limit changed between consecutive 500-bar windows on **11 176 of 11 176**
+    steps (7 678 of 11 176 for the plain per-window median/MAD recipe; the
+    pre-repair cache read 8 343 of 8 344 on the 8 844-bar synthetic series, and
+    the emitted clipped value moves by up to ≈1.6e-2 across windows).  An
+    estimator that consumes the clipped series bar by bar (α_t jumping) then
     depends on when it was asked, which is not a property of the data.
 
     This helper gives the limit a **long, fixed half-life**: the centre and the
@@ -251,15 +280,18 @@ class AnchorMAD:
 def build_anchor(returns, *, half_life: float = 0.0) -> AnchorMAD:
     """The anchored centre/scale of a return series (:class:`AnchorMAD`).
 
-    The recipe is **the same one** :func:`clip_outliers` has always used
-    (``median`` and ``1.4826 · median|x − centre|``) — the only change is that it
-    is evaluated **once, over the whole series**, instead of being re-derived
-    from whichever window the estimator was handed.  That keeps the clip's
-    severity exactly as documented while removing its window dependence: the
-    window-rounding artefact of the old per-window limit (measured on the shipped
-    BTC 1h series: the limit changed on 7 659 of 11 174 consecutive 500-bar
-    windows, and the oldest still-present observation changed value on 11 172 of
-    11 173 steps) disappears, because the limit no longer depends on the window.
+    The ``half_life=0`` default is the **plain** recipe (``median`` and
+    ``1.4826 · median|x − centre|``) — the pre-fix per-window limit, not the
+    ``_anchored_mad`` recipe the estimators use by default (see
+    :data:`DEFAULT_MAD_HALF_LIFE`) — evaluated **once, over the whole series**,
+    instead of being re-derived from whichever window the estimator was handed.
+    That removes its window dependence: re-measured on the shipped BTC 1h series
+    at revision ``fa028be``, the plain per-window limit changed on **7 678 of
+    11 176** consecutive 500-bar windows (the pre-repair cache, with 11 174
+    consecutive windows, read 7 659), and one series-wide anchor removes the
+    window-rounding artefact entirely (0 changes, bit-for-bit, measured on the
+    8 844-bar synthetic series the regression test pins: 8 344 of 8 344 per-window
+    changes → 0).
 
     ``half_life > 0`` switches to the long-memory variant
     (:func:`_anchored_mad`, exponentially weighted centre and scale): it differs
@@ -273,7 +305,8 @@ def build_anchor(returns, *, half_life: float = 0.0) -> AnchorMAD:
     scalar estimator needs is that ``clip(x_i)`` is a function of ``x_i`` and one
     fixed pair of numbers, and re-anchoring per bar reintroduces exactly the
     instability this fixes.  The centre is a robust location, so the leak is
-    immaterial (a splice moves it by ~1e-7 on the shipped series).
+    immaterial (on the pre-repair cache a ``+27.63 %`` splice bar moved it by
+    ~1e-7; the repaired cache has no return beyond 4.94 %).
     """
     r = np.asarray(returns, dtype=np.float64).ravel()
     r = r[np.isfinite(r)]
@@ -496,10 +529,13 @@ def ewma_variance(returns, *, lam: float = DEFAULT_LAMBDA,
     :func:`series_anchor` from the **whole series it was handed** and only then
     applies ``window``, so the Winsor limit is no longer re-derived from the
     window (P3/P4 audit item 7).  ``ewma_vol(r, window=500)`` and
-    ``ewma_vol(r, window=400)`` therefore clip identically; they used to disagree
-    (0.524216 against 0.524062 %/bar) because each computed the limit from its own
-    window.  ``ewma_vol(r[-500:], window=0)`` still differs — that caller sliced
-    the series itself, and needs ``anchor=series_anchor(r)`` to be window-free.
+    ``ewma_vol(r, window=400)`` therefore clip identically; re-measured on the
+    shipped series at revision ``fa028be`` the two agree to 4.2e-12 relative
+    (0.002899771 for 500, 400 and 0 alike), where before the fix each computed the
+    limit from its own window — the historical pair was 0.524216 against 0.524062
+    %/bar on the pre-repair cache.  ``ewma_vol(r[-500:], window=0)`` still differs
+    (0.289976 %/bar) — that caller sliced the series itself, and needs
+    ``anchor=series_anchor(r)`` to be window-free.
     """
     r = _clipped(returns, window=window, outlier_sigma=outlier_sigma,
                  anchor=anchor)
@@ -538,11 +574,13 @@ def ewma_vol_series(returns, *, lam: float = DEFAULT_LAMBDA, window: int = 0,
     and cheap); a positive window restricts the recursion to the tail.
 
     Used by the research/reporting path (high- vs low-vol windows) and by the
-    tests; the live path calls the scalar :func:`ewma_vol` through
-    :class:`VolForecaster`.  The clip is the same one-the-whole-series anchor the
-    scalar path uses (:func:`_clipped`: clip the full series, *then* apply
-    ``window``), so a rolling window cannot move a limit that has already been
-    emitted; ``anchor`` still overrides it.
+    tests.  The live risk path does **not** come through here: ``RiskManager`` and
+    ``PositionGuard`` call the scalar :func:`forecast_vol` directly with their own
+    TTL cache and at most 600 bars, and :class:`VolForecaster` (which memoises a
+    whole forecast, not the anchor) has no production caller.  The clip is the
+    same one-the-whole-series anchor the scalar path uses (:func:`_clipped`: clip
+    the full series, *then* apply ``window``), so a rolling window cannot move a
+    limit that has already been emitted; ``anchor`` still overrides it.
     """
     r = _clipped(returns, window=window, outlier_sigma=outlier_sigma,
                  anchor=anchor)
@@ -601,8 +639,10 @@ def garch11_loglik_grad(x2: np.ndarray, var_s: float, theta) -> tuple[float, np.
 
     **Cost.**  The recursion cannot be vectorised (it is sequential), but
     iterating a pre-extracted ``list`` of Python floats instead of indexing the
-    ndarray is exact and measured **≈2×** faster (1.78 ms → 0.89 ms per 500-bar
-    pass; the ``x2[i]``/``x2[i-1]`` ``__getitem__`` calls were most of the cost).
+    ndarray is exact: a 500-bar pass measures **≈0.39 ms** on this checkout,
+    where the indexed-ndarray form it replaced measured ≈1.78 ms (so the
+    ``x2[i]``/``x2[i-1]`` ``__getitem__`` calls were most of that cost; the stale
+    "0.89 ms" pair in an earlier revision of this comment is 2× high).
     The values are bit-identical, which matters because the optimiser's result is
     asserted against a fixed objective in the test suite.
     """
@@ -693,8 +733,13 @@ def _garch11_grid_scan(x2: np.ndarray, var_s: float) -> tuple[float, float, floa
 def _garch11_mle(x2: np.ndarray, var_s: float) -> tuple[float, float, float, float] | None:
     """Free-``omega`` GARCH(1,1) Gaussian MLE inside :data:`GARCH_MAX_PERSISTENCE`.
 
-    Returns ``(omega, alpha, beta, sum_0.5_LL)`` in the caller's own units, or
-    ``None`` when scipy is unavailable / the optimiser fails.
+    Returns ``(omega, alpha, beta, sum_0.5_LL)``, or ``None`` when scipy is
+    unavailable / the optimiser fails.  ``omega``, ``alpha`` and ``beta`` come back
+    in the caller's own units, but ``sum_0.5_LL`` is in the **z-normalised** units
+    the fit actually maximises in: re-measured on the shipped window the same fit
+    reads ``231.509`` there and ``−286.288`` in percent² units — the gap is exactly
+    ``0.5·n·log(var_s)``, the likelihood's scale-bearing term — so only compare it
+    with another objective from this function.
 
     **Scale normalisation is not cosmetic.**  The likelihood's only scale-bearing
     term is the intercept, and it is bounded by a box expressed in the data's
@@ -782,24 +827,29 @@ def _garch11_scipy_mle(r: np.ndarray, *, outlier_sigma: float = 8.0
     measurement that reverses it).  The previous docstring here asserted that the
     free-``omega`` likelihood is **unbounded** and that "Nelder-Mead, L-BFGS-B
     and SLSQP … all converged to that corner and rejected the generating
-    parameters of a synthetic GARCH(1,1)".  Re-measured on the shipped BTC 1h
-    500-bar window (``tests/test_p34_audit_fixes.py`` re-runs it): all three
-    optimisers converge to **ω ≈ 0.002265, α ≈ 0.0697, β ≈ 0.9254** with
-    ``0.5·ΣLL = −226.771`` — they agree to 5 decimals and reject *nothing*.  The
-    IGARCH grid, by contrast, lands on the degenerate ``α = 1, β = 0`` corner
-    where the ``x²/v`` term is unbounded below (its own objective reads
-    ``3.6e5``-scale garbage: measured mean ``0.5·ΣLL / n = 40.65`` against the
-    MLE's ``−0.4535``), i.e. the *grid* is the pathological fit, not the MLE.
+    parameters of a synthetic GARCH(1,1)".  Re-measured at revision ``fa028be``
+    on the shipped BTC 1h 500-bar window (``log_returns(close)[-500:]``, clipped
+    at ``sigma=8``): all three optimisers return the **same** fit —
+    **ω ≈ 0.0813 (percent²), α ≈ 0.1965, β ≈ 0.1546**, agreeing to 6 decimals —
+    and reject *nothing*.  (The stale numbers this docstring used to quote —
+    ω ≈ 0.002265, α ≈ 0.0697, β ≈ 0.9254, ``0.5·ΣLL = −226.771`` — were measured
+    on the pre-repair 8 846-bar cache and are not reproducible on the current
+    11 676-bar one; the objective is also reported here in z-normalised units, see
+    :func:`_garch11_mle`.)  The IGARCH grid, by contrast, lands on the degenerate
+    ``α = 1, β = 0`` corner where the ``x²/v`` term is unbounded below: on the
+    same window its objective reads a mean ``0.5·(log v + x²/v) = 52.209`` against
+    the MLE's ``−0.5726``, i.e. the *grid* is the pathological fit, not the MLE.
     The old rationale was wrong, so the estimator is the fitted GARCH(1,1).
 
     Both figures the old docstring quoted were also **sums** presented as means
     (``1.8e4`` and ``3.6e5`` are sums of a quantity this module defines and
     reports as a per-observation mean): the per-observation means are ``36`` and
-    ``7.2e5`` respectively, and neither is a likelihood a well-posed fit
-    produces.  The fallback keeps the honest *production* justification instead:
-    the grid is cheap (≈2 ms, no optimiser, deterministic) and its corner is
-    observable on this cache, which is why :func:`garch11_forecast` blends rather
-    than trusting one step.
+    ``720`` respectively (the second was quoted as ``7.2e5``, a factor-1000
+    slip), and neither is a likelihood a well-posed fit produces.  The fallback
+    keeps the honest *production* justification instead: the grid is cheap
+    (≈1.5 ms, no optimiser, deterministic) and its corner is observable on this
+    cache, which is why :func:`garch11_forecast` blends rather than trusting one
+    step.
 
     ``outlier_sigma`` is looser than the module default (8 vs 6) because the
     likelihood is *supposed* to see the large moves whose clustering it models.
@@ -853,8 +903,8 @@ def garch11_filter(x2: np.ndarray, var_s: float, a: float, b: float,
     v[0] = prev if prev > floor else floor
     # Same pre-extracted-list trick as :func:`garch11_loglik_grad`: this loop is
     # called once per likelihood pass (hundreds per fit), so the ndarray
-    # ``__getitem__`` overhead dominated it (measured 0.20 ms → 0.14 ms per
-    # 500-bar pass; values bit-identical).
+    # ``__getitem__`` overhead dominated it (a 500-bar pass measures ≈0.07 ms now
+    # against ≈0.20 ms for the indexed form; values bit-identical).
     for i, xi in enumerate(xs[:-1]):
         prev = a * xi + b * prev
         v[i + 1] = prev if prev > floor else floor
@@ -867,10 +917,13 @@ def garch11_filter_grid(x2: np.ndarray, var_s: float, betas) -> np.ndarray:
     ``alpha = 1 - beta`` (unit persistence), so ``betas`` alone describes the
     grid.  Returns a ``(len(betas), len(x2))`` array of conditional variances.
 
-    The scalar version in a Python loop measured ~434 ms per fit on the full
-    8 846-bar cache (100 grid points x 8 846 steps), which is not a path the
-    doc's budget table can report; the vectorised form advances the whole grid
-    one bar at a time and is ~1 ms per grid point.
+    The scalar version in a Python loop measures ≈1.7 ms per pass on the current
+    11 676-bar cache, i.e. ≈0.17 s for the 100-point grid — a path the doc's
+    budget table cannot report (the stale "~434 ms per fit" predates the loop
+    rewrite and a smaller cache); the vectorised form advances the whole grid one
+    bar at a time and measures **≈32 ms for the whole 100-point grid on that
+    cache** (≈0.32 ms per grid point, and ≈1.5 ms when the window is the default
+    500 bars).
     """
     x2 = np.asarray(x2, dtype=np.float64)
     n = x2.size
@@ -929,12 +982,15 @@ def garch11_params(returns, *, window: int = DEFAULT_WINDOW) -> dict:
     (:func:`clip_outliers`) for the data-splice reason documented on
     :data:`DEFAULT_OUTLIER_SIGMA`.
 
-    **Cost: not a per-bar call.**  A full fit measures ≈0.23 s on a 500-bar window
-    (≈575 likelihood passes of the Nelder-Mead polish over the variance-targeted
-    grid start), against :data:`PER_BAR_BUDGET_SEC` = 2 ms.  It is a research /
-    reporting estimator: cache it or lift it off the per-bar path.  The
-    optimiser-free IGARCH grid fallback (``fitted=False``) is the cheap branch
-    (≈3 ms) and is what a caller that needs something per bar should use.
+    **Cost: not a per-bar call.**  A full fit measures **≈0.13 s on the shipped
+    BTC 1h 500-bar window** and ≈0.21 s on a synthetic one (**316** and **509**
+    likelihood passes of the Nelder-Mead polish over the variance-targeted grid
+    start, respectively — the stale "≈575" is high), against
+    :data:`PER_BAR_BUDGET_SEC` = 2 ms; on the whole 11 676-bar cache
+    (``window=0``) it costs ≈3.7 s.  It is a research / reporting estimator: cache
+    it or lift it off the per-bar path.  The optimiser-free IGARCH grid fallback
+    (``fitted=False``) is the cheap branch (≈1.5 ms) and is what a caller that
+    needs something per bar should use.
     """
     r = _clipped(returns, window=window, outlier_sigma=DEFAULT_OUTLIER_SIGMA)
     backend = garch_backend()
@@ -964,8 +1020,9 @@ def garch11_params(returns, *, window: int = DEFAULT_WINDOW) -> dict:
 #: (``res.forecast(horizon=1)`` returns ``0.5 * sigma2_{t+1} + 0.5 * sigma2_t``).
 #: The blend is insurance against a *degenerate fit*, and that is now the only
 #: reason it exists: with the primary free-``omega`` MLE the one-step forecast is
-#: already sane (measured 0.445 %/bar on the shipped window against EWMA's
-#: 0.524 %/bar), but if scipy is unavailable the estimator falls back to the
+#: already sane (re-measured on the shipped 500-bar window: **0.2970 %/bar**
+#: against EWMA's **0.2900 %/bar**, a ratio of 1.024), but if scipy is unavailable
+#: the estimator falls back to the
 #: IGARCH grid, whose fit on this cache sits on the constant-variance corner
 #: (``alpha = 1, beta = 0``) and whose pure one-step forecast would be the last
 #: squared return divided by 10000 (``0.00076 %/bar``).  Blending bounds the
@@ -990,16 +1047,19 @@ def garch11_forecast(returns, *, window: int = DEFAULT_WINDOW, unit: str = "per_
     Returns ``0.0`` when the fit is unusable (fewer than 50 bars) — the caller
     then falls back to EWMA; :func:`forecast_vol` does that for you.
 
-    **Cost: ≈0.23 s/call** (it runs the full MLE of :func:`garch11_params`), i.e.
-    ~115× the 2 ms per-bar budget.  It is an explicit opt-in estimator, never a
+    **Cost: ≈0.13–0.21 s/call** (it runs the full MLE of :func:`garch11_params`;
+    0.13 s on the shipped window, 0.21 s on a synthetic one), i.e. ~65–105× the
+    2 ms per-bar budget.  It is an explicit opt-in estimator, never a
     default, and must not be lifted onto the per-bar path; see the module
     docstring's cost section.
     """
     r = _last(returns, window)
     # The *same* window feeds the fit and the filter: fitting on the full history
     # and filtering a 500-bar tail (or vice versa) mixes two sample levels, and it
-    # is also measurably slower — a full-history grid over the 8 846-bar cache
-    # cost 33 ms/call against 2.1 ms for the default 500-bar window.
+    # is also measurably slower — a full-history grid over the current
+    # 11 676-bar cache costs ≈43 ms/call against ≈1.5 ms for the default 500-bar
+    # window (the stale "33 ms on the 8 846-bar cache" figure is the same
+    # measurement on the pre-repair cache).
     p = garch11_params(r, window=0)
     if not p["ok"]:
         return 0.0
@@ -1016,25 +1076,37 @@ def _garch11_variance(r: np.ndarray, p: dict, *, lam: float = DEFAULT_LAMBDA,
     **Same data as the fit.**  The returns are winsorised with
     :func:`clip_outliers` at the **same** threshold
     (:data:`DEFAULT_OUTLIER_SIGMA`) the fit used.  Filtering the raw series with
-    parameters fitted on the clipped one was a real bug: the unclipped
-    ``+27.6 %`` splice bar is ``~1.6·10**4`` in percent² against a conditional
-    level near ``0.2``, so a single bar drove the filtered variance and the
-    forecast to **4.72 %/bar — 9.6×** the EWMA level, where the fitted model's own
-    one-step number is **0.48 %/bar**.
+    parameters fitted on the clipped one was a real bug on the pre-repair cache:
+    the unclipped ``+27.6 %`` splice bar was ``~1.6·10**4`` in percent² against a
+    conditional level near ``0.2``, so a single bar drove the filtered variance
+    and the forecast to **4.72 %/bar — 9.6×** the EWMA level, where the fitted
+    model's own one-step number was **0.48 %/bar**.  That witness is gone (the
+    vendor repaired the splice), so on the current cache the two agree:
+    re-measured at revision ``fa028be`` the filtered forecast is 0.2970 %/bar with
+    the clip and 0.2970 %/bar without it (the largest return in the shipped
+    500-bar window is 2.57 %, inside the clip), and the guarantee is kept because
+    the next splice-scale bar would recreate the divergence.
 
     **Units.**  ``p["omega"]`` is fraction² (the unit of every public entry
     point) while the filter runs in percent², and one fraction² is **1e4**
     percent².  The intercept and the returns must therefore be converted
-    together; scaling only one of them is a real 1e4 error that was measured at
-    **6.6× the EWMA level** on the shipped window.
+    together.  Scaling only one of them was measured on the pre-repair cache at
+    **6.6× the EWMA level**, but that figure is not reproducible on the current
+    one: re-measured at revision ``fa028be`` the two one-sided breaks read 0.739×
+    (intercept not scaled) and 1.001× (returns not scaled) of the EWMA level,
+    because this sample's fitted intercept is small.  The conversion stays a unit
+    identity, not a fitted convenience — the hazard is real and only the sample
+    hides it.
 
     **Seed.**  The filter starts at the model's own long-run level
     ``omega / (1 - alpha - beta)`` rather than at the 500-bar sample variance.
-    Seeding with the sample variance is not neutral: at the fitted persistence
-    (``~0.985`` on the shipped window) an inflated seed decays only to
-    ``0.985**500 ≈ 5e-4`` of its initial size, so the filter would report the
-    *seed* for the whole window instead of the conditional level.  Starting at
-    the model's own level needs only the memory the model actually has.
+    Seeding with the sample variance is not neutral when the fit is persistent: at
+    the persistence the pre-repair fit had (``~0.985``) an inflated seed decays
+    only to ``0.985**500 ≈ 5e-4`` of its initial size, so the filter would report
+    the *seed* for the whole window instead of the conditional level.  The current
+    shipped window fits a much less persistent model (``α + β`` = 0.35–0.40, so a
+    seed would be forgotten in a few bars), but the code keeps the model's own
+    level because that is the model's own equation, not a property of one sample.
     """
     if r.size == 0:
         return 0.0

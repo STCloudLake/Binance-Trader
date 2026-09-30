@@ -42,7 +42,8 @@ SYMBOL = "BTCUSDT"
 DATE_START = "2026-02-01"
 DATE_END = "2026-03-01"
 #: Engine window: long enough for the AND genome to take a non-trivial number
-#: of trades (16 vs 83 under OR), short enough to stay a fast test.
+#: of trades (AND=16 vs OR=83; legacy and hybrid agree for each logic, so this
+#: is selectivity, not an engine divergence), short enough to stay a fast test.
 ENGINE_START = "2026-01-01"
 ENGINE_END = "2026-03-31"
 INITIAL_BALANCE = 10000.0
