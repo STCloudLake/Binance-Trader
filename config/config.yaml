@@ -134,6 +134,49 @@ news:
   fetch_interval_minutes: 30
   max_articles_per_symbol: 10
   volume_spike_multiplier: 3.0
+# Volatility targeting (Phase P3 — docs/core-algorithms/10-volatility-targeting.md).
+# Conditional volatility is predictable (ARCH/GARCH: Tsay ch. 3) even though the
+# direction of returns is not; these keys turn that forecast into RISK decisions
+# (position size, stop/trailing width).  Every key defaults to the pre-P3
+# behaviour, so `enabled: false` means the whole block is inert and sizing/stops
+# are bit-identical to the fixed-fraction implementation.
+#
+# NOTE on naming: this is a NEW `risk:` block.  The `hard_limits` / `soft_params`
+# blocks continue to come from config/risk_params.yaml — nothing there moved.
+risk:
+  vol_targeting:
+    # Master switch. false → no vol targeting anywhere (P3 is fully opt-in).
+    enabled: false
+    # Estimator: 'ewma' (RiskMetrics λ=0.94, the documented default) |
+    # 'realized_cc' | 'realized_parkinson' | 'realized_garman_klass' | 'garch11'.
+    # Cheap methods are ~1 ms/bar; 'garch11' measures ~12 ms/bar and is for
+    # research/reporting, not the hot path.
+    method: ewma
+    # EWMA decay and the bar window the estimator sees.
+    lam: 0.94
+    window: 500
+    # Target volatility per trade, in PERCENT of price per bar (0.45 ≈ BTC 1h's
+    # realised 0.42 %/bar).  The sizer scales the fixed-fraction notional by
+    # target/forecast, so a symbol twice as volatile gets half the notional.
+    target_vol_pct: 0.45
+    # Bounds on that scale factor (1.0 = the fixed-fraction baseline).
+    max_scale: 2.0
+    min_scale: 0.25
+    # Hard ceiling on the notional as a percent of account balance; applied AFTER
+    # the vol scale so the existing hard limits can never be exceeded.
+    max_position_notional_pct: 10.0
+    # Stop / trailing width: distance = stop_atr_multiple × forecast vol per bar,
+    # clamped to [stop_min_pct, stop_max_pct] (percent).  Only used when this
+    # block is enabled; otherwise the fixed hard_limits.trailing_stop_distance_pct
+    # and soft_params.stop_loss_pct apply unchanged.
+    stop_vol_multiple: 3.0
+    stop_min_pct: 0.5
+    stop_max_pct: 6.0
+    # Triple-barrier widths (core/ml/labels.py) driven by the same forecast when
+    # enabled, in place of the ATR-scaled default.
+    barrier_vol_multiple: 1.0
+    barrier_min_pct: 0.004
+    barrier_max_pct: 0.06
 satellite_position:
   capital_pct: 0.3
   max_symbols: 10

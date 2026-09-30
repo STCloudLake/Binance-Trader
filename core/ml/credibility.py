@@ -475,7 +475,12 @@ def evaluate_model_oos(
     """
     if model_factory is None:
         from core.ml.trainer import default_binary_factory
-        model_factory = default_binary_factory
+        # `default_binary_factory(...)` is a *builder*: it returns the
+        # `fit(X, y, sample_weight)` factory. Assigning the builder itself made the
+        # default path call `default_binary_factory(X, y, w)` with weights as
+        # `n_estimators` and then fail with a TypeError in every fold
+        # (found by the phase-P4 meta-labelling work).
+        model_factory = default_binary_factory()
     if calibrate_method:
         calibrate = calibrate_method
 

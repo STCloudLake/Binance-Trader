@@ -12,6 +12,21 @@ from core.strategy.evaluation_kernel import (
     check_higher_tf_trend,
 )
 
+# ── P4 integration seams — all OFF (no live behaviour change by default) ──
+#
+# Phase P4 adds four new capabilities (pairs/cointegration, meta-labelling,
+# microstructure features, regime gating).  Every one of them is a *new*
+# component, so the live path must be byte-for-byte the pre-P4 path until a
+# caller flips a flag **and** registers the component.  These three module
+# constants are the whole story:
+#
+#: Report the detected regime in the signal cache (no gating, no signal change).
+P4_REGIME_DIAGNOSTICS_ENABLED = False
+#: Let a registered ``MetaLabeler`` filter/size live entries (never a direction).
+P4_META_FILTER_ENABLED = False
+#: Let a registered pairs provider override a strategy's indicator signal.
+P4_PAIRS_SIGNALS_ENABLED = False
+
 
 class StrategyEngine:
     def __init__(self, config: Config, event_bus: EventBus, market_data: MarketDataProvider):
@@ -32,6 +47,83 @@ class StrategyEngine:
         #: (audit P2 #5).
         self._ml_prediction: dict[str, dict] = {}
         self._news_sentiment: dict[str, float] = {}
+        #: P4 seam: ``(symbol, interval) -> PairsSignal | None`` (see
+        #: :mod:`core.strategy.pairs`).  ``None`` = the seam is inert.
+        self._p4_pairs_provider = None
+        #: P4 seam: ``(MetaLabeler, probability_fn)`` where
+        #: ``probability_fn(df, symbol) -> float`` is the secondary model's
+        #: ``P(primary trade hits its profit barrier)``.
+        self._p4_meta_labeler = None
+        self._p4_meta_probability = None
+
+    # ── P4 wiring (explicit, opt-in, no effect until a flag is enabled) ──
+
+    def wire_pairs_provider(self, provider) -> None:
+        """Register ``provider(symbol, interval) -> PairsSignal | None``.
+
+        The signal is used only when :data:`P4_PAIRS_SIGNALS_ENABLED` is true,
+        and only as the ``indicator_signal`` input of the **shared** fusion
+        kernel — so a pairs entry travels the identical risk/execution pipeline
+        as any other strategy signal.
+        """
+        self._p4_pairs_provider = provider
+
+    def wire_meta_filter(self, labeler, probability_fn) -> None:
+        """Register the meta-labelling filter (see :mod:`core.ml.meta`).
+
+        ``probability_fn(df, symbol)`` must return the secondary model's
+        probability for the *current* bar; it is the caller's job to supply a
+        causal feature matrix.  The seam multiplies the fused score by the
+        meta size multiplier and suppresses the entry when the filter says no —
+        it can never change the side.
+        """
+        self._p4_meta_labeler = labeler
+        self._p4_meta_probability = probability_fn
+
+    def _p4_pairs_indicator(self, symbol: str, interval: str) -> float | None:
+        """The pairs provider's ``indicator_signal``, or ``None`` when inert."""
+        if not P4_PAIRS_SIGNALS_ENABLED or self._p4_pairs_provider is None:
+            return None
+        try:
+            signal = self._p4_pairs_provider(symbol, interval)
+        except Exception:
+            from loguru import logger
+            logger.exception(f"P4 pairs provider failed for {symbol} {interval}")
+            return None
+        if signal is None or not getattr(signal, "allowed", False):
+            return None
+        return float(getattr(signal, "indicator_signal", 0.0))
+
+    def _p4_regime(self, df) -> dict | None:
+        """Regime label for diagnostics, or ``None`` when the seam is off."""
+        if not (P4_REGIME_DIAGNOSTICS_ENABLED or P4_META_FILTER_ENABLED):
+            return None
+        try:
+            from core.strategy.regime import classify_last
+            return classify_last(df)
+        except Exception:
+            from loguru import logger
+            logger.exception("P4 regime classification failed")
+            return None
+
+    def _p4_meta(self, symbol: str, df, side: str, score: float) -> tuple[float, dict | None]:
+        """Apply the meta filter/size to ``score`` (no-op unless enabled)."""
+        if not P4_META_FILTER_ENABLED or self._p4_meta_labeler is None \
+                or self._p4_meta_probability is None:
+            return float(score), None
+        try:
+            p = float(self._p4_meta_probability(df, symbol))
+            decision = self._p4_meta_labeler.decide(p, 1.0 if side == "long" else -1.0)
+        except Exception:
+            from loguru import logger
+            logger.exception(f"P4 meta filter failed for {symbol} — entry kept unfiltered")
+            return float(score), None
+        info = {"probability": p, "threshold": decision.threshold,
+                "take": bool(decision.take), "size_multiplier": decision.size_multiplier,
+                "reason": decision.reason}
+        if not decision.take:
+            return 0.0, info
+        return float(score) * float(decision.size_multiplier), info
 
     def wire_executor(self, executor):
         self._executor = executor
@@ -174,6 +266,16 @@ class StrategyEngine:
         else:
             indicator_signal = 0.0
 
+        # ── P4 seam: a registered pairs provider may supply the indicator ──
+        # signal (see `core.strategy.pairs`).  Default-off: with
+        # `P4_PAIRS_SIGNALS_ENABLED = False` this is a single `None` check and
+        # the rest of the evaluation is exactly the pre-P4 path.
+        pairs_indicator = self._p4_pairs_indicator(symbol, interval)
+        if pairs_indicator is not None:
+            indicator_signal = pairs_indicator
+            entry_results["long"].append({"condition": "pairs_signal", "met": pairs_indicator > 0})
+            entry_results["short"].append({"condition": "pairs_signal", "met": pairs_indicator < 0})
+
         # ── Shared Kernel: Exit condition evaluation ──
         exit_signal_long = eval_exit_conds(df, strategy.exit_conditions, "long")
         exit_signal_short = eval_exit_conds(df, strategy.exit_conditions, "short")
@@ -211,6 +313,13 @@ class StrategyEngine:
 
         # Determine entry side from the signal
         entry_side = "long" if final_score > 0 else "short"
+
+        # ── P4 seams (regime diagnostics / meta filter+size; all default-off) ──
+        # The meta filter can only scale the fused score towards zero or
+        # suppress the entry — it can never flip the side (Prado's
+        # meta-labelling contract, enforced by `MetaDecision.apply`).
+        p4_regime = self._p4_regime(df)
+        final_score, p4_meta = self._p4_meta(symbol, df, entry_side, final_score)
 
         # ── Shared Kernel: Higher-timeframe trend alignment ──
         if indicator_signal != 0.0 and len(strategy.timeframes) > 1:
@@ -292,6 +401,13 @@ class StrategyEngine:
             "threshold_met": abs(final_score) >= 0.5,
             "weights": {"indicator": w.indicator, "ml": effective_ml_weight, "news": w.news},
         }
+        # P4 diagnostics are attached only when a seam actually produced
+        # something, so the default cache payload is unchanged.
+        if p4_regime is not None or p4_meta is not None or pairs_indicator is not None:
+            self._signal_cache[key]["p4"] = {
+                "regime": p4_regime, "meta": p4_meta,
+                "pairs_indicator": pairs_indicator,
+            }
 
         # Signal publishing — only when driven by real-time klines
         if not publish:
@@ -451,6 +567,8 @@ class StrategyEngine:
                     "threshold_met": sig.get("threshold_met", False),
                     "indicators": sig.get("indicators", {}),
                     "weights": sig.get("weights", {}),
+                    # P4 diagnostics (absent unless a P4 seam is enabled).
+                    "p4": sig.get("p4"),
                     "entry_conditions": {
                         side: [
                             {"condition": c["condition"], "met": c["met"]}

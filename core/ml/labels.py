@@ -167,6 +167,8 @@ def barrier_widths(
     atr_multiple: float = 1.5,
     min_pct: float = 0.004,
     max_pct: float = 0.06,
+    vol_pct: float | pd.Series | None = None,
+    vol_multiple: float = 1.0,
 ) -> tuple[pd.Series, pd.Series]:
     """Per-bar ``(upper_pct, lower_pct)`` barriers, scaled by ATR/close.
 
@@ -175,9 +177,34 @@ def barrier_widths(
     width here is ``atr_multiple × ATR / close`` clamped to
     ``[min_pct, max_pct]`` — high-volatility regimes widen (fewer premature
     stops), low-volatility regimes narrow (the model still gets a signal).
+
+    ``vol_pct`` (Phase P3) replaces the ATR proxy with a **forecast conditional
+    volatility expressed as a fraction of price** (``0.0045`` = 0.45 %/bar) — the
+    same unit as ``min_pct``/``max_pct`` and the same value
+    ``PositionSizer.barrier_widths_pct`` returns, so no percent/fraction guessing
+    happens here.  A scalar is broadcast to every bar; a Series is aligned by
+    index and forward/back-filled over NaNs.  ``None`` (the default, and what
+    every existing caller passes) keeps the ATR path byte-identical — this
+    parameter is the only thing P3 added here.  ``vol_multiple`` is the number of
+    forecast sigmas the barrier sits at (1.0 = one sigma).
+
+    Why a forecast rather than ATR: ATR is a *backward* average of true range,
+    so it reacts to a regime change only after it has persisted, while the
+    forecast is conditional on the latest squared returns (RiskMetrics/GARCH).
+    Both are clamped by ``[min_pct, max_pct]`` so neither can produce an
+    untradeable barrier.
     """
-    atr = rolling_atr(df, atr_period)
     close = df["close"].astype(float)
+    if vol_pct is not None:
+        if isinstance(vol_pct, pd.Series):
+            vol = vol_pct.reindex(df.index).astype(float)
+            vol = vol.ffill().bfill()
+        else:
+            vol = pd.Series(float(vol_pct), index=df.index, dtype=float)
+        width = (float(vol_multiple) * vol).clip(lower=min_pct, upper=max_pct)
+        width = width.bfill().fillna(min_pct)
+        return width, width
+    atr = rolling_atr(df, atr_period)
     width = (atr_multiple * atr / close).clip(lower=min_pct, upper=max_pct)
     width = width.bfill().fillna(min_pct)
     return width, width
@@ -193,6 +220,8 @@ def create_triple_barrier_label_vol(
     max_pct: float = 0.06,
     timeout_label: float | None = 2.0,
     max_rows: int | None = None,
+    vol_pct: float | pd.Series | None = None,
+    vol_multiple: float = 1.0,
 ) -> pd.Series:
     """Path-aware, volatility-scaled triple-barrier label.
 
@@ -212,6 +241,11 @@ def create_triple_barrier_label_vol(
 
     ``max_rows`` keeps the O(n × horizon) scan bounded for research use (the
     most recent ``max_rows`` bars are labelled, earlier rows become ``NA``).
+
+    ``vol_pct`` / ``vol_multiple`` (Phase P3) are forwarded to
+    :func:`barrier_widths`: a forecast conditional volatility as a **fraction** of
+    price replaces the ATR proxy.  ``None`` leaves every existing number
+    untouched.
     """
     n = len(df)
     high = df["high"].values.astype(np.float64)
@@ -219,7 +253,8 @@ def create_triple_barrier_label_vol(
     close = df["close"].values.astype(np.float64)
     up_w, lo_w = barrier_widths(
         df, atr_period=atr_period, atr_multiple=atr_multiple,
-        min_pct=min_pct, max_pct=max_pct)
+        min_pct=min_pct, max_pct=max_pct,
+        vol_pct=vol_pct, vol_multiple=vol_multiple)
     up_w = up_w.values.astype(np.float64)
     lo_w = lo_w.values.astype(np.float64)
 

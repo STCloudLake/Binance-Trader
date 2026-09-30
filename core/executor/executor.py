@@ -61,6 +61,11 @@ class OrderExecutor:
         self._gate_active = 0
         #: Diagnostic only: which loops currently have a mutation registered.
         self._active_loops: dict[int, int] = {}
+        #: symbol → (monotonic_ts, forecast vol %) published by the predictor
+        #: (Phase P3).  Empty by default: with ``risk.vol_targeting.enabled``
+        #: false nothing ever writes it and the stop path is the fixed-percentage
+        #: one — see :meth:`vol_stop_ctx`.
+        self._forecast_vol_cache: dict[str, tuple[float, float]] = {}
 
     # ---- trade gate ------------------------------------------------------
     def _enter_mutation(self) -> None:
@@ -322,6 +327,11 @@ class OrderExecutor:
                     "unrealized_pnl": float(snap.get("unrealized_pnl") or 0),
                     "stop_loss": sl,
                     "entry_stop_loss": snap.get("entry_stop_loss", sl),
+                    # Phase P3: restored so a position that survived a restart is
+                    # still trailed with the width its entry stop was sized from.
+                    # Absent (all pre-P3 snapshots) → None → the guard falls back
+                    # to the fixed percentage or a fresh forecast.
+                    "stop_vol_pct": snap.get("stop_vol_pct"),
                     "take_profits": parse_levels(snap.get("take_profits")),
                     "position_type": snap.get("position_type") or "satellite",
                     # Restored from the recorded basis, not re-derived from a
@@ -412,6 +422,77 @@ class OrderExecutor:
                         f"({len(snapshots)} from the positions snapshot)")
         except Exception as e:
             logger.warning(f"Failed to restore positions: {e}")
+
+    #: How long a stop-width forecast is reused (seconds).  Opening a position
+    #: must not add a REST round-trip per order: the width is stable over minutes
+    #: and only used when ``risk.vol_targeting.enabled`` is on.
+    _VOL_STOP_TTL_SEC = 300.0
+
+    def vol_stop_ctx(self, symbol: str, vol_pct: float | None = None) -> dict:
+        """Volatility-scaled stop width for a new position (Phase P3).
+
+        Returns ``{}`` — the documented no-op — when ``risk.vol_targeting`` is
+        absent/disabled, so with the shipped default ``enabled: false`` this
+        method cannot alter a single fill.  Otherwise it returns::
+
+            {"vol_pct": <forecast %/bar>, "stop_pct": <stop distance %>,
+             "stop_loss": <price or None>}
+
+        ``stop_pct`` is produced by the **shared** ``PositionSizer`` helper, so the
+        live stop a position opens with is computed by the same code that the
+        trailing updater and the backtest engines use — one definition of
+        "forecast-scaled stop", not three.
+
+        ``vol_pct`` may be supplied by the caller (an upstream predictor already
+        has the frame); when omitted the cached forecast for the symbol is used,
+        and when that is unavailable the result is ``{}`` — i.e. the caller's
+        fixed percentage stands.  That is the documented fallback, not an error.
+        """
+        vt = getattr(self.config, "risk_vol_targeting", None)
+        if vt is None or not getattr(vt, "enabled", False):
+            return {}
+        vol = vol_pct
+        if vol is None:
+            vol = self._cached_forecast_vol_pct(symbol)
+        try:
+            vol = float(vol)
+        except (TypeError, ValueError):
+            return {}
+        if not (vol > 0.0):
+            return {}
+        from core.risk.position_sizer import PositionSizer
+        sizer = PositionSizer(
+            self.config.hard_limits, self.config.soft_params,
+            getattr(self.config, "core_capital_pct", 0.7),
+            getattr(self.config, "satellite_capital_pct", 0.3), vt)
+        return {"vol_pct": vol, "stop_pct": sizer.stop_distance_pct(vol)}
+
+    def set_forecast_vol_pct(self, symbol: str, vol_pct: float | None) -> None:
+        """Publish the latest forecast vol (%) for ``symbol`` to the stop path.
+
+        The live predictor owns the price frame, so it is the cheapest place to
+        compute the forecast; pushing it here keeps :meth:`vol_stop_ctx`
+        synchronous at order time.  ``None`` clears the entry (→ fixed fallback).
+        """
+        if vol_pct is None:
+            self._forecast_vol_cache.pop(str(symbol), None)
+            return
+        try:
+            val = float(vol_pct)
+        except (TypeError, ValueError):
+            return
+        if val > 0.0:
+            self._forecast_vol_cache[str(symbol)] = (time.monotonic(), val)
+
+    def _cached_forecast_vol_pct(self, symbol: str) -> float | None:
+        entry = self._forecast_vol_cache.get(str(symbol))
+        if entry is None:
+            return None
+        ts, val = entry
+        if time.monotonic() - ts > self._VOL_STOP_TTL_SEC:
+            self._forecast_vol_cache.pop(str(symbol), None)
+            return None
+        return val
 
     async def _persist_position(self, db, pos: dict) -> None:
         """Upsert ``pos`` into the ``positions`` snapshot table (same connection).
@@ -572,6 +653,18 @@ class OrderExecutor:
         # No "overwriting an existing position" branch any more: the guard above
         # runs inside the per-symbol lock, so reaching here means `_positions`
         # holds no position for this symbol.
+        #
+        # Phase P3: a volatility-scaled stop width overrides the caller's fixed
+        # percentage *only* when `risk.vol_targeting.enabled` is on (else
+        # `vol_stop_ctx` returns `{}` and nothing below changes).  `stop_vol_pct`
+        # is remembered on the position so `PositionGuard` trails with the same
+        # width this entry stop was built from instead of re-forecasting per tick.
+        stop_sl = data.get("stop_loss")
+        vol_ctx = self.vol_stop_ctx(symbol)
+        if vol_ctx and float(stop_sl or 0) > 0:
+            stop_pct = float(vol_ctx["stop_pct"]) / 100.0
+            stop_sl = (cost_basis * (1 - stop_pct) if side == "long"
+                       else cost_basis * (1 + stop_pct))
         self._positions[symbol] = {
             "symbol": symbol,
             "side": side,
@@ -583,8 +676,9 @@ class OrderExecutor:
             "entry_price": cost_basis,
             "current_price": fill_price,
             "unrealized_pnl": 0,
-            "stop_loss": data.get("stop_loss"),
-            "entry_stop_loss": data.get("stop_loss"),
+            "stop_loss": stop_sl,
+            "entry_stop_loss": stop_sl,
+            "stop_vol_pct": vol_ctx.get("vol_pct"),
             "take_profits": list(data.get("take_profits") or []),
             "position_type": data.get("position_type", "satellite"),
             "position_value": qty * cost_basis,
@@ -784,6 +878,11 @@ class OrderExecutor:
             if price == 0:
                 price = float(data.get("price", 0) or 0)
             trade_group = str(uuid.uuid4())[:8]
+            # Phase P3 stop-width plumbing (no-op with vol targeting off, since
+            # `vol_stop_ctx` returns {}): the live position records the same
+            # forecast context the sim path does, so PositionGuard trails both
+            # book types identically.
+            live_vol_ctx = self.vol_stop_ctx(symbol)
             self._positions[symbol] = {
                 "symbol": symbol,
                 "side": data.get("side", "long"),
@@ -792,6 +891,7 @@ class OrderExecutor:
                 "current_price": price,
                 "unrealized_pnl": 0,
                 "stop_loss": data.get("stop_loss"),
+                "stop_vol_pct": live_vol_ctx.get("vol_pct"),
                 "position_type": data.get("position_type", "satellite"),
                 "position_value": qty * price,
                 "amount_usdt": data.get("amount_usdt", qty * price),

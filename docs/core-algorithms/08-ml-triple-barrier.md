@@ -4,6 +4,18 @@
 > `core/ml/labels.py` 对齐；原「效用分析」表**无仓库来源**，已按审计要求标记为
 > 示意/非实测（见 §效用分析）。ML 生产默认 `ml.enabled: false`，只有通过
 > OOS 门槛的模型才允许上线。
+>
+> **状态（Phase P3 更新）**：barrier 宽度**默认值未变**（仍是
+> `atr_multiple × ATR / close`，clamp 到 `[0.004, 0.06]`，见 §1）。P3 只是额外
+> 增加了一条**可选**路径：`barrier_widths(df, vol_pct=..., vol_multiple=...)` /
+> `create_triple_barrier_label_vol(..., vol_pct=...)` 可以用
+> `core/ml/volatility.forecast_vol` 的条件波动率预报替代 ATR 代理。
+> `vol_pct=None`（默认，也是所有现有调用）走原路径，逐位相同，有回归测试
+> （`tests/test_volatility_targeting.py`）。配置项是 `risk.vol_targeting`
+> 下的 `barrier_vol_multiple` / `barrier_min_pct` / `barrier_max_pct`，整块默认
+> `enabled: false`。详见 [10-volatility-targeting.md](10-volatility-targeting.md)。
+> 目标波动率实测（BTCUSDT 1h，8 846 根）：目标 0.45 %/bar（全样本 200 根块
+> realized vol 中位数 0.4064），当前 EWMA 预报 0.5242 %/bar（≈ 年化 49.06 %）。
 
 ## 算法原理
 

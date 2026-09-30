@@ -1047,6 +1047,13 @@ class BacktestEngine:
                         break  # one interval is enough
 
             # --- CHECK EXITS ---
+            # One full-history slice per (symbol, timeframe) per timestamp is
+            # enough: with per-genome ledgers a chunk can hold 2×N positions in
+            # the SAME symbol, and slicing the whole feed once per position per
+            # bar was O(positions × bars) — the reason a 20-genome GA chunk took
+            # 6 minutes for a 1-month window. The cached slice is exactly what
+            # `df_tf[df_tf.index <= ts]` produced, so results are unchanged.
+            _price_slice_cache: dict[tuple[str, str], pd.DataFrame] = {}
             for pos_key in list(positions.keys()):
                 pos = positions[pos_key]
                 sym = pos["symbol"]
@@ -1058,8 +1065,12 @@ class BacktestEngine:
                 price_now = 0.0
                 pos_tf = pos.get("timeframe", "1h")
                 try:
-                    df_tf = feeder.get_all_data_for_symbol(sym, pos_tf)
-                    df_slice = df_tf[df_tf.index <= ts]
+                    _slice_key = (sym, pos_tf)
+                    df_slice = _price_slice_cache.get(_slice_key)
+                    if df_slice is None:
+                        df_tf = feeder.get_all_data_for_symbol(sym, pos_tf)
+                        df_slice = df_tf[df_tf.index <= ts]
+                        _price_slice_cache[_slice_key] = df_slice
                     if len(df_slice) > 0:
                         price_now = float(df_slice.iloc[-1]["close"])
                 except Exception:
@@ -1458,27 +1469,39 @@ class BacktestEngine:
         # GA selection used to score pure market drift as alpha (a synthetic
         # random walk scored Sharpe 13.7).  The equal-weighted buy & hold return
         # of the run's window is the beta baseline the fitness subtracts.
+        # Cached per (data_dir, symbols, window): a GA chunk reuses the identical
+        # benchmark for every genome, so it is computed once per window.
         buy_hold_pct = None
         try:
             if equity_curve:
                 first_ts = pd.Timestamp(equity_curve[0]["time"])
                 last_ts_bh = pd.Timestamp(equity_curve[-1]["time"])
-                rets = []
-                for sym in symbols:
-                    df_bh = feeder.get_all_data_for_symbol(sym, "1h")
-                    if df_bh is None or len(df_bh) < 2:
-                        continue
-                    window = df_bh[(df_bh.index >= first_ts) & (df_bh.index <= last_ts_bh)]
-                    if len(window) < 2:
-                        window = df_bh[df_bh.index <= last_ts_bh]
-                    if len(window) < 2:
-                        continue
-                    first_close = float(window.iloc[0]["close"])
-                    last_close = float(window.iloc[-1]["close"])
-                    if first_close > 0:
-                        rets.append((last_close - first_close) / first_close)
-                if rets:
-                    buy_hold_pct = sum(rets) / len(rets) * 100.0
+                _bh_key = (str(getattr(self.config, "data_dir", "")),
+                           tuple(symbols), first_ts, last_ts_bh)
+                _bh_cache = getattr(self, "_buy_hold_cache", None)
+                if _bh_cache is None:
+                    _bh_cache = {}
+                    self._buy_hold_cache = _bh_cache
+                if _bh_key in _bh_cache:
+                    buy_hold_pct = _bh_cache[_bh_key]
+                else:
+                    rets = []
+                    for sym in symbols:
+                        df_bh = feeder.get_all_data_for_symbol(sym, "1h")
+                        if df_bh is None or len(df_bh) < 2:
+                            continue
+                        window = df_bh[(df_bh.index >= first_ts) & (df_bh.index <= last_ts_bh)]
+                        if len(window) < 2:
+                            window = df_bh[df_bh.index <= last_ts_bh]
+                        if len(window) < 2:
+                            continue
+                        first_close = float(window.iloc[0]["close"])
+                        last_close = float(window.iloc[-1]["close"])
+                        if first_close > 0:
+                            rets.append((last_close - first_close) / first_close)
+                    if rets:
+                        buy_hold_pct = sum(rets) / len(rets) * 100.0
+                    _bh_cache[_bh_key] = buy_hold_pct
         except Exception as e:  # never let the benchmark break a backtest
             logger.debug(f"Buy&hold benchmark unavailable: {e}")
         metrics["buy_hold_pct"] = round(buy_hold_pct, 4) if buy_hold_pct is not None else None

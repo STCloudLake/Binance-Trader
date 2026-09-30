@@ -1,4 +1,5 @@
 import asyncio
+import time
 from loguru import logger
 
 from app.event_bus import EventBus, Event, EventType
@@ -13,7 +14,26 @@ class PositionGuard:
        locking in profits without waiting for the next strategy kline.
     2. Emergency stop — force-closes any position whose unrealized PnL% drops
        below the configured emergency threshold.
+
+    Phase P3 adds a third dimension to the trailing stop: its **distance** can be
+    driven by a forecast conditional volatility instead of a fixed percentage.
+    Science: conditional volatility is predictable (ARCH/GARCH — Tsay ch. 3) while
+    the sign of the next return is not, so the forecast is spent on risk.  A
+    turbulent regime widens the trailing distance (fewer premature exits), a calm
+    one tightens it (profits are given back less).  The switch is
+    ``risk.vol_targeting.enabled`` and ships **false**, so the default path below
+    is the unchanged fixed-percentage one.
     """
+
+    #: How long a forecast is reused before the history is re-read (seconds).  The
+    #: guard ticks every ``_check_interval_sec``; without this cache it would hit
+    #: the exchange for klines on every tick.
+    _VOL_CACHE_TTL_SEC = 300.0
+    #: Bars requested per refresh — enough for the estimator's window to matter,
+    #: cheap enough to keep the REST call small.
+    _VOL_HISTORY_LIMIT = 600
+    #: Interval used when a position does not record its own timeframe.
+    _DEFAULT_INTERVAL = "1h"
 
     def __init__(self, config: Config, event_bus: EventBus):
         self.config = config
@@ -24,18 +44,80 @@ class PositionGuard:
         self._risk_manager = None
         self._task: asyncio.Task | None = None
         self._check_interval_sec = 15  # check every 15 seconds
-        # Shared trailing-distance helper (same semantics as the backtest engines)
+        # (symbol, interval) → (monotonic_timestamp, vol_pct)
+        self._vol_cache: dict[tuple[str, str], tuple[float, float]] = {}
+        # Shared trailing-distance helper (same semantics as the backtest engines).
+        #
+        # NOTE: `risk.vol_targeting` is passed through so the *live* trailing
+        # distance can scale with the forecast.  Sizing itself is consumed by
+        # `core/risk/manager.py:check_signal`, which is outside this phase's write
+        # scope: enabling the block scales the guard's stop width here, while the
+        # notional target only takes effect where a caller supplies
+        # `forecast_vol_pct` to `PositionSizer.calculate_position_size`.
         from core.risk.position_sizer import PositionSizer
         self._sizer = PositionSizer(
             config.hard_limits, config.soft_params,
             getattr(config, "core_capital_pct", 0.7),
             getattr(config, "satellite_capital_pct", 0.3),
+            getattr(config, "risk_vol_targeting", None),
         )
 
     def wire(self, executor, market_data, risk_manager=None):
         self._executor = executor
         self._market_data = market_data
         self._risk_manager = risk_manager
+
+    # ── volatility plumbing (Phase P3) ──────────────────────────────────
+
+    def vol_targeting_enabled(self) -> bool:
+        """True only when ``risk.vol_targeting.enabled`` is set in the config."""
+        return self._sizer.vol_targeting_enabled()
+
+    async def forecast_vol_pct(self, symbol: str, interval: str | None = None,
+                               timeframe: str | None = None) -> float | None:
+        """Forecast conditional volatility in **percent of price per bar**.
+
+        Returns ``None`` whenever the forecast is unavailable — vol targeting off,
+        no market-data source, a short/failed history, or a zero estimate.  Every
+        caller then falls back to the fixed percentage, which is the documented
+        behaviour and what keeps this change inert by default.
+        """
+        if not self.vol_targeting_enabled():
+            return None
+        if not self._market_data:
+            return None
+        vt = self._sizer.vol_targeting
+        tf = interval or timeframe or self._DEFAULT_INTERVAL
+        key = (str(symbol), str(tf))
+        now = time.monotonic()
+        cached = self._vol_cache.get(key)
+        if cached is not None and now - cached[0] < self._VOL_CACHE_TTL_SEC:
+            return cached[1]
+        getter = getattr(self._market_data, "get_historical", None)
+        if getter is None:
+            return None
+        try:
+            df = await getter(symbol, tf, limit=self._VOL_HISTORY_LIMIT)
+        except Exception as e:  # never let a data hiccup break the risk loop
+            logger.warning(f"PositionGuard: vol history unavailable for {symbol} "
+                           f"{tf}: {e}")
+            return None
+        if df is None or len(df) < 2:
+            return None
+        try:
+            from core.ml.volatility import forecast_vol, to_pct
+            vol = to_pct(forecast_vol(
+                df, method=getattr(vt, "method", "ewma"),
+                window=int(getattr(vt, "window", 500)),
+                lam=float(getattr(vt, "lam", 0.94)),
+                interval=tf))
+        except Exception as e:
+            logger.warning(f"PositionGuard: vol forecast failed for {symbol}: {e}")
+            return None
+        if not vol or vol <= 0.0:
+            return None
+        self._vol_cache[key] = (now, float(vol))
+        return float(vol)
 
     async def start(self):
         self._running = True
@@ -145,6 +227,30 @@ class PositionGuard:
             }))
             logger.info(f"Emergency stop: {symbol} closed, PnL={trade_pnl:.2f}, Balance={new_balance:.0f}")
 
+    async def _resolve_vol_pct(self, symbol: str, pos: dict) -> float | None:
+        """Forecast vol (%) for a position, honouring its recorded entry width.
+
+        A position opened while vol targeting was on carries ``stop_vol_pct`` —
+        the forecast volatility captured **at entry**.  Reusing it keeps the stop
+        width of an open trade stable (a stop that re-widens every 15 s as the
+        forecast jitters is a stop nobody can reason about), and it is the same
+        value the entry-time stop was computed from.  Positions without it (all
+        positions while the switch is off, and everything opened before P3) get
+        ``None`` and therefore the fixed distance.
+        """
+        if not self.vol_targeting_enabled():
+            return None
+        recorded = pos.get("stop_vol_pct")
+        if recorded is not None:
+            try:
+                val = float(recorded)
+            except (TypeError, ValueError):
+                val = 0.0
+            if val > 0.0:
+                return val
+        return await self.forecast_vol_pct(
+            symbol, timeframe=pos.get("timeframe"))
+
     async def _update_trailing_stop(self, symbol: str, pos: dict, price: float,
                                      side: str, _pnl_pct: float):
         """Move stop_loss toward current price, but only in the favorable direction.
@@ -154,11 +260,18 @@ class PositionGuard:
         # (from strategy.risk_exit) wins, otherwise the shared PositionSizer helper
         # reads hard_limits.trailing_stop_distance_pct / trailing_stop_enabled. This
         # keeps live trailing identical to what the backtest engines simulate.
+        #
+        # Phase P3: when `risk.vol_targeting.enabled` and a forecast is available,
+        # the same helper returns a forecast-scaled distance instead of the fixed
+        # 2 %.  With the switch off (default) `vol_pct` is None and the number is
+        # exactly the pre-P3 one.
         override = pos.get("trailing_stop_pct")
         if override is not None:
             distance_pct = float(override)
         else:
-            distance_pct = self._sizer.trailing_stop_distance_pct()
+            vol_pct = await self._resolve_vol_pct(symbol, pos)
+            distance_pct = self._sizer.trailing_stop_distance_pct(
+                forecast_vol_pct=vol_pct)
         if distance_pct <= 0:
             return
         current_sl = pos.get("stop_loss")
@@ -167,7 +280,12 @@ class PositionGuard:
         if side == "long":
             new_sl = price * (1 - distance_pct / 100)
             entry_sl = entry * (1 - distance_pct / 100)
-            floor_sl = max(entry_sl, entry * 0.99)  # at worst 1% below entry
+            # Floor: the pre-P3 "at worst 1% below entry", generalised so a wide
+            # vol-scaled distance still cannot place the stop between price and
+            # entry-level protection... it stays the WIDER of the two, i.e. the
+            # floor never tightens a legitimately wide stop.
+            floor_pct = max(1.0, distance_pct)
+            floor_sl = max(entry_sl, entry * (1 - floor_pct / 100))
             if current_sl:
                 new_sl = max(new_sl, current_sl, floor_sl)  # only move up, respect floor
             else:
@@ -175,7 +293,8 @@ class PositionGuard:
         else:  # short
             new_sl = price * (1 + distance_pct / 100)
             entry_sl = entry * (1 + distance_pct / 100)
-            ceiling_sl = min(entry_sl, entry * 1.01)  # at worst 1% above entry
+            ceiling_pct = max(1.0, distance_pct)
+            ceiling_sl = min(entry_sl, entry * (1 + ceiling_pct / 100))
             if current_sl:
                 new_sl = min(new_sl, current_sl, ceiling_sl)  # only move down, respect ceiling
             else:

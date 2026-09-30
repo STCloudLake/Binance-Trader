@@ -175,6 +175,41 @@ class SignalWeights(BaseModel):
     news: float = 0.2
 
 
+class VolTargetingConfig(BaseModel):
+    """Volatility-targeting knobs (Phase P3) — ``risk.vol_targeting`` in YAML.
+
+    Science: conditional volatility is predictable (ARCH/GARCH — Tsay,
+    *Analysis of Financial Time Series*, ch. 3) while the *sign* of the next
+    return is not, so the forecast is spent on risk rather than direction
+    (``docs/core-algorithms/10-volatility-targeting.md``).
+
+    **SAFE DEFAULT: ``enabled = False``.**  Every other field is inert until the
+    switch is on, so the shipped behaviour of sizing, stops and barriers is
+    bit-identical to the fixed-percentage implementation that P1/P2 measured.
+    The whole block is opt-in precisely because the measured effect is
+    regime-dependent and must be A/B-tested before it manages real money.
+
+    Units: ``target_vol_pct`` and the ``stop_*``/``barrier_*`` widths are percent
+    of price **per bar** (0.45 = 0.45 %/bar); ``lam``/``window`` configure the
+    estimator in :mod:`core.ml.volatility`.
+    """
+
+    enabled: bool = False
+    method: str = "ewma"
+    lam: float = 0.94
+    window: int = 500
+    target_vol_pct: float = 0.45
+    max_scale: float = 2.0
+    min_scale: float = 0.25
+    max_position_notional_pct: float = 10.0
+    stop_vol_multiple: float = 3.0
+    stop_min_pct: float = 0.5
+    stop_max_pct: float = 6.0
+    barrier_vol_multiple: float = 1.0
+    barrier_min_pct: float = 0.004
+    barrier_max_pct: float = 0.06
+
+
 class Config:
     _instance = None
 
@@ -411,6 +446,42 @@ class Config:
             rp = self._get("risk_params", {})
             soft = rp.get("soft_params", {}) if isinstance(rp, dict) else {}
         self.soft_params = SoftRiskParams(**soft) if soft else SoftRiskParams()
+
+        # ── Volatility targeting (docs/overhaul/ALGO_UPGRADE_PLAN.md §二 P3) ──
+        # `risk.vol_targeting` in config.yaml.  SAFE DEFAULT: disabled, so the
+        # sizing / stop / barrier paths keep their pre-P3 fixed-percentage
+        # behaviour unless an operator turns it on deliberately.
+        risk_cfg = self._get("risk", {})
+        vt_raw = risk_cfg.get("vol_targeting", {}) if isinstance(risk_cfg, dict) else {}
+        if not isinstance(vt_raw, dict):
+            vt_raw = {}
+        try:
+            self.risk_vol_targeting = VolTargetingConfig(**vt_raw)
+        except Exception as e:  # a bad type must not stop trading
+            logger.warning(f"Invalid risk.vol_targeting block ({e}) — using defaults "
+                           f"(vol targeting disabled)")
+            self.risk_vol_targeting = VolTargetingConfig()
+        vt = self.risk_vol_targeting
+        if str(vt.method).strip().lower() not in (
+                "ewma", "realized_cc", "realized_parkinson",
+                "realized_garman_klass", "garch11"):
+            logger.warning(f"Invalid risk.vol_targeting.method '{vt.method}', "
+                           f"falling back to 'ewma'")
+            vt.method = "ewma"
+        if not 0.0 <= vt.lam < 1.0:
+            logger.warning(f"Invalid risk.vol_targeting.lam '{vt.lam}', falling back to 0.94")
+            vt.lam = 0.94
+        if vt.target_vol_pct <= 0.0:
+            logger.warning("risk.vol_targeting.target_vol_pct must be > 0 — "
+                           "vol targeting disabled")
+            vt.enabled = False
+        if vt.min_scale > vt.max_scale:
+            logger.warning(f"risk.vol_targeting.min_scale {vt.min_scale} > max_scale "
+                           f"{vt.max_scale} — swapped so the band is usable")
+            vt.min_scale, vt.max_scale = vt.max_scale, vt.min_scale
+        # Exposed for callers that only have `config` in hand (PositionSizer,
+        # PositionGuard) without importing the model.
+        self.vol_targeting = vt
 
         self.db_path = str(PROJECT_ROOT / "data" / "binance_trader.db")
         self.data_dir = str(PROJECT_ROOT / "data")
