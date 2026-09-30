@@ -92,17 +92,20 @@ def test_int_index_fallback_cannot_silently_pass_the_gap_guard():
     """F1: the old fallback frame's index dtype made the guard inert.
 
     Documents the defect *and* proves it is unreachable now: the manager never
-    builds a frame from bare floats, and a hand-built RangeIndex still cannot
-    masquerade as a guarded series.
+    builds a frame from bare floats, and a hand-built RangeIndex is **refused**
+    rather than silently compared as 1-second bars (a non-datetime index is not a
+    series the guard can clear — see the closure-audit LOW-6 fix).
     """
     from core.risk.manager import _series_has_gap
 
     closes = list(_walk(300))
     bare = pd.DataFrame({"close": closes})              # the audited fallback
     assert bare.index.dtype == np.dtype("int64"), "the defect's precondition"
-    assert _series_has_gap(bare.index, "1h") is False, (
-        "a RangeIndex (0,1,2…) is compared as 1-second bars, so the guard never "
-        "fires")
+    assert _series_has_gap(bare.index, "1h") is True, (
+        "a RangeIndex (0,1,2…) is unreadable as a timeline, so the guard fails "
+        "closed instead of reporting 'no gap'")
+    # An unknown interval stays inert: the guard has no bar length to judge by.
+    assert _series_has_gap(bare.index, "7h") is False
 
     # Same prices, real timestamps, one 100-bar hole: the guard fires.
     idx = pd.date_range("2026-01-01", periods=300, freq="1h")

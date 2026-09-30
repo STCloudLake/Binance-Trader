@@ -273,8 +273,11 @@ def merge_history(existing: pd.DataFrame | None,
     then to leaving the stamp alone), so the store converges on one convention.
     Rows whose bar did **not** conflict keep their own stamp and label untouched —
     exactly what ``scripts/download_history.py`` promises — and a genuine second
-    bar is never collapsed, however close its stamp is (the 54 one-millisecond
-    neighbours in the live ``1h`` cache are 55 distinct hours).
+    bar is never collapsed, however close its stamp is (at revision ``0542e02`` the
+    live ``1h`` cache held 54 one-millisecond-neighbour pairs, the close of hour
+    ``H-1`` beside the open of hour ``H``: 55 distinct hours; measured at revision
+    ``09125bd`` the file holds **0** such pairs, its closest pair being exactly
+    1 h / 3 600 s apart).
 
     ``interval=None`` (and labels with no usable grid, e.g. an unknown timeframe)
     keeps the historical exact-timestamp union; :meth:`OHLVCache.save` always

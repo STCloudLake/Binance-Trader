@@ -146,10 +146,17 @@ BTCUSDT, `recent_quote_volume` **pinned** so the two runs price the same window)
 sit here (a 1.0 BTC Δ of `+178.8965` / `+894.4824` = `+2.36 %` / `+11.82 %`, and a
 `0.8288` impact line) were **not reproducible against the window quoted one table
 above**: a 1.0 BTC order is 0.011 % of a 750 M USDT window, so the code gives
-`+1.7455` (+0.0021 %), not `+178.8965`. Working backwards, `+178.8965` belongs to a
-window of ≈ 7.1 × 10⁵ USDT too, i.e. the three quoted figures implied three
-different windows (750.66 M in the table, ≈ 756.78 M in the Δ rows, ≈ 541.7 M in
-the breakdown), none of them stated. The tables below are re-measured in one pass
+`+1.7455` (+0.0021 %), not `+178.8965`. Working backwards from
+`total_impact_usdt(e, e, v, 0.1) = 2·e·0.1·√(e/v)/100` at the table's
+83 043.14 USDT price, `+178.8965` implies a window of **71 576.03 USDT**
+(7.16 × 10⁴ — an order of magnitude *smaller* than the ≈ 7.1 × 10⁵ previously
+claimed here) and `+894.4824` implies a window of **2 863.04 USDT**: the retired
+pair sits in a 1:5 ratio for a 1:10 size step, i.e. it is linear in size, where the
+shipped square-root law scales as size^1.5 (×31.62). The retired `0.8288` line is
+the one figure that *does* belong to the window the table names — at
+750,661,812.73 USDT the code returns **0.828812** — so the old figures implied at
+least three mutually inconsistent windows, none of them stated. The tables below
+are re-measured in one pass
 against **one explicitly named window**, and the window moves whenever the running
 service appends a bar — so the *shape* is the claim, the exact window is a
 timestamped measurement.
@@ -229,9 +236,10 @@ Per-trade breakdown from `total_costs_with_impact` for a 0.6 BTC round trip at
 
 That split is the point: the impact line is *visible* next to fees and spread
 instead of being folded invisibly into PnL. (The previous `0.8288` on this line
-belonged to a ≈ 729.2 M USDT window, 3 % away from the quoted 750.66 M one — the
-same unstated-window defect as the Δ rows. On the window named above the code
-returns 0.8281.)
+reproduces on the window the table names — 0.828812 at 750,661,812.73 USDT, not on
+an unstated ≈ 729.2 M window, which would return 0.840920. It is the retired Δ
+rows, not this line, that belonged to windows of their own. On the window named
+above the code returns 0.8281.)
 
 ## 4. Limits — read this before setting a non-zero `impact_k`
 

@@ -276,8 +276,8 @@ def probabilistic_sharpe(n: int, mean: float, sd: float,
     was ``Φ(mean/se)``, which made the gate's ``AND`` exactly ``t > 2`` and the
     ``PSR >= 0.95`` floor dead weight.  It genuinely reads them now, so the two
     floors are a real conjunction: measured on a fat-left-tailed series with
-    ``t = 2.0`` the corrected PSR is **0.937 < 0.95** (refused), while the normal
-    approximation would report 0.977 (allowed).  See
+    ``t = 2.0`` the corrected PSR is **0.9480 < 0.95** (refused), while the normal
+    approximation would report 0.9772 (allowed).  See
     ``tests/test_reaudit_fixes.py::test_psr_floor_is_stricter_than_the_t_floor_for_fat_tails``.
 
     ``returns`` is optional for backwards compatibility and for callers that hold
@@ -800,8 +800,8 @@ def credibility_gate(
     Prado's ``Φ((mean − benchmark)/SE_adj)`` with
     ``SE_adj ∝ √(1 − γ₃·SR + (γ₄−1)/4·SR²)``.  A fat left tail or a fat right tail
     widens that standard error, so the PSR at ``t = 2`` can sit below 0.95
-    (measured: **0.937** on a fat-left-tailed sample at ``t = 2.0``, where the
-    normal approximation reports 0.977).  This is the *fixed* version of a claim
+    (measured: **0.9480** on a fat-left-tailed sample at ``t = 2.0``, where the
+    normal approximation reports 0.9772).  This is the *fixed* version of a claim
     that used to be false: the function was ``Φ(mean/se)`` with no moment terms,
     which made the ``PSR`` floor nothing but ``t >= 1.645`` and the conjunction
     exactly ``t > 2``.  AND keeps both the audited t floor and the now-real
@@ -853,8 +853,8 @@ def credibility_gate(
     #    audited value (measured: t=1.65, PSR=0.9505 → allowed).  The floors are
     #    NOT redundant *now*: `probabilistic_sharpe` applies Prado's
     #    skew/kurtosis correction (re-audit finding 4), so a fat tail at t=2 puts
-    #    the PSR below 0.95 (measured 0.937) where the old `Φ(mean/se)` reported
-    #    0.977 — the second floor is a real condition, which is what this
+    #    the PSR below 0.95 (measured 0.9480) where the old `Φ(mean/se)` reported
+    #    0.9772 — the second floor is a real condition, which is what this
     #    conjunction always claimed.  AND is strictly stricter than OR: it can
     #    only refuse more.
     if t_stat is None or psr is None:

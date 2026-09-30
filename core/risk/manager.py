@@ -73,19 +73,45 @@ def _series_has_gap(index, interval: str, max_bars: float = _VOL_MAX_GAP_BARS) -
     The cheapest possible sanity check on a price series before it is fed to a
     variance estimator: an unknown interval (no bar length known) returns False,
     i.e. the guard is inert rather than wrongly refusing a forecast.
+
+    The stamps are folded onto the declared **bar key** before they are differenced
+    (:func:`core.market_data.ohlcv_cache.bar_keys` — the same interval-aware rule
+    the cache's write path and ``scripts/download_history.py`` apply).  A bar stored
+    under the other timestamp convention is the *next* bar, not a hole: the live
+    ``data/market/BTCUSDT/1h.parquet`` ends ``…06:00:00`` → ``…07:59:59.999``, a raw
+    delta of 1.99997 h that the old exact-stamp difference called a splice, while
+    the folded keys make it the contiguous 1.0 h step it is.  A genuinely missing
+    bar is still a 2.0 h step on the folded keys and is still refused.
+
+    A caller that passes something which is not a datetime index is **refused**
+    (``True``).  Bare integers are 1970 nanosecond epochs to pandas, so a
+    "conversion" that silently accepted a ``RangeIndex`` would disarm the guard
+    exactly as audit F1 measured; failing closed is the only safe reading of an
+    unreadable index.
     """
     bar = _INTERVAL_HOURS.get(str(interval or "").strip())
     if bar is None or bar <= 0:
         return False
     try:
-        times = sorted(t for t in index)
-        if len(times) < 3:
-            return False
-        limit = float(max_bars) * bar
-        return any((times[i] - times[i - 1]).total_seconds() / 3600.0 > limit
-                   for i in range(1, len(times)))
+        import pandas as pd
+        raw = pd.Index(index)
+        if raw.dtype.kind in "iufb":  # 0, 1, 2… — not timestamps
+            return True
+        times = pd.DatetimeIndex(sorted(pd.DatetimeIndex(raw)))
     except Exception:
+        return True
+    if len(times) < 3:
         return False
+    try:
+        from core.market_data.ohlcv_cache import bar_keys
+        keys = bar_keys(times, interval)
+    except Exception:
+        return True
+    if keys is not None:
+        times = pd.DatetimeIndex(sorted(keys))
+    limit = float(max_bars) * bar
+    return any((times[i] - times[i - 1]).total_seconds() / 3600.0 > limit
+               for i in range(1, len(times)))
 
 
 @dataclass

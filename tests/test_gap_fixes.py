@@ -366,6 +366,7 @@ def test_real_btc_cache_report_matches_its_own_content_whatever_that_is():
     """
     if not BTC_1H.exists():
         pytest.skip("no cached BTCUSDT 1h parquet in this checkout")
+    from core.market_data.ohlcv_cache import bar_keys
     from core.ml.volatility import log_returns
     from scripts.check_data_integrity import gap_report, vol_report
 
@@ -376,7 +377,14 @@ def test_real_btc_cache_report_matches_its_own_content_whatever_that_is():
     assert rep["bars"] == len(frame)
     assert rep["expected"] == int(round(rep["span_hours"] / 1.0)) + 1
     assert rep["missing"] == max(rep["expected"] - len(frame), 0)
+    # The reported timeline is the declared **bar key** (closure-audit D1): the two
+    # timestamp conventions are ``bar_length − 1 ms`` apart, so differencing raw
+    # stamps read the live ``…06:00:00`` → ``…07:59:59.999`` tail as a 1.99997 h
+    # gap with 1 missing bar.  Recomputed here from the same published rule.
     idx = pd.to_datetime(pd.Index(frame.index))
+    keys = bar_keys(idx, "1h")
+    if keys is not None:
+        idx = pd.DatetimeIndex(keys)
     idx = idx[idx.argsort()]
     assert (rep["first"], rep["last"]) == (idx[0].isoformat(), idx[-1].isoformat())
     hours = pd.Series(idx).diff().dt.total_seconds().to_numpy() / 3600.0

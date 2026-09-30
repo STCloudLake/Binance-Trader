@@ -7,7 +7,8 @@ switches off) is untouched:
 * **R1** — ``PositionGuard.forecast_vol_pct`` skipped the splice guard the
   ``RiskManager`` applies, so one cached series was "too spliced to size from" but
   still set the **live trailing-stop distance** (measured before: guard
-  ``0.41803165815 %/bar`` on the very series the manager refused with ``None``).
+  ``0.062009291811329616 %/bar`` on the very series the manager refused with
+  ``None`` — the fixture's gap-free twin gives ``0.061993341684305286 %/bar``).
 * **R2** — doc 13's impact percentages did not reproduce against the window they
   were pinned to.  Here the *formula* and the ``k = 0`` bit-identity are pinned
   (the absolute USDT deltas move with the live window, so they are a doc
@@ -131,8 +132,8 @@ def test_guard_refuses_a_spliced_series_and_the_stop_uses_the_fixed_rule(tmp_pat
 
     Before the fix the guard built its own ``DatetimeIndex`` frame and fed the
     estimator directly, so the same cache produced a forecast (measured
-    ``0.41803165815 %/bar``) whose value drove the live trailing distance; the
-    ``RiskManager`` refused the identical series with ``None``.
+    ``0.062009291811329616 %/bar``) whose value drove the live trailing distance;
+    the ``RiskManager`` refused the identical series with ``None``.
     """
     from core.risk.manager import _series_has_gap
 

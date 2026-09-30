@@ -13,8 +13,11 @@ Claims under test:
 * the fetch wrapper works against a stub (offline) and degrades to ``None``
   instead of raising when the transport fails.
 
-A live snapshot check is skipped when the network is unavailable, so the suite
-never depends on connectivity.
+**No test here touches the network.**  The "provider is available" branch is
+driven by a Binance-shaped snapshot built inside the test, so the suite cannot
+depend on connectivity, on the live tape's trade rate, or on the host's clock —
+the three things that used to make this file's last test fail in a full run and
+pass standalone (see that test's docstring).
 """
 from __future__ import annotations
 
@@ -39,6 +42,21 @@ def _book(bids, asks) -> dict:
 def _trade(qty, price, ts, buyer_maker=True) -> dict:
     return {"price": str(price), "qty": str(qty), "quoteQty": str(price * qty),
             "time": int(ts), "isBuyerMaker": buyer_maker}
+
+
+@pytest.fixture(autouse=True)
+def _restore_fetch_features_last_error():
+    """Restore ``fetch_features.last_error`` around every test in this file.
+
+    That attribute is the **only** module-global mutable state these tests touch
+    (``fetch_features`` has no module-level payload cache and no cached provider;
+    every ``MicrostructureCache`` here is a local).  It is a diagnostic, but a
+    test that read a neighbour's stale message -- e.g. in a skip reason -- would
+    be order-dependent, so this file never lets one leak out.
+    """
+    previous = fetch_features.last_error
+    yield
+    fetch_features.last_error = previous
 
 
 # ── order book features ─────────────────────────────────────────────────
@@ -232,6 +250,8 @@ def test_cache_is_bounded_and_expires_by_ttl():
 # ── fetch wrapper (stubbed: no network in the suite) ────────────────────
 
 class _StubClient:
+    """Any object with the two documented coroutines is a valid provider."""
+
     def __init__(self, book, trades, fail: bool = False):
         self._book, self._trades, self._fail = book, trades, fail
         self.calls = 0
@@ -246,6 +266,40 @@ class _StubClient:
         if self._fail:
             raise RuntimeError("boom")
         return self._trades
+
+
+def _snapshot_book(price: float = 100.0, tick: float = 0.01,
+                   levels: int = 20) -> dict:
+    """A ``/api/v3/depth`` payload: string price/qty pairs, 20 levels a side."""
+    return {
+        "lastUpdateId": 7,
+        "bids": [[f"{price - tick * (i + 1):.2f}", f"{2.0 + i:.6f}"]
+                 for i in range(levels)],
+        "asks": [[f"{price + tick * (i + 1):.2f}", f"{2.5 + i:.6f}"]
+                 for i in range(levels)],
+    }
+
+
+#: The injected tape is stamped in the past, so the live ``as_of_ms=None`` shape
+#: keeps every print whatever the wall clock says when the suite runs.
+SNAPSHOT_START_MS = 1_700_000_000_000
+SNAPSHOT_STEP_MS = 25
+SNAPSHOT_TRADES = 100
+
+
+def _snapshot_trades(count: int = SNAPSHOT_TRADES,
+                     start_ms: int = SNAPSHOT_START_MS,
+                     step_ms: int = SNAPSHOT_STEP_MS,
+                     price: float = 100.0) -> list[dict]:
+    """A ``/api/v3/trades`` payload: string price/qty + ``isBuyerMaker`` bools."""
+    out = []
+    for i in range(count):
+        px = price + (0.01 if i % 2 else -0.01)
+        out.append({"id": i, "price": f"{px:.2f}", "qty": "0.5",
+                    "quoteQty": f"{px * 0.5:.4f}",
+                    "time": int(start_ms + i * step_ms),
+                    "isBuyerMaker": bool(i % 2), "isBestMatch": True})
+    return out
 
 
 @pytest.mark.asyncio
@@ -273,25 +327,91 @@ async def test_fetch_features_degrades_to_none_on_transport_failure():
 
 @pytest.mark.asyncio
 async def test_live_snapshot_is_optional_and_correct_when_available():
-    """Skipped when the public market-data host is unreachable (offline CI)."""
-    from core.market_data.data_client import MarketDataClient
+    """**The claim: the microstructure provider is optional and correct when
+    available.**  "Available" is the live-shape payload the real
+    ``MarketDataClient`` serves -- ``/api/v3/depth`` + ``/api/v3/trades`` raw JSON
+    (string prices/quantities, ``isBuyerMaker`` booleans) -- injected here as a
+    synthetic snapshot instead of fetched.
 
-    client = MarketDataClient("https://data-api.binance.vision", timeout=10.0)
-    try:
-        feats = await fetch_features(client, "BTCUSDT")
-    except Exception as e:  # pragma: no cover - network dependent
-        pytest.skip(f"market-data host unavailable: {e}")
-    finally:
-        await client.close()
-    if feats is None:
-        pytest.skip(f"market-data host unavailable: {fetch_features.last_error}")
+    Why injected: the previous version asserted ``feats["arrival_rate_hz"] > 0``
+    on a **live** fetch.  That is a measurement of the host's tape, not a property
+    of this module, and ``fetch_features`` stamps ``as_of_ms`` *before* the two
+    requests: when the tape is busy enough that 100 prints span less than the
+    round-trip, the look-ahead filter drops every print and the rate is exactly
+    ``0.0``.  Measured on this host: 3 of 40 standalone live fetches returned
+    ``arrival_rate_hz == 0.0`` (dropped 3/90/100 of 100) -- no other test needed
+    to run first, so this was a live-timing dependence, not an ordering one.  The
+    absent/degenerate branches are asserted in the next test; here the provider
+    answers, so every feature must satisfy the documented contract.
+    """
+    client = _StubClient(_snapshot_book(), _snapshot_trades())
+    feats = await fetch_features(client, "BTCUSDT")          # the live-now shape
+
+    assert feats is not None
     assert set(FEATURE_KEYS) <= set(feats)
-    assert feats["mid"] > 0
+    assert feats["symbol"] == "BTCUSDT" and feats["source"] == "snapshot"
+    # 20 levels a side, touch 99.99/100.01 -> mid 100.00, 2 bp spread.
+    assert feats["n_depth_levels"] == 40
+    assert feats["mid"] == pytest.approx(100.0)
+    assert feats["spread_bps"] == pytest.approx(2.0)
+    assert -1.0 <= feats["ofi_depth"] <= 1.0
     assert -1.0 <= feats["ofi_trades"] <= 1.0
-    assert feats["arrival_rate_hz"] > 0        # BTCUSDT prints constantly
+    # 100 prints, 25 ms apart: span 2.475 s -> 99/2.475 = 40 Hz.
+    assert feats["trade_count"] == 100
+    assert feats["arrival_rate_hz"] == pytest.approx(40.0)
+    assert feats["dropped_future_trades"] == 0
     assert feats["trade_count"] <= 100
-    # `as_of_ms` is stamped *before* the request, so prints that arrive while it
-    # is in flight are correctly counted as unavailable at decision time — the
-    # look-ahead guard is expected to drop a few on a live fetch.
-    assert feats["dropped_future_trades"] >= 0
-    assert feats["spread_bps"] < 100.0         # a sanity band for a major
+
+    # The same snapshot at an explicit decision time differs only in the two
+    # stamps: nothing in the compute reads the wall clock.
+    stamped = await fetch_features(client, "BTCUSDT",
+                                   as_of_ms=SNAPSHOT_START_MS
+                                   + (SNAPSHOT_TRADES - 1) * SNAPSHOT_STEP_MS)
+    assert stamped is not None
+    for key in FEATURE_KEYS:
+        if key in ("as_of_ms", "book_age_ms"):
+            continue
+        assert np.isclose(stamped[key], feats[key], equal_nan=True), key
+
+
+@pytest.mark.asyncio
+async def test_an_absent_or_degenerate_snapshot_degrades_to_the_fallback():
+    """The **optional** half of the claim, on the three shapes seen live.
+
+    * transport failure -> ``None`` plus ``last_error`` (never an exception);
+    * an empty page -> the full key contract with the documented *no information*
+      values (``nan`` mid/spread, no depth, no trades, ``0.0`` Hz);
+    * a busy tape, where 100 prints span less than the request's round-trip ->
+      every print postdates ``as_of_ms`` and is dropped: ``0`` trades,
+      ``dropped_future_trades == 100``, ``0.0`` Hz.  This is the exact payload
+      that failed the old live assertion ``arrival_rate_hz > 0``;
+    * a one-millisecond burst -> prints kept but span ``0`` -> ``0.0`` Hz too.
+    """
+    assert await fetch_features(_StubClient({}, [], fail=True), "BTCUSDT") is None
+    assert fetch_features.last_error
+
+    empty = await fetch_features(
+        _StubClient({"lastUpdateId": 7, "bids": [], "asks": []}, []), "BTCUSDT")
+    assert empty is not None
+    assert set(FEATURE_KEYS) <= set(empty)
+    assert np.isnan(empty["mid"]) and np.isnan(empty["spread_bps"])
+    assert empty["n_depth_levels"] == 0
+    assert empty["trade_count"] == 0 and empty["arrival_rate_hz"] == 0.0
+
+    # Year 2100 stamps: present payload, every print after the decision stamp.
+    future = await fetch_features(
+        _StubClient(_snapshot_book(),
+                    _snapshot_trades(start_ms=4_102_444_800_000)), "BTCUSDT")
+    assert future is not None
+    assert set(FEATURE_KEYS) <= set(future)
+    assert future["dropped_future_trades"] == 100
+    assert future["trade_count"] == 0
+    assert future["arrival_rate_hz"] == 0.0     # the value the old assert rejected
+    assert future["mid"] == pytest.approx(100.0)   # the book half still works
+
+    burst = await fetch_features(
+        _StubClient(_snapshot_book(), _snapshot_trades(step_ms=0)), "BTCUSDT")
+    assert burst is not None
+    assert burst["trade_count"] == 100 and burst["dropped_future_trades"] == 0
+    assert burst["arrival_rate_hz"] == 0.0     # zero span is "no rate", not a rate
+    assert np.isnan(burst["activity_ratio"])

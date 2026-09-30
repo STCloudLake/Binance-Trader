@@ -28,7 +28,8 @@ What it reports (per ``<symbol>/<interval>.parquet``)
   The count uses the declared bar length (``core.market_data.ohlcv_cache.bar_keys``
   — the rule ``scripts/download_history.py --merge`` and the cache's write path
   both apply), **never** timestamp proximity: the 54 one-millisecond-adjacent pairs
-  in that file are the close of hour ``H-1`` beside the open of hour ``H``, i.e.
+  in the file as measured at that revision are the close of hour ``H-1`` beside the
+  open of hour ``H``, i.e.
   two different bars.  It is reported, not enforced: ``--strict`` still exits
   non-zero only for calendar gaps, so a mixed-convention cache cannot break an
   existing CI gate,
@@ -107,6 +108,15 @@ def gap_report(df: pd.DataFrame, interval: str,
     when the series is spliced, which is the defect this module measures.
     ``duplicate_bar_rows`` counts rows that are a *second* copy of a bar
     (``flagged`` stays reserved for calendar gaps).
+
+    The timeline is the **declared bar key** (:func:`bar_keys`), not the raw
+    stamp: the two timestamp conventions this cache can hold are ``bar_length −``
+    1 ms apart, so differencing raw stamps measured the live
+    ``data/market/BTCUSDT/1h.parquet`` tail (``…06:00:00`` →
+    ``…07:59:59.999``) as a **1.99997 h gap with 1 missing bar** for a series that
+    is contiguous on the bar grid (folded: max step 1.0 h, 0 gaps, 0 missing).
+    A genuinely missing bar is a 2.0 h step on the folded keys and is still
+    flagged.
     """
     out = {
         "bars": int(len(df)), "first": None, "last": None, "span_hours": 0.0,
@@ -124,6 +134,17 @@ def gap_report(df: pd.DataFrame, interval: str,
     if bar is None or bar <= 0 or len(df) < 2:
         return out
     idx = pd.to_datetime(pd.Index(df.index))
+    # Declared-bar-key normalisation (D1): one bar stored under the close
+    # convention (``open + length − 1 ms``) beside open-convention stamps is the
+    # grid's *next* bar, never a hole.  ``bar_keys`` is the same rule the cache's
+    # write path and ``scripts/download_history.py`` apply; a frame it cannot read
+    # (no usable grid, or an index that is not datetime-like) is reported raw.
+    try:
+        keys = bar_keys(idx, interval)
+        if keys is not None:
+            idx = pd.DatetimeIndex(keys)
+    except Exception:  # a frame the key rule cannot read is itself a finding
+        pass
     order = idx.argsort()
     idx = idx[order]
     out["first"] = idx[0].isoformat()

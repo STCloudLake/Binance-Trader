@@ -255,9 +255,11 @@ def test_merge_is_deterministic_and_handles_empty_side(tmp_path):
 #       wrote the stamp
 # ══════════════════════════════════════════════════════════════════════
 #
-# The live ``data/market/BTCUSDT/1h.parquet`` holds 11 677 rows with **54**
-# one-millisecond-adjacent pairs and **55** bars stored twice: 8 767 bar-open
-# stamps plus 2 910 Binance ``close_time`` stamps (``open + length - 1 ms``).
+# At revision ``0542e02`` the live ``data/market/BTCUSDT/1h.parquet`` held 11 677
+# rows with **54** one-millisecond-adjacent pairs and **55** bars stored twice:
+# 8 767 bar-open stamps plus 2 910 Binance ``close_time`` stamps
+# (``open + length - 1 ms``); at revision ``09125bd`` the file holds **0** such
+# pairs, so the fixture below reproduces the measured 0542e02 shape.
 # The exact-timestamp union above cannot see such a pair — its two stamps are
 # 3 599.999 s apart — so the running service's flush re-expands a repaired file
 # to 11 677 rows on the next write.

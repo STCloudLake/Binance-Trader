@@ -70,6 +70,7 @@ LIVE_CACHE_TEST_FILES = {
     "test_p34_audit_fixes.py",
     "test_p34_code_defects.py",
     "test_pairs.py",
+    "test_residual_closure.py",
     "test_volatility_targeting.py",
 }
 

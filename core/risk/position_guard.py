@@ -89,10 +89,12 @@ class PositionGuard:
         history and feed it straight to the estimator, so the *same* cached series
         that ``RiskManager.forecast_vol_pct`` refuses (→ ``None``, fixed sizing)
         produced a forecast here (the re-audit measured ``0.42584 %/bar`` on the
-        live spliced cache; the test fixture in
-        ``tests/test_reaudit_fixes.py`` produces ``0.41803165815 %/bar`` on a
-        synthetic 100-bar hole) — and that number drives the **live trailing-stop
-        distance**, i.e. real risk.  The check is now the *same* function the
+        then-live spliced cache — that splice has since been repaired; the test
+        fixture in ``tests/test_reaudit_fixes.py`` produces
+        ``0.062009291811329616 %/bar`` on a synthetic 100-bar hole, against
+        ``0.061993341684305286 %/bar`` for its gap-free twin) — and that number
+        drives the **live trailing-stop distance**, i.e. real risk.  The check is
+        now the *same* function the
         manager uses — :func:`core.risk.manager._series_has_gap`, with its own
         ``_VOL_MAX_GAP_BARS`` / bar-length table — so the two consumers of one
         series cannot disagree: a hole beyond 1.5 bar lengths refuses the forecast
