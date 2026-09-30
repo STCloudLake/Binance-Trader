@@ -44,7 +44,10 @@ Metrics and the gate (the honest protocol)
 4. the folded threshold is applied to the fold's test rows, and the gate consumes
    the resulting **outer** net expectancy, trade count, t-stat and PSR through
    :func:`core.ml.credibility.gate_from_evaluation` (AUC > 0.55, net
-   expectancy > 0, ≥ 100 trades, t > 2 or PSR ≥ 0.95).
+   expectancy > 0, ≥ 100 trades, t > 2 **and** PSR ≥ 0.95, where the PSR is
+   Prado's skew/kurtosis-corrected PSR of the outer net-trade returns — the
+   higher-moment correction landed with re-audit finding 4, so the PSR floor is a
+   genuine second condition and not just ``t >= 1.645``).
 
 Costs come from ``core.ml.credibility.cost_pct_for`` (the sim cost model), so the
 gate can never gate on a cheaper cost than the fills pay.

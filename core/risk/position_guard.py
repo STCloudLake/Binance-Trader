@@ -78,9 +78,27 @@ class PositionGuard:
         """Forecast conditional volatility in **percent of price per bar**.
 
         Returns ``None`` whenever the forecast is unavailable — vol targeting off,
-        no market-data source, a short/failed history, or a zero estimate.  Every
-        caller then falls back to the fixed percentage, which is the documented
-        behaviour and what keeps this change inert by default.
+        no market-data source, a short/failed history, a zero estimate, or a
+        **spliced** series (a calendar gap beyond ``_VOL_MAX_GAP_BARS`` bar
+        lengths).  Every caller then falls back to the fixed percentage, which is
+        the documented behaviour and what keeps this change inert by default.
+
+        Spliced-series refusal (re-audit finding 1)
+        ------------------------------------------
+        This guard used to build a ``DatetimeIndex`` frame from the provider's
+        history and feed it straight to the estimator, so the *same* cached series
+        that ``RiskManager.forecast_vol_pct`` refuses (→ ``None``, fixed sizing)
+        produced a forecast here (the re-audit measured ``0.42584 %/bar`` on the
+        live spliced cache; the test fixture in
+        ``tests/test_reaudit_fixes.py`` produces ``0.41803165815 %/bar`` on a
+        synthetic 100-bar hole) — and that number drives the **live trailing-stop
+        distance**, i.e. real risk.  The check is now the *same* function the
+        manager uses — :func:`core.risk.manager._series_has_gap`, with its own
+        ``_VOL_MAX_GAP_BARS`` / bar-length table — so the two consumers of one
+        series cannot disagree: a hole beyond 1.5 bar lengths refuses the forecast
+        here too, :meth:`_resolve_vol_pct` returns ``None`` and the trailing stop
+        falls back to ``hard_limits.trailing_stop_distance_pct`` (the documented
+        fixed rule).  A refusal is logged, never silent.
         """
         if not self.vol_targeting_enabled():
             return None
@@ -103,6 +121,21 @@ class PositionGuard:
                            f"{tf}: {e}")
             return None
         if df is None or len(df) < 2:
+            return None
+        # The splice guard, shared verbatim with RiskManager (re-audit finding 1):
+        # one cached series must not be "too spliced to size from" but good enough
+        # to set a live stop.  Refusing falls back to the fixed trailing distance.
+        try:
+            from core.risk.manager import _VOL_MAX_GAP_BARS, _series_has_gap
+            if _series_has_gap(getattr(df, "index", ()), tf):
+                logger.warning(
+                    f"PositionGuard: refusing a volatility forecast for {symbol} "
+                    f"{tf} — the series carries a calendar gap beyond "
+                    f"{_VOL_MAX_GAP_BARS} bars; the trailing stop falls back "
+                    f"to the fixed distance (run scripts/check_data_integrity.py)")
+                return None
+        except Exception as e:  # never let the guard itself break the risk loop
+            logger.warning(f"PositionGuard: gap check failed for {symbol} {tf}: {e}")
             return None
         try:
             from core.ml.volatility import forecast_vol, to_pct

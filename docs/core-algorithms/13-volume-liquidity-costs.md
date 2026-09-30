@@ -113,9 +113,13 @@ for sym, iv in (('BTCUSDT','1h'), ('XRPUSDT','1m')):
 "
 ```
 
-Observed (`k = 0.1`; BTCUSDT 1h window ends 2026-09-30 05:59:59, XRPUSDT 1m window
-ends 2026-09-30 06:27:59 — the running app keeps appending bars, so the volume
-figures move while the *shape* of the table does not):
+Observed (`k = 0.1`; a snapshot taken when the BTCUSDT 1h window ended
+2026-09-30 05:59:59 and the XRPUSDT 1m window ended 2026-09-30 06:27:59 — the
+running app keeps appending bars, so the volume figures move while the *shape* of
+the table does not. Re-running the command above after the twin-bar repair reported
+a BTCUSDT window of 751 885 467.06 USDT, i.e. **+0.16 %** on the figure below; the
+500 USDT row then reads participation 0.000066 % and round trip 0.0008 USDT, still
+the same rounded values):
 
 | symbol | tf | 20-bar quote vol (USDT) | order (USDT) | participation | impact (k=0.1) | round-trip impact | capped @1 % |
 |---|---|---|---|---|---|---|---|
@@ -135,30 +139,99 @@ Two facts this table states plainly:
   order is untouched, because a 1 % ceiling there is 7.5 M USDT. The cap binds on
   the *ratio*, not on the order size, and the accepted numbers show it.
 
-Pre/post comparison on the **same** run (100 consecutive BTC 1h pairs, cost from
-the shipped config, fee 0.04 %, spread 0.01 % for BTCUSDT, `recent_quote_volume`
-pinned to the same 20-bar window):
+Pre/post comparison (cost from the shipped config: fee 0.04 %, spread 0.01 % for
+BTCUSDT, `recent_quote_volume` **pinned** so the two runs price the same window).
 
-| size | `k = 0` (pre-P6) | `k = 0.1` | Δ | `k = 0.5` | Δ |
-|---|---|---|---|---|---|
-| 0.01 BTC | 75.6777 USDT | 75.8566 | +0.1789 (+0.24 %) | 76.5722 | +0.8945 (+1.18 %) |
-| 1.0 BTC | 7 567.7708 USDT | 7 746.6673 | +178.8965 (+2.36 %) | 8 462.2533 | +894.4824 (+11.82 %) |
+**What changed in this section (re-audit finding 2).** The numbers that used to
+sit here (a 1.0 BTC Δ of `+178.8965` / `+894.4824` = `+2.36 %` / `+11.82 %`, and a
+`0.8288` impact line) were **not reproducible against the window quoted one table
+above**: a 1.0 BTC order is 0.011 % of a 750 M USDT window, so the code gives
+`+1.7455` (+0.0021 %), not `+178.8965`. Working backwards, `+178.8965` belongs to a
+window of ≈ 7.1 × 10⁵ USDT too, i.e. the three quoted figures implied three
+different windows (750.66 M in the table, ≈ 756.78 M in the Δ rows, ≈ 541.7 M in
+the breakdown), none of them stated. The tables below are re-measured in one pass
+against **one explicitly named window**, and the window moves whenever the running
+service appends a bar — so the *shape* is the claim, the exact window is a
+timestamped measurement.
 
-The `k = 0` column equals the legacy cost **bit for bit** (`==`, not `approx`), and
-that is asserted twice: in the loop above (with and without the volume argument)
-and in `tests/test_liquidity.py::test_impact_k_zero_is_bit_identical`.
+Reproduce (read-only; nothing is written, the DB is untouched):
+
+```powershell
+python -c "
+import pandas as pd
+from app.config import Config
+from core.risk.liquidity import recent_quote_volume, total_impact_usdt, participation_pct
+from core.backtest.cost_model import total_costs_with_impact, apply_trading_costs
+Config._instance=None; cfg=Config.load('sim')
+df=pd.read_parquet('data/market/BTCUSDT/1h.parquet')
+v=recent_quote_volume(df,20); price=float(df['close'].iloc[-1])
+print('window',f'{v:,.2f}','ends',df.index[-1],'price',price)
+for qty in (0.01,1.0,10.0,100.0):
+    e=qty*price
+    print(f'{qty:>7} BTC notional={e:,.2f} part={participation_pct(e,v):.6f}%',
+          f'k0.1={total_impact_usdt(e,e,v,0.1):.4f}',
+          f'k0.5={total_impact_usdt(e,e,v,0.5):.4f}')
+print('k=0 identical:', apply_trading_costs(price,price*1.02,1.0,'BTCUSDT',cfg)
+      == apply_trading_costs(price,price*1.02,1.0,'BTCUSDT',cfg,recent_quote_volume=v))
+cfg.risk_liquidity.impact_k=0.1
+print(total_costs_with_impact(83384.0,85000.0,0.6,'BTCUSDT',cfg,recent_quote_volume=v))
+"
+```
+
+Observed (window ends **2026-09-30 06:00:00**, after the twin-bar repair of §9 R3 of
+`ALGO_UPGRADE_EVIDENCE.md`; a later run is a different window, see the note above):
+
+```text
+window 751,885,467.06  ends 2026-09-30 06:00:00  price 83043.14
+   0.01 BTC notional=830.43   part=0.000110% k0.1=0.0017 k0.5=0.0087
+    1.0 BTC notional=83,043.14 part=0.011045% k0.1=1.7455 k0.5=8.7273
+   10.0 BTC notional=830,431.40 part=0.110447% k0.1=55.1963 k0.5=275.9814
+  100.0 BTC notional=8,304,314.00 part=1.104465% k0.1=1745.4596 k0.5=8727.2978
+k=0 identical: True 75.48621426 75.48621426
+{'fees_usdt': 40.4122, 'spread_usdt': 5.0515, 'impact_usdt': 0.8281,
+ 'total_usdt': 46.2918, 'legacy_usdt': 45.4637, 'impact_pct': 0.0017,
+ 'recent_quote_volume': 751885467.0637, 'impact_k': 0.1}
+```
+
+| size | participation | `k = 0` (pre-P6) | `k = 0.1` Δ | `k = 0.5` Δ |
+|---|---|---|---|---|
+| 0.01 BTC (830.43 USDT) | 0.000110 % | 0 (base = legacy) | **+0.0017** (+0.0002 %) | **+0.0087** (+0.0011 %) |
+| 1.0 BTC (83 043.14 USDT) | 0.011045 % | 0 (base = legacy) | **+1.7455** (+0.0021 %) | **+8.7273** (+0.0105 %) |
+| 10 BTC (830 431.40 USDT) | 0.110447 % | 0 (base = legacy) | **+55.1963** (+0.0066 %) | **+275.9814** (+0.0332 %) |
+| 100 BTC (8 304 314.00 USDT) | 1.104465 % | 0 (base = legacy) | **+1 745.4596** (+0.0210 %) | **+8 727.2978** (+0.1051 %) |
+
+The `k = 0` column equals the legacy cost **bit for bit** (`==`, not `approx`):
+measured `75.48621426 == 75.48621426` for a 1.0 BTC round trip priced at
+83 043.14 → 84 704.00, and asserted in
+`tests/test_liquidity.py::test_impact_k_zero_is_bit_identical` plus in the command
+above.
+
+**Why the impact column is small here, and when it is not.** A 20-bar 1h window on
+BTCUSDT is ≈ 7.5 × 10⁸ USDT traded notional, so a retail order (≤ 0.01 BTC) is
+0.0001 % of it and a 1.0 BTC order is 0.011 % — the square root of a very small
+number is a small number. The order has to be a *visible fraction* of the window
+before the term matters: at 100 BTC (1.1 % of the window) the model charges
+0.021 %/0.105 % of notional, i.e. the same order of magnitude as the 0.05 % round
+trip the fee-plus-spread model already charged. That scaling — not a large
+absolute number at retail size — is the claim, and it is exactly why the shipped
+default is `k = 0` (§5).
+
 Per-trade breakdown from `total_costs_with_impact` for a 0.6 BTC round trip at
-83 384 → 85 000 (≈ 50 030 USDT) on the same window, `k = 0.1`:
+83 384 → 85 000 (≈ 50 030 USDT entry) on the **same** 751 885 467.06 USDT window,
+`k = 0.1`:
 
 | component | USDT |
 |---|---|
 | fees (0.04 % × both sides) | 40.4122 |
 | spread (0.005 % × both sides) | 5.0515 |
-| **impact** | **0.8288** |
-| total | 46.2925 |
+| **impact** | **0.8281** |
+| total | 46.2918 |
 
 That split is the point: the impact line is *visible* next to fees and spread
-instead of being folded invisibly into PnL.
+instead of being folded invisibly into PnL. (The previous `0.8288` on this line
+belonged to a ≈ 729.2 M USDT window, 3 % away from the quoted 750.66 M one — the
+same unstated-window defect as the Δ rows. On the window named above the code
+returns 0.8281.)
 
 ## 4. Limits — read this before setting a non-zero `impact_k`
 

@@ -1731,8 +1731,11 @@ class BacktestEngine:
            :func:`core.ml.credibility.credibility_gate` when it was trained,
         4. the sidecar's ``feature_names`` equal the contract the engine will score
            with (positional scoring on a different contract is silent corruption),
-        5. the sidecar's ``feature_schema_hash`` matches
-           :func:`core.ml.features.feature_schema_hash` of that contract.
+        5. the sidecar's ``feature_schema_hash`` is **present and equal** to
+           :func:`core.ml.features.feature_schema_hash` of that contract — a
+           missing hash is a refusal, not a pass (re-audit finding 5: the check
+           used to be ``if stored and ...``, so a sidecar with ``gate.allowed``
+           and matching names but no hash was accepted).
 
         It deliberately does **not** instantiate a predictor (no market-data
         provider exists at this point in a backtest) and deliberately does not
@@ -1775,7 +1778,15 @@ class BacktestEngine:
                                f"extra_in_engine={extra[:4]})")
             stored = meta.get("feature_schema_hash")
             current = feature_schema_hash(expected)
-            if stored and str(stored) != current:
+            # Re-audit finding 5: `if stored and ...` accepted a sidecar that had
+            # `gate.allowed` and matching feature *names* but **no schema hash**
+            # (the audit's e2e loaded 2 of 7 artefacts that way).  A hash that is
+            # absent cannot be compared, so it is a refusal — the same rule the
+            # mismatch below already follows.
+            if not stored:
+                return False, ("feature schema hash missing: the sidecar carries no "
+                               f"feature_schema_hash (engine expects {current})")
+            if str(stored) != current:
                 return False, (f"feature schema hash mismatch: sidecar {stored} vs "
                                f"engine {current}")
         except Exception as e:

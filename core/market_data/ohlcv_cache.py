@@ -186,6 +186,66 @@ def _canonical_ns(stamp_ns: int, step: int, convention: str) -> int | None:
     return bar_open + (step - CONVENTION_GAP_NS)
 
 
+def _frame_hash(frame: pd.DataFrame | None) -> str | None:
+    """Content hash of a frame, invariant to row order and index dtype.
+
+    Used only to answer "would this write change the file?".  ``None`` for a
+    ``None``/empty frame.  The frame is reduced to the three things a parquet
+    store can differ in — its columns, one value blob and one int64-stamp blob —
+    both sorted, so the hash depends on the *content*, never on the order rows
+    happened to arrive in and never on ``DatetimeIndex`` vs ``Index[datetime64]``.
+    A frame whose columns are not hashable falls back to a value-only result
+    rather than raising into the flush loop.
+    """
+    if frame is None or len(frame) == 0:
+        return None
+    import hashlib
+
+    try:
+        stamps = pd.DatetimeIndex(frame.index).asi8.astype(np.int64)
+    except Exception:
+        stamps = np.arange(len(frame), dtype=np.int64)
+    try:
+        values = np.sort(pd.util.hash_pandas_object(
+            frame.reset_index(drop=True), index=False).to_numpy(dtype=np.uint64))
+    except Exception:
+        values = np.sort(pd.util.hash_pandas_object(
+            frame.reset_index(drop=True).astype(str),
+            index=False).to_numpy(dtype=np.uint64))
+    digest = hashlib.sha256()
+    digest.update(",".join(str(c) for c in frame.columns).encode())
+    digest.update(np.sort(stamps).tobytes())
+    digest.update(values.tobytes())
+    return digest.hexdigest()
+
+
+def _canonical_write(existing: pd.DataFrame | None,
+                     incoming: pd.DataFrame | None,
+                     interval: str | None) -> tuple[pd.DataFrame | None, bool]:
+    """``(frame_to_write, changed)`` for one ``(symbol, interval)`` store.
+
+    ``changed`` is ``False`` exactly when writing ``frame_to_write`` would leave
+    the file's content as it already is — the already-deduped, nothing-new case.
+    That test is what lets the periodic flush repair a file it never appended to
+    **without** rewriting (and re-rotating) every cache file on every tick, and it
+    is what makes a no-op flush byte-preserving: the caller skips the write
+    altogether, so the file is not even re-encoded.
+
+    ``changed`` is derived from the *merged* frame, not from the merge's inputs:
+    a stale in-memory window that is already a subset of disk merges to exactly
+    what is on disk, so it reports ``False``.  A genuine change — a new bar, or a
+    duplicate bar the exact-timestamp union could not see — reports ``True``.
+    """
+    combined = merge_history(existing, incoming, interval)
+    if combined is None:
+        return None, False
+    if existing is None or len(existing) == 0:
+        return combined, len(combined) > 0
+    if _frame_hash(combined) == _frame_hash(existing):
+        return combined, False
+    return combined, True
+
+
 def merge_history(existing: pd.DataFrame | None,
                   incoming: pd.DataFrame | None,
                   interval: str | None = None) -> pd.DataFrame | None:
@@ -377,8 +437,8 @@ class OHLVCache:
         """
         if symbol in self._cache and interval in self._cache[symbol]:
             path = self._path(symbol, interval)
-            combined = merge_history(self._read_disk(path),
-                                     self._cache[symbol][interval],
+            existing = self._read_disk(path)
+            combined = merge_history(existing, self._cache[symbol][interval],
                                      interval)
             if combined is not None:
                 combined.to_parquet(path)
@@ -386,9 +446,74 @@ class OHLVCache:
             self._dirty.discard((symbol, interval))
 
     def flush_all(self):
-        """Write all dirty cache entries to disk. Called periodically."""
+        """Write dirty entries, and dedupe **already-written** files in place.
+
+        Called periodically.  Two passes, and the difference between them is the
+        re-audit defect this closes:
+
+        1. **dirty** keys (a live candle arrived) — rewritten through
+           :meth:`save`, exactly as before;
+        2. every other ``(symbol, interval)`` already **in memory** — re-read,
+           unioned with its own frame and written back **only when that changes
+           the content** (:func:`_canonical_write`).
+
+        Why pass 2 has to exist: ``save`` is interval-aware and *would* collapse a
+        file that stores one bar under both timestamp conventions, but it only ran
+        for **dirty** keys.  A file that is never appended to again therefore kept
+        its duplicates for ever — the measured case is the live
+        ``data/market/BTCUSDT/1h.parquet``, which still held **55** twin bars
+        (11 678 rows for 11 623 bars) after the "已合并" claim, because nothing
+        ever dirtied it again.  Loading the file is enough to un-dirty it now.
+
+        Why pass 2 does not rewrite everything: an already-deduped file whose
+        in-memory frame adds nothing produces a merged frame whose content hash
+        equals the on-disk one, so :func:`_canonical_write` reports ``changed ==
+        False`` and **no write happens at all** — the bytes on disk are literally
+        untouched (not rewritten to the same value).  That is asserted in
+        ``tests/test_reaudit_fixes.py::test_flush_does_not_rewrite_an_already_deduped_file``.
+
+        Cost: one parquet read per cached key per flush (every 300 s in the
+        service), and a write only for the keys that actually changed.
+        """
         for symbol, interval in list(self._dirty):
             try:
                 self.save(symbol, interval)
             except Exception as e:
                 logger.warning(f"Failed to flush cache {symbol}/{interval}: {e}")
+        for symbol in list(self._cache):
+            for interval in list(self._cache[symbol]):
+                if (symbol, interval) in self._dirty:
+                    continue  # just handled above
+                try:
+                    self.dedupe(symbol, interval)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to dedupe cache {symbol}/{interval}: {e}")
+
+    def dedupe(self, symbol: str, interval: str) -> bool:
+        """Collapse twin-convention rows in one **already stored** file.
+
+        Returns ``True`` when the file was written, ``False`` when it already
+        stored one row per bar (so nothing was touched).  Only used for keys that
+        are not dirty; :meth:`save` performs the same union for a key that is.
+        """
+        if symbol not in self._cache or interval not in self._cache[symbol]:
+            return False
+        base = self.data_dir / "market" / symbol
+        path = base / f"{interval}.parquet"
+        if not path.exists():
+            return False  # never create a directory for a file that is not there
+        existing = self._read_disk(path)
+        if existing is None or len(existing) == 0:
+            return False
+        combined, changed = _canonical_write(
+            existing, self._cache[symbol][interval], interval)
+        if combined is None:
+            return False
+        # The in-memory frame converges on the deduped store either way, so the
+        # next flush sees a frame that already matches the file.
+        self._cache[symbol][interval] = combined
+        if not changed:
+            return False
+        combined.to_parquet(path)
+        return True

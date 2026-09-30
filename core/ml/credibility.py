@@ -20,7 +20,10 @@ This module is the single decision point:
 * :func:`credibility_gate` returns a status dict — ``allowed = OOS AUC > 0.55
   AND net expectancy > 0 AND trades >= min_trades AND t > 2 AND PSR >= 0.95``
   (audit F3: the significance floors are a conjunction and missing t/PSR is a
-  refusal, not a skipped check).
+  refusal, not a skipped check).  :func:`probabilistic_sharpe` is Prado's PSR
+  **with** the skew/kurtosis correction (re-audit finding 4 — it used to be
+  ``Φ(mean/se)``, which made the PSR floor an alias of ``t >= 1.645`` while the
+  docstrings claimed it read higher moments).
 * :func:`ml_accuracy_neutral_abstention` is the corrected diagnostic for
   ``engine.py`` (see the TODO handed to the Lead).
 
@@ -216,6 +219,13 @@ def net_trade_stats(
     95 % CI is ``mean ± 1.96 × SE``.  A mean alone is not evidence — 27 trades at
     +0.36 % with SE 0.28 % is t = 1.28, i.e. indistinguishable from zero.
     Returns zeros with ``n = 0`` when nothing is taken.
+
+    ``psr`` is the **skew/kurtosis-corrected** Prado PSR of those same net-trade
+    returns (re-audit finding 4): the net series is handed to
+    :func:`probabilistic_sharpe` so its higher moments are actually read, which is
+    what makes the gate's ``PSR >= 0.95`` floor a real second condition rather than
+    a restatement of ``t > 2``.  The ``t_stat``/``se`` fields stay the plain
+    normal-theory numbers — only the PSR is tail-aware.
     """
     r = np.asarray(fwd_returns, dtype=float)
     mask = np.asarray(take_mask, dtype=bool) & np.isfinite(r)
@@ -239,24 +249,67 @@ def net_trade_stats(
     return {
         "n": n, "mean": mean, "sd": sd, "se": se, "t_stat": float(t),
         "ci_low": mean - 1.96 * se, "ci_high": mean + 1.96 * se,
-        "psr": probabilistic_sharpe(n, mean, sd),
+        "psr": probabilistic_sharpe(n, mean, sd, returns=net),
     }
 
 
 def probabilistic_sharpe(n: int, mean: float, sd: float,
-                         benchmark: float = 0.0) -> float:
-    """``P(true mean > benchmark)`` for i.i.d. per-trade returns (PSR).
+                         benchmark: float = 0.0,
+                         returns=None) -> float:
+    """``P(true mean > benchmark)`` for per-trade returns (PSR).
 
-    Bailey & López de Prado's Probabilistic Sharpe Ratio without skew/kurtosis
-    terms: ``PSR = Φ((mean − benchmark) / (sd / sqrt(n)))``.  The plan asks for
-    "t > 2 **or** PSR"; with a normal approximation ``t = 2`` ⇔ ``PSR = 0.977``,
-    so PSR is reported for transparency and the t-stat is the pass/fail test.
+    Prado's Probabilistic Sharpe Ratio *with* the higher-moment correction
+    (Bailey & López de Prado 2012, eq. 5–6; the same formula
+    ``core.ml.calibration`` cites): the sampling standard error of the mean
+    return is wider than ``sd/√n`` whenever the returns are skewed or fat-tailed,
+
+        ``SE_adj = sd · √( (1 − γ₃·SR + (γ₄ − 1)/4 · SR²) / (n − 1) )``
+
+    with ``SR = (mean − benchmark)/sd`` and ``γ₃``/``γ₄`` the sample skewness and
+    (non-excess) kurtosis of the **net-trade returns** supplied as ``returns``.
+    ``PSR = Φ((mean − benchmark)/SE_adj)``; for a normal sample (``γ₃ = 0``,
+    ``γ₄ = 3``) the bracket is exactly 1 and the result *is* ``Φ(√n·SR)`` — the
+    old normal approximation, unchanged.
+
+    Re-audit finding 4 fixed the justification, not just the docstring: the
+    docstrings used to *claim* this function read skew and kurtosis while the code
+    was ``Φ(mean/se)``, which made the gate's ``AND`` exactly ``t > 2`` and the
+    ``PSR >= 0.95`` floor dead weight.  It genuinely reads them now, so the two
+    floors are a real conjunction: measured on a fat-left-tailed series with
+    ``t = 2.0`` the corrected PSR is **0.937 < 0.95** (refused), while the normal
+    approximation would report 0.977 (allowed).  See
+    ``tests/test_reaudit_fixes.py::test_psr_floor_is_stricter_than_the_t_floor_for_fat_tails``.
+
+    ``returns`` is optional for backwards compatibility and for callers that hold
+    only the summary statistics (``core.strategy.pairs``); with ``returns=None``,
+    fewer than 4 usable values, or a non-finite moment, the correction is skipped
+    (equivalent to assuming normality) rather than guessing a tail shape.  ``0.0``
+    for ``n < 2`` or ``sd <= 0`` — the unchanged degenerate cases.
     """
     n = int(n)
     sd = float(sd)
     if n < 2 or sd <= 0:
         return 0.0
-    return float(_norm_cdf((float(mean) - float(benchmark)) / (sd / math.sqrt(n))))
+    diff = float(mean) - float(benchmark)
+    se = sd / math.sqrt(n)
+    if returns is not None:
+        try:
+            r = np.asarray(returns, dtype=float)
+            r = r[np.isfinite(r)]
+            if r.size > 3:
+                sd_r = float(r.std(ddof=1))
+                if sd_r > 0.0:
+                    sr = diff / sd_r
+                    g3 = float(((r - r.mean()) ** 3).mean()) / sd_r ** 3
+                    g4 = float(((r - r.mean()) ** 4).mean()) / sd_r ** 4
+                    bracket = 1.0 - g3 * sr + (g4 - 1.0) / 4.0 * sr ** 2
+                    if math.isfinite(bracket) and bracket > 0.0:
+                        se = sd_r * math.sqrt(bracket / (r.size - 1))
+        except Exception:
+            se = sd / math.sqrt(n)  # never let a diagnostic break the gate
+    if se <= 0.0:
+        return 0.0
+    return float(_norm_cdf(diff / se))
 
 
 def _signed_net_stats(fwd_returns, take_mask, sides, cost_pct: float) -> dict:
@@ -276,7 +329,7 @@ def _signed_net_stats(fwd_returns, take_mask, sides, cost_pct: float) -> dict:
         "n": n, "mean": mean, "sd": sd, "se": se,
         "t_stat": float(mean / se) if se > 0 else 0.0,
         "ci_low": mean - 1.96 * se, "ci_high": mean + 1.96 * se,
-        "psr": probabilistic_sharpe(n, mean, sd),
+        "psr": probabilistic_sharpe(n, mean, sd, returns=net),
     }
 
 
@@ -736,14 +789,23 @@ def credibility_gate(
          evidence`` rather than skipped (audit F3).  Both numbers are reported in
          the reason either way.
 
-    **Why AND** (audit F3): the module previously *documented* the two floors as a
-    conjunction but *implemented* ``or``, and there the 2.0 t floor is dead —
-    ``PSR >= 0.95`` is the one-sided normal probability, so under normality it is
-    exactly ``t >= 1.645`` (measured: ``t=1.65, PSR=0.9505`` was allowed, while
-    the audited floor is 2.0).  The floors are not redundant off the normal:
-    :func:`probabilistic_sharpe` reads skew and kurtosis, so a fat left tail can
-    put the PSR below 0.95 at ``t = 2``.  AND keeps both the audited t floor and
-    the tail-aware floor; it can only refuse more than the old ``or``, never less.
+    **Why AND** (audit F3, re-audit finding 4): the module previously *documented*
+    the two floors as a conjunction but *implemented* ``or``, and there the 2.0 t
+    floor is dead — ``PSR >= 0.95`` is the one-sided normal probability, so under
+    normality it is exactly ``t >= 1.645`` (measured: ``t=1.65, PSR=0.9505`` was
+    allowed, while the audited floor is 2.0).
+
+    The two floors are genuinely non-redundant **because
+    :func:`probabilistic_sharpe` now really does read skew and kurtosis** —
+    Prado's ``Φ((mean − benchmark)/SE_adj)`` with
+    ``SE_adj ∝ √(1 − γ₃·SR + (γ₄−1)/4·SR²)``.  A fat left tail or a fat right tail
+    widens that standard error, so the PSR at ``t = 2`` can sit below 0.95
+    (measured: **0.937** on a fat-left-tailed sample at ``t = 2.0``, where the
+    normal approximation reports 0.977).  This is the *fixed* version of a claim
+    that used to be false: the function was ``Φ(mean/se)`` with no moment terms,
+    which made the ``PSR`` floor nothing but ``t >= 1.645`` and the conjunction
+    exactly ``t > 2``.  AND keeps both the audited t floor and the now-real
+    tail-aware floor; it can only refuse more than the old ``or``, never less.
 
     Today's candidates therefore fail on every count, which is the documented
     outcome: no symbol measured on real cached data has reached 100 outer trades
@@ -789,9 +851,12 @@ def credibility_gate(
     #    one-sided normal probability, so `PSR >= 0.95` is exactly `t >= 1.645`
     #    under normality, i.e. the 2.0 t floor was silently 18 % weaker than the
     #    audited value (measured: t=1.65, PSR=0.9505 → allowed).  The floors are
-    #    NOT redundant off the normal: with negative skew or fat tails the PSR at
-    #    t=2 can sit below 0.95, which is the case the second floor exists for.
-    #    AND is strictly stricter than OR: it can only refuse more.
+    #    NOT redundant *now*: `probabilistic_sharpe` applies Prado's
+    #    skew/kurtosis correction (re-audit finding 4), so a fat tail at t=2 puts
+    #    the PSR below 0.95 (measured 0.937) where the old `Φ(mean/se)` reported
+    #    0.977 — the second floor is a real condition, which is what this
+    #    conjunction always claimed.  AND is strictly stricter than OR: it can
+    #    only refuse more.
     if t_stat is None or psr is None:
         missing = [name for name, value in (("t_stat", t_stat), ("psr", psr))
                    if value is None]
@@ -936,6 +1001,11 @@ __all__ = [
     "cost_pct_for", "round_trip_cost_pct_from_quote",
     "net_expectancy", "net_trade_stats", "probabilistic_sharpe",
     "cost_aware_threshold", "evaluate_model_oos", "credibility_gate",
-    "gate_from_evaluation", "ml_accuracy_neutral_abstention", "signed_score",
+    "gate_from_evaluation", "ml_accuracy_neutral_abstention",
     "fold_min_trades",
 ]
+# NOTE (re-audit finding 7): ``signed_score`` used to be listed here but is not
+# defined in this module — it lives in :mod:`core.ml.calibration` — so
+# ``from core.ml.credibility import *`` raised ``AttributeError``.  Every entry
+# above is a name that really resolves here; the star-import is pinned by
+# ``tests/test_reaudit_fixes.py::test_star_import_of_credibility_resolves``.

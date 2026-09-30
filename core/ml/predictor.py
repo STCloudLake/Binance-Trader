@@ -664,12 +664,20 @@ class MLPredictor:
                 f"model {model_path} expects {len(names)} features but the "
                 f"predictor is configured for {len(self._feature_list)}; "
                 f"missing_from_predictor={missing[:4]} extra_in_predictor={extra[:4]}")
-        # The stored schema hash is verified too (audit P2 #10): a sidecar whose
-        # hash does not match its own column list was written by a different
-        # contract and must not be scored positionally.
+        # The stored schema hash is verified too (audit P2 #10; tightened by
+        # re-audit finding 5): a sidecar whose hash does not match its own column
+        # list was written by a different contract and must not be scored
+        # positionally — and a sidecar with **no** hash at all is refused the same
+        # way, because an absent hash cannot be compared.  The old `if stored and
+        # ...` let a hand-written or truncated sidecar through on names alone.
         stored_hash = meta.get("feature_schema_hash")
         expected_hash = feature_schema_hash(self._feature_list)
-        if stored_hash and str(stored_hash) != expected_hash:
+        if not stored_hash:
+            raise FeatureContractError(
+                f"model {model_path} carries no feature schema hash "
+                f"(feature_schema_hash missing); this predictor requires "
+                f"{expected_hash} — refusing to score positionally")
+        if str(stored_hash) != expected_hash:
             raise FeatureContractError(
                 f"model {model_path} was trained on feature schema "
                 f"{stored_hash} but this predictor uses {expected_hash}")

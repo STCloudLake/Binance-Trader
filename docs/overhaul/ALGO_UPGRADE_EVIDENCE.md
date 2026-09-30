@@ -1,7 +1,7 @@
-# 算法升级证据索引（P1 GA / P2 ML / P3 波动率 / P4 新能力 / gap fixes）
+# 算法升级证据索引（P1 GA / P2 ML / P3 波动率 / P4 新能力 / gap fixes / 复核修复）
 
-**状态**: 证据已归档（本次实测，非引用） · **生成**: 2026-09-30 · **基线提交**: 本次审计 `fe11ccf`（其后 `0542e02` 更正了四处过期数字）
-**工作树**: 与四个并行代理的改动同时存在（`core/market_data/ohlcv_cache.py` + `web/routes/backtest.py`、`core/risk/position_sizer.py` + `core/risk/liquidity.py`、`tests/test_meta_labeling.py`、`tests/test_pairs.py`）；`data/models/` 现有 15 个 `.pkl` 与 **0 个 `_meta.json`**。所有"本次实测"数字均为该工作树快照；`fe11ccf` 基线数字已在前次归档中留档。
+**状态**: 证据已归档（本次实测，非引用） · **生成**: 2026-09-30 · **基线提交**: `b49883b`（本文件所在的 HEAD；`b49883b` 之后的工作树改动 = 本轮复核修复，见 §9）
+**工作树**: 本轮复核修复仅由单一代理写入（另三个并行代理已停止）；改动文件为 `core/risk/position_guard.py`、`core/ml/credibility.py`、`core/ml/meta.py`、`core/backtest/engine.py`（仅 preload 校验）、`core/ml/predictor.py`（仅同侧车校验）、`core/market_data/ohlcv_cache.py` + `core/market_data/provider.py`（仅惰性去重/flush）、`docs/core-algorithms/13-*.md`、本文件、新增 `tests/test_reaudit_fixes.py`。`data/models/` 仍为 15 个 `.pkl` / **0 个 `_meta.json`**。
 **对应计划**: [`ALGO_UPGRADE_PLAN.md`](ALGO_UPGRADE_PLAN.md)（P1–P4 验收标准） · **审计快照**: [`REFACTOR_AUDIT.md`](REFACTOR_AUDIT.md)
 
 ## 0. 一页速览
@@ -14,7 +14,7 @@
 | P4 能力 | `a9e549e` | 四个新能力有独立参照、无前视、默认惰性 | HMM 三 regime 合成序列 ≥95% 准确率；ADF 模拟零分布复现 MacKinnon 临界值；真实 1h 主流币：配对与 meta-label 全部拒绝（有效结论） | `tests/test_meta_labeling.py`（24，正被并行修改）·`tests/test_pairs.py`（28，正被并行修改）·`tests/test_regime.py`（14）·`tests/test_microstructure.py`（19） | `python -m pytest tests/test_meta_labeling.py tests/test_pairs.py tests/test_regime.py tests/test_microstructure.py -q` |
 | gap fixes | `2751bbb` | 实盘波动率定仓接线、成本语义统一、单一入场求值器 | 开关关闭时两侧均 240.0 USDT（balance 10 000）；BTC 成交 50 012.5000 / 往返 0.25005%；四个 AND/OR 基因入场数一致 40/0/0/40；sklearn 警告 1 602 → 0 | `tests/test_gap_fixes.py`（12） | `python -m pytest tests/test_gap_fixes.py -q` |
 | 发布审计 | `2751bbb` | 路由/测试/编译/数据完整性 | 路由 118→118，ADDED 0 / REMOVED 0；全量测试复跑 919 passed / 1 skipped / 0 failed；`compileall` 退出 0；缓存 `25/29` 文件带 gap | `scripts/regen_route_baseline.py`（新）· `scripts/check_data_integrity.py` | 见 §6 |
-| **最终独立审计** | **`fe11ccf`** | 审计的每条 H/M 缺陷已修或已量化上报 | 全量测试 **1039 passed / 1 failed**（314 s）；唯一失败 `tests/test_ml_credibility.py::test_feature_pipeline_cost_is_bounded` 是**负载敏感的计算预算断言**（`elapsed < 3.0 s`，单独运行 `1 passed in 0.90s`），与本次修复无关；早前一次全量运行为 **1040 passed / 0 failed**（470 s）。`compileall` 退出 0；缓存 **24/29** 文件带 gap；`data/models` 15 `.pkl` / 0 `_meta.json`；F1/F3/F4/F5 的 before→after 见 §8 | **新** `tests/test_final_audit_fixes.py`（13 项） | `python -m pytest tests/test_final_audit_fixes.py -q` |
+| **最终独立审计** | **`fe11ccf`→`b49883b`** | 审计的每条 H/M 缺陷已修或已量化上报 | 全量测试 **1040 passed / 0 failed**（227.3 s，退出码 0）；`compileall` 退出 0；缓存 **24/29** 文件带 gap、**twin 0/29**（`BTCUSDT/1h` 已实测去重，见 §6 与 §9 R3）；`data/models` 15 `.pkl` / 0 `_meta.json`；F1/F3/F4/F5 的 before→after 见 §8，本轮复核 1–7 的 before→after 见 §9 | **新** `tests/test_final_audit_fixes.py`（13 项）+ **新** `tests/test_reaudit_fixes.py` | `python -m pytest tests/test_final_audit_fixes.py tests/test_reaudit_fixes.py -q` |
 
 ---
 
@@ -90,7 +90,7 @@ P2 硬门（`enabled:false`）：`OOS AUC 0.5342 <= 0.55; net expectancy -0.1822
 | 路由基线 | `python scripts/regen_route_baseline.py` | 旧 118 → 新 118；**ADDED 0 / REMOVED 0**；`docs/overhaul/route-baseline.json` 与提交版本**逐字节相同**（`git diff` 为空）。P1–P4 未新增也未删除任何 `APIRoute`/`WebSocketRoute` |
 | 全量测试 | `python -m pytest tests/ -q -p no:cacheprovider` | 最终独立审计（`fe11ccf`+工作树）两次全量运行：**1040 passed / 0 failed**（470 s，退出码 0）与 **1039 passed / 1 failed**（314 s）。唯一的失败 `tests/test_ml_credibility.py::test_feature_pipeline_cost_is_bounded` 是**负载/计算预算敏感**断言（`elapsed < 3.0 s`；单独运行为 `1 passed in 0.90s`），与本次修复文件无关。同一工作树的**首次**运行为 `1022 passed, 3 failed`（242 s），3 个失败**均不在本次修复文件内**——`tests/test_measured_threshold_policy.py`（2 项，并行代理新增）与 `tests/test_meta_labeling.py::test_real_primary_rules_are_refused_by_the_meta_gate`（并行代理拥有；该文件在测量期间被重写）——三者随后由并行代理修好，复跑即 `41 passed`。基线（`2751bbb`）：`919 passed, 1 skipped, 0 failed`（375 s） |
 | 编译 | `python -m compileall -q app core web db scripts tools` | 退出码 **0** |
-| 数据完整性 | `python scripts/check_data_integrity.py` | **24/29** 缓存文件存在 >1.5×bar 的日历缺口；干净 5 个：`ADAUSDT/1h`、`BTCUSDT/1d`、`BTCUSDT/1h`、`USDCUSDT/5m`、`ZECUSDT/5m`（`BTCUSDT/1h` 的 55 个 `twin` 已由并行缓存修复合并，缺口 0，largest 0.0 h）；另 **1/29** 文件在两个时间戳口径下重复存了同一根 bar（`twin`），缓存下一次 flush 会合并 |
+| 数据完整性 | `python scripts/check_data_integrity.py` | **24/29** 缓存文件存在 >1.5×bar 的日历缺口；干净 5 个：`ADAUSDT/1h`、`BTCUSDT/1d`、`BTCUSDT/1h`、`USDCUSDT/5m`、`ZECUSDT/5m`。⚠️ **本行原写"`BTCUSDT/1h` 的 55 个 `twin` 已合并"是错的**（复核发现 3）：`check_data_integrity` 当时报 **1/29** 文件带 twin，实测该文件 **11 678 行 / 11 623 棵 bar / 55 棵重复 / 110 行 twin**。根因是 `flush_all` 只重写 **dirty** 键，永不追加的文件永远不会被去重。已在 §9 R3 修复并实测：**11 623 行 / 0 twin**，复跑 `check_data_integrity` 的 `twin` 列为 **0**，提示行"1/29 files store a bar twice"整段消失 |
 | 模型产物 | `Get-ChildItem data/models` | **15 个 `.pkl`、0 个 `_meta.json`** —— 修复前 `skip_ml_training` 会把 15 个未过门的模型全部加载；修复后全部被拒绝（见 §8 F4） |
 
 `scripts/regen_route_baseline.py` 用**临时 DB + 临时 config 目录**构建应用（绝不打开生产库），枚举每个 `APIRoute` 的 method+path 与 `WebSocketRoute`，排序后按既有格式（indent=1、CRLF、无尾换行）写回；有 REMOVED 时退出 1。`--check` 只报告不落盘。
@@ -98,7 +98,7 @@ P2 硬门（`enabled:false`）：`OOS AUC 0.5342 <= 0.55; net expectancy -0.1822
 ## 7. 尚未闭环（not yet closed）
 
 1. **hybrid 引擎的 `condition_logic`**：在基线提交 `2751bbb` 上 `git show 2751bbb:core/backtest/signal_matrix.py | grep -c condition_logic` = **0**，即向量化混合引擎当时仍只做 OR，`condition_logic: and` 的冠军在该模式下会被按 OR 评估（标量内核 `StrategyConfig.entry_sides` 已一致）。**该项在测量期间由并行改动关闭**：当前工作树 `core/backtest/signal_matrix.py`（mtime 2026-09-30 12:16）已在 `:303` 读取 `condition_logic` 并区分 AND/OR，新增 `tests/test_hybrid_condition_logic.py`（4 项，本次运行 `4 passed in 6.17s`）。该修复**尚未提交，且不在本次写权限内**，故列为"已由他人关闭、待提交复核"。
-2. **缓存缺口文件**：基线实测 **25/29**；最终独立审计（`fe11ccf`+工作树）实测 **24/29**，干净文件见 §6（`BTCUSDT/1h` 已由并行缓存修复转干净）。修复口径：`python scripts/download_history.py --symbols <SYM> --intervals <tf> --start <first> --end <last> --merge`。
+2. **缓存缺口文件**：基线实测 **25/29**；最终独立审计（`fe11ccf`+工作树）实测 **24/29**；本轮复核（`b49883b`+工作树）复测仍为 **24/29**，干净文件见 §6（`BTCUSDT/1h` 已由并行缓存修复转干净）。**twin（同一根 bar 两种时间戳口径各存一行）已从 1/29 修复为 0/29**（§9 R3）。修复口径：`python scripts/download_history.py --symbols <SYM> --intervals <tf> --start <first> --end <last> --merge`。
 3. **杠杆与评估口径不一致**：`config/risk_params.yaml` 为 `leverage: 2` / `max_leverage: 4`，而 `core/ga/*.py` 与 `core/backtest/engine.py` 中 `leverage` 命中 **0** 次 —— GA/回测仍按现金模型计价，实盘盈亏与回撤约为其 2×。未修。
 4. **路由基线无自动化回归门**：`tests/` 中无任何用例引用 `route-baseline.json` 或 `regen_route_baseline.py`；脚本只在人工运行时以退出码 1 报告删除。建议加一条只读断言（本文件之外的工作）。
 5. **P5 独立只读复核**未在本证据范围内执行；本文所有数字均为本次实测，来源脚本与命令已逐条给出。
@@ -116,11 +116,15 @@ P2 硬门（`enabled:false`）：`OOS AUC 0.5342 <= 0.55; net expectancy -0.1822
 | **F5.2** (LOW) | `ml.gate_min_psr` 在 `app/config.py` 加载但**无处读取**（门控硬编码 `GATE_MIN_PSR`） | 值经 `MLPredictor._gate_config()` → `min_psr` kwarg → `gate_from_evaluation` → `credibility_gate` 全链路打通；`scripts/ml_credibility_measure.py` 同步补上 | `ml:` 块 26 个键的"生产读取者"表：**未读键 = `[]`**（`tests/test_final_audit_fixes.py::test_every_ml_config_key_has_a_production_reader` 常驻断言） |
 | **F5.3** (LOW) | `default_meta_cost_pct(None, "ETHUSDT")` 返回 **0.14 %**（credibility 的硬编码回退），sim 成本是 **0.26 %**；`docs/core-algorithms/12` 的"与成交同源"只在显式传 config 时成立 | `core/ml/meta.py`：`config=None` 时**解析当前配置**（`Config.load()`）再取 `cost_pct_for`；只有配置本身不可加载才退回文档化默认值 | `default_meta_cost_pct(None, "ETHUSDT")` = **0.26**（= 传 config 的值 = `cost_pct_for`），BTC **0.25**；`docs/core-algorithms/12` 的说法现由构造成立 |
 
-**F3 的 AND/OR 决定（及理由）**：采用 **AND**（`t > gate_min_t_stat` **且** `PSR >= gate_min_psr`，值为文档化的 2.0 / 0.95）。理由：①模块 docstring 本就把两个下限写成合取，只有实现用了 `or`；②`PSR` 就是正态单侧概率，`or` 使 2.0 的 t 下限完全失效（等价 1.645，实测放行了 `t=1.65`），而 2.0 是审计（P2 #3）钉住的值；③两个下限在非正态下并不冗余——PSR 读偏度/峰度，厚左尾可在 `t=2` 时把 PSR 压到 0.95 以下，这正是第二个下限存在的意义；④AND 严格强于 OR，只会拒绝更多、不会放行更多。边界由 `test_significance_floors_are_a_conjunction_at_the_boundary` 钉住（`t=1.60/1.65/1.70/2.00` 拒绝，`t=2.01` 放行，`t=3.0 & PSR=0.94` 拒绝）。
+**F3 的 AND/OR 决定（及理由）**：采用 **AND**（`t > gate_min_t_stat` **且** `PSR >= gate_min_psr`，值为文档化的 2.0 / 0.95）。理由：①模块 docstring 本就把两个下限写成合取，只有实现用了 `or`；②`PSR` 就是正态单侧概率，`or` 使 2.0 的 t 下限完全失效（等价 1.645，实测放行了 `t=1.65`），而 2.0 是审计（P2 #3）钉住的值；③两个下限**现在**确实不冗余——`probabilistic_sharpe` 已改用 Prado 的偏度/峰度修正（复核发现 4，见 §9 R4），厚尾在 `t=2` 时把 PSR 压到 **0.9480 < 0.95**（正态近似报 0.9772）；④AND 严格强于 OR，只会拒绝更多、不会放行更多。边界由 `test_significance_floors_are_a_conjunction_at_the_boundary` 钉住（`t=1.60/1.65/1.70/2.00` 拒绝，`t=2.01` 放行，`t=3.0 & PSR=0.94` 拒绝），厚尾边界由 `tests/test_reaudit_fixes.py::test_psr_floor_is_stricter_than_the_t_floor_for_fat_tails` 钉住。
+
+> 更正（复核发现 4）：本段原先写"PSR 读偏度/峰度"作为 ③ 的理由，但当时的 `probabilistic_sharpe` 是 `Φ(mean/se)`、**不读**任何高阶矩，因此那个论证是**假的**——AND 在当时恰好等价于 `t > 2`。现已实现真实公式，③ 才成立；见 §9 R4。
 
 **连带影响的既有测试（均为"旧行为被钉住"，随修复同步更正，非放宽）**：`tests/test_ml_credibility.py::test_gate_passes_a_model_with_real_signal_and_positive_expectancy`（补 `n_trades/t_stat/psr`）、`::test_gate_requires_a_significance_floor`（`t=2.0 & PSR=0.975` 由放行改为拒绝）、`tests/test_gap_fixes.py::test_live_kline_stream_is_the_last_resort_forecast_source`（candle 补 `close_time`，与两个生产发布者一致）。
 
-### 提交清单（`fe11ccf` 及其后）
+### 提交清单（截至 `b49883b`）
+
+`git log --oneline` 自计划冻结起的**完整**提交列表（本文件所在 HEAD = `b49883b`）：
 
 | 提交 | 说明 |
 |---|---|
@@ -130,6 +134,24 @@ P2 硬门（`enabled:false`）：`OOS AUC 0.5342 <= 0.55; net expectancy -0.1822
 | `2751bbb` | P1–P4 + 审计修复整合 |
 | `beda096` | 关闭 P3/P4 审计发现（因果 regime、PIT 缓存、真实 GARCH MLE、稳定裁剪） |
 | `fa028be` | 缓存修复：实盘缓存不再覆盖长历史 + 合并 |
-| `fe11ccf` | **本次审计基线**：更正全部被证伪的数字；按 bar-open 键去重合并 bar |
+| `fe11ccf` | 最终独立审计基线：更正全部被证伪的数字；按 bar-open 键去重合并 bar |
 | `0542e02` | 更正最后四处过期数字 |
-| 最终审计（未提交） | F1/F3/F4/F5 修复 + `tests/test_final_audit_fixes.py`（13 项） |
+| `b49883b` | **当前基线**：关闭最终审计缺陷、修复数据路径缺口、加入成交量感知的执行现实性（`tests/test_final_audit_fixes.py` 13 项） |
+| *工作树（未提交）* | **复核修复 1–7 + `tests/test_reaudit_fixes.py`**，见 §9 |
+
+## 9. 复核修复（`b49883b` 工作树）——7 项发现的 before/after
+
+新证据文件：`tests/test_reaudit_fixes.py`。全部数字均为本轮实测；未提交（本节即其归档）。
+
+| 编号 | 缺陷（修复前实测） | 修复 | 修复后实测 |
+|---|---|---|---|
+| **R1** (MED) | `PositionGuard.forecast_vol_pct` 自行用 provider 历史建 `DatetimeIndex` 帧但**不做** `_series_has_gap`，于是同一条拼接序列 `RiskManager → None` 而 `PositionGuard → 0.41803165815 %/bar`，且该值喂给**实盘移动止损距离** | `core/risk/position_guard.py`：预测前调用与 manager **同一个** `core.risk.manager._series_has_gap`（同一 `_VOL_MAX_GAP_BARS`=1.5 与同一 bar 长度表），命中即 `return None` 并 `logger.warning`；`_resolve_vol_pct` 随之回落到固定距离 | 同一拼接序列：guard 预测 **None**（拒绝，日志可见），manager 同样 **None**；无缺口序列两侧同为 **0.41803165815 %/bar**（逐位相同，修复前该路径的未防护值为同一数字）。开关关闭时移动距离与 pre-P3 逐位相同 |
+| **R2** (MED) | `docs/core-algorithms/13` §3 的影响成本百分比**不可复现**：声称 1.0 BTC 往返 `+178.8965`（+2.36 %）/`+894.4824`（+11.82 %）"钉在同一 20 根窗口"，但同页引用的窗口是 750,661,812.73 USDT，代码在该窗口给出 **+1.7455**（+0.0021 %）/ **+8.7273**（+0.0105 %）；`0.8288` 的 impact 行也属于另一个窗口 | 文档：给出**可复现命令**，并把整节重测到**一个显式命名的窗口**上，附订单规模递增表说明"零售规模影响≈0、只有成为窗口的可见比例才生效"；同时记录旧数字各自隐含的窗口（≈756.78 M / ≈541.7 M / ≈729.2 M），说明它们为何不可比对 | 同一命令：窗口 **751,885,467.06 USDT**（ends 2026-09-30 06:00:00，price 83 043.14）。0.01 BTC **+0.0017**（+0.0002 %）；1.0 BTC **+1.7455**（+0.0021 %）；10 BTC **+55.1963**（+0.0066 %）；100 BTC **+1 745.4596**（+0.0210 %）（`k=0.5` 分别为 +0.0087/+8.7273/+275.9814/+8 727.2978）；`k=0` 与 legacy **逐位相同**（实测 `75.48621426 == 75.48621426`）；0.6 BTC 分解 impact **0.8281**、total 46.2918 |
+| **R3** (MED) | §6 原写 `BTCUSDT/1h` 的 55 个 twin "已合并"是**假**：`check_data_integrity` 报 **1/29** 文件带 twin，实盘文件 **11 678 行 / 11 623 棵 bar / 55 棵重复 / 110 行 twin**。根因：`flush_all` 只重写 **dirty** 键 | `core/market_data/ohlcv_cache.py`：新增 `_frame_hash` + `_canonical_write`（内容哈希判"写是否会改变文件"）与 `OHLVCache.dedupe`；`flush_all` 在 dirty 键之后对**所有已加载键**做一次去重，仅在内容真的改变时落盘 | 实盘 `data/market/BTCUSDT/1h.parquet`：**11 678 → 11 623 行**，`twin_bars` **55 → 0**，`twin_rows` **110 → 0**，bar 键集合**完全相同**（11623），55 棵冲突 bar 全部保留**较新**的那一行；`check_data_integrity` 该行转 **ok**、`twin` 列 **0**、"1/29 files store a bar twice"提示消失。第二次 flush **不写盘**（`dedupe → False`），文件 **字节完全相同**（sha256 `0543b03d1ed8c3ff`） |
+| **R4** (LOW) | `core/ml/credibility.py:246-259` 是 `Φ(mean/se)`、**不读**偏度/峰度，而 `:743-746` 与 `core/ml/meta.py:47` 及文档 §8 声称它读——AND 因此**恰好等价于 `t > 2`** | 选择**实现** Prado 的修正公式：`SE_adj = sd·√((1 − γ₃·SR + (γ₄−1)/4·SR²)/(n−1))`，`returns` 作为可选参数（缺省/样本不足/矩非有限时退化为正态近似）；`net_trade_stats` 与 `_signed_net_stats` 把净收益序列传入；docstring/doc 改为**真**陈述 | 正态样本 `t=2.0000` → PSR **0.9773**（与旧式 0.9772 一致，逐位不变）；厚左尾 10 个 −40σ 异常值、`t=2.000000` → **0.9480 < 0.95 → 门拒绝**（同序列旧式报 0.9772）；同形状 `t=3` → **0.9864 → 放行**。`tests/test_ml_credibility.py::test_probabilistic_sharpe_matches_the_normal_approximation` 的 6 条断言全部仍然通过（`returns=None` 走同一公式） |
+| **R5** (LOW) | `core/backtest/engine.py:1778` 的 `if stored and …` 与 `core/ml/predictor.py:672` 接受**缺 `feature_schema_hash`** 的侧车（审计 e2e 因此加载了 7 个产物中的 2 个） | 两处均改为**要求存在**：engine 返回 `False, "feature schema hash missing: …"`；predictor 抛 `FeatureContractError("… carries no feature schema hash …")`（与既有的 mismatch 异常同类） | 缺 hash 的侧车：engine **拒绝**并给出含 `feature schema hash missing` 的理由，predictor **抛异常**；完整侧车（`gate.allowed` + 契约名 + 正确 hash）**照常加载**；本仓库 `data/models` 15 个无侧车 `.pkl` 仍全部拒绝 |
+| **R6** (LOW) | 本文件头仍写基线 `fe11ccf`、提交列表缺 `b49883b`、结尾写"最终审计（未提交）" | 头部改钉 `b49883b` 并列出工作树为本轮修复；提交清单补齐到 `b49883b`（含 `b49883b` 一行）；`data/models` 现状、全量测试数字、twin 行全部按本轮实测重写 | 本文件（`git rev-parse HEAD` = `b49883b98a33354e83b0362fbd1c6eaca97a2ed8`） |
+| **R7** (LOW) | `core/ml/credibility.py:939` 的 `__all__` 导出未定义的 `signed_score`，`from core.ml.credibility import *` 抛 `AttributeError` | 移除该条目（`signed_score` 属于 `core.ml.calibration`，无生产调用者从 credibility 导入它——已 grep 全仓库确认），并加注释说明 | 星号导入**成功**；`[n for n in credibility.__all__ if not hasattr(credibility, n)] == []`；`tests/test_reaudit_fixes.py::test_star_import_of_credibility_resolves` 常驻钉住 |
+
+**默认配置不变**：波动率目标化关闭、`risk.liquidity` 关闭、ML 关闭、P4 全部开关关闭时为逐位不变；vol targeting 打开但序列有缺口时，止损回落到文档化的固定规则。
+

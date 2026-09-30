@@ -196,6 +196,12 @@ class MarketDataProvider:
         the bars it already had.  ``OHLVCache.save`` re-reads the file and unions
         the timestamps again, so the guarantee also covers a repair that lands
         between this read and the write.
+
+        The in-memory union passes ``interval`` too (re-audit finding 3), so the
+        frame this process holds is the same bar-aware one the write path stores:
+        with the historical 2-argument call the merged frame kept twin-convention
+        rows in memory, which meant the next flush of that key rewrote the file
+        every time before the write path collapsed them.
         """
         from loguru import logger
 
@@ -240,9 +246,14 @@ class MarketDataProvider:
                     df = df[~df.index.duplicated(keep='last')]
                     df.sort_index(inplace=True)
                     # Union with the history already known (disk + memory): the
-                    # fetched window is a *widening*, never a replacement.
+                    # fetched window is a *widening*, never a replacement.  The
+                    # interval is passed so the **in-memory** merge is the same
+                    # bar-aware one `OHLVCache.save` writes (re-audit finding 3):
+                    # an exact-timestamp union leaves the twin-convention rows in
+                    # memory, so every later flush of this key rewrites the file
+                    # before the write path collapses them.
                     self.cache.update(symbol, interval,
-                                      merge_history(existing, df))
+                                      merge_history(existing, df, interval))
                     self.cache.save(symbol, interval)
 
         logger.info(f"Pre-fetched history for {len(symbols)} symbols x {len(intervals)} intervals")
