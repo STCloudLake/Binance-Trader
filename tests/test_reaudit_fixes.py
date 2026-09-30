@@ -688,38 +688,56 @@ def test_evidence_index_reports_the_current_revision_and_a_current_chain():
     expected = int(_git_or_fail(
         ["rev-list", "--count", f"{EVIDENCE_BASELINE}^..HEAD"]))
 
-    # ── 1. the chain table matches the repository, row for row ───────────
-    if len(chain) != expected:
+    # ── 1. the chain table is a contiguous prefix of the real history ────
+    # The document lists the chain oldest-first while `git log` is
+    # newest-first, so compare against the reversed history.
+    recorded = _git_or_fail(
+        ["log", "--format=%h", f"{EVIDENCE_BASELINE}^..HEAD"]).split()
+    oldest_first = list(reversed(recorded))
+    if chain != oldest_first[:len(chain)]:
         pytest.fail(
-            f"the evidence index's commit chain has {len(chain)} row(s) but "
-            f"`git rev-list --count {EVIDENCE_BASELINE}^..HEAD` = {expected}: "
-            f"missing={sorted(set(_git_or_fail(['log', '--format=%h',
-                                               f'{EVIDENCE_BASELINE}^..HEAD'])
-                                   .split()) - set(chain))}, "
-            f"table={chain}")
+            f"the evidence index's commit chain is not a contiguous prefix "
+            f"(oldest first) of `git log --format=%h "
+            f"{EVIDENCE_BASELINE}^..HEAD`: table={chain[:6]}… "
+            f"history={oldest_first[:6]}… ({expected} commit(s) in the "
+            f"history)")
 
-    # ── 2. the audited revision is named in the document ─────────────────
-    hashes = set(re.findall(r"`([0-9a-f]{7,40})`", text))
-    short = head[:7]
-    if short not in hashes:
+    # ── 2. the chain reaches the newest commit that changed verified code ─
+    # Doc-only commits (this file, README, docs/**) must not force an index
+    # refresh: the refresh commit would immediately invalidate itself, so a
+    # guard demanding the table always end at HEAD could never be green.  The
+    # audited revision is therefore the newest commit that touched code,
+    # tests, scripts, tools, config or the database layer.
+    code_paths = ("core", "app", "web", "db", "scripts", "tools", "tests",
+                  "config")
+    newest_code = _git_or_fail(
+        ["log", "--format=%h", "-1", f"{EVIDENCE_BASELINE}^..HEAD", "--",
+         *code_paths])
+    if chain[-1] != newest_code:
         pytest.fail(
-            f"the evidence index is stale: it never names the current HEAD "
-            f"{short} ({head}). State the audited revision explicitly -- either "
-            f"the header's 基线提交 or the newest row of the chain table -- and, "
-            f"when the document's own edits are doc-only, say so (the audited "
-            f"code revision is then the newest commit that touched code, not "
-            f"this doc-only commit)")
+            f"the evidence index stops at {chain[-1]} but the newest commit "
+            f"that changed verified code/tests/scripts is {newest_code} "
+            f"(HEAD is {head[:7]}): add the missing row(s) to §8")
+
+    # ── 3. the audited revision is named in the document ─────────────────
+    hashes = set(re.findall(r"`([0-9a-f]{7,40})`", text))
+    if chain[-1] not in hashes:
+        pytest.fail(
+            f"the audited revision {chain[-1]} (the newest commit touching "
+            "code/tests) is never named in the document; state it explicitly "
+            "and say that later doc-only edits are not part of it")
 
     # ── 3. the chain starts at the plan freeze, with no gaps ─────────────
     assert chain[0].startswith(EVIDENCE_BASELINE), (
         f"the chain table must start at the plan freeze {EVIDENCE_BASELINE}; "
         f"it starts at {chain[0]}")
     recorded = set(_git_or_fail(
-        ["log", "--format=%h", f"{EVIDENCE_BASELINE}^..HEAD"]).split())
+        ["log", "--format=%h", f"{EVIDENCE_BASELINE}^..{newest_code}"]).split())
     missing = recorded - set(chain)
     if missing:
-        pytest.fail(f"the chain table omits {len(missing)} commit(s) of "
-                    f"{EVIDENCE_BASELINE}^..HEAD: {sorted(missing)}")
+        pytest.fail(f"the chain table omits {len(missing)} commit(s) up to the "
+                    f"audited revision {newest_code}: {sorted(missing)} "
+                    f"(doc-only commits after it need not be listed)")
 
     # ── 4. the stale "uncommitted" claims are gone ───────────────────────
     # These are the concrete strings the stale index carried, including §9's
