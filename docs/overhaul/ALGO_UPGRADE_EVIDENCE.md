@@ -1,6 +1,6 @@
 # 算法升级证据索引（P1 GA / P2 ML / P3 波动率 / P4 新能力 / gap fixes / 复核修复）
 
-**状态**: 证据已归档（本次实测，非引用） · **生成**: 2026-09-30 · **审计 revision**: `cc63efd`（P6-B/C/D 实现；本文档自身的编辑**只动文档**，不是被审计代码的一部分） · **上一轮审计 revision**: `3e90013`（§11 的残留收口轮；其前为 `5f50771` 裁决轮，更早 `1a452ce` 为 §0 表、§6、§9–§10 的数字来源） · **提交链**: `git log --oneline f1f6a4c^..HEAD`（见 §8 提交清单，含被审计代码的 **17** 行；其后如有纯文档提交，按 §8 说明不并入被审计 revision）
+**状态**: 证据已归档（本次实测，非引用） · **生成**: 2026-09-30 · **审计 revision**: `363b4c0`（研究文档 D 项修复 + P6-C 文档 + D-13 配置注释；本文档自身的编辑**只动文档**，不是被审计代码的一部分） · **上一轮审计 revision**: `cc63efd`（P6-B/C/D 实现）；更早为 `3e90013`（残留收口轮）与 `1a452ce`（§0 表、§6、§9–§10 的数字来源） · **提交链**: `git log --oneline f1f6a4c^..HEAD`（见 §8 提交清单，含被审计代码的 **22** 行；其后如有纯文档提交，按 §8 说明不并入被审计 revision）
 **工作树**: 本轮闭环修复（已提交为 `1a452ce`）由单一代理写入；改动文件为 `core/risk/manager.py`（D1/LOW-6：bar-key 折叠 + 非时间索引拒绝 + 覆盖范围说明）、`scripts/check_data_integrity.py`（同一折叠）、`core/market_data/ohlcv_cache.py`（LOW-5 注释）、`core/ml/credibility.py`（LOW-3 实测值）、`core/risk/position_guard.py`（R1 实测值）、`docs/core-algorithms/13-volume-liquidity-costs.md`（LOW-2）、本文件（LOW-4）、`README.md`（LOW-1）、`tests/test_residual_closure.py`（新）+ `tests/test_final_audit_fixes.py` / `tests/test_gap_fixes.py` / `tests/test_reaudit_fixes.py` / `tests/test_cache_durability.py` / `tests/test_measured_threshold_policy.py`（随行为/注册表同步）。上一轮（`b49883b` 工作树，后续提交为 `828e375`）的复核修复见 §9，改动文件为 `core/risk/position_guard.py`、`core/ml/credibility.py`、`core/ml/meta.py`、`core/backtest/engine.py`（仅 preload 校验）、`core/ml/predictor.py`（仅同侧车校验）、`core/market_data/ohlcv_cache.py` + `core/market_data/provider.py`（仅惰性去重/flush）、`docs/core-algorithms/13-*.md`、本文件、新增 `tests/test_reaudit_fixes.py`。`data/models/` 仍为 15 个 `.pkl` / **0 个 `_meta.json`**。
 **对应计划**: [`ALGO_UPGRADE_PLAN.md`](ALGO_UPGRADE_PLAN.md)（P1–P4 验收标准） · **审计快照**: [`REFACTOR_AUDIT.md`](REFACTOR_AUDIT.md)
 
@@ -135,7 +135,7 @@ P6 的目标、阶段划分与量化验收标准已冻结于
 
 **连带影响的既有测试（均为"旧行为被钉住"，随修复同步更正，非放宽）**：`tests/test_ml_credibility.py::test_gate_passes_a_model_with_real_signal_and_positive_expectancy`（补 `n_trades/t_stat/psr`）、`::test_gate_requires_a_significance_floor`（`t=2.0 & PSR=0.975` 由放行改为拒绝）、`tests/test_gap_fixes.py::test_live_kline_stream_is_the_last_resort_forecast_source`（candle 补 `close_time`，与两个生产发布者一致）。
 
-### 提交清单（截至被审计代码 revision `cc63efd`）
+### 提交清单（截至被审计代码 revision `363b4c0`）
 
 `git log --oneline` 自计划冻结起的提交列表（**被审计代码 revision = `3e90013`**，即最新一个改动代码/测试的提交；其后若只有纯文档提交——例如本文件的 `P6_VOLUME_PLAN.md` 交叉链接——则按下方规则**不**并入被审计 revision，因为守卫只要求链覆盖到最新改动代码的提交）
 
@@ -158,7 +158,11 @@ P6 的目标、阶段划分与量化验收标准已冻结于
 | `508e54a` | 冻结 P6 规划（`docs/overhaul/P6_VOLUME_PLAN.md`：P6-A…P6-E、量化验收标准、依赖、风险、DoD）并交叉链接；**纯文档** |
 | `c703b8b` | 证据索引守卫改为可维护：被审计 revision 定义为"最新改动经验证代码的提交"（`core/app/web/db/scripts/tools/tests/config`），守卫校验"连续最旧优先前缀 + 覆盖到该 revision + 命名该 revision"，纯文档提交不再强制刷新（此前任何新提交都会永久变红）。改动在 `tests/` |
 | `0b9266d` | 新增研究级公式文档 `docs/research/CORE_ALGORITHMS.md`（11 章 + 符号表 + 118 公式 + A/B/C 证据分级 + D-1…D-31 不一致清单）；撤回规划里过期的 P6-A 冲击百分比；**纯文档** |
-| `cc63efd` | **当前被审计代码 revision**：P6-B/C/D —— 缓存新增 `quote_volume`/`trade_count`（含回填与向后兼容）、ML 契约 **v1 39 列 → v2 54 列**（hash `335e63360104` → `1f30fded996d`）与版本化拒绝、P6-A 成交量缝隙接线（默认全关逐位一致）、`volume_bars.py`/`breadth.py`/实验工具、GA 量能模板与基因 + 冲击进入适应度。**v2 契约的门判定：两者均被拒**（BTCUSDT AUC 0.5228 / 0 笔；ETHUSDT AUC 0.5324 / 净 −0.4132% / 889 笔 / t=−3.67） |
+| `cc63efd` | 上一轮：P6-B/C/D 实现 —— 缓存新增 `quote_volume`/`trade_count`（含回填与向后兼容）、ML 契约 v1 39 列 → v2 54 列（hash `335e63360104` → `1f30fded996d`）与版本化拒绝、P6-A 成交量缝隙接线（默认全关逐位一致）、`volume_bars.py`/`breadth.py`/实验工具、GA 量能模板与基因 + 冲击进入适应度。v2 契约门判定：**两者均被拒**（BTCUSDT AUC 0.5228 / 0 笔；ETHUSDT AUC 0.5324 / 净 −0.4132% / 889 笔 / t=−3.67） |
+| `9694c42` | 证据索引补链并记录被审计 revision；**纯文档** |
+| `4a7aaed` | P6-C 结案文档：美元棒/量钟**未改善**（因果成立但门判定 FAIL/FAIL，AUC 差 −0.0527）；量能广度已建成未接线（676 可用/705 报告的 USDT 交易对）；**纯文档** |
+| `117e5ea` | 研究文档 D 项修复：D-16 改为**改正三处声明**（buy_hold 只报告与门控、不重算适应度，实测 22.9878 两者相同）、**D-19 真实标签订签缺陷修复**（timeout 类现按 `[start, stop)` 填充，predictor 统一计算持久化分布）、D-4 v1 哈希改为**可重算**（`_schema_hash(FEATURE_V1_NAMES)`）、7 个死配置键接线或删除（`ga:` 现仅 3 键、0 未读取）、DSR 试次计数统一、新增 `volume_flow` 指标族（按需、默认零成本；模板保留原写法并给出"改写会改变触发 bar"的证据）、成交量缩放基因改为**诚实文档化**（评分层可执行性模型）；外加两条活缓存脆断言去钉（注入 +2.5%/+6%/−6%/+3 根/拼接式 +30% 全部通过）与一批文档数字扫正 |
+| `363b4c0` | **当前被审计代码 revision**：`config/config.yaml` 的 garch11 成本注释由 "≈12 ms/bar" 改为实测值（默认 500 窗口 ≈0.13–0.16 s/次，window=0 ≈3.7 s；廉价方法 ≤1 ms/bar，实时形状 ewma 0.14–0.20 ms） |
 
 ## 9. 复核修复（`b49883b` 工作树）——7 项发现的 before/after
 
