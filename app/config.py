@@ -1,3 +1,4 @@
+import importlib
 import os
 import yaml
 from pathlib import Path
@@ -377,6 +378,219 @@ LIQUIDITY_KEY_READERS: dict[str, str] = {
 }
 
 
+class ExperimentalConfig(BaseModel):
+    """The `experimental:` block — one switch per experimental capability.
+
+    These are the P4-era capacities that were implemented and tested but were
+    only reachable by editing module-level Python constants.  Every switch here
+    maps 1:1 to exactly one such constant (see :data:`EXPERIMENTAL_FLAG_TARGETS`)
+    and is applied by :func:`apply_experimental_flags`, which the app startup path
+    calls explicitly — so with the block absent (or all-false) every constant
+    keeps the ``False`` value it ships with and every signal/size is
+    bit-identical to HEAD (``tests/test_experimental_switches.py`` pins this
+    against a real HEAD worktree).
+
+    **Default: everything false.**  Turning a switch on only opens *that* seam;
+    it never bypasses the capability's own acceptance test.  Each of those gates
+    can and does refuse on real data:
+
+    * pairs — 0 of 30 real 1h/4h/15m major-pair cointegration tests pass the 5 %
+      level (``docs/research/CORE_ALGORITHMS.md`` §4.4), so ``pair_guard`` refuses;
+    * meta-labelling — the meta gate refused 10 of 10 primary rules on the real
+      1h cache (§5.4);
+    * regime gating — only causal HMM labels may be gated on, and
+      ``gate_regimes`` raises ``NonCausalRegimeError`` rather than consume a
+      whole-sample label (§7.5);
+    * microstructure features are quoted from a live book that is stale in
+      milliseconds.
+
+    **Honest scope: enabling a switch can still change nothing reachable.**
+    ``regime_diagnostics``, ``pairs_enabled``, ``meta_labeling_enabled`` and
+    ``microstructure_enabled`` have **no production reader at all** (the live
+    equivalents are the ``engine_*`` switches, and microstructure has no wiring
+    seam anywhere) — see each note in :data:`EXPERIMENTAL_KEY_NOTES` and README
+    §4.4.  ``engine_pairs_signals`` / ``engine_meta_filter`` have a reachable
+    engine seam but need a caller to ``wire_pairs_provider`` /
+    ``wire_meta_filter``, which no production component does yet.  Only
+    ``engine_regime_diagnostics`` is reachable end-to-end on its own (it adds the
+    regime label to the signal cache; it changes no direction and no size).
+    """
+
+    # ── engine seams (`core/strategy/engine.py`) ──
+    engine_regime_diagnostics: bool = False
+    engine_meta_filter: bool = False
+    engine_pairs_signals: bool = False
+    # ── regime (`core/strategy/regime.py`) ──
+    regime_gating: bool = False
+    regime_diagnostics: bool = False
+    # ── pairs (`core/strategy/pairs.py`) ──
+    pairs_enabled: bool = False
+    # ── meta-labelling (`core/ml/meta.py`) ──
+    meta_labeling_enabled: bool = False
+    # ── microstructure (`core/market_data/microstructure.py`) ──
+    microstructure_enabled: bool = False
+
+
+#: `experimental:` key → ``(module, CONSTANT)`` it flips.  This table **is** the
+#: wiring: :func:`apply_experimental_flags` is data-driven from it, so a key can
+#: never be added to the YAML without naming the constant it controls, and
+#: ``tests/test_experimental_switches.py::test_every_experimental_key_has_a_reader``
+#: asserts the table is complete and that each named constant really exists.
+EXPERIMENTAL_FLAG_TARGETS: dict[str, tuple[str, str]] = {
+    "engine_regime_diagnostics": (
+        "core.strategy.engine", "P4_REGIME_DIAGNOSTICS_ENABLED"),
+    "engine_meta_filter": ("core.strategy.engine", "P4_META_FILTER_ENABLED"),
+    "engine_pairs_signals": ("core.strategy.engine", "P4_PAIRS_SIGNALS_ENABLED"),
+    "regime_gating": ("core.strategy.regime", "REGIME_GATING_ENABLED"),
+    "regime_diagnostics": ("core.strategy.regime", "REGIME_DIAGNOSTICS_ENABLED"),
+    "pairs_enabled": ("core.strategy.pairs", "PAIRS_ENABLED"),
+    "meta_labeling_enabled": ("core.ml.meta", "META_LABELING_ENABLED"),
+    "microstructure_enabled": (
+        "core.market_data.microstructure", "MICROSTRUCTURE_ENABLED"),
+}
+
+#: The `experimental:` block grouped by the layer each switch belongs to, in the
+#: order the YAML documents them.  Used by the startup notice.
+EXPERIMENTAL_LAYERS: dict[str, tuple[str, ...]] = {
+    "engine seams (core/strategy/engine.py)": (
+        "engine_regime_diagnostics", "engine_meta_filter", "engine_pairs_signals"),
+    "regime (core/strategy/regime.py)": ("regime_gating", "regime_diagnostics"),
+    "pairs (core/strategy/pairs.py)": ("pairs_enabled",),
+    "meta-labelling (core/ml/meta.py)": ("meta_labeling_enabled",),
+    "microstructure (core/market_data/microstructure.py)": (
+        "microstructure_enabled",),
+}
+
+#: One line per switch: what it does, what it does **not** do, and whether its own
+#: gate can refuse it.  Fed to the startup notice, so the operator reads the same
+#: caveat the YAML carries instead of assuming a switch equals a working feature.
+EXPERIMENTAL_KEY_NOTES: dict[str, str] = {
+    "engine_regime_diagnostics":
+        "attach the regime label to the signal cache (DIAGNOSTICS ONLY: no gating, "
+        "no direction, no size change). GATED: a usable live label needs the causal "
+        "HMM path.",
+    "engine_meta_filter":
+        "let a MetaLabeler suppress/scale an entry (never the side). Needs "
+        "wire_meta_filter(); no production caller registers one, so alone it changes "
+        "nothing. GATED: the meta gate refused 10/10 primary rules on real 1h data.",
+    "engine_pairs_signals":
+        "let a pairs provider replace the indicator signal. Needs "
+        "wire_pairs_provider(); no production caller registers one, so alone it "
+        "changes nothing. GATED: 0/30 real major-pair cointegration tests pass.",
+    "regime_gating":
+        "regime-gate master switch; also switches hmm_two_state(causal=None) to the "
+        "causal path. No production component builds a gate, so no live signal/size "
+        "changes yet. GATED: gate_regimes refuses non-causal HMM labels.",
+    "regime_diagnostics":
+        "report the regime label — NO production reader (the live diagnostics switch "
+        "is engine_regime_diagnostics): enabling it changes nothing reachable.",
+    "pairs_enabled":
+        "pairs-module master switch — NO production reader: enabling it changes "
+        "nothing reachable.",
+    "meta_labeling_enabled":
+        "meta-labelling master switch — NO production reader: enabling it changes "
+        "nothing reachable.",
+    "microstructure_enabled":
+        "microstructure-feature master switch — NO production reader and NO wiring "
+        "seam anywhere in the pipeline: enabling it changes nothing reachable.",
+}
+
+
+def experimental_from_raw(raw: Any) -> tuple["ExperimentalConfig", list[str]]:
+    """Parse the raw `experimental:` mapping into a model plus warnings.
+
+    An **unknown key is reported, never silently ignored** (the project's rule is
+    that every config key has a reader, so a key nobody reads must be visible).
+    A non-mapping block is likewise reported and replaced by the all-false
+    defaults.  Values go through :func:`_as_bool`, the same coercion every other
+    boolean in this file uses, so ``"yes"``/``1``/``"on"`` are accepted.
+    """
+    messages: list[str] = []
+    if raw is None:
+        return ExperimentalConfig(), messages
+    if not isinstance(raw, dict):
+        messages.append(f"experimental must be a mapping of switch -> bool, got "
+                        f"{type(raw).__name__} — all experimental features stay OFF")
+        return ExperimentalConfig(), messages
+    unknown = sorted(k for k in raw if k not in ExperimentalConfig.model_fields)
+    for key in unknown:
+        messages.append(
+            f"experimental.{key} is not a known switch — IGNORED. Known switches: "
+            f"{sorted(ExperimentalConfig.model_fields)} "
+            f"(app/config.py:EXPERIMENTAL_FLAG_TARGETS)")
+    known = {k: _as_bool(v, False) for k, v in raw.items()
+             if k in ExperimentalConfig.model_fields}
+    return ExperimentalConfig(**known), messages
+
+
+def experimental_notices(exp) -> list[str]:
+    """Startup NOTICEs for the `experimental:` block.
+
+    Mirrors :func:`inert_barrier_key_warnings` / :func:`liquidity_key_warnings`:
+    ``[]`` for the shipped all-false block (the default path stays silent), and
+    one message naming **exactly** the enabled switches, grouped by layer, with
+    the reminder that each capability is still gated by its own acceptance test
+    on real data.
+    """
+    if exp is None:
+        return []
+    enabled = [key for key in EXPERIMENTAL_FLAG_TARGETS if bool(getattr(exp, key, False))]
+    if not enabled:
+        return []
+    lines: list[str] = []
+    for layer, keys in EXPERIMENTAL_LAYERS.items():
+        active = [key for key in keys if key in enabled]
+        if not active:
+            continue
+        lines.append(f"  [{layer}]")
+        for key in active:
+            module, constant = EXPERIMENTAL_FLAG_TARGETS[key]
+            lines.append(f"  - experimental.{key} -> {module}.{constant}: "
+                         f"{EXPERIMENTAL_KEY_NOTES[key]}")
+    return [
+        f"EXPERIMENTAL FEATURES ENABLED ({len(enabled)} of "
+        f"{len(EXPERIMENTAL_FLAG_TARGETS)}) — each one is still gated by its OWN "
+        f"acceptance test on real data, and a gate may refuse it:\n"
+        + "\n".join(lines)]
+
+
+def apply_experimental_flags(config=None) -> dict[str, bool]:
+    """Push the `experimental:` switches onto the modules' module-level flags.
+
+    Called **explicitly** from the app startup path (``app/main.py``, right after
+    the config is loaded and before any component is constructed), never from
+    :meth:`Config._load`: the modules keep their ``False`` defaults unless the
+    operator configured a switch, and importing this module in a test cannot flip
+    a flag under another test's feet.
+
+    Only the **enabled** switches are written; a disabled one is left at its
+    shipped ``False`` default, so the all-false block imports nothing and touches
+    no module attribute at all — that is the bit-identity guarantee of this layer
+    (``tests/test_experimental_switches.py`` compares signals *and* sizing against
+    a HEAD worktree).
+
+    Returns ``{switch: enabled}`` for all switches (handy for a startup log line
+    or an audit).
+    """
+    if config is None:
+        config = Config.load()
+    exp = getattr(config, "experimental", None)
+    if exp is None:
+        exp = ExperimentalConfig()
+    applied = {key: bool(getattr(exp, key, False))
+               for key in EXPERIMENTAL_FLAG_TARGETS}
+    enabled = [key for key, value in applied.items() if value]
+    if enabled:
+        for key in enabled:
+            module_name, attribute = EXPERIMENTAL_FLAG_TARGETS[key]
+            module = importlib.import_module(module_name)
+            setattr(module, attribute, True)
+        logger.info("Experimental flags applied: " + ", ".join(
+            f"{key} -> {EXPERIMENTAL_FLAG_TARGETS[key][0]}."
+            f"{EXPERIMENTAL_FLAG_TARGETS[key][1]}" for key in enabled))
+    return applied
+
+
 class Config:
     _instance = None
 
@@ -702,6 +916,20 @@ class Config:
         # fields, and this alias is deliberate (not a config key — it is not in
         # `risk.liquidity`, so it cannot become an unread-key defect).
         object.__setattr__(vt, "risk_liquidity", lq)
+
+        # ── Experimental-feature switches (`experimental:` in config.yaml) ────
+        # One switch per experimental capability (P4 seams / regime / pairs /
+        # meta / microstructure).  SAFE DEFAULT: every switch false, and the
+        # mapping onto the modules' module-level constants happens only when the
+        # app startup path calls `apply_experimental_flags(self)` — so with the
+        # block absent or all-false no constant is written and every signal/size
+        # is bit-identical to HEAD.  An unknown key is reported here, not
+        # silently ignored (every config key must have a reader).
+        self.experimental, _exp_messages = experimental_from_raw(
+            self._get("experimental"))
+        self.experimental_notice_messages = experimental_notices(self.experimental)
+        for _msg in self.experimental_notice_messages + _exp_messages:
+            logger.warning(_msg)
 
         self.db_path = str(PROJECT_ROOT / "data" / "binance_trader.db")
         self.data_dir = str(PROJECT_ROOT / "data")

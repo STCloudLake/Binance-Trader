@@ -1326,6 +1326,8 @@ $$(\texttt{hmm\_present} \wedge \neg\,\texttt{causal\_hmm}) \Rightarrow \text{ra
 
 即：门关闭时全样本拟合（与旧行为逐位相同），门一打开就自动切到因果路径——"门永远不会在没要求的情况下消费看过后来的标签"（`:274-278`）。
 
+**配置化（本 revision 新增，覆盖 §4–§7 的四个 P4 能力）.** 上面这些常量现在由 `config/config.yaml` 的 `experimental:` 块控制：每个能力一个开关、**默认全部 `false`**，`app/config.py::apply_experimental_flags` 由 `app/main.py` 的启动路径显式调用（全关时**不导入任何能力模块、不写任何常量**，信号与仓位与 HEAD 逐位一致；`tests/test_experimental_switches.py` 用 `git worktree` 在 `3a140cf` 上逐字节比对信号缓存与 10 组定仓）。**打开开关 ≠ 能力生效**：本轮复核 D-26 仍然成立，且不止它列出的两个——`META_LABELING_ENABLED`（`core/ml/meta.py:102`）与 `REGIME_DIAGNOSTICS_ENABLED`（`core/strategy/regime.py:103`）同样**无生产读取者**（全仓库 grep 只命中定义、docstring 与 `__all__`）；engine 的三个 `P4_*` 缝虽在生产 `_evaluate`（`core/strategy/engine.py:273,:321-322`）里被读，但需要 `wire_pairs_provider` / `wire_meta_filter` 注册组件，而生产链路没有注册者，因此**只有 `engine_regime_diagnostics` 单开就能改变可达行为**（把 regime 标签加进信号缓存，不改方向、不改仓位）。各能力自身的验收门仍会拒绝：配对实测 **0/30**（§4.4）、meta 门 **10/10** 拒绝一级规则（§5.4）、regime 只允许因果 HMM 标签（§7.4）。开关清单、默认值与诚实预期见 `README.md` §4.4。
+
 **归档实测：** 已知三 regime 合成序列上 HMM 恢复已知波动率、**≥95 % 准确率**、延迟数根 bar；tercile 分类器因果；两次运行逐位一致；门默认关闭且关闭时全放行（`docs/overhaul/ALGO_UPGRADE_EVIDENCE.md:81`）。`tests/test_regime.py` 我实测 **14** 项 `def test`，与文档一致。
 
 **成本（代码记录）.** 因果解码 3 000 bar、默认参数（250 bar 重拟合 / 250 bar warm-up）= 12 次拟合 + 12 次扫掠，实测 **≈2.3–2.6 s**（`:503-512`）。作者**明确否证**了 `docs/core-algorithms/11-pairs-cointegration.md` 里写的 "≈18–21 s"——"not in this file and does not reproduce"（`:508-510`）。这本身是一处**文档 cite 错误**（把 regime 的数字写进了 pairs 文档），见 §11 D-8。

@@ -130,6 +130,7 @@ usage: main.py [-h] [--mode {sim,live,backtest}] [--port PORT] [--db DB]
 | `backtest.engine_mode` / `ml_enabled` | `auto` / `false` | 引擎选择（非法值回退 `auto`）；false 时会就地关掉策略的 `ml_config.enabled` |
 | `sim.cost_model.*` | `enabled: true`、`fee_tier: VIP0`、`slippage_bps: 2` | 模拟盘成本模型（见 §4.2） |
 | `risk.*` | 全部 `enabled: false` | 波动率目标化 / 流动性，默认惰性（见 §4.3） |
+| `experimental.*` | 全部 `false` | P4 实验性能力开关（engine 缝 / regime / pairs / meta / microstructure，见 §4.4） |
 
 `config/risk_params.yaml` 给出 `hard_limits`（日/周回撤、日亏损、最大敞口、最大笔数、杠杆、追踪止损、紧急止损等）与 `soft_params`（仓位比例、止损、杠杆、三档止盈）；**以文件里的值为准**，本文不复制这张表。自选列表**不在 YAML 里**，存在数据库 `system_config.watchlist_symbols`（兜底 `BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT`，上限 30），改动**下次重启生效**（`POST /api/market/watchlist` 的响应带 `restart_required: true`）；手续费档位同理——本机读不到真实账户的 30 天交易量与 BNB 持仓，只能手动选择并持久化。
 
@@ -209,9 +210,22 @@ slippage_usdt = |fill − price| × quantity；cost_usdt = fee + slippage_usdt
 | **ML 门控** | `config.yaml` `ml.enabled: false`；门在 `core/ml/credibility.py::credibility_gate`（OOS AUC > 0.55 **且** 净成本期望 > 0），由 `core/ml/predictor.py::_gate_config` 消费 | 实测线上模型**差于多数类**（accuracy 0.41–0.47 vs 0.54–0.67，OOS AUC 0.396–0.447）且反校准（预测 0.91 → 实际 0.22），开启是**负贡献** |
 | **波动率目标化** | `risk.vol_targeting.enabled: false` | 完全 opt-in；关闭时仓位与止损宽度与固定比例实现**逐位一致**。该块里 `barrier_vol_multiple` / `barrier_min_pct` / `barrier_max_pct` 是 **RESERVED/惰性**键（无生产调用方，设成非默认值只在启动时打 WARNING），不要当成生效配置 |
 | **`risk.liquidity`（成交量/冲击）** | `enabled: false`、`impact_k: 0.0` | 关闭时 `PositionSizer` 不调用参与度钩子，回测成本保持审计过的 `fees + spread/2` 逐位不变（`tests/test_liquidity.py` 守护）。`impact_k` 在配置里明确标注 **ILLUSTRATIVE, NOT CALIBRATED** |
-| **P4 新能力** | 模块级常量全为 `False`：`META_LABELING_ENABLED`（`core/ml/meta.py`）、`PAIRS_ENABLED`（`core/strategy/pairs.py`）、`REGIME_GATING_ENABLED`（`core/strategy/regime.py`）、`MICROSTRUCTURE_ENABLED`（`core/market_data/microstructure.py`） | 已实现且有独立测试，但**未接入实时链路**（默认惰性、关闭时全放行）；在真实 1h 主流币数据上配对与 meta-label 门**拒绝**全部被测一级规则——这是有效结论，不是缺陷 |
+| **P4 新能力** | 模块级常量全为 `False`：`META_LABELING_ENABLED`（`core/ml/meta.py`）、`PAIRS_ENABLED`（`core/strategy/pairs.py`）、`REGIME_GATING_ENABLED`（`core/strategy/regime.py`）、`MICROSTRUCTURE_ENABLED`（`core/market_data/microstructure.py`） | 已实现且有独立测试，但**未接入实时链路**（默认惰性、关闭时全放行）；在真实 1h 主流币数据上配对与 meta-label 门**拒绝**全部被测一级规则——这是有效结论，不是缺陷。这些常量现在有配置开关，见 §4.4 |
 
 `core/` 里仍有 GA、AI（DeepSeek 控制器 + 策略生命周期）、新闻情绪、代币启发式筛查（`core/market_data/screener.py`）在链路上；`experimental/` 是**不在交易链路上**的死代码存档（见 [`experimental/ml/README.md`](experimental/ml/README.md)）。
+
+### 4.4 实验性开关（`config.yaml` 的 `experimental:`，默认全关）
+
+P4 那批能力此前只能改 Python 常量；现在一个能力一个开关，`app/config.py::apply_experimental_flags` 由 `app/main.py` 启动路径显式调用（配置全关时**不导入能力模块、不写任何常量**，信号与仓位与 HEAD **逐位一致**，`tests/test_experimental_switches.py` 用 `git worktree` 在 `3a140cf` 上逐字节比对）。
+
+| 开关（默认 `false`） | 常量 → 实际改动 |
+|---|---|
+| `engine_regime_diagnostics` | `P4_REGIME_DIAGNOSTICS_ENABLED`：把 regime 标签附进信号缓存（**只诊断，不改方向/仓位**）；这是唯一"单开即可达"的开关 |
+| `engine_meta_filter` / `engine_pairs_signals` | `P4_META_FILTER_ENABLED` / `P4_PAIRS_SIGNALS_ENABLED`：已注册的 MetaLabeler / pairs provider 可过滤或替换信号，但生产链路**尚未注册**（`wire_meta_filter` / `wire_pairs_provider` 无调用者），单开无效 |
+| `regime_gating` / `regime_diagnostics` | `REGIME_GATING_ENABLED` 切到因果 HMM 并启用门；`REGIME_DIAGNOSTICS_ENABLED` **无生产读取者** |
+| `pairs_enabled` / `meta_labeling_enabled` / `microstructure_enabled` | `PAIRS_ENABLED` / `META_LABELING_ENABLED` / `MICROSTRUCTURE_ENABLED`：**均无生产读取者**（microstructure 连**接线缝隙都没有**），打开不改变任何可达行为 |
+
+每个开关只打开**那道缝**，能力自身的验收门仍会拒绝：真实 1h 主流币配对 **0/30** 通过协整检验、meta 门 **10/10** 拒绝一级规则、regime 只接受因果 HMM 标签。**诚实预期**：这些开关提高的是**可测量性与纪律**（能否复现、能否 A/B），**不增加预测优势**。启动时会打一条 WARNING 逐项列出已开启的开关（`experimental_notices`，与 `inert_barrier_key_warnings` 同型），未知键也会被点名而不是静默忽略。
 
 ---
 

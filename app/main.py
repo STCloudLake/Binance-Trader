@@ -14,7 +14,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from loguru import logger
 import uvicorn
 
-from app.config import Config, ConfigError
+from app.config import Config, ConfigError, apply_experimental_flags
 from app.event_bus import EventBus, Event, EventType
 from db.database import init_database, load_sim_balance, save_sim_balance, atomic_adjust_balance, DEFAULT_BALANCE
 from core.market_data.provider import (
@@ -179,6 +179,12 @@ async def main():
         Path(config.config_dir).mkdir(parents=True, exist_ok=True)
 
     logger.info(f"Config loaded. DB: {config.db_path}")
+
+    # 1.5 Apply the `experimental:` switches BEFORE any component is built.
+    # Explicit (not inside Config._load) so the core modules keep their shipped
+    # `False` defaults when nothing is configured; with the block absent or
+    # all-false this opens no seam and touches no module attribute.
+    apply_experimental_flags(config)
 
     # Pre-flight: fail fast (before the ~70-90 s warm-up) when the port is taken.
     # A connect probe — see ``port_in_use`` — so a TIME_WAIT socket from the

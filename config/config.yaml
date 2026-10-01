@@ -74,6 +74,56 @@ binance:
 core_position:
   capital_pct: 0.7
   max_symbols: 5
+# ── 实验性开关（experimental）────────────────────────────────────────────
+# P4 那批能力此前只能靠改 Python 常量来开关；这里给每个能力一个配置开关。
+# **默认全部 false**，且整块缺失等价于全 false：此时 `app/config.py`
+# ::apply_experimental_flags（由 `app/main.py` 启动路径显式调用）不会碰任何模块常量，
+# 信号与仓位与 HEAD 逐位一致（tests/test_experimental_switches.py 用 HEAD worktree 钉住）。
+#
+# 两条必须知道的事：
+#  1) 打开一个开关只是打开**那道缝**，不等于能力生效——每个能力仍受**自己的验收门**
+#     约束，真实数据上这些门会拒绝（见每条注释）。
+#  2) 有四个开关**当前没有任何生产读取者**（regime_diagnostics / pairs_enabled /
+#     meta_labeling_enabled / microstructure_enabled）：打开它们本身不改变任何可达
+#     路径，注释已逐条写明。engine_pairs_signals / engine_meta_filter 有缝但需要
+#     调用方 wire_pairs_provider() / wire_meta_filter() 注册组件，生产链路尚未注册。
+# 启动时会打一条 WARNING 列出所有已开启项并提醒"各自受验收门约束"
+#（experimental_notices，与 inert_barrier_key_warnings / liquidity_key_warnings 同型）。
+experimental:
+  # ── engine 缝（core/strategy/engine.py）──
+  # P4_REGIME_DIAGNOSTICS_ENABLED：把 regime 标签附到信号缓存里，**只做诊断**，
+  # 不参与门控、不改方向也不改仓位。真实数据上可用的标签只在 HMM 因果模式下成立。
+  engine_regime_diagnostics: false
+  # P4_META_FILTER_ENABLED：允许 MetaLabeler 过滤/缩放入场（永不改方向）。
+  # 还需要 wire_meta_filter() 注册二级模型——生产链路尚未注册，单开此项无效果。
+  # 门：真实 1h 数据上 meta 门 10/10 拒绝全部被测一级规则。
+  engine_meta_filter: false
+  # P4_PAIRS_SIGNALS_ENABLED：允许 pairs provider 覆盖 indicator 信号。
+  # 还需要 wire_pairs_provider()——生产链路尚未注册，单开此项无效果。
+  # 门：真实 1h/4h/15m 主流币对协整检验 **0/30** 通过 5% 水平。
+  engine_pairs_signals: false
+  # ── regime（core/strategy/regime.py）──
+  # REGIME_GATING_ENABLED：regime 门控总开关，并把 hmm_two_state(causal=None)
+  # 切到因果路径。没有任何生产组件构造 RegimeGate，因此目前不改任何实盘信号/仓位。
+  # 门：gate_regimes 在 HMM 标签非因果时直接拒绝（NonCausalRegimeError）。
+  regime_gating: false
+  # REGIME_DIAGNOSTICS_ENABLED：只报告 regime 标签。
+  # **无生产读取者**（实盘诊断用的是 engine_regime_diagnostics），打开即无效果；
+  # 即便接线，标签也只在因果 HMM 模式下可用（gate_regimes 拒绝非因果标签）。
+  regime_diagnostics: false
+  # ── pairs（core/strategy/pairs.py）──
+  # PAIRS_ENABLED：pairs 模块总开关。**无生产读取者**，打开它本身不改变任何可达路径；
+  # 即便接线，真实 1h/4h/15m 主流币对协整检验 **0/30** 通过 5% 水平，pair_guard 会拒绝。
+  pairs_enabled: false
+  # ── meta（core/ml/meta.py）──
+  # META_LABELING_ENABLED：meta-labelling 模块总开关。**无生产读取者**，同上；
+  # 即便接线，真实 1h 数据上 meta 门 **10/10** 拒绝被测一级规则。
+  meta_labeling_enabled: false
+  # ── microstructure（core/market_data/microstructure.py）──
+  # MICROSTRUCTURE_ENABLED：微观结构特征总开关。**无生产读取者，且链路上没有任何
+  # 接线缝隙**（没有 wire_microstructure 之类），打开它不改变任何可达行为；即便接线，
+  # 特征取自毫秒级过期的盘口，改善的是**测量**而不是方向判断。
+  microstructure_enabled: false
 language: zh
 ml:
   # ── ML credibility gate (docs/overhaul/ALGO_UPGRADE_PLAN.md §二 P2) ──

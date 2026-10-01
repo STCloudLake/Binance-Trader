@@ -21,8 +21,19 @@ defaults):
 
 Determinism and data policy
 ---------------------------
-No randomness, no network, no writes: the real-data assertions only *read*
-``data/market/*.parquet`` and are skipped when the checkout does not ship them.
+No randomness, no network, no writes to ``data/**``: the real-data assertions
+only *read* ``data/market/*.parquet`` and are skipped when the checkout does not
+ship them.
+
+The cache is mid-migration from v1 (``open/high/low/close/volume``) to v2
+(adding ``quote_volume``/``trade_count``), and ``core.risk.liquidity`` prefers
+the stored ``quote_volume`` whenever the column carries a usable number, so a
+real-data expectation must never pin the column set: it is **derived from the
+frame the test just read**, by :func:`_quote_volume_values` — stored
+``quote_volume`` when usable, otherwise the documented ``Σ volume × close``
+proxy.  Both branches are additionally pinned on synthetic frames the tests
+build, and the two cache states are proven end-to-end on temp copies written
+under ``tmp_path`` (:func:`test_both_cache_versions_agree_on_a_temp_copy`).
 """
 
 from __future__ import annotations
@@ -56,23 +67,81 @@ def _frame(volumes, closes):
     return pd.DataFrame({"volume": volumes, "close": closes})
 
 
+def _quote_volume_values(frame, lookback_bars: int = 20) -> list[float]:
+    """The very values ``recent_quote_volume`` sums for ``frame`` (P6-B rule).
+
+    Derived from the frame in hand, never from a pinned column set: the cache is
+    being rewritten from v1 to v2 while this suite runs, and
+    ``core/risk/liquidity._series`` takes whichever of the two the frame carries:
+
+    * a **usable** ``quote_volume`` column (at least one finite value in the tail
+      window) ⇒ those stored values win — the VWAP-like figure is not equal to
+      ``volume × close`` (measured ~0.14 % apart on BTC 1h);
+    * otherwise — the column is absent (v1) **or** present and entirely
+      non-finite (a v2 file whose backfill has not run) — ⇒ the documented proxy
+      ``volume × close`` over the same tail window.
+
+    The tail window is taken **before** non-finite bars are dropped, exactly as
+    the helper does (it tails the full column, then filters).  The "usable"
+    test, however, is a property of the **column**, not of the window: the
+    helper decides ``quote_volume`` vs proxy before it slices, so a column that
+    is partly quoted but whose tail window happens to be entirely non-finite
+    yields ``[]`` — ``0.0``, the documented "not measured" signal — and *not*
+    the proxy.  Only pairwise finite ``volume``/``close`` bars enter the proxy.
+    Returned as a list so the mapping / 1-D-sequence input forms can be handed
+    the identical numbers.
+    """
+    if "quote_volume" in list(frame.columns):
+        quoted = pd.to_numeric(frame["quote_volume"], errors="coerce")
+        if quoted.notna().any():
+            window = quoted.tail(lookback_bars) if lookback_bars else quoted
+            return [float(v) for v in window.dropna()]
+    tail = frame.tail(lookback_bars) if lookback_bars else frame
+    volumes = pd.to_numeric(tail["volume"], errors="coerce")
+    closes = pd.to_numeric(tail["close"], errors="coerce")
+    return [float(v * c) for v, c in zip(volumes, closes)
+            if math.isfinite(float(v)) and math.isfinite(float(c))]
+
+
+def _expected_quote_volume(frame, lookback_bars: int = 20) -> float:
+    """The documented expectation for ``frame`` under either cache version."""
+    values = _quote_volume_values(frame, lookback_bars)
+    return math.fsum(values) if values else 0.0
+
+
 # ── 1. the helper module ────────────────────────────────────────────────
 
 def test_recent_quote_volume_uses_tail_window_and_real_prices():
-    """The window is the LAST ``lookback_bars`` bars, priced with their closes."""
+    """The window is the LAST ``lookback_bars`` bars — on either cache version.
+
+    Old assertion (P6-B-invalid): ``expected = Σ volume × close`` over the tail,
+    which only holds while the file is v1.  Once ``quote_volume`` exists the
+    helper prefers the stored column (VWAP ≈ close, not equal), so the pin
+    failed *mid-migration*, depending on which file the running backfill had
+    reached.  New rule: the expectation is derived from the frame just read —
+    ``Σ quote_volume`` when that column is usable, else the documented proxy —
+    by :func:`_expected_quote_volume`.
+    """
     from core.risk.liquidity import recent_quote_volume
 
     df = _read(BTC_1H)
     tail = df.tail(20)
-    expected = float((tail["volume"] * tail["close"]).sum())
+    expected = _expected_quote_volume(df, 20)
     got = recent_quote_volume(df, 20)
     assert got == pytest.approx(expected, rel=1e-9)
     # A different window is a different number: the lookback really bounds it.
     assert recent_quote_volume(df, 20) != pytest.approx(
         recent_quote_volume(df, 40), rel=1e-9)
-    # It is a quote (USDT) figure, not base-asset volume: the notional must
-    # exceed the raw base-asset sum by roughly the price level.
-    assert got > float(tail["close"].min()) * float(tail["volume"].sum())
+    # It is a quote (USDT) figure, not base-asset volume: per base unit traded it
+    # sits at the window's own price level.  Derived from the frame (a 10 % band
+    # absorbs the VWAP-vs-close gap and either cache version), not pinned to a
+    # price: the old ``got > min(close) × Σ volume`` form was a near-miss tie on
+    # the v2 column and is replaced by the ratio it was approximating.
+    base = float(tail["volume"].sum())
+    assert base > 0.0 and got > 0.0
+    per_unit = got / base
+    assert float(tail["close"].min()) * 0.9 < per_unit < \
+        float(tail["close"].max()) * 1.1
 
 
 def test_recent_quote_volume_input_forms_agree():
@@ -81,13 +150,21 @@ def test_recent_quote_volume_input_forms_agree():
 
     df = _read(BTC_1H).tail(20)
     by_frame = recent_quote_volume(df, 20)
+    # Version-agnostic: the frame's own documented source, not a pinned column.
+    assert by_frame == pytest.approx(_expected_quote_volume(df, 20), rel=1e-9)
     assert recent_quote_volume(frame=df, lookback_bars=20) == by_frame
     assert recent_quote_volume(df, lookback_bars=20) == by_frame
+    # A mapping with only ``volume`` (+ close) is summed as BASE volume: the
+    # documented "a plain volume series is not price-converted" path, so this
+    # number does not move with the cache version.
     assert recent_quote_volume({"volume": list(df["volume"]),
                                 "close": list(df["close"])}) == pytest.approx(
         float(df["volume"].sum()))  # mapping path: volume already priced
-    # A mapping that already carries quote_volume needs no price column.
-    qv = [float(v) for v in (df["volume"] * df["close"])]
+    # A mapping that already carries quote_volume needs no price column.  The
+    # values are the frame's own documented source (stored quote_volume when
+    # usable, else volume × close), so this agrees with ``by_frame`` on either
+    # cache version — the old ``Σ volume × close`` construction did not.
+    qv = _quote_volume_values(df, 20)
     assert recent_quote_volume({"quote_volume": qv}, 20) == pytest.approx(by_frame)
     # An injected provider wins over everything else.
     assert recent_quote_volume(df, 20, provider=lambda n: 1234.5) == 1234.5
@@ -108,6 +185,74 @@ def test_recent_quote_volume_edges_are_zero_not_nan():
     assert recent_quote_volume([math.nan, 1.0], 20) == 1.0  # NaN bars dropped
     with pytest.raises(TypeError):
         recent_quote_volume(None, 20, provider=42)
+
+
+def test_quote_volume_rule_is_pinned_on_synthetic_v1_and_v2_frames():
+    """The P6-B source rule, pinned on frames the test builds — never the cache.
+
+    The rule the live cache cannot be asked to prove, because it may be in
+    either state: a usable stored ``quote_volume`` wins, otherwise the
+    documented proxy ``Σ volume × close`` is used, both over the tail window.
+    Building both shapes here keeps the fallback path covered even while every
+    file on disk is v2 (and the v2 path covered while they are still v1).
+    """
+    from core.risk.liquidity import recent_quote_volume
+
+    volumes = [1.0, 2.0, 3.0, 4.0, 5.0]
+    closes = [10.0, 20.0, 30.0, 40.0, 50.0]
+    v1 = _frame(volumes, closes)                        # no quote_volume column
+    v2 = pd.DataFrame({"volume": volumes, "close": closes,
+                       "quote_volume": [11.0, 21.0, 33.0, 44.0, 55.0]})
+    # Tail window (the last 3 bars) and the whole series (lookback <= 0).
+    assert recent_quote_volume(v1, 3) == pytest.approx(3 * 30.0 + 4 * 40.0 + 5 * 50.0)
+    assert recent_quote_volume(v1, 0) == pytest.approx(10.0 + 40.0 + 90.0 + 160.0
+                                                       + 250.0)
+    assert recent_quote_volume(v2, 3) == pytest.approx(33.0 + 44.0 + 55.0)
+    assert recent_quote_volume(v2, 0) == pytest.approx(164.0)
+    # The stored column really wins: on this frame the proxy is a different
+    # number, so a regression to "always price with closes" cannot pass.
+    assert recent_quote_volume(v2, 3) != pytest.approx(3 * 30.0 + 4 * 40.0 + 5 * 50.0)
+    # Both frames agree when the stored column equals the proxy, which is the
+    # only case in which a comparison between them is meaningful.
+    same = pd.DataFrame({"volume": volumes, "close": closes,
+                         "quote_volume": [v * c for v, c in zip(volumes, closes)]})
+    assert recent_quote_volume(same, 20) == pytest.approx(recent_quote_volume(v1, 20))
+
+
+def test_non_finite_quote_volume_column_falls_back_to_the_proxy():
+    """A v2-shaped file whose backfill has not run → the documented proxy.
+
+    ``core/risk/liquidity`` documents both shapes: a ``quote_volume`` column
+    that is *present but entirely non-finite* is not a measurement, so the
+    proxy is used instead of returning 0.0 ("unknown volume", which would refuse
+    orders the proxy can size honestly); a window with only *some* bars quoted
+    sums the quoted ones and drops the holes rather than filling them.
+    """
+    from core.risk.liquidity import recent_quote_volume
+
+    volumes = [1.0, 2.0, 3.0, 4.0]
+    closes = [10.0, 20.0, 30.0, 40.0]
+    proxy = 10.0 + 40.0 + 90.0 + 160.0                 # Σ volume × close = 300
+    all_nan = pd.DataFrame({"volume": volumes, "close": closes,
+                            "quote_volume": [float("nan")] * 4})
+    assert recent_quote_volume(all_nan, 4) == pytest.approx(proxy)
+    # Partially quoted: the two finite bars only — a hole is "fewer bars", not a
+    # proxy-priced bar.
+    partial = pd.DataFrame({"volume": volumes, "close": closes,
+                            "quote_volume": [float("nan"), 5.0,
+                                             float("nan"), 7.0]})
+    assert recent_quote_volume(partial, 4) == pytest.approx(12.0)
+    assert recent_quote_volume(partial, 4) != pytest.approx(proxy)
+    # "Entirely non-finite" is decided on the whole COLUMN, before the window:
+    # a partly quoted column whose tail window holds no finite bar is 0.0 ("not
+    # measured" — the caller refuses rather than filling the hole with a proxy
+    # that would look like data).
+    late_hole = pd.DataFrame({"volume": volumes, "close": closes,
+                              "quote_volume": [8.0, 9.0,
+                                               float("nan"), float("nan")]})
+    assert recent_quote_volume(late_hole, 2) == 0.0
+    assert recent_quote_volume(late_hole, 2) != pytest.approx(3 * 30.0 + 4 * 40.0)
+    assert recent_quote_volume(late_hole, 2) == _expected_quote_volume(late_hole, 2)
 
 
 def test_participation_pct_units_and_undefined():
@@ -246,7 +391,11 @@ def test_real_data_capacity_table():
 
     btc = _read(BTC_1H)
     btc_vol = recent_quote_volume(btc, 20)
-    btc_derived = float((btc["volume"].tail(20) * btc["close"].tail(20)).sum())
+    # Derived from the frame just read under either cache version: the stored
+    # P6-B ``quote_volume`` when usable, else the documented Σ volume × close
+    # proxy (:func:`_expected_quote_volume`).  This line used to pin the proxy
+    # and so failed the moment the migration reached BTC 1h.
+    btc_derived = _expected_quote_volume(btc, 20)
     assert btc_vol == pytest.approx(btc_derived, rel=1e-9)
     assert btc_vol > 0.0
     # 500 and 50 000 USDT are both a tiny fraction of a single BTC 1h day.
@@ -280,6 +429,65 @@ def test_real_data_capacity_table():
         # Deep enough to absorb it: passed through bit-identically.
         assert allowed_50k == 50_000.0 and reason_50k.startswith("ok:")
         assert participation_pct(allowed_50k, xrp_vol) <= 1.0
+
+
+def test_both_cache_versions_agree_on_a_temp_copy(tmp_path):
+    """Proof on disk: a v1 copy and a v2 copy, each read back and asserted.
+
+    The live cache is rewritten from v1 to v2 *while this suite runs*, so the
+    test builds both states itself under ``tmp_path`` (it writes nothing under
+    ``data/**``): the frame it just read is written once with the P6-B columns
+    dropped (v1), and once carrying a **synthetic** ``quote_volume`` column — the
+    proxy × 1.005, a VWAP-like gap that is small but *provable*, so the two
+    copies are certainly different figures and "the stored column wins" cannot
+    pass by coincidence.  (The real stored column is exercised by the three
+    live-data tests above; this test is about the rule, not the measurement.)
+    Each copy is read back from disk and compared with the same derived
+    expectation, which is the end-to-end proof that one rule covers both versions.
+    """
+    from core.risk.liquidity import recent_quote_volume
+
+    df = _read(BTC_1H)
+    proxy = pd.to_numeric(df["volume"], errors="coerce") * \
+        pd.to_numeric(df["close"], errors="coerce")
+    v1 = df.drop(columns=[c for c in ("quote_volume", "trade_count")
+                          if c in df.columns])
+    v2 = v1.copy()
+    v2["quote_volume"] = proxy * 1.005
+    assert "quote_volume" not in v1.columns and "quote_volume" in v2.columns
+
+    parsed = {}
+    for name, frame in (("v1", v1), ("v2", v2)):
+        path = tmp_path / f"BTCUSDT_1h_{name}.parquet"
+        frame.to_parquet(path)
+        parsed[name] = pd.read_parquet(path)
+    assert "quote_volume" not in parsed["v1"].columns
+    assert "quote_volume" in parsed["v2"].columns
+    assert "trade_count" not in parsed["v1"].columns
+    assert len(parsed["v1"]) == len(parsed["v2"]) == len(df)
+
+    # Same rule, both files: the derived expectation is what the helper returns.
+    for name, frame in parsed.items():
+        got = recent_quote_volume(frame, 20)
+        assert got == pytest.approx(_expected_quote_volume(frame, 20),
+                                    rel=1e-9), name
+        # And the rule picked the documented branch for this version.
+        if name == "v2":
+            stored = float(pd.to_numeric(frame["quote_volume"], errors="coerce")
+                           .tail(20).dropna().sum())
+            assert got == pytest.approx(stored, rel=1e-9)
+        else:
+            derived_proxy = float((frame["volume"].tail(20)
+                                   * frame["close"].tail(20)).sum())
+            assert got == pytest.approx(derived_proxy, rel=1e-9)
+
+    # The two cache states are *provably* different figures (the v2 copy holds
+    # 1.005 × the v1 proxy), so the agreement above is not the trivial case of
+    # both versions carrying the same number.
+    v1_vol = recent_quote_volume(parsed["v1"], 20)
+    v2_vol = recent_quote_volume(parsed["v2"], 20)
+    assert v1_vol != pytest.approx(v2_vol, rel=1e-6)
+    assert v2_vol == pytest.approx(v1_vol * 1.005, rel=1e-9)
 
 
 def test_cap_rule_holds_for_a_shallow_and_a_deep_window():
