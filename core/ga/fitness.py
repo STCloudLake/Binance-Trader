@@ -29,7 +29,8 @@ a genome that loses to buy & hold is rejected rather than re-scored.  A genome's
 
 import time
 import random
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import (ProcessPoolExecutor, ThreadPoolExecutor,
+                                wait, FIRST_COMPLETED)
 from pathlib import Path
 from loguru import logger
 import numpy as np
@@ -1171,6 +1172,30 @@ def evaluate_population_batch(
 # C-extension crashes under multi-threading.
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _emit_chunk_progress(worker_args: dict, item) -> None:
+    """Best-effort push of one progress item to the parent process.
+
+    ``worker_args["progress_queue"]`` is a ``multiprocessing.Manager().Queue()``
+    proxy created by :func:`evaluate_population_multiprocess` (``None`` when no
+    progress callback was registered, in which case this is a no-op).  Progress
+    must never break an evaluation, so every failure is swallowed.
+    """
+    queue = worker_args.get("progress_queue")
+    if queue is None:
+        return
+    try:
+        queue.put(item)
+    except Exception:  # pragma: no cover - a dead parent must not kill a chunk
+        pass
+
+
+def _emit_genomes_done(worker_args: dict, n: int) -> None:
+    """Report ``n`` more fully evaluated genomes of this worker's chunk."""
+    if n > 0:
+        _emit_chunk_progress(
+            worker_args, ("genome", worker_args.get("chunk_start_idx", 0), int(n)))
+
+
 def _mp_worker(worker_args: dict) -> list:
     """Module-level picklable worker for ProcessPoolExecutor.
 
@@ -1183,10 +1208,21 @@ def _mp_worker(worker_args: dict) -> list:
             population_chunk, symbols, date_start, date_end,
             initial_balance, cost_enabled, taker_fee_pct, spread_pct,
             weights, chunk_start_idx, engine_mode
+            progress_queue: optional Manager queue used to stream progress to the
+                parent (``None``/absent → no progress traffic at all).
+            evaluate_hook: optional in-process test seam replacing the engine call.
 
     Returns:
         list of (index, result_dict) tuples
     """
+    # ── Test hook: lets a suite inject a deterministic/failing evaluator without
+    # replacing this module-level worker (which must stay picklable).  Checked
+    # BEFORE any import/engine/DB work so a stubbed chunk is cheap.  A hook owns
+    # its own progress reporting (it gets ``worker_args``, queue included). ──
+    _hook = worker_args.get("evaluate_hook")
+    if _hook is not None:
+        return _hook(worker_args)
+
     import random as _random
     import numpy as _np
     from app.config import Config
@@ -1227,12 +1263,6 @@ def _mp_worker(worker_args: dict) -> list:
     weights = worker_args.get("weights")
     volume_context = worker_args.get("volume_context")
 
-    # ── Test hook: lets a suite inject a deterministic/failing evaluator without
-    # replacing this module-level worker (which must stay picklable). ──
-    _hook = worker_args.get("evaluate_hook")
-    if _hook is not None:
-        return _hook(worker_args)
-
     chunk_configs = []
     for i, chrom in enumerate(population_chunk):
         config_obj = _c2s(chrom)
@@ -1240,6 +1270,22 @@ def _mp_worker(worker_args: dict) -> list:
             config_obj.ml_config.enabled = False
         config_obj.name = f"ga_mp_{chunk_start}_{chunk_start + i}_{_random.randint(1000, 9999)}"
         chunk_configs.append(config_obj)
+
+    # ── Sub-chunk liveness ────────────────────────────────────────────────
+    # One engine pass evaluates the WHOLE chunk at once, so a chunk only ends
+    # after every genome has traded the full window (hours for a 30-genome
+    # job).  The engine already exposes a per-bar observer used by the web
+    # backtest route; forwarding it here costs nothing and turns hours of
+    # silence into a bar-level heartbeat.  Throttled to ~1 tick/s.
+    _last_tick = [0.0]
+
+    def _engine_progress(step, total_steps, _ts):
+        now = time.time()
+        if step != total_steps and (now - _last_tick[0]) < 1.0:
+            return
+        _last_tick[0] = now
+        _emit_chunk_progress(
+            worker_args, ("bar", chunk_start, int(step), int(total_steps)))
 
     result = engine.run_with_exit_evaluation(
         strategies=chunk_configs,
@@ -1253,9 +1299,11 @@ def _mp_worker(worker_args: dict) -> list:
         per_strategy_isolation=True,
         per_genome_ledger=True,
         use_live_spread=worker_args.get("use_live_spread", False),
+        progress_callback=_engine_progress,
     )
 
     if "error" in result:
+        _emit_genomes_done(worker_args, len(chunk_configs))
         return [(chunk_start + i, {"fitness": -999, "error": result["error"],
                                    "flag": "engine_error", "trade_count": 0,
                                    "strategy_name": c.name})
@@ -1298,6 +1346,9 @@ def _mp_worker(worker_args: dict) -> list:
             "flag": stats.get("flag", ""),
             "strategy_name": config_obj.name,
         }))
+        # One tick per fully scored genome of this chunk (the parent turns these
+        # into ``eval_completed`` / ``eval_equivalent`` in the progress file).
+        _emit_genomes_done(worker_args, 1)
 
     return results
 
@@ -1332,6 +1383,7 @@ def evaluate_population_multiprocess(
     initial_balance: float = 10000.0,
     max_workers: int = 4,
     progress_callback=None,
+    progress_detail_callback=None,
     weights: dict | None = None,
     cost_enabled: bool = True,
     taker_fee_pct: float = 0.04,
@@ -1343,6 +1395,7 @@ def evaluate_population_multiprocess(
     seed: int = 0,
     volume_context: "VolumeContext | None" = None,
     alpha_weight: float | None = None,
+    evaluate_hook=None,
 ) -> list[dict]:
     """Evaluate chromosomes in parallel PROCESSES (not threads).
 
@@ -1352,7 +1405,15 @@ def evaluate_population_multiprocess(
     Args:
         max_workers: Number of parallel processes. Each gets ~ceil(N/max_workers)
                      strategies and runs one batched backtest.
-        progress_callback: Called as callback(completed_count, total_count).
+        progress_callback: Called as callback(completed_count, total_count) —
+                     ``completed_count`` counts fully evaluated strategies.
+        progress_detail_callback: Optional richer observer, called with a dict
+                     (``eval_completed``/``eval_total``/``eval_equivalent`` plus
+                     the in-flight chunk's ``bar_step``/``bar_total``/
+                     ``chunk_progress_pct``).  Fed by a ``Manager`` queue the
+                     worker processes push to, so a chunk that runs for hours
+                     still reports every ~1s instead of going silent.
+        evaluate_hook: Optional in-process test seam forwarded to ``_mp_worker``.
         seed: Job seed; each worker seeds ``random``/``numpy`` from it.
         batch_trials / prior_trials: DSR multiple-testing counts.
         use_live_spread: False → no order-book lookups for historical fills.
@@ -1360,6 +1421,14 @@ def evaluate_population_multiprocess(
     A chunk that dies is retried **once in-process at max_workers=1** before it
     is marked -999: production showed every generation losing its whole
     population because one crashed chunk poisoned all of them.
+
+    Note: a chunk is ONE engine pass over all of its genomes (``per_genome_ledger``
+    gives each genome its own cash ledger and ``max_open_trades // chunk_size``
+    slots — engine.py:706-708), so genomes of a chunk finish together and the
+    per-genome count can only advance chunk by chunk.  Splitting the chunk into
+    per-genome engine calls would multiply each genome's slot allowance and
+    change the GA's results, so liveness between chunk boundaries comes from the
+    engine's per-bar ticks instead.
     """
     total = len(population)
     results: list = [None] * total
@@ -1382,6 +1451,22 @@ def evaluate_population_multiprocess(
         f"GA multiprocess eval: {total} strategies in {len(chunks)} processes "
         f"on {date_start}~{date_end} with {len(symbols)} symbols"
     )
+
+    # ── Progress channel (only when somebody is listening) ────────────────
+    # A Manager queue is the only stdlib way to stream from the pool's worker
+    # processes back to this one (a plain mp.Queue cannot be pickled into a
+    # submission).  No listener → no queue → zero overhead, identical behaviour.
+    progress_queue = None
+    _manager = None
+    if progress_callback or progress_detail_callback:
+        try:
+            import multiprocessing as _mp
+            _manager = _mp.Manager()
+            progress_queue = _manager.Queue()
+        except Exception as e:  # pragma: no cover - falls back to chunk reports
+            logger.warning(f"Progress queue unavailable ({e}); "
+                           "progress falls back to one report per chunk")
+            progress_queue = None
 
     # Prepare worker args for each chunk
     futures_args = []
@@ -1408,39 +1493,137 @@ def evaluate_population_multiprocess(
             "volume_context": volume_context,
             # Deterministic per-chunk seed (identical for a given job seed).
             "seed": (int(seed) + _ci) if seed else 0,
+            # Progress back-channel (None → the worker does no progress work).
+            "progress_queue": progress_queue,
         }
+        if evaluate_hook is not None:
+            args["evaluate_hook"] = evaluate_hook
         futures_args.append(args)
 
+    chunk_sizes = {cs: size for cs, size in chunks}
+    done_by_chunk: dict[int, int] = {}
+    bar_by_chunk: dict[int, tuple[int, int]] = {}
     completed_count = 0
 
-    with ProcessPoolExecutor(max_workers=len(chunks)) as executor:
-        futures = {executor.submit(_mp_worker, a): a["chunk_start_idx"]
-                   for a in futures_args}
-
-        for future in as_completed(futures):
-            chunk_start = futures[future]
-            chunk_size = next(
-                (s for cs, s in chunks if cs == chunk_start), total - chunk_start
-            )
-            args_for_chunk = next(a for a in futures_args
-                                  if a["chunk_start_idx"] == chunk_start)
+    def _drain_queue() -> bool:
+        """Consume everything the workers pushed; True when something arrived."""
+        if progress_queue is None:
+            return False
+        arrived = False
+        while True:
             try:
-                chunk_results = future.result(timeout=3600)
-            except Exception as e:
-                logger.error(f"Multiprocess chunk failed ({e}); retrying "
-                             f"chunk@{chunk_start} at max_workers=1")
-                chunk_results, path = _single_worker_retry(args_for_chunk, e)
-                if path == "failed":
-                    logger.error("Single-worker retry failed too")
-            else:
-                path = "process"
-            for idx, r in chunk_results:
-                results[idx] = r
-            completed_count += len(chunk_results)
-            paths_used[chunk_start] = path
+                item = progress_queue.get_nowait()
+            except Exception:
+                break
+            try:
+                kind = item[0]
+                if kind == "genome":
+                    _, cs, n = item
+                    done_by_chunk[cs] = max(done_by_chunk.get(cs, 0), int(n))
+                elif kind == "bar":
+                    _, cs, step, steps = item
+                    bar_by_chunk[cs] = (int(step), int(steps))
+                else:  # pragma: no cover - forward-compatible
+                    continue
+            except Exception:  # pragma: no cover - never fail on a bad item
+                continue
+            arrived = True
+        return arrived
 
-            if progress_callback:
+    def _work_detail() -> dict:
+        """Fine-grained view: work done in *strategy-equivalents* (a float).
+
+        ``eval_equivalent`` counts finished genomes plus the bar fraction of the
+        chunk currently in flight, so an operator can see movement inside a
+        multi-hour chunk without pretending a genome finished.
+        """
+        work = 0.0
+        for cs, size in chunk_sizes.items():
+            done = min(done_by_chunk.get(cs, 0), size)
+            if done >= size:
+                work += size
+                continue
+            step, steps = bar_by_chunk.get(cs, (0, 0))
+            frac = (step / steps) if steps > 0 else 0.0
+            work += done + max(0.0, min(1.0, frac)) * (size - done)
+        detail = {"eval_equivalent": round(work, 3)}
+        if bar_by_chunk:
+            cs, (step, steps) = max(
+                bar_by_chunk.items(),
+                key=lambda kv: (kv[1][0] / kv[1][1]) if kv[1][1] else 0.0)
+            detail["bar_step"] = step
+            detail["bar_total"] = steps
+            detail["chunk_progress_pct"] = (
+                round(100.0 * step / steps, 1) if steps else 0.0)
+        return detail
+
+    def _emit_progress() -> None:
+        if progress_callback:
+            try:
                 progress_callback(completed_count, total)
+            except Exception as e:  # pragma: no cover - progress must not fail a run
+                logger.warning(f"progress_callback failed: {e}")
+        if progress_detail_callback:
+            try:
+                progress_detail_callback({
+                    "eval_completed": completed_count,
+                    "eval_total": total,
+                    **_work_detail()})
+            except Exception as e:  # pragma: no cover
+                logger.warning(f"progress_detail_callback failed: {e}")
+
+    try:
+        with ProcessPoolExecutor(max_workers=len(chunks)) as executor:
+            futures = {executor.submit(_mp_worker, a): a["chunk_start_idx"]
+                       for a in futures_args}
+
+            # ``wait`` + a timeout (instead of ``as_completed``) so the queue can
+            # be drained while the chunks are still running.
+            pending = set(futures)
+            while pending:
+                done, pending = wait(pending, timeout=0.5,
+                                     return_when=FIRST_COMPLETED)
+                for future in done:
+                    chunk_start = futures[future]
+                    args_for_chunk = next(a for a in futures_args
+                                          if a["chunk_start_idx"] == chunk_start)
+                    try:
+                        chunk_results = future.result(timeout=3600)
+                    except Exception as e:
+                        logger.error(f"Multiprocess chunk failed ({e}); retrying "
+                                     f"chunk@{chunk_start} at max_workers=1")
+                        chunk_results, path = _single_worker_retry(args_for_chunk, e)
+                        if path == "failed":
+                            logger.error("Single-worker retry failed too")
+                    else:
+                        path = "process"
+                    for idx, r in chunk_results:
+                        results[idx] = r
+                    paths_used[chunk_start] = path
+                    # A finished chunk is definitive evidence for its own genomes
+                    # (the queue may have failed, or a hook may not have ticked).
+                    done_by_chunk[chunk_start] = max(
+                        done_by_chunk.get(chunk_start, 0),
+                        chunk_sizes.get(chunk_start, len(chunk_results)))
+                    if progress_queue is None:
+                        completed_count += len(chunk_results)
+                drained = _drain_queue()
+                if progress_queue is not None:
+                    completed_count = sum(done_by_chunk.values())
+                if done or drained:
+                    _emit_progress()
+
+            if progress_queue is not None:
+                completed_count = sum(done_by_chunk.values())
+        # Final, authoritative report (only when something is listening).
+        if progress_callback or progress_detail_callback:
+            _emit_progress()
+    finally:
+        if _manager is not None:
+            try:
+                _manager.shutdown()
+            except Exception:  # pragma: no cover
+                pass
 
     # Apply results to population
     for i, r in enumerate(results):

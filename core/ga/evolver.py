@@ -119,6 +119,9 @@ class GAStrategyEvolver:
         self._running = False
         self._stop_after_gen = False
         self._progress_callback = None
+        #: Wall-clock start of the run, so every progress payload can carry an
+        #: honest ``elapsed_s`` (set by :meth:`evolve`).
+        self._run_t_start = 0.0
         self._seed = int(getattr(self.config, "seed", 0) or 0)
         self._window_key = str(getattr(self.config, "window_key", "") or "")
         self._prior_trials = 0
@@ -182,6 +185,7 @@ class GAStrategyEvolver:
         self._running = True
         cfg = self.config
         t_start = time.time()
+        self._run_t_start = t_start
 
         # ── Determinism: seed from the job before anything random happens ──
         import numpy as np
@@ -271,7 +275,17 @@ class GAStrategyEvolver:
                     # P6-D: None unless the executability model is on for some genome.
                     volume_context=self.volume_context_for(
                         symbols, date_start, train_end),
-                    progress_callback=lambda c, t: self._report_progress(self._generation or 1, c, t))
+                    progress_callback=lambda c, t: self._report_progress(self._generation or 1, c, t),
+                    # Sub-chunk liveness: this branch reports a chunk only when
+                    # the WHOLE chunk has been evaluated (one engine pass over
+                    # every genome of the chunk).  For the shipped 30-genome /
+                    # 9-month job that is hours, so the progress file stayed at
+                    # ``{"phase": "starting"}`` for the entire first generation.
+                    # ``progress_detail_callback`` carries the engine's existing
+                    # bar-step ticks (no engine change, no extra computation).
+                    progress_detail_callback=lambda d: self._report_progress(
+                        self._generation or 1, d.get("eval_completed", 0),
+                        d.get("eval_total", 0), detail=d))
             else:
                 # Single-process: use existing threaded batch evaluation
                 from core.ga.fitness import evaluate_population_batch
@@ -817,11 +831,44 @@ class GAStrategyEvolver:
         except Exception:
             pass
 
-    def _report_progress(self, gen: int, completed: int, total: int):
-        if self._progress_callback:
-            self._progress_callback({
-                "generation": gen,
-                "eval_completed": completed,
-                "eval_total": total,
-                "phase": "evolving",
-            })
+    def _report_progress(self, gen: int, completed: int, total: int,
+                         detail: dict | None = None):
+        """Emit one progress payload (dict) to the registered callback.
+
+        The four keys the UI has always read (``generation``, ``eval_completed``,
+        ``eval_total``, ``phase``) are unchanged; everything else is additive so
+        an operator can judge a long generation without the UI:
+
+        ``total_generations`` / ``elapsed_s`` / ``best_fitness`` / ``best_trades``
+        (best-so-far — ``None`` until the first generation has been scored) plus,
+        when the multiprocess branch supplies them, ``eval_equivalent`` (work done
+        in strategy-equivalents, a float) and the in-flight chunk's
+        ``bar_step``/``bar_total``/``chunk_progress_pct``.
+        """
+        if not self._progress_callback:
+            return
+        generations = int(getattr(self.config, "generations", 0) or 0)
+        payload = {
+            "generation": int(gen or 0),
+            "total_generations": generations,
+            "eval_completed": int(completed or 0),
+            "eval_total": int(total or 0),
+            "phase": "evolving",
+        }
+        if self._run_t_start:
+            payload["elapsed_s"] = round(time.time() - self._run_t_start, 1)
+        if self._best_chromosome is not None:
+            try:
+                payload["best_fitness"] = round(
+                    float(self._best_chromosome.get("fitness_result", {})
+                          .get("fitness", 0) or 0), 6)
+                payload["best_trades"] = int(
+                    self._best_chromosome.get("fitness_result", {})
+                    .get("trade_count", 0) or 0)
+            except Exception:  # pragma: no cover - progress must never raise
+                pass
+        for key, value in (detail or {}).items():
+            if key in ("eval_completed", "eval_total") or value is None:
+                continue
+            payload[key] = value
+        self._progress_callback(payload)

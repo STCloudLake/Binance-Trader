@@ -774,9 +774,12 @@ function pollGAStatus() {
         var genPct = total > 0 ? (gen / total * 100) : 0;
 
         // Intra-gen: how many chromosomes evaluated in current gen?
+        // ``eval_equivalent`` adds the in-flight chunk's bar fraction, so the
+        // bar moves inside a multi-hour chunk instead of sitting at 0%.
         var evalDone = s.eval_completed || 0;
         var evalTotal = s.eval_total || s.population_size || 30;
-        var evalPct = evalTotal > 0 ? Math.round(evalDone / evalTotal * 100) : 0;
+        var evalWork = Math.max(evalDone, s.eval_equivalent || 0);
+        var evalPct = evalTotal > 0 ? Math.round(evalWork / evalTotal * 100) : 0;
 
         // Overall progress: blend gen-level and intra-gen
         _gaOverallPct = genPct + (evalPct / total);
@@ -813,7 +816,10 @@ function pollGAStatus() {
         }
 
         document.getElementById('ga-eval-text').textContent =
-            '{{ _("Evaluating chromosomes") }}: ' + evalDone + ' / ' + evalTotal;
+            '{{ _("Evaluating chromosomes") }}: ' + evalDone + ' / ' + evalTotal
+            + (s.chunk_progress_pct !== undefined && s.chunk_progress_pct !== null
+               ? ' (' + s.chunk_progress_pct + '% {{ _("of current batch") }})' : '')
+            + (s.best_fitness ? ' | {{ _("best") }}: ' + Number(s.best_fitness).toFixed(2) : '');
         document.getElementById('ga-step-text').textContent = _gaOverallPct.toFixed(1) + '%';
 
         // ── ETA is handled by tick timer (always ticking) ──

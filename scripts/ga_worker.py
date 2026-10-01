@@ -15,17 +15,110 @@ import time
 import traceback
 from pathlib import Path
 
+from loguru import logger
+
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 
-def update_progress(job_file: str, data: dict):
-    """Write progress atomically."""
+#: Wall-clock start of this worker process (set by :func:`main`, read by the
+#: progress reporter so every payload can carry ``started_at``/``elapsed_s``).
+_STARTED_AT = time.time()
+
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def update_progress(job_file: str, data: dict, merge: bool = True):
+    """Write progress atomically.
+
+    ``merge=True`` (the default) folds ``data`` into whatever is already on disk
+    instead of replacing it.  Replacing used to drop the generation/best-so-far
+    fields every time an intra-generation tick arrived, so the UI lost the
+    generation it had already been told about.
+    """
+    payload = data
+    if merge:
+        try:
+            with open(job_file + ".progress") as f:
+                existing = json.load(f)
+            if isinstance(existing, dict):
+                payload = {**existing, **data}
+        except Exception:
+            payload = data
     tmp = job_file + ".progress.tmp"
     final = job_file + ".progress"
     with open(tmp, "w") as f:
-        json.dump(data, f)
+        json.dump(payload, f)
     Path(tmp).replace(final)
+
+
+def make_progress_reporter(job_file: str, job_type: str = "ga",
+                           clock=time.time):
+    """Build the ``on_progress`` callback handed to the evolver.
+
+    The evolver reports two shapes:
+
+    * a **dict** — intra-generation evaluation progress
+      (``phase``/``generation``/``eval_completed``/``eval_total``/``elapsed_s``/
+      ``eval_equivalent``/``best_*`` from
+      ``GAStrategyEvolver._report_progress``);
+    * a **tuple** ``(generation, total_generations, gen_info)`` — one generation
+      finished, which also gets a per-generation INFO line in the job log.
+
+    Both are merged into the progress file (never replacing it), stamped with
+    ``started_at``/``updated_at``/``elapsed_s``, and the result stays plain
+    JSON (``json.dump`` would fail on a numpy scalar otherwise).
+    """
+    state: dict = {
+        "phase": "starting",
+        "job_type": job_type,
+        "started_at": _now_iso(),
+        "updated_at": _now_iso(),
+        "elapsed_s": 0.0,
+    }
+    logged_generation = [0]
+
+    def _publish() -> None:
+        state["updated_at"] = _now_iso()
+        state["elapsed_s"] = round(clock() - _STARTED_AT, 1)
+        update_progress(job_file, dict(state))
+
+    def on_progress(info):
+        if isinstance(info, dict):
+            state.update({k: v for k, v in info.items() if v is not None})
+        else:
+            gen, total, gen_info = info
+            gen_info = gen_info or {}
+            state.update({
+                "phase": "gen_complete",
+                "generation": int(gen),
+                "total_generations": int(total),
+                "best_fitness": gen_info.get("best_fitness", 0),
+                "avg_fitness": gen_info.get("avg_fitness", 0),
+                "best_sharpe": gen_info.get("best_sharpe", 0),
+                "best_win_rate": gen_info.get("best_win_rate", 0),
+                "best_trades": gen_info.get("best_trades", 0),
+                "generation_elapsed_s": round(
+                    float(gen_info.get("elapsed", 0) or 0), 1),
+            })
+            if int(gen) > logged_generation[0]:
+                logged_generation[0] = int(gen)
+                # One INFO line per generation, so `tail job.log` is informative
+                # without the UI (the evolver logs its own per-generation line
+                # too; this one carries the job-relative elapsed time).
+                logger.info(
+                    f"[ga_worker] gen {int(gen)}/{int(total)} complete | "
+                    f"best={float(gen_info.get('best_fitness', 0) or 0):.2f} "
+                    f"avg={float(gen_info.get('avg_fitness', 0) or 0):.2f} "
+                    f"trades={int(gen_info.get('best_trades', 0) or 0)} "
+                    f"elapsed={state['elapsed_s']:.0f}s "
+                    f"gen_elapsed={state['generation_elapsed_s']:.0f}s")
+        _publish()
+
+    on_progress.state = state  # exposed for tests/diagnostics
+    return on_progress
 
 
 def write_result(job_file: str, data: dict):
@@ -154,24 +247,11 @@ def run_ga(job: dict, job_file: str):
 
     evolver = GAStrategyEvolver(engine, loader, ga_cfg)
 
-    def on_progress(info):
-        if isinstance(info, dict):
-            update_progress(job_file, {
-                "phase": info.get("phase", "evolving"),
-                "eval_completed": info.get("eval_completed", 0),
-                "eval_total": info.get("eval_total", 0),
-            })
-        else:
-            gen, total, gen_info = info
-            update_progress(job_file, {
-                "phase": "gen_complete",
-                "generation": gen,
-                "total_generations": total,
-                "best_fitness": gen_info.get("best_fitness", 0),
-                "best_sharpe": gen_info.get("best_sharpe", 0),
-                "best_win_rate": gen_info.get("best_win_rate", 0),
-                "best_trades": gen_info.get("best_trades", 0),
-            })
+    # One reporter fills the progress file for every shape the evolver emits
+    # (intra-generation dict / per-generation tuple) and logs one line per
+    # generation.  It used to be an inline closure that REPLACED the payload,
+    # which lost generation/best fields on every intra-generation tick.
+    on_progress = make_progress_reporter(job_file, "ga")
 
     evolver.set_progress_callback(on_progress)
 
@@ -335,7 +415,13 @@ def main():
         # the same fallback seed.
         job["_job_file"] = args.job_file
 
-        update_progress(args.job_file, {"phase": "starting", "job_type": args.job_type})
+        update_progress(args.job_file, {
+            "phase": "starting",
+            "job_type": args.job_type,
+            "started_at": _now_iso(),
+            "updated_at": _now_iso(),
+            "elapsed_s": 0.0,
+        })
 
         if args.job_type == "ga":
             run_ga(job, args.job_file)

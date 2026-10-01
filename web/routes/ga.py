@@ -226,6 +226,10 @@ _ga_state = {
     # already rendered them — the DSR/WF block was dead UI) ──
     "validation": None, "dsr": None, "provenance": None,
     "published": None, "rejection_reasons": [], "seed": 0,
+    # ── Live progress detail (additive; the worker writes these alongside the
+    # keys the panel has always read) ──
+    "eval_completed": 0, "eval_total": 0, "eval_equivalent": 0.0,
+    "avg_fitness": 0, "progress_updated_at": None, "progress": None,
 }
 
 # ── Walk-Forward state ────────────────────────────────────────────
@@ -339,6 +343,8 @@ def register(app: FastAPI, ctx) -> None:
             "best_trades": 0, "champion_name": "", "champion_config": None,
             "population_size": pop_size, "started": ga_start_time,
             "eval_completed": 0, "eval_total": 0, "phase": "init",
+            "eval_equivalent": 0.0, "avg_fitness": 0,
+            "progress_updated_at": None, "progress": None,
             "history": [], "error": None, "stopped": False, "resumable": False,
             "checkpoint_gen": 0, "job_file": job_file,
             "validation": None, "dsr": None, "provenance": None,
@@ -413,6 +419,17 @@ def register(app: FastAPI, ctx) -> None:
                         _ga_state["phase"] = progress.get("phase", "evolving")
                         _ga_state["eval_completed"] = progress.get("eval_completed", 0)
                         _ga_state["eval_total"] = progress.get("eval_total", 0)
+                        # Sub-generation detail (absent on pre-fix job files, so
+                        # every one of these is guarded by a presence check).
+                        _ga_state["progress"] = progress
+                        if progress.get("eval_equivalent") is not None:
+                            _ga_state["eval_equivalent"] = progress["eval_equivalent"]
+                        if progress.get("avg_fitness") is not None:
+                            _ga_state["avg_fitness"] = progress["avg_fitness"]
+                        if progress.get("best_trades") is not None:
+                            _ga_state["best_trades"] = progress["best_trades"]
+                        if progress.get("updated_at"):
+                            _ga_state["progress_updated_at"] = progress["updated_at"]
                         if "generation" in progress:
                             _ga_state["generation"] = progress["generation"]
                             _ga_state["total_generations"] = progress["total_generations"]
