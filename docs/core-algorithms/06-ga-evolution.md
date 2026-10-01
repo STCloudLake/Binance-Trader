@@ -177,6 +177,9 @@ DSR 去偏 Sharpe × 证据量 − 最大回撤。
 > 因此"beta 不再被计为 alpha"这句话对 **fitness** 不成立，对**发布门**成立——
 > 冠军可以因为跑输等权买持而被拒（归档冠军的唯一拒绝原因就是
 > `alpha_vs_buy_hold=-52.20% <= 0`）。
+> **`ga.benchmark_mode`（下下节）可以选择门消费哪个基准**：`buy_hold` 保持上面这条公式与
+> 数值**逐位不变**；`exposure_matched` / `risk_matched` 改消费 `alpha_vs_benchmark_pct`，
+> `none` 跳过这条判据。这条不变性只对 **fitness** 成立，与基准选择无关。
 
 ## 统计显著性（DSR）与发布门槛
 
@@ -198,9 +201,76 @@ DSR 的完整单位约定见 `07-deflated-sharpe-ratio.md`。要点：
 - **`DSR <= 0` 禁止发布**（`evolver._publication_decision`）。
 
 发布门槛（`core/ga/evolver.py`）：`trades ≥ 30`（`ga.min_champion_trades`）**且**
-净盈亏 > 0 **且** PF > 1 **且** DSR > 0 **且**（有验证窗口时）验证 Sharpe > 0。
-不满足时**仍然写文件**，但 `enabled: false`，并在 `provenance.rejection_reasons` 里列出原因。
+净盈亏 > 0 **且** PF > 1 **且** DSR > 0 **且**（有验证窗口时）验证 Sharpe > 0 **且**
+基准 alpha > 0（见下节；`none` 时跳过这一条）。不满足时**仍然写文件**，但 `enabled: false`，
+并在 `provenance.rejection_reasons` 里列出原因。
 旧实现只要种群非空就发布**启用**的冠军——已发布过 fitness −42.3、0 交易的策略。
+
+## 发布门基准：`ga.benchmark_mode`（`core/ga/benchmark.py`）
+
+**为什么要有这个开关（实测）**：满仓买入持有基准（`metrics["buy_hold_pct"]`）与
+**只在部分时间持仓**的策略按**总收益**比，没有做敞口或风险匹配。归档冠军
+`strategies/ga_champion_1790844776.yaml`（窗口 2026-06-01~2026-09-01）实测
+`buy_hold_pct = 17.739`、`alpha_vs_buy_hold_pct = −12.1206`，而同一冠军 OOS 窗口
+Sharpe **5.6903**、最大回撤 **0.03 %**——它输给的是一个 100 % 在场的基准。
+（诚实说明：该冠军同时还因 `validation_dsr = −0.3855 ≤ 0` 被拒，换基准**不能**让它变成可发布。）
+
+四种取值：
+
+| 取值 | 基准定义 | 门 |
+|---|---|---|
+| `buy_hold`（**代码缺省**） | 同窗口同币种等权满仓买入持有（`engine.metrics["buy_hold_pct"]`） | 消费 `alpha_vs_buy_hold_pct`（与旧版逐位一致） |
+| `exposure_matched`（`config/config.yaml` 已启用） | 同一篮子**只在策略持仓期间**持有 | 消费 `alpha_vs_benchmark_pct` |
+| `risk_matched` | 满仓基准按策略已实现日波动率缩放 | 同上 |
+| `none` | 无 | **只**跳过基准判据 |
+
+**`exposure_matched` 的精确定义**（也是唯一推荐默认）：
+
+1. 对篮子里每个币，从**策略自己的成交**重建持仓区间 `[opened_at, closed_at]`，裁到窗口
+   `[t0, t1]`；窗口结束时仍未平仓的按 `t1` 裁剪；重叠区间取**并集**（不重复计敞口）。
+2. 该币的基准收益 `Rₛ` = 在**这些区间的并集**上买入持有的收益：每个区间取区间内首/末收盘价，
+   区间收益**复合** `Π(1+rᵢ) − 1`（区间之间视为现金，0 %）。区间内 bar 少于 2 根 ⇒ 该区间不计；
+   该币所有区间都不可用 ⇒ 从篮子剔除。
+3. 权重 `wₛ = mean(amount_usdt) / initial_balance`（裁剪到 `[0,1]`）——**策略实际投入的保证金占比**，
+   即"策略自己的相对敞口"，由成交直接测得；因此空仓部分在两个账号里都赚 0。
+   成交不带可用名义金额时退回 `1/len(symbols)` 并记 `weighting: equal_share_of_basket`。
+4. `benchmark_pct = Σₛ wₛ·Rₛ × 100`。**零成交** ⇒ 基准 `0.0`、alpha = 策略收益
+   （门仍以 `no_trades`、DSR、净期望拒绝）；**无可用 bar** ⇒ `benchmark_pct = None`，
+   门**跳过**该判据并在 provenance 记 `benchmark_available: false`。
+
+**`risk_matched`**：`buy_hold_pct × (σ_strategy / σ_benchmark)`，两条 σ 都是既有
+`daily_returns` / `per_period_sharpe`（`core.ga.fitness` / `core.backtest.metrics`）口径的
+**日**收益标准差；`σ_benchmark = 0` 时缩放无定义 ⇒ 用原基准并记 `risk_scale_fallback: true`。
+反向结果 `strategy_return × σ_benchmark/σ_strategy` 一并上报。
+
+**校验与缺省**：`app/config.py` 在**配置加载**时用 `parse_benchmark_mode` 校验，未知取值抛
+`UnknownBenchmarkModeError`；job 字段 `benchmark_mode` 在 `scripts/ga_worker.py` 的
+**job 加载**阶段同样校验（与 `timeframe_pool` 同型）。字段不存在 ⇒ 跟 `config.ga_benchmark_mode`
+（不是 job 级覆盖），键不存在 ⇒ 代码缺省 `buy_hold`。`GARunConfig.benchmark_mode = None`
+表示"跟配置"，一路透传到 `engine.run_with_exit_evaluation(benchmark_mode=...)`。
+
+**只上报、不门控**：策略 vs 基准 Sharpe、信息比率（日超额 `mean/std × √365`）、
+Jensen 式 alpha/beta（OLS，年度化）、扣费后每笔净边际（`trade["pnl"]` 已扣 `cost`）、
+在场时间占比。`buy_hold` / `none` 两种模式**不读行情**（直接复用旧值），所以缺省路径零额外 I/O。
+
+**逐位一致性**：`buy_hold`（以及键不存在）时 `alpha_vs_benchmark_pct` 与
+`alpha_vs_buy_hold_pct` 是**同一个浮点数**（同样的运算），门结论与拒绝原因字符串逐字相同
+（`alpha_vs_buy_hold=... <= 0 (no edge over buy & hold)`）。
+`tests/test_ga_benchmark_mode.py::test_buy_hold_is_byte_identical_to_the_head_worktree`
+在 `git worktree` 里检出改动前版本、同一 harness 跑两棵树，把**评分值、门结论、旧 provenance 键**
+按字节比对。
+
+## 评估/执行一致性：冠军只交易它被评估过的币
+
+冠军 YAML 过去写 `symbols: []`（= 交易自选列表 `system_config.watchlist_symbols` 里的**全部**币），
+而 GA 只评估了 job 的篮子（实测：3 币 vs 自选 5 币）——启用冠军会交易**从未被评估过的币**。
+现在 `core/ga/evolver.py::evolve` 在写冠军前把**被评估的篮子**写进 `champion_config.symbols`，
+而执行路径本来就尊重它（`core/strategy/engine.py`：`_on_kline` / `evaluate_all_now` 在
+`strategy.symbols` 非空时跳过表外币，启动时打
+`Strategy '<name>' restricted to symbols: [...]`）。选"限制交易"而不是"拒绝启用不匹配的冠军"：
+限制是更安全的一侧，且旧 YAML 的 `symbols: []` 继续表示"不限"，向后兼容。
+`tests/test_ga_benchmark_mode.py::test_enabling_a_champion_can_only_trade_its_recorded_basket`
+用真实 `StrategyEngine.evaluate_all_now()` 钉住这一点。
 
 ## 冠军 YAML 的 `provenance` 溯源块
 
@@ -217,13 +287,34 @@ provenance:
   prior_trials: 1114
   fitness_components: {fitness: ..., fitness_base: ..., fitness_alpha: ..., sharpe: ...,
                        deflated_sharpe: ..., max_dd: ..., trade_count: ..., profit_factor: ...,
-                       raw_profit_factor: ..., buy_hold_pct: ..., alpha_vs_buy_hold_pct: ...}
+                       raw_profit_factor: ..., buy_hold_pct: ..., alpha_vs_buy_hold_pct: ...,
+                       benchmark_mode: exposure_matched,      # 门消费的模式（新增）
+                       benchmark_pct: ..., alpha_vs_benchmark_pct: ...}   # 新增
+  benchmark:               # 新增：基准溯源（只有 mode 的 alpha 门控，其余只上报）
+    mode: exposure_matched
+    buy_hold_pct: 17.739           # 满仓买入持有（历史字段）
+    benchmark_pct: ...             # 匹配后的基准收益
+    alpha_vs_benchmark_pct: ...    # 门消费的 alpha
+    alpha_vs_buy_hold_pct: ...
+    benchmark_sharpe: ...          # 基准自身的风险指标（此前完全不记录）
+    benchmark_max_dd_pct: ...
+    benchmark_time_in_market_pct: ...      # 基准在场时间占比
+    strategy_time_in_market_pct: ...       # 策略在场时间占比
+    information_ratio: ...         # 只上报
+    jensen_alpha_annual_pct: ...   # 只上报
+    benchmark_beta: ...
+    net_edge_per_trade: ...        # 扣费后每笔净边际（USDT / %）
+    net_edge_per_trade_pct: ...
+    strategy_risk_matched_pct: ... # risk_matched 的反方向
+    report: {...}                  # core.ga.benchmark 的完整报告（权重、notes、可用性）
   validation: {...}
   published: false
   rejection_reasons: ["trades=12 < 30 (not enough evidence)", ...]
   eval: {engine_mode: legacy, use_live_spread: false}
   written_at: 2026-...
 ```
+
+冠军的 `symbols:` 现在写**被评估的篮子**（不是 `[]`）——见"评估/执行一致性"一节。
 
 `StrategyConfig`（线上/回测共用的 schema）不带运行元数据，所以该块写在 YAML 文档里，
 旧策略没有这个块也能正常加载。

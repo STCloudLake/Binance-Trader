@@ -213,11 +213,31 @@ def job_timeframe_pool(job: dict) -> list | None:
     return parse_timeframe_pool(job.get("timeframe_pool"))
 
 
+def job_benchmark_mode(job: dict) -> str | None:
+    """Validated ``benchmark_mode`` job field — ``None`` = follow the config.
+
+    The benchmark the publication gate consumes (``core.ga.benchmark``).
+    Validation reuses the canonical parser, so an unknown value raises the named
+    ``UnknownBenchmarkModeError`` (= the same "fail at load" contract as
+    ``job_timeframe_pool``): a typo can never silently select a different gate.
+    An absent/blank field returns ``None`` — the run then follows
+    ``config.ga_benchmark_mode`` / the code default ``buy_hold``, i.e. the
+    operator's config, not a job-file default.
+    """
+    from core.ga.benchmark import parse_benchmark_mode
+
+    raw = job.get("benchmark_mode")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    return parse_benchmark_mode(raw)
+
+
 def ga_run_config(job: dict, pop_size: int, generations: int, seed: int):
     """The ``GARunConfig`` for this job — one construction point for GA and WF.
 
     Carries the validated ``timeframe_pool`` through to the evolver (which
-    confines the timeframe gene to it), alongside the job's worker count/seed.
+    confines the timeframe gene to it), alongside the job's worker count/seed
+    and its validated ``benchmark_mode`` (``None`` = the config's mode).
     """
     from core.ga.evolver import GARunConfig
 
@@ -229,6 +249,7 @@ def ga_run_config(job: dict, pop_size: int, generations: int, seed: int):
         max_workers=job.get("max_workers", 1),  # >1 uses multi-process (safe for TA-Lib)
         seed=seed,
         timeframe_pool=job_timeframe_pool(job),
+        benchmark_mode=job_benchmark_mode(job),
     )
 
 
@@ -284,6 +305,16 @@ def run_ga(job: dict, job_file: str):
         logger.info("[ga_worker] timeframe_pool=unrestricted "
                     "(no timeframe_pool in the job file)")
 
+    # The job field, when present, overrides the config for this run; `None`
+    # means the run follows `config.ga_benchmark_mode` (code default buy_hold).
+    from core.ga.benchmark import coerce_benchmark_mode
+    benchmark_mode = coerce_benchmark_mode(
+        ga_cfg.benchmark_mode or getattr(config, "ga_benchmark_mode", None))
+    logger.info(
+        f"[ga_worker] benchmark_mode={benchmark_mode} "
+        f"({'job field' if ga_cfg.benchmark_mode else 'config'}) "
+        f"— the publication gate compares against it")
+
     evolver = GAStrategyEvolver(engine, loader, ga_cfg)
 
     # One reporter fills the progress file for every shape the evolver emits
@@ -315,6 +346,8 @@ def run_ga(job: dict, job_file: str):
     result["seed"] = seed
     # Result-side audit: which timeframes this run was allowed to evolve.
     result["timeframe_pool"] = timeframe_pool
+    # ... and which benchmark its gate consumed.
+    result["benchmark_mode"] = benchmark_mode
     write_result(job_file, result)
 
 
@@ -437,6 +470,8 @@ def run_walkforward(job: dict, job_file: str):
         "report": report.to_dict(),
         "seed": seed,
         "timeframe_pool": timeframe_pool,
+        "benchmark_mode": (ga_cfg.benchmark_mode
+                           or getattr(config, "ga_benchmark_mode", None)),
     })
 
 
@@ -459,6 +494,13 @@ def main():
         # interval in the result file instead of after hours of 1m backtests.
         # ``None`` (field absent) = the historical, unrestricted behaviour.
         job["timeframe_pool"] = job_timeframe_pool(job)
+
+        # ── Job-load validation: a bad benchmark mode fails HERE too ──
+        # ``job_benchmark_mode`` raises the named ``UnknownBenchmarkModeError``,
+        # so a typo lands in the result file at load instead of silently
+        # running the whole evolution against a different gate.  ``None``
+        # (field absent) = follow ``config.ga_benchmark_mode``.
+        job["benchmark_mode"] = job_benchmark_mode(job)
 
         update_progress(args.job_file, {
             "phase": "starting",

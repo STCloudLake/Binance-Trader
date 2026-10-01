@@ -25,6 +25,9 @@ from core.ga.genome import (
     random_chromosome, confine_timeframe_gene,
     ContinuousGene, CategoricalGene, StructuralGene,
 )
+from core.ga.benchmark import (
+    BUY_HOLD, NONE, alpha_label, coerce_benchmark_mode, mode_description,
+)
 from core.strategy.loader import StrategyLoader
 
 
@@ -67,6 +70,12 @@ class GARunConfig:
     #: ``timeframe_pool``; ``None`` = **no restriction**, the historical search
     #: space).  Confined into the timeframe gene on init, mutation and decode.
     timeframe_pool: list[str] | None = None
+    #: The benchmark the publication gate consumes (``core.ga.benchmark``).
+    #: ``None`` = **follow ``config.ga_benchmark_mode``** (whose code default is
+    #: the legacy ``buy_hold``) — an absent job field must not override the
+    #: operator's config.  Set by ``scripts/ga_worker.py`` from a validated job
+    #: field, so a job can pin the mode per run.
+    benchmark_mode: str | None = None
 
 
 def dsr_trial_counts(prior_trials: int, ledger_total: int, population: int,
@@ -212,6 +221,17 @@ class GAStrategyEvolver:
                 ",".join(timeframe_pool) + " (timeframe gene confined to it)"
                 if timeframe_pool else "unrestricted (all intervals)"))
 
+        # ── Benchmark mode: the gate's comparison, logged up front ──
+        # ``None`` on the run config = follow ``config.ga_benchmark_mode``
+        # (code default ``buy_hold`` = the legacy fully-invested benchmark).
+        _job_mode = getattr(cfg, "benchmark_mode", None)
+        _benchmark_mode = coerce_benchmark_mode(
+            _job_mode or getattr(getattr(self.engine, "config", None),
+                                 "ga_benchmark_mode", None) or BUY_HOLD)
+        logger.info(f"GA benchmark_mode={_benchmark_mode} "
+                    f"({'job field' if _job_mode else 'config'})"
+                    f" — the publication gate compares against it")
+
         # Training period: if validation_start is set, stop training there
         train_end = validation_start if validation_start else date_end
         has_validation = validation_start is not None
@@ -293,6 +313,7 @@ class GAStrategyEvolver:
                     prior_trials=_dsr_prior,
                     alpha_weight=_alpha_weight,
                     seed=self._seed,
+                    benchmark_mode=_job_mode,
                     # P6-D: None unless the executability model is on for some genome.
                     volume_context=self.volume_context_for(
                         symbols, date_start, train_end),
@@ -321,6 +342,7 @@ class GAStrategyEvolver:
                     batch_trials=_batch_trials,
                     prior_trials=_dsr_prior,
                     alpha_weight=_alpha_weight,
+                    benchmark_mode=_job_mode,
                     # P6-D: None unless the executability model is on for some genome.
                     volume_context=self.volume_context_for(
                         symbols, date_start, train_end),
@@ -424,7 +446,8 @@ class GAStrategyEvolver:
                     self.engine, self.loader,
                     ga_loader=self.ga_loader,
                     n_trials=n_trials,
-                    alpha_weight=_alpha_weight)
+                    alpha_weight=_alpha_weight,
+                    benchmark_mode=_job_mode)
                 validation = {
                     "sharpe": val_result.get("sharpe", 0),
                     "win_rate": val_result.get("win_rate", 0),
@@ -434,6 +457,14 @@ class GAStrategyEvolver:
                     "max_dd": val_result.get("max_dd", 0),
                     "dsr": val_result.get("dsr", 0),
                     "buy_hold_pct": val_result.get("buy_hold_pct"),
+                    # The selected benchmark's own OOS numbers (reported only).
+                    "benchmark_mode": val_result.get("benchmark_mode"),
+                    "benchmark_pct": val_result.get("benchmark_pct"),
+                    "alpha_vs_benchmark_pct": val_result.get("alpha_vs_benchmark_pct"),
+                    "benchmark_sharpe": val_result.get("benchmark_sharpe"),
+                    "benchmark_max_dd": val_result.get("benchmark_max_dd"),
+                    "benchmark_time_in_market_pct": val_result.get(
+                        "benchmark_time_in_market_pct"),
                     "start": validation_start, "end": date_end,
                 }
                 logger.info(
@@ -449,6 +480,19 @@ class GAStrategyEvolver:
             published, rejection_reasons = self._publication_decision(
                 train_result, validation)
             champion_config.enabled = published
+            # ── Evaluation/execution consistency ──────────────────────────
+            # The champion was SCORED on the job's basket, while the live
+            # watcher only honours a strategy's own ``symbols`` list
+            # (``core/strategy/engine.py`` skips a symbol outside it in
+            # ``_on_kline``/``evaluate_all_now``).  The YAML used to ship
+            # ``symbols: []`` = "every symbol the watchlist holds", so an
+            # enabled champion would have traded pairs it was never evaluated
+            # on.  The evaluated basket is written here, and the engine's
+            # existing restriction + startup log line
+            # (``Strategy '<name>' restricted to symbols: [...]``) is what makes
+            # evaluation and execution agree.  An empty basket (an old job file
+            # with no symbols) keeps the historical "all symbols" behaviour.
+            champion_config.symbols = list(symbols)
             self.loader.save(champion_config)
 
             # ── Provenance + gate metadata on the YAML ──
@@ -483,6 +527,46 @@ class GAStrategyEvolver:
                     "raw_profit_factor": train_result.get("raw_profit_factor"),
                     "buy_hold_pct": train_result.get("buy_hold_pct"),
                     "alpha_vs_buy_hold_pct": train_result.get("alpha_vs_buy_hold_pct"),
+                    # The selected benchmark (additive; the keys above are the
+                    # pre-``benchmark_mode`` contract and do not move).
+                    "benchmark_mode": train_result.get("benchmark_mode"),
+                    "benchmark_pct": train_result.get("benchmark_pct"),
+                    "alpha_vs_benchmark_pct": train_result.get(
+                        "alpha_vs_benchmark_pct"),
+                },
+                # ── Benchmark provenance (``ga.benchmark_mode``) ──────────
+                # Only the mode's alpha GATES; everything else is reported so a
+                # published champion can be risk-compared afterwards.  Before
+                # this, the YAML kept the raw buy & hold return and nothing
+                # else, so no exposure/risk comparison was possible at all.
+                "benchmark": {
+                    "mode": (train_result.get("benchmark_mode")
+                             or _benchmark_mode),
+                    "buy_hold_pct": train_result.get("buy_hold_pct"),
+                    "benchmark_pct": train_result.get("benchmark_pct"),
+                    "alpha_vs_benchmark_pct": train_result.get(
+                        "alpha_vs_benchmark_pct"),
+                    "alpha_vs_buy_hold_pct": train_result.get(
+                        "alpha_vs_buy_hold_pct"),
+                    # The benchmark's OWN risk numbers.
+                    "benchmark_sharpe": train_result.get("benchmark_sharpe"),
+                    "benchmark_max_dd_pct": train_result.get("benchmark_max_dd"),
+                    "benchmark_time_in_market_pct": train_result.get(
+                        "benchmark_time_in_market_pct"),
+                    # Strategy side of the same comparison (reported, not gated).
+                    "strategy_time_in_market_pct": train_result.get(
+                        "strategy_time_in_market_pct"),
+                    "information_ratio": train_result.get("information_ratio"),
+                    "jensen_alpha_annual_pct": train_result.get(
+                        "jensen_alpha_annual_pct"),
+                    "benchmark_beta": train_result.get("benchmark_beta"),
+                    "net_edge_per_trade": train_result.get("net_edge_per_trade"),
+                    "net_edge_per_trade_pct": train_result.get(
+                        "net_edge_per_trade_pct"),
+                    "strategy_risk_matched_pct": train_result.get(
+                        "strategy_risk_matched_pct"),
+                    # The full report (weights, per-mode notes, availability).
+                    "report": train_result.get("benchmark") or {},
                 },
                 "validation": validation,
                 "published": published,
@@ -519,6 +603,9 @@ class GAStrategyEvolver:
                 "enabled": published,
                 "seed": provenance["seed"],
                 "timeframe_pool": provenance["timeframe_pool"],
+                # The benchmark this run's gate consumed + the full report.
+                "benchmark_mode": provenance["benchmark"]["mode"],
+                "benchmark": provenance["benchmark"],
             }
         else:
             return {"error": "No valid champion found"}
@@ -534,9 +621,15 @@ class GAStrategyEvolver:
         """``(published, rejection_reasons)`` for the champion.
 
         Gate: ``trades >= 30 AND net_pnl > 0 AND pf > 1 AND dsr > 0 AND
-        validation > 0``.  The validation terms are only required when an
-        out-of-sample window was actually provided (a plain GA run has none and
-        is gated on its train metrics + DSR).
+        validation > 0`` plus the **benchmark** criterion, which consumes the
+        alpha of the mode selected by ``ga.benchmark_mode``
+        (``core.ga.benchmark``).  ``buy_hold`` — the code default — reads
+        ``alpha_vs_buy_hold_pct`` exactly as before, so the verdict and the
+        reason string are unchanged; ``exposure_matched`` / ``risk_matched``
+        consume their own alpha, and ``none`` skips only this criterion (the
+        DSR/PSR and net-expectancy terms still gate).  The validation terms are
+        only required when an out-of-sample window was actually provided (a
+        plain GA run has none and is gated on its train metrics + DSR).
         """
         _cfg = getattr(self.engine, "config", None)
         min_trades = int(getattr(_cfg, "ga_min_champion_trades",
@@ -546,7 +639,20 @@ class GAStrategyEvolver:
         pnl = float(train_result.get("total_return") or 0.0)
         pf = float(train_result.get("profit_factor") or 0.0)
         dsr = float(train_result.get("dsr") or 0.0)
-        alpha = float(train_result.get("alpha_vs_buy_hold_pct") or 0.0)
+
+        # ── Benchmark criterion: the SELECTED mode's alpha ──
+        # ``benchmark_mode`` travels with the scored result, so the gate consumes
+        # exactly the benchmark the evaluation used.  A result dict without the
+        # field (an older caller) is the legacy ``buy_hold`` case — the reason
+        # string is then byte-identical to the pre-``benchmark_mode`` one.
+        bench_mode = coerce_benchmark_mode(train_result.get("benchmark_mode"))
+        alpha = train_result.get("alpha_vs_benchmark_pct")
+        if alpha is None:
+            alpha = train_result.get("alpha_vs_buy_hold_pct")
+        alpha = float(alpha or 0.0)
+        bench_available = train_result.get("benchmark_pct")
+        if bench_available is None and bench_mode == BUY_HOLD:
+            bench_available = train_result.get("buy_hold_pct")
 
         if trades < min_trades:
             reasons.append(
@@ -559,9 +665,10 @@ class GAStrategyEvolver:
             reasons.append(f"profit_factor={pf:.3f} <= 1 (after shrink cap)")
         if dsr <= 0:
             reasons.append(f"dsr={dsr:.4f} <= 0 (indistinguishable from data mining)")
-        if train_result.get("buy_hold_pct") is not None and alpha <= 0:
+        if bench_mode != NONE and bench_available is not None and alpha <= 0:
             reasons.append(
-                f"alpha_vs_buy_hold={alpha:.2f}% <= 0 (no edge over buy & hold)")
+                f"{alpha_label(bench_mode)}={alpha:.2f}% <= 0 "
+                f"(no edge over {mode_description(bench_mode)})")
 
         if validation is not None:
             v_sharpe = float(validation.get("sharpe") or 0.0)

@@ -10,6 +10,13 @@ from core.backtest.engine_hybrid import run_hybrid
 from core.backtest.signal_matrix import NO_MARKET_DATA_MESSAGE
 from core.backtest.cost_model import apply_trading_costs
 from core.backtest.trade_book import close_position
+from core.ga.benchmark import (
+    COMPUTED_BENCHMARK_MODES,
+    CODE_DEFAULT_BENCHMARK_MODE,
+    build_benchmark,
+    coerce_benchmark_mode,
+    legacy_report,
+)
 from core.strategy.indicators import compute_all, evaluate_condition
 from core.strategy.evaluation_kernel import (
     evaluate_exit_conditions,
@@ -245,7 +252,8 @@ class BacktestEngine:
                                   per_strategy_isolation: bool = False,
                                   spread_overrides: dict | None = None,
                                   use_live_spread: bool = True,
-                                  per_genome_ledger: bool | None = None):
+                                  per_genome_ledger: bool | None = None,
+                                  benchmark_mode: str | None = None):
         """Full backtest with ML predictions, signal fusion, and risk controls.
 
         Args:
@@ -274,6 +282,14 @@ class BacktestEngine:
                 cash/equity sub-ledger, returned under ``per_strategy_equity``.
                 Off by default so the hybrid/legacy parity contract (one shared
                 cash balance, one shared position counter) is untouched.
+            benchmark_mode: ``ga.benchmark_mode`` for THIS run (``None`` = read
+                ``config.ga_benchmark_mode``, which itself defaults to the code
+                default ``buy_hold``).  Selects the benchmark the GA publication
+                gate consumes and the benchmark report stored next to each
+                genome's ledger (``core.ga.benchmark``).  ``buy_hold``/``none``
+                never touch the price cache: they reuse the legacy
+                ``metrics["buy_hold_pct"]`` verbatim, so the default path stays
+                byte-identical to the pre-``benchmark_mode`` behaviour.
         """
         t0 = time.time()
         if per_genome_ledger is None:
@@ -1585,6 +1601,56 @@ class BacktestEngine:
                 for s_name in ledger_balances
             }
 
+        # ── Selectable benchmark for the publication gate ──────────────
+        # ``ga.benchmark_mode`` (core/ga/benchmark.py).  The default —
+        # ``buy_hold`` — is reported straight from the legacy value above and
+        # reads no price data, so the pre-existing behaviour is untouched.
+        # ``none`` disables only the benchmark criterion.  The two matched modes
+        # reconstruct the strategy's own in-market intervals from its trades and
+        # read the SAME 1h frames the legacy benchmark reads; a failure here is
+        # reported as "unavailable" and can never take a backtest down.
+        if per_strategy_equity:
+            _bm_mode = coerce_benchmark_mode(
+                benchmark_mode if benchmark_mode is not None
+                else getattr(self.config, "ga_benchmark_mode",
+                             CODE_DEFAULT_BENCHMARK_MODE))
+            _bm_start = _bm_end = None
+            if equity_curve:
+                try:
+                    _bm_start = pd.Timestamp(equity_curve[0]["time"])
+                    _bm_end = pd.Timestamp(equity_curve[-1]["time"])
+                except Exception:  # pragma: no cover - defensive
+                    _bm_start = _bm_end = None
+            if _bm_mode in COMPUTED_BENCHMARK_MODES and _bm_start is not None:
+                try:
+                    _bm_frames = self._benchmark_frames(symbols)
+                    _bm_reports = {
+                        s_name: build_benchmark(
+                            _bm_mode,
+                            trades=entry.get("trades") or [],
+                            symbols=list(symbols),
+                            frames=_bm_frames,
+                            window_start=_bm_start, window_end=_bm_end,
+                            initial_balance=initial_balance,
+                            strategy_equity=entry.get("equity_curve") or [],
+                            buy_hold_pct=metrics["buy_hold_pct"])
+                        for s_name, entry in per_strategy_equity.items()
+                    }
+                except Exception as e:  # never let the benchmark break a run
+                    logger.warning(f"{_bm_mode} benchmark unavailable: {e}")
+                    _bm_reports = {
+                        s_name: dict(legacy_report(_bm_mode, metrics["buy_hold_pct"],
+                                                   entry.get("trades")),
+                                     notes=f"benchmark computation failed: {e}")
+                        for s_name, entry in per_strategy_equity.items()}
+            else:
+                _bm_reports = {
+                    s_name: legacy_report(_bm_mode, metrics["buy_hold_pct"],
+                                          entry.get("trades"))
+                    for s_name, entry in per_strategy_equity.items()}
+            for s_name, entry in per_strategy_equity.items():
+                entry["benchmark"] = _bm_reports[s_name]
+
         # ── Monte Carlo robustness assessment ──
         try:
             from core.backtest.monte_carlo import monte_carlo_simulation
@@ -1612,6 +1678,28 @@ class BacktestEngine:
             "per_strategy_equity": per_strategy_equity,
             "monte_carlo": mc_result,
         }
+
+    def _benchmark_frames(self, symbols) -> dict:
+        """``{symbol: 1h frame}`` for the benchmark — one read per run.
+
+        The same series the legacy buy & hold reads
+        (``feeder.get_all_data_for_symbol(sym, "1h")``), cached on ``_run_state``
+        for the duration of the run: a GA chunk scores every genome of the chunk
+        in one engine pass, and the benchmark must not re-read the parquet tree
+        per genome.  A symbol with no data maps to ``None`` (the benchmark drops
+        it, exactly like the legacy equal-weighted return does).
+        """
+        cache = self._run_state.setdefault("benchmark_frames", {})
+        frames: dict = {}
+        for symbol in symbols or []:
+            if symbol not in cache:
+                try:
+                    cache[symbol] = self._feeder.get_all_data_for_symbol(symbol, "1h")
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.debug(f"benchmark frame unavailable for {symbol}: {e}")
+                    cache[symbol] = None
+            frames[symbol] = cache[symbol]
+        return frames
 
     def _close_position(self, pos_key, pos, exit_price, ts, reason, trades, events,
                          balance, positions, per_matrix,

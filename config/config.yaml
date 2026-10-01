@@ -64,6 +64,29 @@ ga:
   # (`leverage` appears 0 times in core/ga/** and core/backtest/engine.py); a
   # config key promising an override would be a lie, so the mismatch with
   # `risk_params.yaml` leverage is stated in the champion provenance instead.
+  #
+  # ── Publication-gate benchmark (core/ga/benchmark.py) ──────────────────
+  # Which benchmark a champion's alpha is measured against before it may be
+  # published.  buy_hold = the code default (fully-invested equal-weighted
+  # basket of the same window, the historical behaviour); risk_matched = that
+  # basket scaled to the strategy's realised daily volatility; none = no
+  # benchmark criterion (DSR/PSR and net expectancy still gate).
+  #
+  # exposure_matched is shipped ON: it is the only mode that compares like with
+  # like for this operator's setup.  Measured on the last champion
+  # (strategies/ga_champion_1790844776.yaml, window 2026-06-01~2026-09-01):
+  # buy & hold +17.74 % against a strategy that was in the market a fraction of
+  # the time with max drawdown 0.11 % and OOS Sharpe 5.69 — raw total return
+  # versus a 100 %-invested benchmark, with no exposure or risk matching.  The
+  # exposure-matched benchmark holds the same basket only while the strategy
+  # holds a position (each symbol's buy & hold return over the union of that
+  # symbol's own entry→exit intervals, weighted by the capital the strategy
+  # actually deployed), so idle cash earns what it earned for the strategy.
+  # The selected mode's alpha gates; every mode's benchmark return, its own
+  # Sharpe / max drawdown / time-in-market share, the information ratio, the
+  # Jensen-style alpha and the per-trade net edge are recorded in the champion
+  # provenance (reported, never gated).
+  benchmark_mode: exposure_matched
 binance:
   # Trading/account client (orders, balances). testnet.binance.vision is reachable.
   testnet: true

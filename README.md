@@ -12,7 +12,7 @@ data-api.binance.vision (REST) / data-stream.binance.vision (WS) → MarketDataP
 ```
 
 > **状态**：`VERSION` **2.0.1** · Python **3.12**（实测 3.12.10）· Windows / Linux · 默认只监听 `127.0.0.1:8899`
-> **测试**：**1339** 项收集（`python -m pytest tests/ --collect-only -q`）；全量基线要求 `1339 passed, 0 failed`。见 [§5.1](#51-测试)。
+> **测试**：**1364** 项收集（`python -m pytest tests/ --collect-only -q`）；全量基线要求 `1364 passed, 0 failed`。见 [§5.1](#51-测试)。
 > 本 README 只写**当前代码事实**，每个数字旁给出发它的命令；与代码冲突时以代码为准。
 
 ---
@@ -253,6 +253,22 @@ P4 那批能力此前只能改 Python 常量；现在一个能力一个开关，
 | **基因约束** | `core/ga/genome.py` 的 `timeframes` 分类基因：随机初始化、变异可选集合、交叉/精英/`resume` 检查点（`confine_timeframe_gene`）、解码（`chromosome_to_strategy`）全都被限制在白名单内；解出的策略 `timeframes` **非空且 ⊆ 白名单** |
 | **可审计** | 启动日志 `GA timeframe_pool=15m,1h,4h`（不限制时为 `unrestricted`）、progress JSON 的 `timeframe_pool`、result 与冠军 YAML 的 `provenance.timeframe_pool`；`scripts/ga_job_status.py` 的 `job params` 行打印 `tf_pool=` |
 
+### 4.6 GA 发布门基准（`ga.benchmark_mode`）与"冠军只交易被评估过的币"
+
+发布门原来只用**满仓买入持有**（`metrics["buy_hold_pct"]`，同窗口同币种等权）当基准比**总收益**。对一个只在一小部分时间持仓、回撤 0.11 %、OOS Sharpe 5.69 的短周期策略，这个比较**没有做敞口/风险匹配**——它惩罚的是"拿着现金"。`ga.benchmark_mode` 选择发布门消费哪个基准（`core/ga/benchmark.py`）：
+
+| 取值 | 定义 | 说明 |
+|---|---|---|
+| **`buy_hold`**（**代码缺省**） | 满仓等权买入持有（历史行为） | 键不存在 = 该值；与加入该键之前**逐位一致**（`tests/test_ga_benchmark_mode.py` 用 HEAD worktree 逐字节比对） |
+| **`exposure_matched`**（`config/config.yaml` **已启用**，推荐） | 同一篮子**只在策略持仓期间**持有 | 用策略自己的成交（`opened_at`→`closed_at`，裁到窗口）重建每个币的**持仓区间并集**，算该币在这些区间上的买入持有收益（区间收益**复合** `Π(1+rᵢ)−1`，区间之间算现金 0 %），再按策略**实际投入的保证金占比** `wₛ = mean(amount_usdt)/initial_balance` 加权：`Σ wₛ·Rₛ`。没交易过的币权重为 0（不摊薄）；窗口结束时**未平仓**按窗口末裁剪；**零成交** ⇒ 基准 0、alpha = 策略收益（门仍以 `no_trades`/DSR/净期望拒绝）；区间内**缺 bar** ⇒ 该币剔除，全不可用 ⇒ 基准 `None`、门**跳过**该判据并在 provenance 记 `benchmark_available: false` |
+| `risk_matched` | 满仓基准按策略**已实现日波动率**缩放 | `buy_hold_pct × σ_strategy/σ_benchmark`（两条序列都是既有 `daily_returns`/`per_period_sharpe` 口径；`σ_benchmark = 0` 时退回原值并记 `risk_scale_fallback`），反向 `strategy_return × σ_benchmark/σ_strategy` 同时上报 |
+| `none` | 无基准 | **只**关闭基准判据；`dsr/psr` 与净期望仍然门控 |
+
+- **校验**：未知取值在**配置加载**（`Config.load`，`UnknownBenchmarkModeError`）与 **job 加载**（`scripts/ga_worker.py::job_benchmark_mode`，与 `timeframe_pool` 同型）都立刻失败并点名取值；缺省字段 = 跟 `config.ga_benchmark_mode`（不是 job 级默认覆盖）。
+- **上报（不门控）**：策略 vs 基准 Sharpe、信息比率、Jensen 式 alpha/beta、扣费后每笔净边际、在场时间占比；冠军 provenance 新增 `benchmark` 块（模式、`buy_hold_pct`、匹配后基准收益、基准**自身** Sharpe/最大回撤/在场时间占比等）。此前只记录一个买入持有收益，事后无法做风险比较。
+- **评估/执行一致性**：冠军 YAML 过去写 `symbols: []`（= 交易自选列表里的**全部**币），而 GA 只评估了 job 的篮子（如 3 币 vs 自选 5 币）。现在 `evolve()` 把**被评估的篮子**写进冠军的 `symbols:`，执行路径（`core/strategy/engine.py` 的 `_on_kline` / `evaluate_all_now`：`strategy.symbols` 非空时跳过表外币，启动日志 `Strategy '<name>' restricted to symbols: [...]`）因此只能交易它被评估过的币。**未**选择"拒绝启用不匹配的冠军"：限制交易是更安全、无副作用的一侧（老 YAML 的 `symbols: []` 仍表示"不限"，保持向后兼容）。
+- **对照表**：`python tools/ga_benchmark_modes_table.py`（只读：加载 `strategies/` 里的冠军 + 一个内存里新生成的候选，逐模式各跑一次真实回测并打印基准收益、alpha 与门结论）。
+
 ---
 
 ## 5. 运维
@@ -260,7 +276,7 @@ P4 那批能力此前只能改 Python 常量；现在一个能力一个开关，
 ### 5.1 测试
 
 ```bash
-python -m pytest tests/ --collect-only -q -p no:cacheprovider   # 末行: 1339 tests collected
+python -m pytest tests/ --collect-only -q -p no:cacheprovider   # 末行: 1364 tests collected
 python -m pytest tests/ -q -p no:cacheprovider                  # 全量
 python -m pytest tests/ -q -m "not slow"                        # 跳过慢测
 ```
@@ -268,6 +284,8 @@ python -m pytest tests/ -q -m "not slow"                        # 跳过慢测
 `pytest.ini`：`testpaths=tests`、`asyncio_mode=strict`、`markers=slow`。**没有安装 `pytest-timeout`**，所以 `--timeout=` 会直接报参数错误。
 
 唯一容易被机器负载误报的是 `tests/test_ml_credibility.py::test_feature_pipeline_cost_is_bounded`：它断言特征流水线耗时 `< 3.0 s`，并发压力下会超时失败（实测压力下整跑 1 failed / 1216 passed，同一用例单独运行 1.74s 通过）。看到只有这一条失败时，先单独重跑它再判断。
+
+另一条**与本机环境/缓存有关、与本次改动无关**的失败：`tests/test_meta_labeling.py::test_real_primary_rules_are_refused_by_the_meta_gate`。它在**改动前的 `ba8c212` worktree**（`git worktree add --detach <tmp> ba8c212`，并把本仓库的 `data/market` 以 junction 接进去）用同一份缓存**同样失败**：直接跑是 joblib/loky 的 `_count_physical_cores_win32` 探测（本机没有 `wmic`）抛 `WinError 2` + 解码异常；加 `LOKY_MAX_CPU_COUNT=8` 绕过探测后失败原因变成它自己的断言 `assert gate["allowed"] is False`（`tests/test_meta_labeling.py:401`，本机缓存的最后一版数据上 meta 门放行了一条一级规则）。所以本机 `python -m pytest tests/ -q -p no:cacheprovider` 是 **1363 passed / 1 failed**，去掉这一条是 **1363 passed / 0 failed**。
 
 **干净克隆的隐含前提**：`data/` 全部 gitignore，所以没有任何缓存历史的克隆直接跑全量**不是全绿**——`tests/test_engine_parity_variants.py` 的 7 个真实数据变体依赖 `2026-05-25..2026-05-31` 的 BTCUSDT + ETHUSDT 1h 缓存（`DATE_START` / `DATE_END` / `SYMBOLS` 就在该文件头部），缺数据时以同一句 `NO_MARKET_DATA_MESSAGE` 失败（`tests/test_hybrid_equivalence.py` 同类用例会 skip）。CI 或新机器先下这段历史即可（下面这条会写 `data/market/`，本次未执行）：
 

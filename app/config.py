@@ -709,6 +709,15 @@ class Config:
             self.ga_min_champion_trades = 30
         self.ga_alpha_weight = max(
             _as_float(ga_cfg.get("alpha_weight"), 1.0), 0.0)
+        # The benchmark the GA PUBLICATION GATE compares a champion against
+        # (`core.ga.benchmark`): `buy_hold` (the code default — the historical
+        # fully-invested basket, byte-identical to the pre-`benchmark_mode`
+        # behaviour), `exposure_matched`, `risk_matched` or `none` (no benchmark
+        # criterion; DSR/PSR and net expectancy still gate).  An unknown value
+        # raises the NAMED `UnknownBenchmarkModeError` here — at config load —
+        # instead of silently selecting a different gate.
+        from core.ga.benchmark import parse_benchmark_mode
+        self.ga_benchmark_mode = parse_benchmark_mode(ga_cfg.get("benchmark_mode"))
 
         # Simulated-account cost model (docs/overhaul/TRADE_PAGE_API.md §五之二).
         # Deliberately separate from `backtest.cost_model` above: the backtest model

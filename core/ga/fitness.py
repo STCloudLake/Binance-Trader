@@ -36,6 +36,7 @@ from loguru import logger
 import numpy as np
 import pandas as pd
 from core.ga.genome import chromosome_to_strategy, UnevaluableConditionError
+from core.ga.benchmark import reverse_risk_matched_return, strategy_vs_benchmark
 from core.strategy.loader import StrategyLoader
 
 # ── Scoring constants (single source of truth) ──────────────────────────
@@ -216,6 +217,7 @@ def evaluate_chromosome(
     use_live_spread: bool = False,
     volume_context: "VolumeContext | None" = None,
     alpha_weight: float | None = None,
+    benchmark_mode: str | None = None,
 ) -> dict:
     """Evaluate a single chromosome via backtest.
 
@@ -225,6 +227,9 @@ def evaluate_chromosome(
     Scoring goes through the same :func:`score_stats` used by the batch paths,
     so the train fitness of a champion and the fitness printed during evolution
     are one formula (they used to be two different ones).
+
+    ``benchmark_mode`` is the run's ``ga.benchmark_mode`` (``None`` = read the
+    config, whose code default is ``buy_hold``).
 
     Returns a dict with fitness components.
     """
@@ -245,6 +250,7 @@ def evaluate_chromosome(
             simulate_ai_weights=False,
             ml_engine="lightgbm",
             use_live_spread=use_live_spread,
+            benchmark_mode=benchmark_mode,
             **isolated_eval_kwargs(),
         )
 
@@ -272,6 +278,13 @@ def evaluate_chromosome(
                                           initial_balance)
                 stats["executability"] = modelled["summary"]
         stats["buy_hold_pct"] = metrics.get("buy_hold_pct")
+        # The selected benchmark (`ga.benchmark_mode`) for THIS genome, computed
+        # by the engine next to its own ledger (core.ga.benchmark).
+        _bench = (per_eq or {}).get("benchmark") or {}
+        stats["benchmark"] = _bench
+        stats["benchmark_mode"] = _bench.get("mode") or "buy_hold"
+        stats["benchmark_pct"] = (_bench.get("benchmark_pct")
+                                  if _bench else metrics.get("buy_hold_pct"))
         stats["max_dd"] = stats["max_dd_pct"]
         if not stats["max_dd"]:
             stats["max_dd"] = abs(_finite(metrics.get("max_drawdown_pct", 0)))
@@ -291,6 +304,7 @@ def evaluate_chromosome(
         score["alpha_pct"] = round(_finite(stats["alpha_pct"]), 4)
         score["observations"] = int(stats["observations"])
         score["spread_sources"] = metrics.get("spread_sources", {})
+        score.update(benchmark_result_fields(stats, score))
         return score
 
     except UnevaluableConditionError as e:
@@ -1033,12 +1047,31 @@ def score_stats(stats: dict, chromosome: dict | None = None,
     stats_out["fitness_alpha"] = round(alpha * weight_alpha, 4)
     stats_out["alpha_weight"] = weight_alpha
     # Alpha versus the equal-weighted buy & hold of the SAME window/symbols.
+    _total_return = _finite(stats.get("total_return_pct"))
     baseline = stats.get("buy_hold_pct")
     if baseline is None:
         stats_out["alpha_vs_buy_hold_pct"] = 0.0
     else:
-        stats_out["alpha_vs_buy_hold_pct"] = (
-            _finite(stats.get("total_return_pct")) - _finite(baseline))
+        stats_out["alpha_vs_buy_hold_pct"] = _total_return - _finite(baseline)
+    # Alpha versus the SELECTED benchmark (`ga.benchmark_mode`).  Under the code
+    # default ``buy_hold`` the benchmark *is* the value above, so this is the
+    # same float computed the same way — bit-identical, and the gate's verdict
+    # and reason string do not move.  ``none`` (and an unavailable benchmark)
+    # report 0.0; the gate skips the criterion in exactly those cases.
+    _bench_mode = stats.get("benchmark_mode") or "buy_hold"
+    _bench = stats.get("benchmark_pct")
+    if _bench is None and _bench_mode == "buy_hold":
+        # No report (a hand-built stats dict, or a caller that only set
+        # ``buy_hold_pct``): in ``buy_hold`` mode the benchmark IS the legacy
+        # value, so the two alphas stay one number by construction.
+        _bench = baseline
+    stats_out["benchmark_mode"] = _bench_mode
+    stats_out["benchmark_pct"] = (
+        None if (_bench is None or _bench_mode == "none") else _finite(_bench))
+    if _bench_mode == "none" or _bench is None:
+        stats_out["alpha_vs_benchmark_pct"] = 0.0
+    else:
+        stats_out["alpha_vs_benchmark_pct"] = _total_return - _finite(_bench)
     stats_out["insufficient_data"] = trades < MIN_TRADES_GATE
     if trades == 0:
         stats_out["flag"] = "no_trades"
@@ -1047,6 +1080,43 @@ def score_stats(stats: dict, chromosome: dict | None = None,
     else:
         stats_out["flag"] = ""
     return stats_out
+
+
+def benchmark_result_fields(stats: dict, score: dict | None = None) -> dict:
+    """The benchmark block every GA result dict carries — **reported, not gated**.
+
+    One source for the flattened scalars the champion provenance and the API
+    payload show: the selected mode, its benchmark return and alpha, the
+    benchmark's own Sharpe / max drawdown / time-in-market share, the strategy's
+    time-in-market share, the information ratio, the Jensen-style alpha and beta,
+    and the per-trade net edge after costs.  ``benchmark`` (the full report from
+    ``core.ga.benchmark``) travels along so the provenance is written from the
+    same object that was scored.
+    """
+    report = stats.get("benchmark") or {}
+    mode = stats.get("benchmark_mode") or report.get("mode") or "buy_hold"
+    bench = stats.get("benchmark_pct")
+    alpha = stats.get("alpha_vs_benchmark_pct")
+    sharpe = (score if score is not None else stats).get("sharpe")
+    comparison = strategy_vs_benchmark(report, _finite(sharpe))
+    return {
+        "benchmark_mode": mode,
+        "benchmark_pct": (round(_finite(bench), 4) if bench is not None else None),
+        "alpha_vs_benchmark_pct": round(_finite(alpha), 4),
+        "benchmark": report,
+        "benchmark_sharpe": comparison["benchmark_sharpe"],
+        "benchmark_max_dd": comparison["benchmark_max_dd_pct"],
+        "benchmark_time_in_market_pct": comparison["benchmark_time_in_market_pct"],
+        "strategy_time_in_market_pct": comparison["strategy_time_in_market_pct"],
+        "information_ratio": comparison["information_ratio"],
+        "jensen_alpha_annual_pct": comparison["jensen_alpha_annual_pct"],
+        "benchmark_beta": comparison["benchmark_beta"],
+        "net_edge_per_trade": comparison["net_edge_per_trade"],
+        "net_edge_per_trade_pct": comparison["net_edge_per_trade_pct"],
+        # The other direction of the equal-risk comparison (risk_matched only).
+        "strategy_risk_matched_pct": reverse_risk_matched_return(
+            _finite(stats.get("total_return_pct")), report),
+    }
 
 
 def stats_from_engine_result(result: dict, strategy_name: str,
@@ -1093,6 +1163,14 @@ def stats_from_engine_result(result: dict, strategy_name: str,
         stats["executability"] = modelled["summary"]
     metrics = result.get("metrics", {}) or {}
     stats["buy_hold_pct"] = metrics.get("buy_hold_pct")
+    # The selected benchmark (`ga.benchmark_mode`) the engine computed next to
+    # this genome's own ledger.  Absent (an older engine / a hand-built result)
+    # ⇒ the legacy buy & hold, exactly as before.
+    _bench_report = per.get("benchmark") or {}
+    stats["benchmark"] = _bench_report
+    stats["benchmark_mode"] = _bench_report.get("mode") or "buy_hold"
+    stats["benchmark_pct"] = (_bench_report.get("benchmark_pct")
+                              if _bench_report else metrics.get("buy_hold_pct"))
     if not stats["max_dd_pct"]:
         stats["max_dd_pct"] = abs(_finite(metrics.get("max_drawdown_pct", 0)))
     if not stats["trades"]:
@@ -1125,6 +1203,7 @@ def evaluate_population_batch(
     prior_trials: int = 0,
     volume_context: "VolumeContext | None" = None,
     alpha_weight: float | None = None,
+    benchmark_mode: str | None = None,
 ) -> list[dict]:
     """Evaluate chromosomes in parallel batched backtests.
 
@@ -1216,6 +1295,7 @@ def evaluate_population_batch(
             per_strategy_isolation=True,
             per_genome_ledger=True,
             use_live_spread=use_live_spread,
+            benchmark_mode=benchmark_mode,
         )
 
         if "error" in result:
@@ -1257,6 +1337,7 @@ def evaluate_population_batch(
                 "short_trades": int(stats["short_trades"]),
                 "flag": stats.get("flag", ""),
                 "strategy_name": config.name,
+                **benchmark_result_fields(stats),
             }
 
             with completed_lock:
@@ -1436,6 +1517,7 @@ def _mp_worker(worker_args: dict) -> list:
         per_strategy_isolation=True,
         per_genome_ledger=True,
         use_live_spread=worker_args.get("use_live_spread", False),
+        benchmark_mode=worker_args.get("benchmark_mode"),
         progress_callback=_engine_progress,
     )
 
@@ -1482,6 +1564,7 @@ def _mp_worker(worker_args: dict) -> list:
             "short_trades": int(stats["short_trades"]),
             "flag": stats.get("flag", ""),
             "strategy_name": config_obj.name,
+            **benchmark_result_fields(stats),
         }))
         # One tick per fully scored genome of this chunk (the parent turns these
         # into ``eval_completed`` / ``eval_equivalent`` in the progress file).
@@ -1533,6 +1616,7 @@ def evaluate_population_multiprocess(
     volume_context: "VolumeContext | None" = None,
     alpha_weight: float | None = None,
     evaluate_hook=None,
+    benchmark_mode: str | None = None,
 ) -> list[dict]:
     """Evaluate chromosomes in parallel PROCESSES (not threads).
 
@@ -1625,6 +1709,9 @@ def evaluate_population_multiprocess(
             "prior_trials": prior_trials,
             # `ga.alpha_weight` (None = the shipped ALPHA_WEIGHT).
             "alpha_weight": alpha_weight,
+            # `ga.benchmark_mode` for this job (None = the worker's own config,
+            # whose code default is the legacy `buy_hold`).
+            "benchmark_mode": benchmark_mode,
             # P6-D: one shared, picklable volume context for the executability
             # model (None when the model is off — nothing is measured then).
             "volume_context": volume_context,
