@@ -1,6 +1,6 @@
 # 算法升级证据索引（P1 GA / P2 ML / P3 波动率 / P4 新能力 / gap fixes / 复核修复）
 
-**状态**: 证据已归档（本次实测，非引用） · **生成**: 2026-10-01 · **审计 revision**: `5c010e4`（实验性开关层 + 缓存版本无关的流动性测试；本文档自身的编辑**只动文档**，不是被审计代码的一部分） · **上一轮审计 revision**: `ea9922f`（P6 审计发现的修复）；更早为 `3a140cf`（P6 证据索引）、`363b4c0`（D 项修复与 P6-C 文档）、`cc63efd`（P6-B/C/D 实现）、`3e90013`、`1a452ce`（§0 表、§6、§9–§10 的数字来源） · **提交链**: `git log --oneline f1f6a4c^..HEAD`（见 §8 提交清单，含被审计代码的 **27** 行；其后如有纯文档提交，按 §8 说明不并入被审计 revision）
+**状态**: 证据已归档（本次实测，非引用） · **生成**: 2026-10-01 · **审计 revision**: `9d6f423`（GA 逐基因组进度流；本文档自身的编辑**只动文档**，不是被审计代码的一部分） · **上一轮审计 revision**: `5c010e4`（实验性开关层 + 缓存版本无关的流动性测试）；更早为 `ea9922f`（P6 审计发现修复）、`3a140cf`（P6 证据索引）、`363b4c0`、`cc63efd`（P6-B/C/D）、`1a452ce`（§0 表、§6、§9–§10 的数字来源） · **提交链**: `git log --oneline f1f6a4c^..HEAD`（见 §8 提交清单，含被审计代码的 **29** 行；其后如有纯文档提交，按 §8 说明不并入被审计 revision）
 **工作树**: 本轮闭环修复（已提交为 `1a452ce`）由单一代理写入；改动文件为 `core/risk/manager.py`（D1/LOW-6：bar-key 折叠 + 非时间索引拒绝 + 覆盖范围说明）、`scripts/check_data_integrity.py`（同一折叠）、`core/market_data/ohlcv_cache.py`（LOW-5 注释）、`core/ml/credibility.py`（LOW-3 实测值）、`core/risk/position_guard.py`（R1 实测值）、`docs/core-algorithms/13-volume-liquidity-costs.md`（LOW-2）、本文件（LOW-4）、`README.md`（LOW-1）、`tests/test_residual_closure.py`（新）+ `tests/test_final_audit_fixes.py` / `tests/test_gap_fixes.py` / `tests/test_reaudit_fixes.py` / `tests/test_cache_durability.py` / `tests/test_measured_threshold_policy.py`（随行为/注册表同步）。上一轮（`b49883b` 工作树，后续提交为 `828e375`）的复核修复见 §9，改动文件为 `core/risk/position_guard.py`、`core/ml/credibility.py`、`core/ml/meta.py`、`core/backtest/engine.py`（仅 preload 校验）、`core/ml/predictor.py`（仅同侧车校验）、`core/market_data/ohlcv_cache.py` + `core/market_data/provider.py`（仅惰性去重/flush）、`docs/core-algorithms/13-*.md`、本文件、新增 `tests/test_reaudit_fixes.py`。`data/models/` 仍为 15 个 `.pkl` / **0 个 `_meta.json`**。
 **对应计划**: [`ALGO_UPGRADE_PLAN.md`](ALGO_UPGRADE_PLAN.md)（P1–P4 验收标准） · **审计快照**: [`REFACTOR_AUDIT.md`](REFACTOR_AUDIT.md)
 
@@ -169,6 +169,9 @@ P6 的目标、阶段划分与量化验收标准已冻结于
 
 | `3a140cf` | 新增 [`P6_VOLUME_EVIDENCE.md`](P6_VOLUME_EVIDENCE.md)（P6 逐阶段实测证据、v2 契约下的门判定、量钟实验的负面结论、广度覆盖与 TTL、审计残余处置、未达成清单）并把被审计 revision 钉到 `ea9922f`；**纯文档** |
 | `5c010e4` | **当前被审计代码 revision**：①**实验性开关层**——`config/config.yaml` 的 `experimental:` 块（8 个开关、默认全 false）驱动原先只能改 Python 常量的能力（引擎的 regime 诊断/meta 过滤/pairs 信号、regime 门控与诊断、pairs 能力、meta-labelling、microstructure），`app/config.py` 增类型化配置 + 目标表 + 启动提示，`app/main.py` 启动时应用；模块默认值仍为 `False`，配置块缺失时逐位一致（有 unmodified HEAD 工作树对照哈希）；17 项新测试（键必有读取者、默认关、打开只翻自身、未知键报告、全关时信号/定仓逐位一致）+ README 增补"实验性开关"节 ②**回填导致的测试修正**——`data/market` 29/29 文件迁移到 v2 列后，3 条钉死 `Σ volume×close` 代理的老测试改为**从所读帧推导期望**（BTC 1h 真实 `quote_volume` 1 105 175 220 vs 代理 1 106 675 201，差 0.14%），代理规则另用合成 v1/v2 帧钉住，并有临时副本证明两状态都通过；另一条近临界断言改为推导带 |
+
+| `4a5f0fd` | 证据索引补链（`3a140cf`、`5c010e4`，被审计 revision → `5c010e4`）；**纯文档** |
+| `9d6f423` | **当前被审计代码 revision**：GA 真实进度流 —— 根因是多进程评估**只在"整块（7–8 个基因组）算完"时上报一次**（该任务一块需数小时），进程内路径才逐基因组 tick；现转发引擎已有的逐 bar 观察器 + 每完成一个基因组发一次 tick（队列仅在存在监听者时创建，否则零开销），载荷扩为 `phase/generation/total_generations/eval_completed/eval_total/eval_equivalent/chunk_progress_pct/bar_step/bar_total/elapsed_s/best_fitness/best_trades` + `started_at/updated_at`，每代写一行 INFO 日志，状态路由与面板显示新字段；新增只读 `scripts/ga_job_status.py`（对修前任务也可用，进度过期即非零退出）；**刻意不把块拆成逐基因组**（`engine.py:706-708` 的 `max_positions = max_open_trades // 策略数` 会让单基因组拿到 15 槽位而非 1，改变 GA 结果）。装置实测写入序列 `1,1,2,2,3,3,4,4 → gen_complete`；套件 1252 passed / 0 failed ×2 |
 
 ## 9. 复核修复（`b49883b` 工作树）——7 项发现的 before/after
 
