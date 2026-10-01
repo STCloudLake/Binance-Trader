@@ -10,10 +10,12 @@ Each strategy is encoded as a mixed-type chromosome:
 """
 
 import copy
+import json
 import random
 import re
 import itertools
 from dataclasses import dataclass, field
+from functools import lru_cache
 from core.strategy.loader import (
     StrategyConfig, MLConfig, normalize_condition_logic,
 )
@@ -334,8 +336,16 @@ NEW_GENE_RANGES = {
 #: Columns ``compute_all`` (core/strategy/indicators.py) ALWAYS adds to the frame,
 #: whatever the indicator config is: the raw close, the volume ratio, EMA9/EMA21
 #: (backfilled when the config does not ask for its own EMA pair) and the plain
-#: ``sma`` alias.  A condition may reference these even when the matching
-#: indicator gene is off, so sanitisation must keep them.
+#: ``sma`` alias (backfilled as SMA(close, 20) when the ``sma`` gene is off).
+#: A condition may reference these even when the matching indicator gene is off,
+#: so sanitisation must keep them.
+#:
+#: Every member is *measured* present, not assumed: the probe frame in
+#: :func:`evaluable_columns` and ``tests/test_condition_availability.py`` run
+#: ``compute_all(frame, {})`` and require all five columns.  ``sma`` used to be
+#: the exception (declared here, only written by the ``sma`` indicator branch),
+#: which let the decoder hand out genomes whose ``close > sma`` / ``close < sma``
+#: conditions the evaluator then dropped as "unknown column/identifier: sma".
 ALWAYS_AVAILABLE_COLUMNS = {"close", "volume_ratio", "ema_fast", "ema_slow", "sma"}
 
 #: Condition → required indicator mapping (for sanitization)
@@ -350,7 +360,11 @@ CONDITION_INDICATOR_MAP = {
     "cci": ["cci"],
     "atr_ratio": ["atr"],
     "obv": ["obv"], "obv_sma": ["obv"],
-    "sma": ["sma"],
+    # ``sma`` is produced on every frame (``compute_all`` backfills the plain
+    # alias), so unlike the pre-fix table it requires no gene: keeping it here as
+    # ``["sma"]`` was what let the sanitiser keep ``close > sma`` while the frame
+    # had no such column.
+    "sma": [],
     # Phase 4c
     "dist_to_high_pct": ["swing_points"], "dist_to_low_pct": ["swing_points"],
     "swing_range_pct": ["swing_points"],
@@ -389,20 +403,23 @@ RAW_ALWAYS_AVAILABLE_COLUMNS = frozenset({
     "open", "high", "low", "close", "volume", "volume_sma", "volume_ratio",
 })
 
-#: Columns the *sanitiser* keeps even though ``compute_all`` only adds them when
-#: the matching indicator gene is on.  ``sma`` is the single pre-existing
-#: exemption (``compute_all`` writes ``sma``/``sma_{period}`` only for the ``sma``
-#: indicator, while ``ALWAYS_AVAILABLE_COLUMNS`` — P1's sanitisation contract —
-#: lists it).  Recorded here so the guard can assert the set cannot grow
-#: silently: that is a change to ``core/strategy/**``, outside P6-D's scope.
-SANITISER_ONLY_COLUMNS = frozenset({"sma"})
+#: Columns the *sanitiser* keeps even though ``compute_all`` cannot produce them.
+#: **Empty, and kept as a named constant so it stays that way**: ``sma`` used to
+#: be the single pre-existing exemption (``compute_all`` wrote ``sma``/
+#: ``sma_{period}`` only for the ``sma`` indicator, while
+#: ``ALWAYS_AVAILABLE_COLUMNS`` — P1's sanitisation contract — listed it).  The
+#: column is now backfilled by ``compute_all`` (``ALWAYS_DERIVED_SMA_PERIOD``),
+#: which closed the exemption: a genome's declared conditions and the columns its
+#: frame carries are one set again.  The guard test asserts this set is empty, so
+#: a future exemption has to be declared here and argued, not smuggled in.
+SANITISER_ONLY_COLUMNS: frozenset[str] = frozenset()
 
 #: Column → indicator gene required for ``compute_all`` to add it.
 COLUMN_INDICATOR_OWNER: dict[str, str | None] = {
     "open": None, "high": None, "low": None, "close": None,
     "volume": None, "volume_sma": None, "volume_ratio": None,
     "ema_fast": None, "ema_slow": None,          # backfilled for every frame
-    "sma": "sma",
+    "sma": None,                                 # backfilled for every frame
     "rsi": "rsi", "macd_histogram": "macd",
     "bollinger_lower": "bollinger", "bollinger_middle": "bollinger",
     "bollinger_upper": "bollinger",
@@ -486,12 +503,15 @@ def template_identifier_columns(template: str) -> set[str]:
 
     Parses the condition with the same grammar the evaluator accepts and returns
     the ``Name`` nodes that are **not** calls to the whitelisted condition
-    functions (``sma``/``cross``/``abs``/``min``/``max``/``round``) — i.e. the
-    columns the expression really reads.
+    functions — i.e. the columns the expression really reads.  The function
+    allowlist is the evaluator's own (``core.strategy.indicators._SAFE_FUNCTIONS``),
+    imported lazily so a function added there can never be read as a column here.
     """
     import ast as _ast
 
-    functions = {"sma", "cross", "abs", "min", "max", "round"}
+    from core.strategy.indicators import _SAFE_FUNCTIONS
+
+    functions = set(_SAFE_FUNCTIONS)
     tree = _ast.parse(template, mode="eval")
     columns = set()
     for node in _ast.walk(tree):
@@ -588,6 +608,114 @@ def audit_template_ownership(pools: dict[str, dict[str, list[str]]] | None = Non
                 problems.append(
                     f"{where}: sanitiser keeps the template while its "
                     f"owner '{owner}' is off: {template[:60]}")
+    return problems
+
+
+# ── Decode-time condition validation: no silent drops ──────────────────
+#
+# ``audit_template_ownership`` proves the *pools* are owned.  It cannot see the
+# genome: a decoded chromosome can still carry a condition whose column the
+# frame will not have, and ``evaluate_condition`` answers that with an all-False
+# mask plus one log line — the genome is then scored as if it declared fewer
+# conditions than it does.  That is not hypothetical: ``sma`` was declared
+# always-available while ``compute_all`` only wrote it for the ``sma`` gene, so
+# ``close > sma``/``close < sma`` (a pool template *and* the sanitiser's own
+# fallback, see ``_sanitize_conditions``) were dropped at evaluation time.  The
+# live GA job ``ga_0a442907`` logged 6 such rejections and its champion's
+# entry/exit were exactly those two conditions with the ``sma`` gene off.
+#
+# The check below is measured, not declared: a synthetic probe frame is pushed
+# through the SAME producer the evaluation path uses (``compute_all``) and the
+# condition's column identifiers are compared against the columns that come out.
+# One probe per distinct indicator config per process (``lru_cache``), so a
+# generation pays it once per unique config and nothing per repeated genome.
+#
+# Failure mode: :class:`UnevaluableConditionError` from ``chromosome_to_strategy``
+# → every fitness entry point refuses that genome (fitness −999, counted, logged
+# once with the reason, excluded from selection).  There is no permissive
+# fallback on the GA path; the permissive fallback that remains is
+# ``evaluate_condition``'s runtime all-False (live trading must not crash) and it
+# is reported through ``core.strategy.indicators.condition_failure_log``.
+
+
+class UnevaluableConditionError(ValueError):
+    """A decoded genome carries a condition no evaluation frame can evaluate."""
+
+
+#: Bars in the synthetic probe frame.  Small enough to be cheap (~1-10 ms per
+#: distinct config), long enough for every indicator branch to produce its
+#: columns (presence, not values, is what the check reads).
+_CONDITION_PROBE_BARS = 64
+
+
+def _condition_probe_frame(bars: int = _CONDITION_PROBE_BARS):
+    """Deterministic synthetic OHLCV frame — no I/O, no cached market data."""
+    import numpy as np
+    import pandas as pd
+
+    steps = np.sin(np.arange(bars) / 7.0) * 0.004 + 0.0005
+    close = 100.0 * np.cumprod(1.0 + steps)
+    high = close * 1.001
+    low = close * 0.999
+    return pd.DataFrame(
+        {
+            "open": np.concatenate([[close[0]], close[:-1]]),
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": 10.0 + 5.0 * (1.0 + np.cos(np.arange(bars) / 5.0)),
+        },
+        index=pd.date_range("2000-01-01", periods=bars, freq="1h"),
+    )
+
+
+@lru_cache(maxsize=256)
+def _evaluable_columns_cached(indicators_json: str) -> frozenset:
+    from core.strategy.indicators import compute_all
+
+    frame = compute_all(_condition_probe_frame(), json.loads(indicators_json))
+    return frozenset(str(column) for column in frame.columns)
+
+
+def evaluable_columns(indicators: dict | None) -> frozenset:
+    """Columns ``compute_all`` really produces for *indicators* (measured).
+
+    The probe runs the production producer, so this cannot drift from the
+    evaluator the way a hand-written availability table can.
+    """
+    key = json.dumps(indicators or {}, sort_keys=True, default=str)
+    return _evaluable_columns_cached(key)
+
+
+def unevaluable_conditions(config) -> list[str]:
+    """``[problem, ...]`` for every final condition of *config*.
+
+    Empty means: on the frame ``compute_all(df, config.indicators)`` builds, each
+    condition the decoded genome declares can be evaluated — so scoring the
+    genome scores all of its conditions.
+    """
+    columns = evaluable_columns(getattr(config, "indicators", None))
+    problems: list[str] = []
+    pools = (("entry", getattr(config, "entry_conditions", None) or {}),
+             ("exit", getattr(config, "exit_conditions", None) or {}))
+    for pool_name, conditions in pools:
+        for side in ("long", "short"):
+            for condition in conditions.get(side, []) or []:
+                where = f"{pool_name}.{side}"
+                if not isinstance(condition, str) or not condition.strip():
+                    problems.append(f"{where}: empty condition")
+                    continue
+                try:
+                    identifiers = template_identifier_columns(condition)
+                except SyntaxError as exc:
+                    problems.append(f"{where} '{condition[:60]}': unparseable "
+                                    f"condition ({exc})")
+                    continue
+                unknown = sorted(identifiers - columns)
+                if unknown:
+                    problems.append(
+                        f"{where} '{condition[:60]}': unknown column/"
+                        f"identifier: {', '.join(unknown)}")
     return problems
 
 
@@ -1058,6 +1186,19 @@ def chromosome_to_strategy(chromosome: dict) -> StrategyConfig:
         },
         ml_config=ml_config,
     )
+
+    # ── No silent drops: refuse a genome whose conditions cannot be evaluated ──
+    # Scoring such a genome would score *fewer* conditions than it declares (the
+    # evaluator answers an unknown column with an all-False mask), which is how
+    # ``close > sma``/``close < sma`` produced untrustworthy champion metrics.
+    # Raised here — the single decode point every path shares — so no caller can
+    # score a genome on conditions that vanish at evaluation time; the fitness
+    # entry points turn this into fitness −999 with the reason attached.
+    problems = unevaluable_conditions(config)
+    if problems:
+        raise UnevaluableConditionError(
+            f"genome '{config.name}' carries unevaluable condition(s): "
+            + "; ".join(problems))
     return config
 
 

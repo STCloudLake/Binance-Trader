@@ -15,6 +15,18 @@ import talib
 #: the ownership.
 VOLUME_FLOW_INDICATOR = "volume_flow"
 
+#: Period of the plain ``sma`` alias column :func:`compute_all` derives from
+#: ``close`` when the indicator config carries no ``sma`` gene of its own.
+#: 20 bars matches ``core.ga.genome.INDICATOR_CONFIG_FOR_COLUMNS["sma"]`` and the
+#: ``volume_sma`` / ``volume_ratio`` backfill's 20-bar window, so the column a
+#: condition reads is the same series the GA's availability tables declare.
+#: ``sma`` is part of ``core.ga.genome.ALWAYS_AVAILABLE_COLUMNS`` (conditions like
+#: ``close > sma`` / ``close < sma`` are in the GA's condition pools) but used to
+#: be written only by the ``sma`` indicator branch below — a chromosome with the
+#: gene off then got a frame without the column and the condition was silently
+#: rejected by :func:`evaluate_condition` ("unknown column/identifier: sma").
+ALWAYS_DERIVED_SMA_PERIOD = 20
+
 
 def _safe_int(val, default):
     """Parse config value to int, handling empty strings and non-numeric values."""
@@ -170,6 +182,21 @@ def compute_all(df: pd.DataFrame, indicator_configs: dict) -> pd.DataFrame:
             result["ema_fast"] = talib.EMA(result["close"].values, timeperiod=9)
         if "ema_slow" not in result.columns:
             result["ema_slow"] = talib.EMA(result["close"].values, timeperiod=21)
+        # ``sma`` belongs to the same always-available family as the two EMAs
+        # above (``core.ga.genome.ALWAYS_AVAILABLE_COLUMNS``) and the GA's pools
+        # carry ``close > sma`` / ``close < sma``, but the ``sma`` branch of the
+        # indicator loop is the only other writer of this column.  With the gene
+        # off, ``evaluate_condition`` answered "unknown column/identifier: sma"
+        # with an all-False mask and the genome was scored as if it declared
+        # fewer conditions (live GA job ``ga_0a442907``, 6 warnings; the champion
+        # entry/exit were exactly ``close > sma`` / ``close < sma``).  Backfilled
+        # here so the declaration is true on every frame the evaluator sees; the
+        # gene still wins when it is on — it writes the alias with its own period
+        # before this block runs.  Measured cost of the backfill: 0.12 ms per
+        # 9 000 bars, against ~1.1 ms for the whole empty-config ``compute_all``.
+        if "sma" not in result.columns:
+            result["sma"] = result["close"].rolling(
+                ALWAYS_DERIVED_SMA_PERIOD).mean()
         if "price_momentum_24h" not in result.columns:
             result["price_momentum_24h"] = result["close"].pct_change(periods=24)
         # Normalized ATR (volatility relative to price)
@@ -181,6 +208,17 @@ def compute_all(df: pd.DataFrame, indicator_configs: dict) -> pd.DataFrame:
 
 
 _COND_FAIL_LOG: set[str] = set()  # dedup failed conditions to avoid log spam
+
+
+def condition_failure_log() -> frozenset[str]:
+    """``{"condition:reason", ...}`` for every condition :func:`evaluate_condition`
+    has rejected or failed to evaluate in this process.
+
+    The permissive all-False fallback is only acceptable while it is visible;
+    this is the accessor that makes it so (the GA rejects such genomes before
+    scoring — see ``core.ga.genome.unevaluable_conditions``).
+    """
+    return frozenset(_COND_FAIL_LOG)
 
 
 class UnsafeConditionError(ValueError):
@@ -366,6 +404,15 @@ def evaluate_condition(df: pd.DataFrame, condition: str) -> pd.Series:
 
     Unknown columns, disallowed syntax or evaluation errors yield an all-False
     Series (never an exception, never code execution).
+
+    The all-False fallback is **deliberate and permissive**: this function runs
+    on the live trading path, where a bad condition must degrade to "no signal"
+    rather than take the process down.  It is also **reported** — the reason is
+    logged once per distinct ``condition:reason`` pair and kept in
+    :func:`condition_failure_log`.  It is *not* an acceptable GA outcome: the GA
+    decoder refuses such a genome outright (``core.ga.genome.
+    UnevaluableConditionError``), so a genome can no longer be scored on a frame
+    that silently dropped one of its conditions.
     """
     false_series = pd.Series(False, index=df.index, dtype=bool)
     if not isinstance(condition, str) or not condition.strip():

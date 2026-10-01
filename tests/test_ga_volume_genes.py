@@ -154,12 +154,15 @@ def test_declared_columns_really_exist_in_a_compute_all_frame():
 def test_always_available_set_is_consistent_with_the_sanitiser():
     """``ALWAYS_AVAILABLE_COLUMNS`` may not claim more than it can deliver.
 
-    ``ema_fast``/``ema_slow`` are backfilled for every frame (measured below);
-    ``sma`` is the one pre-existing exemption — the sanitiser keeps it while
-    ``compute_all`` only writes it for the ``sma`` indicator — and it is recorded
-    in ``SANITISER_ONLY_COLUMNS`` so the exemption cannot grow silently.
+    ``ema_fast``/``ema_slow`` and — since the ``sma`` defect — ``sma`` are
+    backfilled for every frame (measured below on an EMPTY indicator config), so
+    the sanitiser's contract and ``compute_all`` agree column for column.
+    ``SANITISER_ONLY_COLUMNS`` is therefore empty: the old ``sma`` exemption
+    (declared available, written only by the ``sma`` gene) is what let a decoded
+    genome carry ``close > sma`` while its frame had no such column, and the
+    evaluator dropped the condition with an all-False mask.
     """
-    from core.strategy.indicators import compute_all
+    from core.strategy.indicators import (ALWAYS_DERIVED_SMA_PERIOD, compute_all)
 
     raw = pd.DataFrame({
         "open": [1.0, 2.0, 3.0] * 10, "high": [2.0, 3.0, 4.0] * 10,
@@ -167,17 +170,21 @@ def test_always_available_set_is_consistent_with_the_sanitiser():
         "volume": [10.0, 20.0, 30.0] * 10,
     })
     frame = compute_all(raw.copy(), {})
-    for column in ("close", "volume", "volume_sma", "volume_ratio",
-                   "ema_fast", "ema_slow"):
+    for column in G.ALWAYS_AVAILABLE_COLUMNS:
         assert column in frame.columns, column
-    assert "sma" not in frame.columns, (
-        "compute_all now derives `sma` without the sma indicator — the "
-        "SANITISER_ONLY_COLUMNS exemption can be removed")
+    # `sma` is the SMA(N) of close — the same series the condition language's
+    # `sma(close, N)` computes, so a condition and the column can never disagree.
+    pd.testing.assert_series_equal(
+        frame["sma"], raw["close"].rolling(ALWAYS_DERIVED_SMA_PERIOD).mean(),
+        check_names=False)
+    # The `sma` gene, when present, still owns the alias (its own period).
+    gene = compute_all(raw.copy(), {"sma": {"period": 3}})
+    assert len(gene) == len(frame) and not gene["sma"].equals(frame["sma"])
 
-    assert G.SANITISER_ONLY_COLUMNS == {"sma"}
+    assert G.SANITISER_ONLY_COLUMNS == frozenset()
     assert G.ALWAYS_AVAILABLE_COLUMNS - G.RAW_ALWAYS_AVAILABLE_COLUMNS == {
         "ema_fast", "ema_slow", "sma"}
-    # Every new template's columns are raw/owned — none relies on the exemption.
+    # No template outside the `sma` family leans on the backfill.
     for template, columns in G.TEMPLATE_REQUIRED_COLUMNS.items():
         if template in ALL_NEW_TEMPLATES:
             assert "sma" not in columns

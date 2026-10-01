@@ -35,7 +35,7 @@ from pathlib import Path
 from loguru import logger
 import numpy as np
 import pandas as pd
-from core.ga.genome import chromosome_to_strategy
+from core.ga.genome import chromosome_to_strategy, UnevaluableConditionError
 from core.strategy.loader import StrategyLoader
 
 # ── Scoring constants (single source of truth) ──────────────────────────
@@ -79,6 +79,95 @@ def isolated_eval_kwargs() -> dict:
     except (TypeError, ValueError):  # pragma: no cover - defensive
         pass
     return kwargs
+
+
+# ── Genome rejection: an unevaluable condition is never scored ──────────
+#
+# The decoder (``chromosome_to_strategy``) refuses a genome whose conditions
+# cannot be evaluated on the frame its own indicator config produces.  These
+# helpers turn that refusal into the fitness contract: fitness −999 (the value
+# every selection path already treats as "not a candidate"), a counted reason,
+# and one warning per genome — instead of the old behaviour, where the evaluator
+# dropped the condition with an all-False mask and the genome was scored as if
+# it had declared fewer conditions (see ``core.ga.genome`` module notes).
+
+#: ``{reason: count}`` of genomes refused before any backtest.
+CONDITION_REJECTIONS: dict[str, int] = {}
+#: ``{(genome name, reason)}`` already logged, so a retried genome logs once.
+_REJECTION_LOGGED: set[tuple[str, str]] = set()
+
+
+def condition_rejection_counts() -> dict[str, int]:
+    """``{reason: count}`` — genomes the decoder refused as unevaluable.
+
+    Per process (each multiprocess worker counts its own chunk); the reason also
+    travels in the genome's result dict as ``error`` + ``flag``.
+    """
+    return dict(CONDITION_REJECTIONS)
+
+
+def _reject_unevaluable(chromosome, error, strategy_name: str | None = None
+                        ) -> dict:
+    """Fitness result for a genome refused by the decoder (fitness −999)."""
+    name = strategy_name or (chromosome or {}).get("name", "ga_strategy")
+    reason = str(error)
+    CONDITION_REJECTIONS[reason] = CONDITION_REJECTIONS.get(reason, 0) + 1
+    if (name, reason) not in _REJECTION_LOGGED:
+        _REJECTION_LOGGED.add((name, reason))
+        logger.warning(
+            f"GA genome '{name}' REJECTED — fitness -999, excluded from "
+            f"selection: {reason}")
+    return {"fitness": -999, "error": f"unevaluable condition: {reason}",
+            "flag": "unevaluable_condition", "trade_count": 0,
+            "strategy_name": name}
+
+
+#: Conditions no OHLCV bar can satisfy (prices are positive), used by the
+#: placeholder below so it can never open a position.
+_NEVER_LONG = "close < 0"
+_NEVER_SHORT = "close > 1e15"
+
+
+def _chromosome_timeframes(chromosome) -> list[str]:
+    """The genome's own ``timeframes`` gene (comma-joined), else the default.
+
+    Read straight off the chromosome because the genome this replaces cannot be
+    decoded; the placeholder must stay inside the intervals the chunk already
+    uses, so it never adds a data load of its own.
+    """
+    from core.market_data.provider import DEFAULT_TIMEFRAME
+
+    for gene in (chromosome or {}).get("categorical", []) or []:
+        if getattr(gene, "name", "") == "timeframes":
+            frames = [tf.strip() for tf in str(gene.value).split(",") if tf.strip()]
+            if frames:
+                return frames
+    return [DEFAULT_TIMEFRAME]
+
+
+def _rejected_slot_placeholder(name: str, chromosome=None):
+    """A never-trading strategy that keeps a rejected genome's slot in a chunk.
+
+    The engine derives every genome's position allowance from the **chunk size**
+    (``max_open_trades // len(strategies)`` — ``core/backtest/engine.py:706-708``),
+    so simply dropping a rejected genome from the engine call would silently
+    raise the slot budget of the *surviving* genomes of that chunk — a change to
+    the GA's search semantics.  The placeholder holds the slot instead: it
+    carries no indicator (the cheapest ``compute_all`` group) and conditions that
+    cannot fire, which is exactly what the engine saw in that slot before the fix
+    (a genome whose conditions were dropped never traded either).  Its result is
+    never scored; only the slot divisor and the chunk's data intervals matter.
+    """
+    from core.strategy.loader import MLConfig, StrategyConfig
+
+    return StrategyConfig(
+        name=name, enabled=True, mode="trend",
+        timeframes=_chromosome_timeframes(chromosome),
+        indicators={},
+        entry_conditions={"long": [_NEVER_LONG], "short": [_NEVER_SHORT]},
+        exit_conditions={"long": [_NEVER_LONG], "short": [_NEVER_SHORT]},
+        ml_config=MLConfig(enabled=False),
+    )
 
 
 def _finite(value, default: float = 0.0, ndigits: int | None = None) -> float:
@@ -203,6 +292,12 @@ def evaluate_chromosome(
         score["observations"] = int(stats["observations"])
         score["spread_sources"] = metrics.get("spread_sources", {})
         return score
+
+    except UnevaluableConditionError as e:
+        # The genome declares a condition its own frame cannot evaluate; scoring
+        # it would score fewer conditions than it declares.  Counted + logged,
+        # −999 → not selectable (see `_reject_unevaluable`).
+        return _reject_unevaluable(chromosome, e)
 
     except Exception as e:
         logger.debug(f"Fitness eval failed: {e}")
@@ -1077,14 +1172,36 @@ def evaluate_population_batch(
         """Evaluate one chunk of strategies (called in a thread)."""
         chunk_pop = population[chunk_start:chunk_end]
 
-        # Build StrategyConfig objects
-        chunk_configs = []
+        # Build StrategyConfig objects.  A genome the decoder refuses is scored
+        # −999 here and replaced by a never-trading placeholder so the engine
+        # still sees ONE strategy per genome of the chunk: that keeps the
+        # population↔result index mapping AND the per-genome slot divisor
+        # (``max_open_trades // len(strategies)``) identical for the survivors.
+        chunk_configs = []          # one entry per genome — what the engine gets
+        scored: list[tuple[object, int]] = []   # (config, population index)
         for i, chrom in enumerate(chunk_pop):
-            config = chromosome_to_strategy(chrom)
+            idx = chunk_start + i
+            config_name = (f"ga_chunk_{chunk_start}_{chunk_start + i}_"
+                           f"{random.randint(1000, 9999)}")
+            try:
+                config = chromosome_to_strategy(chrom)
+            except UnevaluableConditionError as exc:
+                results[idx] = _reject_unevaluable(chrom, exc)
+                chunk_configs.append(_rejected_slot_placeholder(
+                    f"{config_name}_rejected", chrom))
+                with completed_lock:
+                    completed[0] += 1
+                    if progress_callback:
+                        progress_callback(completed[0], total)
+                continue
             if config.ml_config:
                 config.ml_config.enabled = False
-            config.name = f"ga_chunk_{chunk_start}_{chunk_start + i}_{random.randint(1000,9999)}"
+            config.name = config_name
             chunk_configs.append(config)
+            scored.append((config, idx))
+
+        if not scored:
+            return
 
         # Single backtest for this chunk
         result = engine.run_with_exit_evaluation(
@@ -1102,15 +1219,14 @@ def evaluate_population_batch(
         )
 
         if "error" in result:
-            for i in range(len(chunk_configs)):
-                results[chunk_start + i] = {
+            for _config, idx in scored:
+                results[idx] = {
                     "fitness": -999, "error": result["error"],
                     "flag": "engine_error", "trade_count": 0}
             return
 
         # Extract per-strategy stats and score with the shared formula.
-        for i, config in enumerate(chunk_configs):
-            idx = chunk_start + i
+        for config, idx in scored:
             chrom = population[idx]
             stats = stats_from_engine_result(
                 result, config.name, initial_balance,
@@ -1263,13 +1379,34 @@ def _mp_worker(worker_args: dict) -> list:
     weights = worker_args.get("weights")
     volume_context = worker_args.get("volume_context")
 
-    chunk_configs = []
+    # Genomes the decoder refuses are scored −999 here (counted + logged) and
+    # replaced by a never-trading placeholder, so the engine still sees one
+    # strategy per genome of the chunk: the population↔result mapping and the
+    # per-genome slot divisor stay exactly as they were.
+    from core.ga.genome import UnevaluableConditionError as _Unevaluable
+
+    chunk_configs = []          # one entry per genome — what the engine gets
+    scored: list[tuple[object, int]] = []   # (config, population index)
+    results: list = []
     for i, chrom in enumerate(population_chunk):
-        config_obj = _c2s(chrom)
+        idx = chunk_start + i
+        config_name = f"ga_mp_{chunk_start}_{chunk_start + i}_{_random.randint(1000, 9999)}"
+        try:
+            config_obj = _c2s(chrom)
+        except _Unevaluable as exc:
+            results.append((idx, _reject_unevaluable(chrom, exc)))
+            chunk_configs.append(_rejected_slot_placeholder(
+                f"{config_name}_rejected", chrom))
+            _emit_genomes_done(worker_args, 1)
+            continue
         if config_obj.ml_config:
             config_obj.ml_config.enabled = False
-        config_obj.name = f"ga_mp_{chunk_start}_{chunk_start + i}_{_random.randint(1000, 9999)}"
+        config_obj.name = config_name
         chunk_configs.append(config_obj)
+        scored.append((config_obj, idx))
+
+    if not scored:
+        return results
 
     # ── Sub-chunk liveness ────────────────────────────────────────────────
     # One engine pass evaluates the WHOLE chunk at once, so a chunk only ends
@@ -1303,19 +1440,19 @@ def _mp_worker(worker_args: dict) -> list:
     )
 
     if "error" in result:
-        _emit_genomes_done(worker_args, len(chunk_configs))
-        return [(chunk_start + i, {"fitness": -999, "error": result["error"],
-                                   "flag": "engine_error", "trade_count": 0,
-                                   "strategy_name": c.name})
-                for i, c in enumerate(chunk_configs)]
+        _emit_genomes_done(worker_args, len(scored))
+        results.extend(
+            (idx, {"fitness": -999, "error": result["error"],
+                   "flag": "engine_error", "trade_count": 0,
+                   "strategy_name": c.name})
+            for c, idx in scored)
+        return results
 
     # ── Extract per-strategy stats — the SAME shared scorer as the threaded path.
     # (Before this, the two paths were separate copy-pasted formulas and the
     # multiprocess one hardcoded sharpe=0/max_dd=0.)
-    results = []
-    for i, config_obj in enumerate(chunk_configs):
-        idx = chunk_start + i
-        chrom = population_chunk[i]
+    for config_obj, idx in scored:
+        chrom = population_chunk[idx - chunk_start]
         stats = stats_from_engine_result(
             result, config_obj.name, initial_balance,
             chromosome=chrom, config=getattr(engine, "config", None),
