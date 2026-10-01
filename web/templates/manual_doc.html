@@ -1,0 +1,125 @@
+{% extends "base.html" %}
+
+{% block head_extra %}
+{# KaTeX from CDN (same origin family as the Tailwind/HTMX/ECharts CDNs already
+   used by base.html).  Every asset is non-blocking; when the CDN is
+   unreachable the raw LaTeX source stays readable (see .katex-unavailable in
+   partials/manual_style.html). #}
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+{% endblock %}
+
+{% block content %}
+{% include "partials/manual_style.html" %}
+<div class="flex flex-col md:flex-row gap-5">
+    {% include "partials/manual_tree.html" %}
+
+    <div class="flex-1 min-w-0">
+        {% if doc %}
+        <nav class="text-[11px] text-slate-500 mb-2 flex flex-wrap items-center gap-1">
+            {% for crumb in breadcrumbs %}
+                {% if crumb.url %}
+                <a href="{{ crumb.url }}" class="hover:text-sky-300">{{ crumb.label }}</a><span class="text-slate-700">/</span>
+                {% else %}
+                <span class="text-slate-300">{{ crumb.label }}</span>
+                {% endif %}
+            {% endfor %}
+        </nav>
+
+        <article class="card">
+            <header class="border-b border-slate-700 pb-2 mb-1">
+                <h2 class="text-xl font-bold text-slate-100">{{ doc.title }}</h2>
+                <p class="mt-1 text-[11px] text-slate-600 font-mono">
+                    {{ doc.path }} · {{ doc.bytes }} bytes · 实时读自仓库文件
+                </p>
+            </header>
+
+            {% if doc.toc %}
+            <details open class="mb-3 mt-3 bg-slate-900 rounded p-2">
+                <summary class="cursor-pointer text-xs text-sky-300 select-none">本页目录 / On this page ({{ doc.toc|length }})</summary>
+                <ul class="mt-2 space-y-0.5">
+                    {% for head in doc.toc %}
+                    <li style="margin-left: {{ (head.level - 2) * 14 }}px" class="text-[11px]">
+                        <a href="#{{ head.id }}" class="text-slate-400 hover:text-sky-300">{{ head.text }}</a>
+                    </li>
+                    {% endfor %}
+                </ul>
+            </details>
+            {% endif %}
+
+            <div id="manual-content" class="manual-body">{{ doc.html|safe }}</div>
+
+            <p class="katex-unavailable-note mt-4 text-[11px] text-amber-400">
+                公式渲染依赖 KaTeX CDN，当前不可达：下方公式以原始 LaTeX 源码显示（内容不受影响）。
+            </p>
+        </article>
+
+        <div class="flex flex-col sm:flex-row justify-between gap-2 mt-4 text-xs">
+            {% if prev_doc %}
+            <a href="{{ prev_doc.url }}" class="card !p-2 hover:border-sky-500 min-w-0">
+                <span class="text-slate-500">← 上一篇</span>
+                <span class="block text-sky-400 truncate">{{ prev_doc.title }}</span>
+            </a>
+            {% else %}<span></span>{% endif %}
+            {% if next_doc %}
+            <a href="{{ next_doc.url }}" class="card !p-2 hover:border-sky-500 sm:text-right min-w-0">
+                <span class="text-slate-500">下一篇 →</span>
+                <span class="block text-sky-400 truncate">{{ next_doc.title }}</span>
+            </a>
+            {% endif %}
+        </div>
+
+        <script>
+        (function () {
+            function unavailable() { document.documentElement.classList.add('katex-unavailable'); }
+            function render() {
+                var root = document.getElementById('manual-content');
+                if (!root) return;
+                if (!window.katex || !window.renderMathInElement) { unavailable(); return; }
+                try {
+                    window.renderMathInElement(root, {
+                        delimiters: [
+                            { left: '$$', right: '$$', display: true },
+                            { left: '$', right: '$', display: false }
+                        ],
+                        ignoredTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code', 'option'],
+                        throwOnError: false,
+                        errorColor: '#f87171'
+                    });
+                    root.setAttribute('data-katex', 'rendered');
+                } catch (e) { unavailable(); }
+            }
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', render);
+            } else {
+                render();
+            }
+            window.addEventListener('load', function () {
+                var root = document.getElementById('manual-content');
+                if (root && root.getAttribute('data-katex') !== 'rendered') render();
+            });
+        })();
+        </script>
+        {% else %}
+        <article class="card">
+            <h2 class="text-lg font-bold text-red-400">文档不存在 / Not found</h2>
+            <p class="mt-2 text-sm text-slate-400">
+                手册里没有这个文档：<code class="text-amber-400 break-all">{{ requested }}</code>
+            </p>
+            <p class="mt-2 text-[11px] text-slate-500 leading-relaxed">
+                只收录 <code>{{ tree.rule }}</code>；绝对路径、<code>..</code>、百分号编码的穿越、
+                符号链接与隐藏项一律 404。
+            </p>
+            <h3 class="mt-4 text-sm font-semibold text-slate-200">主要文档 / Main documents</h3>
+            <ul class="mt-2 space-y-1">
+                {% for item in main_documents %}
+                <li><a href="{{ item.url }}" class="text-sm text-sky-400 hover:underline">{{ item.title }}</a>
+                    <span class="text-[11px] text-slate-600 font-mono">{{ item.path }}</span></li>
+                {% endfor %}
+            </ul>
+        </article>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

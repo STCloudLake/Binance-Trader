@@ -22,6 +22,8 @@ behaviour change):
     web/routes/ga.py            GA / walk-forward / calibration endpoints
     web/routes/db_manager.py    DB manager APIs
     web/routes/market.py        trade-page APIs (market/account/orders/history)
+    web/routes/audit.py         token screener API/partials
+    web/routes/manual.py        in-app documentation manual (/manual, /api/manual/tree)
     web/ws/alerts.py            /ws/alerts WebSocket
 
 ``register(app, ctx)`` modules are called in the original route-registration
@@ -65,6 +67,7 @@ from web.routes import (
     db_manager as routes_db_manager,
     market as routes_market,
     audit as routes_audit,
+    manual as routes_manual,
 )
 from web.ws import alerts as ws_alerts
 
@@ -111,5 +114,7 @@ def create_app(config: Config, event_bus: EventBus, auth_manager=None) -> FastAP
     routes_market.register(app, ctx)
     # 代币检测 (heuristic token screen over public mainnet market data).
     routes_audit.register(app, ctx)
+    # 手册 (documentation manual over docs/** + the root READMEs; read-only).
+    routes_manual.register(app, ctx)
 
     return app

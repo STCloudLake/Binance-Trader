@@ -1,0 +1,37 @@
+{# Styles for the manual pages.  Tailwind's preflight unstyles headings/lists,
+   so the rendered markdown needs its own rules; they are scoped to
+   .manual-body so no other page is affected. #}
+<style>
+    .manual-body { font-size: 0.9rem; }
+    .manual-body h1 { font-size: 1.5rem; font-weight: 700; color: #f1f5f9; margin: 1.4rem 0 0.8rem; padding-bottom: 0.4rem; border-bottom: 1px solid #334155; }
+    .manual-body h2 { font-size: 1.25rem; font-weight: 700; color: #f1f5f9; margin: 1.3rem 0 0.6rem; padding-bottom: 0.25rem; border-bottom: 1px solid #1e293b; }
+    .manual-body h3 { font-size: 1.08rem; font-weight: 600; color: #e2e8f0; margin: 1.1rem 0 0.5rem; }
+    .manual-body h4 { font-size: 0.98rem; font-weight: 600; color: #cbd5e1; margin: 1rem 0 0.4rem; }
+    .manual-body h5, .manual-body h6 { font-size: 0.92rem; font-weight: 600; color: #94a3b8; margin: 0.9rem 0 0.3rem; }
+    .manual-body p { margin: 0.6rem 0; line-height: 1.8; color: #cbd5e1; }
+    .manual-body ul { list-style: disc; margin: 0.6rem 0 0.6rem 1.4rem; color: #cbd5e1; }
+    .manual-body ol { list-style: decimal; margin: 0.6rem 0 0.6rem 1.6rem; color: #cbd5e1; }
+    .manual-body ul ul { list-style: circle; }
+    .manual-body li { margin: 0.25rem 0; line-height: 1.7; }
+    .manual-body li > p { margin: 0.2rem 0; }
+    .manual-body a { color: #38bdf8; text-decoration: underline; text-underline-offset: 2px; word-break: break-word; }
+    .manual-body a:hover { color: #7dd3fc; }
+    .manual-body strong { color: #f1f5f9; }
+    .manual-body code { background: #0b1220; color: #7dd3fc; padding: 0.1rem 0.32rem; border-radius: 4px; font-size: 0.85em; }
+    .manual-body pre { background: #0b1220; border: 1px solid #334155; border-radius: 8px; padding: 0.75rem 0.9rem; overflow-x: auto; margin: 0.8rem 0; }
+    .manual-body pre code { background: transparent; color: #e2e8f0; padding: 0; font-size: 0.82rem; line-height: 1.55; }
+    .manual-body table { border-collapse: collapse; width: 100%; margin: 0.8rem 0; font-size: 0.8rem; display: block; overflow-x: auto; }
+    .manual-body th, .manual-body td { border: 1px solid #334155; padding: 0.35rem 0.6rem; text-align: left; vertical-align: top; }
+    .manual-body th { background: #1e293b; color: #e2e8f0; font-weight: 600; white-space: nowrap; }
+    .manual-body blockquote { border-left: 3px solid #38bdf8; background: #1e293b80; padding: 0.5rem 0.9rem; margin: 0.8rem 0; color: #94a3b8; }
+    .manual-body hr { border: 0; border-top: 1px solid #334155; margin: 1.3rem 0; }
+    .manual-body img { max-width: 100%; }
+    .manual-body .math-block { overflow-x: auto; margin: 0.9rem 0; padding: 0.3rem 0; text-align: center; color: #e2e8f0; }
+    .manual-body .math-inline { color: #e2e8f0; }
+    .manual-dead-link { color: #f87171; border-bottom: 1px dotted #f87171; cursor: help; }
+    .manual-tree-link.manual-current { background: #1e293b; color: #38bdf8; }
+    /* KaTeX degrades to the raw LaTeX source when the CDN cannot be reached. */
+    .katex-unavailable-note { display: none; }
+    .katex-unavailable .katex-unavailable-note { display: block; }
+    .katex-unavailable .math-block, .katex-unavailable .math-inline { color: #fbbf24; font-size: 0.85em; }
+</style>

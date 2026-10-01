@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block content %}
+{% include "partials/manual_style.html" %}
+<div class="flex flex-col md:flex-row gap-5">
+    {% include "partials/manual_tree.html" %}
+
+    <div class="flex-1 min-w-0">
+        <div class="card">
+            <h2 class="text-xl font-bold text-slate-100">手册 / Manual</h2>
+            <p class="mt-2 text-sm text-slate-400 leading-relaxed">
+                平台内文档手册：把仓库里的 markdown 文档渲染成可浏览的页面，左侧是目录树，可按标题或路径筛选。
+                <strong class="text-slate-300">不复制文件</strong>——每次请求直接读取仓库文件，编辑立即生效；
+                文档链接会重写为手册路由，公式用 KaTeX 渲染。
+            </p>
+            <div class="mt-3 grid grid-cols-2 sm:grid-cols-4 gap-2 text-center">
+                <div class="bg-slate-900 rounded p-2">
+                    <div class="text-lg font-bold text-sky-400">{{ doc_count }}</div>
+                    <div class="text-[10px] text-slate-500">篇文档</div>
+                </div>
+                <div class="bg-slate-900 rounded p-2">
+                    <div class="text-lg font-bold text-sky-400">{{ dir_count }}</div>
+                    <div class="text-[10px] text-slate-500">个目录</div>
+                </div>
+                <div class="bg-slate-900 rounded p-2">
+                    <div class="text-lg font-bold text-sky-400">{{ main_documents|length }}</div>
+                    <div class="text-[10px] text-slate-500">主要文档</div>
+                </div>
+                <div class="bg-slate-900 rounded p-2">
+                    <a href="{{ tree_endpoint }}" class="text-lg font-bold text-sky-400 hover:underline">JSON</a>
+                    <div class="text-[10px] text-slate-500">目录树接口</div>
+                </div>
+            </div>
+            <p class="mt-3 text-[11px] text-slate-500 leading-relaxed">
+                收录规则：<code class="text-sky-300">{{ tree.rule }}</code>
+                —— 隐藏项、符号链接、非 markdown 文件、以及 <code>docs/</code> 之外的 markdown（例如
+                <code>experimental/ml/README.md</code>）都不属于手册。
+            </p>
+        </div>
+
+        <div class="card mt-4">
+            <h3 class="text-sm font-semibold text-slate-200 mb-2">主要文档 / Main documents</h3>
+            <ul class="space-y-1">
+                {% for doc in main_documents %}
+                <li class="flex flex-col sm:flex-row sm:items-baseline gap-1 sm:gap-3 border-b border-slate-800 pb-1">
+                    <a href="{{ doc.url }}" class="text-sm text-sky-400 hover:underline shrink-0">{{ doc.title }}</a>
+                    <span class="text-[11px] text-slate-600 font-mono truncate">{{ doc.path }}</span>
+                </li>
+                {% endfor %}
+            </ul>
+        </div>
+
+        <div class="card mt-4">
+            <h3 class="text-sm font-semibold text-slate-200 mb-2">目录 / Groups</h3>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-1">
+                {% for dir in tree.dirs if dir.path %}
+                <a href="#{{ dir.anchor }}" class="flex items-center justify-between gap-2 px-2 py-1 rounded bg-slate-900 hover:bg-slate-800 text-xs">
+                    <span class="text-slate-300 truncate">{{ dir.label }}</span>
+                    <span class="text-slate-500 font-mono text-[10px] shrink-0">{{ dir.path }} · {{ dir.count }}</span>
+                </a>
+                {% endfor %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

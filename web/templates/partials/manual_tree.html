@@ -1,0 +1,82 @@
+{# Sidebar of the manual: collapsible directory tree + client-side filter.
+   Rendered server-side (so the tree works without JS) from the same payload the
+   JSON endpoint at /api/manual/tree returns.  Included by manual.html and
+   manual_doc.html. #}
+{% macro manual_node(node, current) %}
+{% if node.type == 'dir' %}
+<details class="manual-dir" data-manual-dir="1" id="{{ node.anchor }}"
+         {% if node.path == '' or not current or current.startswith(node.path ~ '/') %}open{% endif %}>
+    <summary class="cursor-pointer select-none px-2 py-1 rounded text-slate-300 hover:bg-slate-800 text-[11px] font-semibold uppercase tracking-wide">
+        {{ node.label }} <span class="text-slate-500 font-normal">({{ node.count }})</span>
+    </summary>
+    <div class="ml-2 border-l border-slate-700 pl-2 space-y-0.5">
+        {% for child in node.children %}{{ manual_node(child, current) }}{% endfor %}
+    </div>
+</details>
+{% else %}
+<a href="{{ node.url }}" data-manual-doc="{{ node.path }}" data-manual-title="{{ node.title }}"
+   title="{{ node.path }}"
+   class="manual-tree-link block px-2 py-1 rounded text-xs truncate {{ 'manual-current' if node.path == current else 'text-slate-400 hover:bg-slate-800 hover:text-sky-300' }}">{{ node.title }}</a>
+{% endif %}
+{% endmacro %}
+
+<div class="w-full md:w-80 shrink-0">
+    <div class="md:sticky md:top-4">
+        <div class="card !p-3">
+            <div class="flex items-center justify-between gap-2 mb-2">
+                <a href="/manual" class="text-sm font-bold text-sky-400">手册 / Manual</a>
+                <span class="text-[10px] text-slate-500">{{ tree.doc_count }} 篇</span>
+            </div>
+            <input id="manual-filter" type="search" autocomplete="off"
+                   placeholder="筛选文档 / Filter…"
+                   class="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-sky-500">
+            <nav id="manual-tree" class="manual-tree mt-2 max-h-[68vh] overflow-y-auto pr-1 space-y-0.5">
+                {% for node in tree.roots %}{{ manual_node(node, current_doc) }}{% endfor %}
+            </nav>
+            <p class="mt-2 text-[10px] text-slate-600 leading-relaxed">
+                内容实时读自仓库文件（{{ tree.rule }}）。
+            </p>
+        </div>
+    </div>
+</div>
+
+<script>
+(function () {
+    var input = document.getElementById('manual-filter');
+    var tree = document.getElementById('manual-tree');
+    if (!input || !tree) return;
+
+    function apply() {
+        var q = input.value.trim().toLowerCase();
+        tree.querySelectorAll('a[data-manual-doc]').forEach(function (a) {
+            var hay = ((a.dataset.manualTitle || '') + ' ' + (a.dataset.manualDoc || '')).toLowerCase();
+            a.style.display = (!q || hay.indexOf(q) >= 0) ? '' : 'none';
+        });
+        tree.querySelectorAll('details[data-manual-dir]').forEach(function (d) {
+            var visible = d.querySelectorAll('a[data-manual-doc]');
+            var any = Array.prototype.some.call(visible, function (a) { return a.style.display !== 'none'; });
+            d.style.display = any ? '' : 'none';
+            if (q) d.open = true;
+        });
+    }
+    input.addEventListener('input', apply);
+    input.addEventListener('search', apply);
+
+    function openAncestors(el) {
+        var node = el;
+        while (node) {
+            if (node.tagName === 'DETAILS') node.open = true;
+            node = node.parentElement;
+        }
+    }
+    function jumpToHash() {
+        if (!location.hash) return;
+        var el = document.getElementById(location.hash.slice(1));
+        if (!el) return;
+        openAncestors(el);
+        el.scrollIntoView({ block: 'center' });
+    }
+    window.addEventListener('hashchange', jumpToHash);
+    jumpToHash();
+})();
+</script>

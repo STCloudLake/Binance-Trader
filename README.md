@@ -12,7 +12,7 @@ data-api.binance.vision (REST) / data-stream.binance.vision (WS) → MarketDataP
 ```
 
 > **状态**：`VERSION` **2.0.1** · Python **3.12**（实测 3.12.10）· Windows / Linux · 默认只监听 `127.0.0.1:8899`
-> **测试**：**1217** 项收集，基线全绿（`1217 passed, 0 failed`）。见 [§5.1](#51-测试)。
+> **测试**：**1318** 项收集（`python -m pytest tests/ --collect-only -q`）；全量基线要求 `1318 passed, 0 failed`。见 [§5.1](#51-测试)。
 > 本 README 只写**当前代码事实**，每个数字旁给出发它的命令；与代码冲突时以代码为准。
 
 ---
@@ -154,18 +154,33 @@ usage: main.py [-h] [--mode {sim,live,backtest}] [--port PORT] [--db DB]
 | `/alerts` | 预警中心：告警列表、筛选、规则开关 | 登录 |
 | `/settings` | AI 模式与参数、Binance 凭据与 testnet 开关、风控阈值、熔断状态与重置、重启服务 | **trader**（否则 302 → `/trade`）；凭据/风控/重启写接口 **admin** |
 | `/db-manager`、`/users` | 表浏览/行删除/备份恢复/优化清理/CSV 导出；用户管理 | **admin**（否则 302 → `/trade`） |
+| `/manual`、`/manual/{doc_path}` | **手册**：`docs/**` 与根 README 的站内文档浏览器（目录树 / 渲染 / 跳转），见 §3.3 | 登录（只读，viewer 可读） |
 | `/login` | 登录页 | 公开 |
 
 授权检查目前在 handler 内部完成（`web/deps.py` 的 `_require_trader` / `_require_admin` 与等价内联判断），三层角色 `admin` / `trader` / `viewer`（admin 也是 trader）；`TODO(authz)` 标记了将来改成 FastAPI 依赖的位置。前端是 Jinja2 + HTMX + Tailwind CDN + ECharts，Jinja 环境开启 autoescape，导航在移动端真实可用。
 
-### 3.2 路由总数：118
+### 3.2 路由总数：121
 
 ```bash
 python scripts/regen_route_baseline.py --check
-# old routes: 118 / new routes: 118 / added: 0 / removed: 0
+# old routes: 121 / new routes: 121 / added: 0 / removed: 0
 ```
 
-118 条 = **117 个 HTTP 路由**（GET 69 / POST 43 / DELETE 4 / PUT 1）+ **1 个 WebSocket**（`/ws/alerts`）。按模块分组的端点清单不必在 README 里维护：**`docs/overhaul/route-baseline.json` 是权威清单**，上面的脚本可从运行期路由表重新生成（`--check` 只报告不写；有路由消失时退出 1）。注意 `/docs`、`/redoc` 被显式关掉（404），但 `/openapi.json` 仍可访问。
+121 条 = **120 个 HTTP 路由**（GET 72 / POST 43 / DELETE 4 / PUT 1）+ **1 个 WebSocket**（`/ws/alerts`）。按模块分组的端点清单不必在 README 里维护：**`docs/overhaul/route-baseline.json` 是权威清单**，上面的脚本可从运行期路由表重新生成（`--check` 只报告不写；有路由消失时退出 1）。注意 `/docs`、`/redoc` 被显式关掉（404），但 `/openapi.json` 仍可访问。
+
+### 3.3 手册 `/manual`（站内文档浏览器）
+
+把仓库里已有的 markdown 文档做成站内手册，不再需要翻原始文件：`GET /manual`（落地页：简介 + 目录树 + 主要文档清单）、`GET /manual/{doc_path}`（单篇文档，`doc_path` 是**仓库相对路径**，如 `/manual/docs/overhaul/PLAN.md`）、`GET /api/manual/tree`（JSON 目录树，供侧栏筛选与工具使用）。三条路由与其他运营页同源鉴权（`AuthMiddleware`）：未登录访问页面 302 → `/login`，访问 `/api/manual/tree` 得 401。
+
+| 关注点 | 行为 |
+|---|---|
+| **收录规则**（代码与文档同一条） | 仅 `docs/**/*.md`（递归）+ 根 `README.md` / `README_EN.md`；路径任一段以 `.` 开头、符号链接、非 markdown、以及 `docs/` 之外的 markdown（如 `experimental/ml/README.md`）都不收录。因此 `docs/overhaul/route-baseline.json` 是**文档而非手册页面** |
+| **数据来源** | 请求时直接读取文件（不复制、不落库）；仅缓存渲染结果，缓存键为 `(路径, mtime_ns, size)`，改文件立即失效 |
+| **路径安全** | 请求路径先归一化并拒绝 `..` / 绝对路径 / 盘符 / NUL / 空段 / 百分号编码（含双重编码）穿越，再要求它属于上面的收录集合，最后校验 `resolve()` 后仍在允许根内且不是符号链接；其余一律 404 |
+| **渲染** | markdown-it-py（CommonMark + table 规则，`html=False`，文档里的原始 HTML 只当文本）+ KaTeX CDN 渲染 `$$…$$` / `$…$`（CDN 不可达时回退显示原始 LaTeX 源码） |
+| **导航** | 侧栏目录树按目录分组、可折叠、当前文档高亮、支持标题/路径筛选；页内目录（`##` 以下）、面包屑、上一篇/下一篇；文档内相对链接（同目录 / 上级 / 跨目录 / 目录链接 / `#锚点`）重写为手册路由，目标不在手册内时渲染为标记过的死链接（不跳转、不 404） |
+
+对应测试 `tests/test_manual_route.py`（收录完整性、200+标题、404、穿越拒绝、链接重写、鉴权、JSON 形状）。
 
 ---
 
@@ -234,7 +249,7 @@ P4 那批能力此前只能改 Python 常量；现在一个能力一个开关，
 ### 5.1 测试
 
 ```bash
-python -m pytest tests/ --collect-only -q -p no:cacheprovider   # 末行: 1217 tests collected
+python -m pytest tests/ --collect-only -q -p no:cacheprovider   # 末行: 1318 tests collected
 python -m pytest tests/ -q -p no:cacheprovider                  # 全量
 python -m pytest tests/ -q -m "not slow"                        # 跳过慢测
 ```
@@ -344,6 +359,7 @@ python -m app.main --mode sim >> run_logs/service.log 2>&1   # PowerShell 用 *>
 | [`docs/overhaul/TRADE_PAGE_API.md`](docs/overhaul/TRADE_PAGE_API.md) · [`MARKET_PAGES_API.md`](docs/overhaul/MARKET_PAGES_API.md) | `/trade` 与行情/币种/数据/代币检测页的接口契约（冻结版），后者含主机可达性前置事实 |
 | [`docs/overhaul/route-baseline.json`](docs/overhaul/route-baseline.json) | **路由权威清单**（当前 118 条），用于奇偶校验 |
 | [`docs/audit/`](docs/audit/) · [`docs/superpowers/`](docs/superpowers/) · [`experimental/ml/README.md`](experimental/ml/README.md) | 历史审计分报告 R1–R15 与严重度分级；设计规格与实施计划（唯一的设计史来源）；被移出生产链路的 ML 死码清单 |
+| `/manual`（站内手册） | 上表的站内渲染版本（§3.3）：目录树 + 筛选、页内目录与面包屑、相对链接重写、KaTeX 公式；只收录 `docs/**` 与根 README，`route-baseline.json` 等非 markdown 文件不在其中 |
 
 ### 许可与致谢
 

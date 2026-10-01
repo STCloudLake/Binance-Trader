@@ -29,6 +29,7 @@
         #mobile-nav { transition: max-height 0.3s ease; max-height: 0; overflow: hidden; }
         #mobile-nav.open { max-height: 500px; }
     </style>
+    {% block head_extra %}{% endblock %}
 </head>
 <body class="min-h-screen">
     <nav class="border-b border-slate-700 px-4 md:px-6 py-3">
@@ -38,7 +39,7 @@
                 <img src="/static/favicon.ico" alt="Binance" class="w-5 h-5"><span class="hidden sm:inline">Binance Trader</span></h1>
 
             {# ── Desktop nav links (hidden on mobile) ── #}
-            {% set pages = [('trade', _('现货交易')), ('market', _('行情/币种')), ('data', _('市场数据')), ('audit', _('代币检测')), ('strategies', _('策略监控')), ('backtest', _('回测')), ('ai', _('AI 面板')), ('alerts', _('预警中心')), ('settings', _('设置'))] %}
+            {% set pages = [('trade', _('现货交易')), ('market', _('行情/币种')), ('data', _('市场数据')), ('audit', _('代币检测')), ('strategies', _('策略监控')), ('backtest', _('回测')), ('ai', _('AI 面板')), ('alerts', _('预警中心')), ('manual', _('手册')), ('settings', _('设置'))] %}
             <div class="hidden md:flex items-center gap-1 flex-1 overflow-x-auto">
                 {% for slug, label in pages %}
                 <a href="/{{ slug }}" class="nav-link text-sm whitespace-nowrap {{ 'active' if current_page == slug else '' }}">{{ label }}</a>

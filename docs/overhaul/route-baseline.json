@@ -129,6 +129,10 @@
  ],
  [
   "GET",
+  "/api/manual/tree"
+ ],
+ [
+  "GET",
   "/api/market-state"
  ],
  [
@@ -218,6 +222,14 @@
  [
   "GET",
   "/login"
+ ],
+ [
+  "GET",
+  "/manual"
+ ],
+ [
+  "GET",
+  "/manual/{doc_path:path}"
  ],
  [
   "GET",
