@@ -12,7 +12,7 @@ data-api.binance.vision (REST) / data-stream.binance.vision (WS) → MarketDataP
 ```
 
 > **状态**：`VERSION` **2.0.1** · Python **3.12**（实测 3.12.10）· Windows / Linux · 默认只监听 `127.0.0.1:8899`
-> **测试**：**1318** 项收集（`python -m pytest tests/ --collect-only -q`）；全量基线要求 `1318 passed, 0 failed`。见 [§5.1](#51-测试)。
+> **测试**：**1339** 项收集（`python -m pytest tests/ --collect-only -q`）；全量基线要求 `1339 passed, 0 failed`。见 [§5.1](#51-测试)。
 > 本 README 只写**当前代码事实**，每个数字旁给出发它的命令；与代码冲突时以代码为准。
 
 ---
@@ -242,6 +242,17 @@ P4 那批能力此前只能改 Python 常量；现在一个能力一个开关，
 
 每个开关只打开**那道缝**，能力自身的验收门仍会拒绝：真实 1h 主流币配对 **0/30** 通过协整检验、meta 门 **10/10** 拒绝一级规则、regime 只接受因果 HMM 标签。**诚实预期**：这些开关提高的是**可测量性与纪律**（能否复现、能否 A/B），**不增加预测优势**。启动时会打一条 WARNING 逐项列出已开启的开关（`experimental_notices`，与 `inert_barrier_key_warnings` 同型），未知键也会被点名而不是静默忽略。
 
+### 4.5 GA 任务的周期白名单（job 字段 `timeframe_pool`）
+
+周期是**基因组的一部分**，所以不设限的 GA 会把大部分预算花在 `1m` 基因上：3 个月 × 3 币的 1m 回测每币 **~390 000** 根 bar，是 15m 的 **15×**、1h 的 **60×**（实测：pop 20 / 3 币 / 12 workers 的任务 25 分钟只评估完 20 个基因组中的 11 个）。`POST /api/ga/evolve` 与 `POST /api/ga/walkforward` 现在接受 job 字段 **`timeframe_pool`**（如 `["15m","1h","4h"]`），面板「Timeframes (GA gene pool)」默认勾选 `15m/1h/4h`（全部取消勾选 = 不写该字段 = 不限制）：
+
+| 关注点 | 约定 |
+|---|---|
+| **缺省** | 字段不存在 = **不限制**，与加入该字段之前**逐位一致**（`1m/5m/15m/1h/4h` 全部仍可选，`tests/test_ga_timeframe_pool.py` 守护） |
+| **校验** | 取值必须来自**唯一 interval registry** `core.market_data.provider.INTERVAL_SPEC`（`--list-intervals` 是可下载集合的超集，`1s`/`1M` 因无 bar 长度/ML 规格被拒绝）；非法周期 → 接口 **HTTP 400** 或 worker **加载即失败**（`UnknownTimeframeError`，错误信息点名非法值与可接受集合），不会先跑几小时 |
+| **基因约束** | `core/ga/genome.py` 的 `timeframes` 分类基因：随机初始化、变异可选集合、交叉/精英/`resume` 检查点（`confine_timeframe_gene`）、解码（`chromosome_to_strategy`）全都被限制在白名单内；解出的策略 `timeframes` **非空且 ⊆ 白名单** |
+| **可审计** | 启动日志 `GA timeframe_pool=15m,1h,4h`（不限制时为 `unrestricted`）、progress JSON 的 `timeframe_pool`、result 与冠军 YAML 的 `provenance.timeframe_pool`；`scripts/ga_job_status.py` 的 `job params` 行打印 `tf_pool=` |
+
 ---
 
 ## 5. 运维
@@ -249,7 +260,7 @@ P4 那批能力此前只能改 Python 常量；现在一个能力一个开关，
 ### 5.1 测试
 
 ```bash
-python -m pytest tests/ --collect-only -q -p no:cacheprovider   # 末行: 1318 tests collected
+python -m pytest tests/ --collect-only -q -p no:cacheprovider   # 末行: 1339 tests collected
 python -m pytest tests/ -q -p no:cacheprovider                  # 全量
 python -m pytest tests/ -q -m "not slow"                        # 跳过慢测
 ```

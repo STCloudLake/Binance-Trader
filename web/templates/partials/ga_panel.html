@@ -60,6 +60,28 @@
             </div>
         </div>
 
+        <!-- Timeframe whitelist (job field ``timeframe_pool``).  The timeframe is
+             part of the genome, so an unconstrained run spends most of its budget
+             on 1m genomes (~390k bars per symbol for 3 months — 15x a 15m run).
+             ALL boxes unticked = no pool = the historical, unrestricted run.
+             The list comes from the interval registry (server-side), so it cannot
+             drift from what the worker accepts. -->
+        <div class="mt-2">
+            <label class="text-sm text-slate-400 mb-1 block">{{ _("Timeframes (GA gene pool)") }}
+                <span class="text-xs text-slate-500 ml-2">{{ _("all unticked = no restriction") }}</span>
+            </label>
+            <div id="ga-timeframe-pool"
+                 class="flex flex-wrap gap-x-4 gap-y-1 bg-slate-800 border border-slate-600 rounded px-3 py-2">
+                {% for tf in ga_timeframes|default([], true) %}
+                <label class="flex items-center gap-1 text-xs text-slate-300">
+                    <input type="checkbox" class="ga-tf-pool accent-sky-500" value="{{ tf }}"
+                           {% if tf in ga_default_timeframes|default([], true) %}checked{% endif %}>
+                    {{ tf }}
+                </label>
+                {% endfor %}
+            </div>
+        </div>
+
         <!-- Symbols — searchable multi-select fed by GET /api/market/symbols.
              Defaults to the persisted watchlist (GET /api/market/watchlist);
              the server validates the choice against the universe and caps it. -->
@@ -550,6 +572,17 @@ function updateResourceEstimate() {
     }
 }
 
+function gaTimeframePool() {
+    // Ticked intervals = the job's ``timeframe_pool`` (the GA timeframe gene's
+    // allowed cycles).  An empty list means "no restriction" and the server
+    // omits the field entirely, i.e. exactly the historical search space.
+    var out = [];
+    document.querySelectorAll('.ga-tf-pool').forEach(function(el) {
+        if (el.checked) out.push(el.value);
+    });
+    return out;
+}
+
 function startGA() {
     var btn = document.getElementById('ga-start-btn');
     var errorDiv = document.getElementById('ga-error');
@@ -583,6 +616,7 @@ function startGA() {
         generations: parseInt(document.getElementById('ga-generations').value) || 15,
         max_workers: parseInt(document.getElementById('ga-workers').value) || 4,
         seed_strategies: ['mean_reversion_rsi_bollinger_bands'],
+        timeframe_pool: gaTimeframePool(),
         cost_enabled: true,
         taker_fee_pct: parseFloat(document.getElementById('ga-cost-fee').value) || 0.04,
         seed: parseInt(document.getElementById('ga-seed').value) || 0,
@@ -650,6 +684,10 @@ function setInputsLocked(locked) {
         var el = document.getElementById(id);
         if (el) el.disabled = locked;
     });
+    // The timeframe whitelist is a chip group, not a single input.
+    document.querySelectorAll('.ga-tf-pool').forEach(function(el) {
+        el.disabled = locked;
+    });
     if (locked) gaCloseDropdown();
 }
 
@@ -661,6 +699,12 @@ function restoreParams(params) {
     if (params.generations) document.getElementById('ga-generations').value = params.generations;
     if (params.max_workers) document.getElementById('ga-workers').value = params.max_workers;
     if (params.seed) document.getElementById('ga-seed').value = params.seed;
+    if (params.timeframe_pool) {
+        var wanted = params.timeframe_pool;
+        document.querySelectorAll('.ga-tf-pool').forEach(function(el) {
+            el.checked = wanted.indexOf(el.value) >= 0;
+        });
+    }
     if (params.symbols && params.symbols.length) {
         gaState.selected = params.symbols.slice();
         gaRegisterSymbols(params.symbols);
@@ -712,6 +756,7 @@ function resumeGA() {
             generations: parseInt(document.getElementById('ga-generations').value) || 15,
             max_workers: parseInt(document.getElementById('ga-workers').value) || 4,
             seed_strategies: ['mean_reversion_rsi_bollinger_bands'],
+            timeframe_pool: gaTimeframePool(),
             resume: true,
             cost_enabled: true,
             taker_fee_pct: parseFloat(document.getElementById('ga-cost-fee').value) || 0.04,

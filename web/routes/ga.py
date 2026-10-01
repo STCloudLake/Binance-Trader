@@ -35,6 +35,13 @@ from web.rendering import _render
 #: Keeps a batch bounded (population × generations × symbols) as required.
 MAX_GA_SYMBOLS = 20
 
+#: Timeframes the GA panel pre-checks.  The timeframe gene is part of the genome,
+#: so an unconstrained run spends most of its wall clock on ``1m`` (a 3-month ×
+#: 3-symbol 1m backtest is ~390 000 bars per symbol — 15× a 15m run).  The panel
+#: therefore defaults to the cycles an operator would actually trade; unticking
+#: every box posts no pool at all = the historical, unrestricted search space.
+DEFAULT_GA_TIMEFRAME_POOL = ["15m", "1h", "4h"]
+
 
 # ── symbol plumbing ───────────────────────────────────────────────
 
@@ -100,6 +107,28 @@ def _list_param(payload, key) -> list:
     if isinstance(value, (list, tuple)):
         return list(value)
     return []
+
+
+def _timeframe_pool_param(payload) -> list:
+    """``timeframe_pool`` job field → validated, shortest-first list (``[]`` = none).
+
+    Accepts a JSON list (the panel), a JSON-encoded string (form) or a plain
+    comma-separated string.  Validation reuses the canonical interval registry
+    (``core.ga.genome.parse_timeframe_pool`` ← ``INTERVAL_SPEC``), so a typo is a
+    **400 on the request** naming the offender; the worker re-validates the job
+    file it actually reads, so a hand-written job file fails there too.
+    """
+    from core.ga.genome import parse_timeframe_pool
+
+    value = payload.get("timeframe_pool")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            value = value.split(",")
+    if value in (None, "", []):
+        return []
+    return parse_timeframe_pool(value) or []  # raises TimeframePoolError
 
 
 def _spread_param(payload, default: dict) -> dict:
@@ -226,6 +255,9 @@ _ga_state = {
     # already rendered them — the DSR/WF block was dead UI) ──
     "validation": None, "dsr": None, "provenance": None,
     "published": None, "rejection_reasons": [], "seed": 0,
+    # ── The job's timeframe whitelist (``None``/``[]`` = unrestricted); the
+    # worker re-publishes the effective pool in its progress payload ──
+    "timeframe_pool": None,
     # ── Live progress detail (additive; the worker writes these alongside the
     # keys the panel has always read) ──
     "eval_completed": 0, "eval_total": 0, "eval_equivalent": 0.0,
@@ -273,6 +305,13 @@ def register(app: FastAPI, ctx) -> None:
         if not seed:
             seed = int.from_bytes(os.urandom(4), "big")
 
+        # ── Timeframe whitelist (the GA timeframe gene's allowed cycles) ──
+        # Absent/empty ⇒ no restriction = the historical search space.
+        try:
+            timeframe_pool = _timeframe_pool_param(body)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
         # ── Runtime cost model params (override config.yaml) ──
         cost_enabled = _bool_param(body, "cost_enabled", True)
         taker_fee_pct = _float_param(body, "taker_fee_pct", 0.04)
@@ -314,6 +353,10 @@ def register(app: FastAPI, ctx) -> None:
             "resume": resume,
             "seed": seed,
         }
+        # Only written when the operator restricted the cycles: a default job
+        # file stays byte-identical to the pre-``timeframe_pool`` payload.
+        if timeframe_pool:
+            job_data["timeframe_pool"] = list(timeframe_pool)
         with open(job_file, "w") as f:
             json.dump(job_data, f)
 
@@ -349,6 +392,7 @@ def register(app: FastAPI, ctx) -> None:
             "checkpoint_gen": 0, "job_file": job_file,
             "validation": None, "dsr": None, "provenance": None,
             "published": None, "rejection_reasons": [], "seed": seed,
+            "timeframe_pool": list(timeframe_pool),
             "params": {
                 "date_start": date_start, "date_end": date_end,
                 "validation_start": validation_start,
@@ -356,6 +400,7 @@ def register(app: FastAPI, ctx) -> None:
                 "max_workers": max_workers,
                 "symbols": symbols,
                 "seed": seed,
+                "timeframe_pool": list(timeframe_pool),
                 "mode": "ga",
             },
         })
@@ -428,6 +473,10 @@ def register(app: FastAPI, ctx) -> None:
                             _ga_state["avg_fitness"] = progress["avg_fitness"]
                         if progress.get("best_trades") is not None:
                             _ga_state["best_trades"] = progress["best_trades"]
+                        # Effective timeframe whitelist, straight from the worker:
+                        # the console shows the constraint the run really used.
+                        if progress.get("timeframe_pool") is not None:
+                            _ga_state["timeframe_pool"] = progress["timeframe_pool"]
                         if progress.get("updated_at"):
                             _ga_state["progress_updated_at"] = progress["updated_at"]
                         if "generation" in progress:
@@ -488,6 +537,12 @@ def register(app: FastAPI, ctx) -> None:
         max_workers = _int_param(body, "max_workers", 1, minimum=1, maximum=16)  # clamp 1-16
         resume = _bool_param(body, "resume", False)
 
+        # ── Timeframe whitelist (shared with the GA endpoint / the same panel) ──
+        try:
+            timeframe_pool = _timeframe_pool_param(body)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
         # Apply cost model overrides
         cost_enabled = _bool_param(body, "cost_enabled", True)
         taker_fee_pct = _float_param(body, "taker_fee_pct", 0.04)
@@ -521,6 +576,8 @@ def register(app: FastAPI, ctx) -> None:
             "spread_pct": spread_pct,
             "resume": resume,
         }
+        if timeframe_pool:
+            job_data["timeframe_pool"] = list(timeframe_pool)
         with open(job_file, "w") as f:
             json.dump(job_data, f)
 
@@ -556,6 +613,7 @@ def register(app: FastAPI, ctx) -> None:
                 "population_size": pop_size, "generations": generations,
                 "max_workers": max_workers,
                 "symbols": symbols,
+                "timeframe_pool": list(timeframe_pool),
                 "mode": "walkforward",
             },
         })
@@ -623,10 +681,18 @@ def register(app: FastAPI, ctx) -> None:
 
     @app.get("/partials/ga-panel")
     async def partial_ga_panel(request: Request):
+        # Lazy import: the registry reader lives with the genome it constrains.
+        from core.ga.genome import known_timeframes
+
         return _render("partials/ga_panel.html", {
             "request": request, "state": _ga_state,
             # Symbol picker: default = persisted watchlist, cap enforced in the
             # UI exactly like the endpoint enforces it server-side.
             "ga_default_symbols": await default_ga_symbols(config),
             "ga_max_symbols": MAX_GA_SYMBOLS,
+            # Timeframe whitelist picker: the accepted intervals come from the
+            # canonical registry (never a second copy in the template), and the
+            # tradeable cycles are pre-checked.
+            "ga_timeframes": known_timeframes(),
+            "ga_default_timeframes": DEFAULT_GA_TIMEFRAME_POOL,
         })

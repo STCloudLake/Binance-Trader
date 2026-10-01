@@ -22,7 +22,8 @@ from loguru import logger
 
 from core.ga.genome import (
     strategy_to_chromosome, chromosome_to_strategy,
-    random_chromosome, ContinuousGene, CategoricalGene, StructuralGene,
+    random_chromosome, confine_timeframe_gene,
+    ContinuousGene, CategoricalGene, StructuralGene,
 )
 from core.strategy.loader import StrategyLoader
 
@@ -62,6 +63,10 @@ class GARunConfig:
     early_stop_generations: int = 10  # stop if no improvement for N gens
     seed: int = 0              # job seed (0 = derive from the clock, logged)
     window_key: str = ""       # walk-forward window identity for the checkpoint
+    #: Per-job timeframe whitelist (``web/routes/ga.py`` job field
+    #: ``timeframe_pool``; ``None`` = **no restriction**, the historical search
+    #: space).  Confined into the timeframe gene on init, mutation and decode.
+    timeframe_pool: list[str] | None = None
 
 
 def dsr_trial_counts(prior_trials: int, ledger_total: int, population: int,
@@ -198,6 +203,15 @@ class GAStrategyEvolver:
         self._window_key = window_key or f"{date_start}~{date_end}"
         logger.info(f"GA seed={effective_seed} window={self._window_key}")
 
+        # ── Timeframe whitelist: the effective pool is logged up front ──
+        # Auditable from the job log alone; ``None`` (the default) means the
+        # pre-existing search space and is logged as such.
+        timeframe_pool = list(getattr(cfg, "timeframe_pool", None) or [])
+        logger.info(
+            "GA timeframe_pool=" + (
+                ",".join(timeframe_pool) + " (timeframe gene confined to it)"
+                if timeframe_pool else "unrestricted (all intervals)"))
+
         # Training period: if validation_start is set, stop training there
         train_end = validation_start if validation_start else date_end
         has_validation = validation_start is not None
@@ -233,6 +247,13 @@ class GAStrategyEvolver:
             self._best_chromosome = None
             self._stagnation_count = 0
             self._history = []
+
+        # ── Confine the whole population to the job's timeframe pool ──
+        # Covers a resumed checkpoint, a seeded strategy and any genome created
+        # by an older (pre-pool) code path, before a single backtest is scored.
+        if timeframe_pool:
+            for chrom in self._population:
+                confine_timeframe_gene(chrom, timeframe_pool)
 
         # ── Evolution loop ──
         for gen in range(cfg.generations):
@@ -379,7 +400,8 @@ class GAStrategyEvolver:
             self.clear_checkpoint()  # clean completion — no resume needed
 
         if self._best_chromosome:
-            champion_config = chromosome_to_strategy(self._best_chromosome)
+            champion_config = chromosome_to_strategy(
+                self._best_chromosome, timeframe_pool=cfg.timeframe_pool or None)
             champion_config.name = f"ga_champion_{int(time.time())}"
             train_result = dict(self._best_chromosome.get("fitness_result", {}) or {})
 
@@ -439,6 +461,9 @@ class GAStrategyEvolver:
                 },
                 "symbols": list(symbols),
                 "timeframes": list(champion_config.timeframes),
+                # The job's timeframe whitelist: ``None`` = unrestricted.  Makes
+                # a champion's timeframe constraint auditable afterwards.
+                "timeframe_pool": list(cfg.timeframe_pool) if cfg.timeframe_pool else None,
                 # The evolved entry structure, so a champion's AND/OR gene is
                 # traceable without parsing the strategy body.
                 "condition_logic": champion_config.condition_logic,
@@ -493,6 +518,7 @@ class GAStrategyEvolver:
                 "rejection_reasons": rejection_reasons,
                 "enabled": published,
                 "seed": provenance["seed"],
+                "timeframe_pool": provenance["timeframe_pool"],
             }
         else:
             return {"error": "No valid champion found"}
@@ -619,7 +645,8 @@ class GAStrategyEvolver:
             for name in seed_strategies[:cfg.elite_count]:
                 try:
                     s_config = self.loader.load(name)
-                    chrom = strategy_to_chromosome(s_config)
+                    chrom = strategy_to_chromosome(
+                        s_config, timeframe_pool=getattr(cfg, "timeframe_pool", None))
                     chrom["name"] = f"seed_{name}"
                     population.append(chrom)
                 except Exception as e:
@@ -628,7 +655,9 @@ class GAStrategyEvolver:
         # Fill remainder with random
         needed = cfg.population_size - len(population)
         for i in range(needed):
-            population.append(random_chromosome(f"ga_rand_{i}"))
+            population.append(random_chromosome(
+                f"ga_rand_{i}",
+                timeframe_pool=getattr(cfg, "timeframe_pool", None)))
 
         return population
 
@@ -663,7 +692,9 @@ class GAStrategyEvolver:
 
         # ── Diversity injection ──
         for i in range(cfg.immigrant_count):
-            new_pop.append(random_chromosome(f"ga_immigrant_{i}"))
+            new_pop.append(random_chromosome(
+                f"ga_immigrant_{i}",
+                timeframe_pool=getattr(cfg, "timeframe_pool", None)))
 
         # Trim to exact population size
         return new_pop[:cfg.population_size]
@@ -759,6 +790,9 @@ class GAStrategyEvolver:
         # Evolvable condition logic (OR = looser, AND = stricter)
         if random.random() < 0.1:
             chrom["condition_logic"] = random.choice(["or", "and"])
+        # The timeframe gene is re-confined on every mutation, so a gene
+        # inherited from a pre-pool checkpoint can never leave the job's pool.
+        confine_timeframe_gene(chrom, getattr(self.config, "timeframe_pool", None))
         chrom["fitness_result"] = {}
         return chrom
 

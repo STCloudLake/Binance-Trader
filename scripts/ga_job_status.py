@@ -301,8 +301,14 @@ def render(info: dict, tail: int) -> str:
     out = []
     out.append(f"job            : {info['job_file']}")
     job = info["job"]
+    # The job's timeframe whitelist (``None``/absent = unrestricted) is part of
+    # the job's identity — the timeframe is a gene, so it decides run time.
+    pool = job.get("timeframe_pool")
+    if isinstance(pool, (list, tuple)):
+        pool = ",".join(str(tf) for tf in pool)
     out.append(f"job params     : pop={job.get('population_size')} "
                f"gens={job.get('generations')} workers={job.get('max_workers')} "
+               f"tf_pool={pool or 'unrestricted'} "
                f"window={job.get('date_start')}~{job.get('date_end')} "
                f"symbols={len(job.get('symbols') or [])}")
     out.append(f"progress file  : {info['progress_file']}")

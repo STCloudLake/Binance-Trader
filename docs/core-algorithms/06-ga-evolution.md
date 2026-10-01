@@ -19,7 +19,7 @@ INIT → EVALUATE(每基因独立仓位槽位 + 独立分账) → SELECT → CRO
 | 基因类型 | 编码内容 | 示例 |
 |----------|----------|------|
 | **ContinuousGene** | 连续参数（指标周期/阈值） | `rsi_period ∈ [5, 28]`、`ema_fast_period ∈ [5, 30]` |
-| **CategoricalGene** | 离散选择 | `mode ∈ {trend, range, scalp, momentum}`、`timeframes` |
+| **CategoricalGene** | 离散选择 | `mode ∈ {trend, range, scalp, momentum}`、`timeframes`（受 job 的 `timeframe_pool` 限制，见下） |
 | **StructuralGene** | 该方向的入场/出场条件列表 | `entry_long = ["rsi < 30", "close > ema_fast"]` |
 | **BooleanGene** | 指标启用/禁用标志 | 13 种指标各 on/off |
 | **condition_logic**（染色体级） | 入场条件组合方式 | `"or"`（默认，宽松）/ `"and"`（严格） |
@@ -35,6 +35,22 @@ INIT → EVALUATE(每基因独立仓位槽位 + 独立分账) → SELECT → CRO
 （实测：子代只保留 8 个基因中的 6 个且 `bb_stddev` 重复）。
 
 **选择算子**：锦标赛选择 (k=3)：随机抽取 3 个个体，选适应度最高者。
+
+### 周期白名单（job 字段 `timeframe_pool`）
+
+周期是基因组的一部分，所以不设限的搜索空间会把大部分墙钟时间花在 `1m` 基因上：3 个月 × 3 币的
+1m 回测每币 ~390 000 根 bar，是 15m 的 15×、1h 的 60×。任务载荷因此可以带
+`timeframe_pool`（如 `["15m","1h","4h"]`），把 `timeframes` 基因限制在操作者真正会交易的周期上：
+
+| 关注点 | 约定 |
+|---|---|
+| 缺省 / 空 | `None`/字段缺失 = **不限制**，`timeframe_gene_options(None)` 仍是原来的 `combinations(TIMEFRAME_OPTIONS, 2)`，种群与冠军逐位不变 |
+| 校验 | 取值必须来自唯一 interval registry `INTERVAL_SPEC`（`core.ga.genome.known_timeframes`）；非法值抛具名 `UnknownTimeframeError`，job **加载即失败**（接口侧同一校验返回 HTTP 400） |
+| 约束点 | 初始化 `random_chromosome(..., timeframe_pool=…)`、编码 `strategy_to_chromosome`（连种子策略的取值一起收敛）、变异（基因 `options` 只含池内组合 + `confine_timeframe_gene`）、`resume`/精英（`evolve()` 开头整群收敛）、解码 `chromosome_to_strategy(..., timeframe_pool=…)`（非空且 ⊆ 池） |
+| 审计 | 启动日志 `GA timeframe_pool=…`、progress/result 的 `timeframe_pool`、冠军 `provenance.timeframe_pool`（不限制时为 `null`） |
+
+单周期池（如 `["1h"]`）下基因只有一个可选值：`CategoricalGene.mutate` 在"去掉当前值后为空"时
+回退到 `options` 本身，因此不会出现 `random.choice([])`。
 
 ### 入场结构（`condition_logic`）：评分 = 发布
 
@@ -194,6 +210,7 @@ provenance:
   window: {train_start: ..., train_end: ..., validation_start: ..., validation_end: ..., key: ...}
   symbols: [BTCUSDT, ETHUSDT]
   timeframes: [1h]
+  timeframe_pool: [15m, 1h, 4h]   # job 的周期白名单（null = 不限制）
   condition_logic: and     # 入场结构基因：or（默认）/ and
   generations: 8
   n_trials: 1234           # population×generations + 历史试验

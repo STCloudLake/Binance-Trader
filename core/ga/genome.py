@@ -20,7 +20,7 @@ from core.strategy.loader import (
     StrategyConfig, MLConfig, normalize_condition_logic,
 )
 from core.market_data.provider import (
-    DEFAULT_INTERVALS, DEFAULT_TIMEFRAME, interval_minutes)
+    DEFAULT_INTERVALS, DEFAULT_TIMEFRAME, INTERVAL_SPEC, interval_minutes)
 
 
 # ── Gene definitions ──────────────────────────────────────────────────
@@ -49,7 +49,12 @@ class CategoricalGene:
     options: list[str]
 
     def mutate(self):
-        self.value = random.choice([o for o in self.options if o != self.value])
+        # ``or self.options`` keeps a single-option gene mutable — a one-interval
+        # ``timeframe_pool`` leaves exactly one choice — instead of raising
+        # ``IndexError`` from ``random.choice([])``.  With two or more options the
+        # choice set (and therefore the RNG stream) is exactly as before.
+        choices = [o for o in self.options if o != self.value] or list(self.options)
+        self.value = random.choice(choices)
 
 
 @dataclass
@@ -273,6 +278,114 @@ MODE_OPTIONS = ["trend", "range", "scalp", "momentum"]
 #: Timeframes the GA evolves over — the intervals INTERVAL_SPEC declares as the
 #: streamed/pre-fetched set, so a new interval added there joins the genes too.
 TIMEFRAME_OPTIONS = list(DEFAULT_INTERVALS)
+
+
+# ── Per-job timeframe whitelist (``timeframe_pool``) ───────────────────
+#
+# The timeframe gene is part of the genome, so an unconstrained population
+# spends most of a run on ``1m``: a 3-month × 3-symbol 1m backtest is ~390 000
+# bars per symbol — 15× a 15m run and 60× an 1h run (measured: a 20-genome job
+# with 12 workers finished 11 genomes in 25 min).  A job may therefore name the
+# cycles the operator would actually trade and the gene is confined to them.
+# An ABSENT field means ``None`` ⇒ exactly the pre-existing search space.
+
+
+class TimeframePoolError(ValueError):
+    """A job's ``timeframe_pool`` is unusable (wrong type / empty)."""
+
+
+class UnknownTimeframeError(TimeframePoolError):
+    """A ``timeframe_pool`` entry is not an interval the codebase accepts."""
+
+
+def known_timeframes() -> list[str]:
+    """Intervals a ``timeframe_pool`` may name — the provider interval registry.
+
+    Read live from ``INTERVAL_SPEC`` (never copied at import time), so adding an
+    interval there stays the one edit that teaches every consumer, the GA genes
+    included.  ``scripts/download_history.py --list-intervals`` names the wider
+    *downloadable* set (``1s``…``1M``); an interval it knows but the registry does
+    not (``1s``/``1M``) is rejected here because the backtest has no
+    bar-length/ML spec for it.
+    """
+    return list(INTERVAL_SPEC)
+
+
+def parse_timeframe_pool(raw) -> list[str] | None:
+    """``timeframe_pool`` job field → validated, de-duplicated, shortest-first pool.
+
+    ``None``/absent/blank ⇒ ``None`` = **no restriction** (the historical
+    behaviour).  Any other value is validated against :func:`known_timeframes`;
+    an unknown interval raises :class:`UnknownTimeframeError` naming the offender
+    and the accepted set, an ill-typed value raises :class:`TimeframePoolError`.
+    Both errors are named, so a bad job fails **at load** instead of after hours
+    of 1m backtests.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        items = raw.split(",")
+    elif isinstance(raw, (list, tuple, set)):
+        items = [piece for entry in raw for piece in str(entry).split(",")]
+    else:
+        raise TimeframePoolError(
+            "timeframe_pool must be a list of intervals (or a comma-separated "
+            f"string), got {type(raw).__name__}")
+    pool: list[str] = []
+    for item in items:
+        interval = str(item).strip()
+        if interval and interval not in pool:
+            pool.append(interval)
+    if not pool:
+        return None
+    unknown = [tf for tf in pool if tf not in known_timeframes()]
+    if unknown:
+        raise UnknownTimeframeError(
+            f"unknown timeframe(s) {', '.join(unknown)} in timeframe_pool; "
+            f"accepted: {', '.join(known_timeframes())}")
+    return sorted(pool, key=interval_minutes)
+
+
+def timeframe_gene_options(pool: list[str] | None = None) -> list[str]:
+    """The timeframe gene's choices — ``pool`` members only when a pool is set.
+
+    The gene holds 1-2 comma-joined intervals, so its choices are the 2-element
+    combinations of the pool; a one-member pool yields that singleton instead
+    (``combinations`` of one element is empty and :meth:`CategoricalGene.mutate`
+    would then have nothing to choose).  With no pool the result is *exactly* the
+    pre-existing ``combinations(TIMEFRAME_OPTIONS, 2)`` list, so the shipped
+    search space is unchanged.
+    """
+    intervals = list(pool) if pool else list(TIMEFRAME_OPTIONS)
+    return [",".join(combo)
+            for combo in itertools.combinations(intervals, min(2, len(intervals)))]
+
+
+def confine_timeframes(timeframes, pool) -> list[str]:
+    """*timeframes* restricted to *pool* — never empty, shortest first."""
+    allowed = set(pool)
+    kept = sorted({tf for tf in (timeframes or []) if tf in allowed},
+                  key=interval_minutes)
+    return kept or [sorted(set(pool), key=interval_minutes)[0]]
+
+
+def confine_timeframe_gene(chromosome: dict, pool: list[str] | None) -> None:
+    """Rewrite a chromosome's timeframe gene into *pool* (in place, idempotent).
+
+    Both the gene's **value** and its **options** are confined, so a pooled run
+    cannot inherit ``1m`` from a seeded strategy, from a checkpoint written
+    before the pool existed, or from a crossover child.  A falsy ``pool`` is a
+    no-op — the historical genome is untouched.
+    """
+    if not pool:
+        return
+    for gene in chromosome.get("categorical", []) or []:
+        if getattr(gene, "name", "") != "timeframes":
+            continue
+        gene.value = ",".join(confine_timeframes(
+            str(getattr(gene, "value", "") or "").split(","), pool))
+        gene.options = timeframe_gene_options(pool)
+
 
 INDICATOR_NAMES = ["rsi", "macd", "bollinger", "adx", "ema", "atr", "stoch", "cci", "obv", "sma", "hurst", "swing_points", "frac_diff"]
 
@@ -843,8 +956,13 @@ def _randomise_volume_genes(chrom: dict) -> None:
             gene.value = values[gene.name]
 
 
-def strategy_to_chromosome(config: StrategyConfig) -> dict:
+def strategy_to_chromosome(config: StrategyConfig,
+                           timeframe_pool: list[str] | None = None) -> dict:
     """Encode a StrategyConfig into a chromosome dict.
+
+    ``timeframe_pool`` (a job's whitelist, ``None`` = unrestricted) confines the
+    timeframe gene's value *and* options to the pool, so a seeded strategy — an
+    existing YAML that trades ``1m`` — cannot inject a cycle the run excluded.
 
     Returns a dict with keys: continuous, categorical, structural
     that can be mutated and decoded back.
@@ -980,9 +1098,13 @@ def strategy_to_chromosome(config: StrategyConfig) -> dict:
         CategoricalGene("mode", config.mode, MODE_OPTIONS),
     ]
     # Timeframes: store as comma-separated for GA; decode splits back
+    timeframes_value = ",".join(config.timeframes)
+    if timeframe_pool:
+        timeframes_value = ",".join(
+            confine_timeframes(config.timeframes, timeframe_pool))
     categorical.append(
-        CategoricalGene("timeframes", ",".join(config.timeframes),
-                        [",".join(c) for c in itertools.combinations(TIMEFRAME_OPTIONS, 2)]))
+        CategoricalGene("timeframes", timeframes_value,
+                        timeframe_gene_options(timeframe_pool)))
 
     # ── Evolvable entry logic (OR = looser, AND = stricter) ──
     # A first-class ``StrategyConfig`` field (schema-level), so the chromosome
@@ -1029,8 +1151,15 @@ def strategy_to_chromosome(config: StrategyConfig) -> dict:
     }
 
 
-def chromosome_to_strategy(chromosome: dict) -> StrategyConfig:
-    """Decode a chromosome dict back into a StrategyConfig."""
+def chromosome_to_strategy(chromosome: dict,
+                           timeframe_pool: list[str] | None = None) -> StrategyConfig:
+    """Decode a chromosome dict back into a StrategyConfig.
+
+    ``timeframe_pool`` (a job's whitelist, ``None`` = unrestricted) makes the
+    decoded strategy's own ``timeframes`` non-empty and inside the pool — belt
+    and braces on top of the gene confinement, covering a checkpoint written
+    before the pool existed.
+    """
     cont = {g.name: g.value for g in chromosome["continuous"]}
     cat = {g.name: g.value for g in chromosome["categorical"]}
     struct = {g.name: g.conditions for g in chromosome["structural"]}
@@ -1120,6 +1249,8 @@ def chromosome_to_strategy(chromosome: dict) -> StrategyConfig:
     )
 
     timeframes = cat.get("timeframes", DEFAULT_TIMEFRAME).split(",")
+    if timeframe_pool:
+        timeframes = confine_timeframes(timeframes, timeframe_pool)
 
     # ── Condition sanitization ──
     # The old code built the enabled set from the BOOLEAN genes.  A chromosome
@@ -1204,10 +1335,21 @@ def chromosome_to_strategy(chromosome: dict) -> StrategyConfig:
 
 # ── Random initialization ─────────────────────────────────────────────
 
-def random_chromosome(name: str = "ga_strategy") -> dict:
-    """Create a random strategy chromosome with diverse indicator selection."""
+def random_chromosome(name: str = "ga_strategy",
+                      timeframe_pool: list[str] | None = None) -> dict:
+    """Create a random strategy chromosome with diverse indicator selection.
+
+    ``timeframe_pool`` (a job's whitelist, ``None`` = unrestricted) confines the
+    sampled timeframes to the pool, so no genome of a pooled run can pick a cycle
+    the operator excluded.  Without it the sampling — and therefore the RNG
+    stream, the population and the champion — is bit-identical to before.
+    """
     mode = random.choice(MODE_OPTIONS)
-    tfs = random.sample(TIMEFRAME_OPTIONS, k=random.choice([1, 2]))
+    if timeframe_pool:
+        pool = list(timeframe_pool)
+        tfs = random.sample(pool, k=min(random.choice([1, 2]), len(pool)))
+    else:
+        tfs = random.sample(TIMEFRAME_OPTIONS, k=random.choice([1, 2]))
     # Shortest first, using the shared interval registry: an unknown timeframe
     # must not raise a KeyError here.
     tfs.sort(key=interval_minutes)
@@ -1228,7 +1370,7 @@ def random_chromosome(name: str = "ga_strategy") -> dict:
             confidence_threshold=random.uniform(0.55, 0.75),
         ),
     )
-    chrom = strategy_to_chromosome(config)
+    chrom = strategy_to_chromosome(config, timeframe_pool=timeframe_pool)
     # indicator_genes are already set by strategy_to_chromosome based on config.indicators
     # Evolvable entry logic: random init explores both OR and AND.
     chrom["condition_logic"] = random.choice(["or", "or", "and"])

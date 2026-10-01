@@ -196,13 +196,49 @@ def _seed_everything(seed: int) -> None:
     np.random.seed(seed % (2 ** 32))
 
 
+def job_timeframe_pool(job: dict) -> list | None:
+    """Validated ``timeframe_pool`` job field — ``None`` = no restriction.
+
+    The pool is the intervals the GA's timeframe gene may hold (the operator's
+    *tradeable* cycles, e.g. ``["15m","1h","4h"]``).  Validation reuses the
+    canonical interval registry (``core.ga.genome.known_timeframes`` ←
+    ``INTERVAL_SPEC``), and a bad value raises the named
+    ``UnknownTimeframeError``/``TimeframePoolError`` so the job fails **at load**
+    with the offending interval in the message — instead of spending hours on 1m
+    genomes (a 3-month × 3-symbol 1m backtest is ~390 000 bars per symbol, 15× a
+    15m run).  An absent/blank field keeps the historical behaviour exactly.
+    """
+    from core.ga.genome import parse_timeframe_pool
+
+    return parse_timeframe_pool(job.get("timeframe_pool"))
+
+
+def ga_run_config(job: dict, pop_size: int, generations: int, seed: int):
+    """The ``GARunConfig`` for this job — one construction point for GA and WF.
+
+    Carries the validated ``timeframe_pool`` through to the evolver (which
+    confines the timeframe gene to it), alongside the job's worker count/seed.
+    """
+    from core.ga.evolver import GARunConfig
+
+    return GARunConfig(
+        population_size=pop_size,
+        generations=generations,
+        elite_count=max(4, pop_size // 10),
+        immigrant_count=max(4, pop_size // 10),
+        max_workers=job.get("max_workers", 1),  # >1 uses multi-process (safe for TA-Lib)
+        seed=seed,
+        timeframe_pool=job_timeframe_pool(job),
+    )
+
+
 def run_ga(job: dict, job_file: str):
     """Run standard GA evolution."""
     from app.config import Config
     from core.strategy.engine import StrategyEngine
     from core.strategy.loader import StrategyLoader
     from core.backtest.engine import BacktestEngine
-    from core.ga.evolver import GAStrategyEvolver, GARunConfig
+    from core.ga.evolver import GAStrategyEvolver
     from core.risk.manager import RiskManager
     from core.executor.executor import OrderExecutor
     from app.event_bus import EventBus
@@ -236,14 +272,17 @@ def run_ga(job: dict, job_file: str):
     pop_size = min(job.get("population_size", 60), 120)
     generations = min(job.get("generations", 20), 50)
 
-    ga_cfg = GARunConfig(
-        population_size=pop_size,
-        generations=generations,
-        elite_count=max(4, pop_size // 10),
-        immigrant_count=max(4, pop_size // 10),
-        max_workers=job.get("max_workers", 1),  # >1 uses multi-process (safe for TA-Lib)
-        seed=seed,
-    )
+    ga_cfg = ga_run_config(job, pop_size, generations, seed)
+    timeframe_pool = ga_cfg.timeframe_pool
+    if timeframe_pool:
+        logger.info(f"[ga_worker] timeframe_pool={','.join(timeframe_pool)} "
+                    f"(GA timeframe gene confined to these intervals)")
+        # The constraint is visible in the progress file while the run is still
+        # going, i.e. in `ga_job_status.py` and the UI, not only afterwards.
+        update_progress(job_file, {"timeframe_pool": list(timeframe_pool)})
+    else:
+        logger.info("[ga_worker] timeframe_pool=unrestricted "
+                    "(no timeframe_pool in the job file)")
 
     evolver = GAStrategyEvolver(engine, loader, ga_cfg)
 
@@ -274,6 +313,8 @@ def run_ga(job: dict, job_file: str):
         window_key=f"{date_start}~{validation_start or date_end}",
     )
     result["seed"] = seed
+    # Result-side audit: which timeframes this run was allowed to evolve.
+    result["timeframe_pool"] = timeframe_pool
     write_result(job_file, result)
 
 
@@ -283,7 +324,6 @@ def run_walkforward(job: dict, job_file: str):
     from core.strategy.engine import StrategyEngine
     from core.strategy.loader import StrategyLoader
     from core.backtest.engine import BacktestEngine
-    from core.ga.evolver import GARunConfig
     from core.ga.walkforward import WalkForwardRunner, WFConfig
     from core.risk.manager import RiskManager
     from core.executor.executor import OrderExecutor
@@ -316,14 +356,11 @@ def run_walkforward(job: dict, job_file: str):
     pop_size = min(job.get("population_size", 60), 120)
     generations = min(job.get("generations", 20), 50)
 
-    ga_cfg = GARunConfig(
-        population_size=pop_size,
-        generations=generations,
-        elite_count=max(4, pop_size // 10),
-        immigrant_count=max(4, pop_size // 10),
-        max_workers=job.get("max_workers", 1),  # >1 uses multi-process (safe for TA-Lib)
-        seed=seed,
-    )
+    ga_cfg = ga_run_config(job, pop_size, generations, seed)
+    timeframe_pool = ga_cfg.timeframe_pool
+    if timeframe_pool:
+        logger.info(f"[ga_worker] timeframe_pool={','.join(timeframe_pool)} "
+                    f"(per-window GA timeframe gene confined to these intervals)")
 
     wf_cfg = WFConfig(
         enabled=True,
@@ -399,6 +436,7 @@ def run_walkforward(job: dict, job_file: str):
         "type": "walkforward",
         "report": report.to_dict(),
         "seed": seed,
+        "timeframe_pool": timeframe_pool,
     })
 
 
@@ -415,6 +453,13 @@ def main():
         # the same fallback seed.
         job["_job_file"] = args.job_file
 
+        # ── Job-load validation: a bad timeframe pool fails HERE ──
+        # ``job_timeframe_pool`` raises the named ``UnknownTimeframeError`` /
+        # ``TimeframePoolError``, so the job dies at load with the offending
+        # interval in the result file instead of after hours of 1m backtests.
+        # ``None`` (field absent) = the historical, unrestricted behaviour.
+        job["timeframe_pool"] = job_timeframe_pool(job)
+
         update_progress(args.job_file, {
             "phase": "starting",
             "job_type": args.job_type,
@@ -429,7 +474,13 @@ def main():
             run_walkforward(job, args.job_file)
 
     except Exception as e:
-        write_result(args.job_file, {"error": str(e), "traceback": traceback.format_exc()})
+        write_result(args.job_file, {
+            "error": str(e),
+            # The named error class, so a caller can tell a rejected job (bad
+            # timeframe_pool, …) from a crash without parsing the message.
+            "error_type": type(e).__name__,
+            "traceback": traceback.format_exc(),
+        })
 
 
 if __name__ == "__main__":
