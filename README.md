@@ -269,6 +269,20 @@ P4 那批能力此前只能改 Python 常量；现在一个能力一个开关，
 - **评估/执行一致性**：冠军 YAML 过去写 `symbols: []`（= 交易自选列表里的**全部**币），而 GA 只评估了 job 的篮子（如 3 币 vs 自选 5 币）。现在 `evolve()` 把**被评估的篮子**写进冠军的 `symbols:`，执行路径（`core/strategy/engine.py` 的 `_on_kline` / `evaluate_all_now`：`strategy.symbols` 非空时跳过表外币，启动日志 `Strategy '<name>' restricted to symbols: [...]`）因此只能交易它被评估过的币。**未**选择"拒绝启用不匹配的冠军"：限制交易是更安全、无副作用的一侧（老 YAML 的 `symbols: []` 仍表示"不限"，保持向后兼容）。
 - **对照表**：`python tools/ga_benchmark_modes_table.py`（只读：加载 `strategies/` 里的冠军 + 一个内存里新生成的候选，逐模式各跑一次真实回测并打印基准收益、alpha 与门结论）。
 
+### 4.7 GA 检查点保留与续跑（job 字段 `keep_checkpoint`）
+
+`core/ga/evolver.py` 过去在**干净完成**时调用 `clear_checkpoint()`（旧 `evolver.py:422`），所以跑完的任务**没有留下任何可续跑的东西**：检查点是 `<data_dir>/data/ga_checkpoint.pkl`（`evolver.py:144`），上一次运行后它并不存在，`resume=True` 只能救崩溃/手动停止的任务。现在：
+
+| 关注点 | 约定 |
+|---|---|
+| **缺省 = 保留** | job 字段 `keep_checkpoint` 缺失 → `config.ga_keep_checkpoint`（`config/config.yaml` 里 **`keep_checkpoint: true`**，带注释）→ 代码缺省 `True`：**完成的运行保留检查点**，可以稍后在此基础上继续演化（如 12 代之上再跑 20 代） |
+| **显式关闭** | `keep_checkpoint: false`（job 字段或配置键）= **旧行为**：干净完成时删除检查点。**停止/崩溃**的运行无论该键为何值都保留检查点（这是原有的崩溃续跑路径） |
+| **续跑语义** | `resume: true` 从检查点的第 g 代**继续到第 g+1 代**，上界仍是本次 job 的 `generations`：`generations: 32` 从第 12 代的检查点续跑 = 只评估 13..32 代，`result["generations"] == 32`。循环起点由 `evolve()` 里的 `for gen in range(_first_gen, cfg.generations)` 决定（`_first_gen` = 检查点代数，新任务为 0） |
+| **窗口守卫** | 检查点记录 `window_key`；续跑请求的窗口与它**不一致**时抛出**具名** `CheckpointWindowMismatchError`（worker 的 result 里 `error_type` 同名），**拒绝**在另一个窗口上静默续跑。窗口为空的旧检查点不阻拦续跑，且不会覆盖本次运行的窗口 |
+| **试错计数（DSR 诚实性）** | 检查点保存 `prior_trials` + `trials_this_run`，续跑时把二者之和作为**下限**并入 `prior_trials`：即使 `data/ga_trials.json` 被清掉，第 13 代的 DSR 也仍以"已试过的 36 次"去膨胀，而不是从本次 population 重新计数；不会重复计数（`max`，不是相加） |
+| **可审计** | 检查点内含 generation / `window_key` / population hash / symbols / `timeframe_pool` / 试错计数；续跑后的冠军 `provenance` 记录 `keep_checkpoint`、`resumed_from_generation`、`checkpoint{path,kept,generation,window_key,resumed_*,population_hash,symbols,timeframe_pool}` 与 `trials{prior_trials,trials_this_run,resumed_trials,n_trials}`；完成日志 `GA checkpoint kept at <path> (generation g)`（worker 再打一条 `[ga_worker] checkpoint kept/cleared at ...`） |
+| **可见性** | `python scripts/ga_job_status.py`（最新任务或 `--job-id`）打印检查点行：路径、是否存在、**代数、mtime**、窗口、population hash、试错数与"续跑将从第 g+1 代继续"；`--checkpoint-file` 可指向别处。GA 面板新增 **Keep checkpoint** 勾选框（默认勾选），完成的运行还会在状态行显示 "checkpoint kept at generation g" 并显示 Resume 按钮 |
+
 ---
 
 ## 5. 运维
@@ -276,7 +290,7 @@ P4 那批能力此前只能改 Python 常量；现在一个能力一个开关，
 ### 5.1 测试
 
 ```bash
-python -m pytest tests/ --collect-only -q -p no:cacheprovider   # 末行: 1364 tests collected
+python -m pytest tests/ --collect-only -q -p no:cacheprovider   # 末行: 1379 tests collected
 python -m pytest tests/ -q -p no:cacheprovider                  # 全量
 python -m pytest tests/ -q -m "not slow"                        # 跳过慢测
 ```
@@ -286,6 +300,8 @@ python -m pytest tests/ -q -m "not slow"                        # 跳过慢测
 唯一容易被机器负载误报的是 `tests/test_ml_credibility.py::test_feature_pipeline_cost_is_bounded`：它断言特征流水线耗时 `< 3.0 s`，并发压力下会超时失败（实测压力下整跑 1 failed / 1216 passed，同一用例单独运行 1.74s 通过）。看到只有这一条失败时，先单独重跑它再判断。
 
 另一条**与本机环境/缓存有关、与本次改动无关**的失败：`tests/test_meta_labeling.py::test_real_primary_rules_are_refused_by_the_meta_gate`。它在**改动前的 `ba8c212` worktree**（`git worktree add --detach <tmp> ba8c212`，并把本仓库的 `data/market` 以 junction 接进去）用同一份缓存**同样失败**：直接跑是 joblib/loky 的 `_count_physical_cores_win32` 探测（本机没有 `wmic`）抛 `WinError 2` + 解码异常；加 `LOKY_MAX_CPU_COUNT=8` 绕过探测后失败原因变成它自己的断言 `assert gate["allowed"] is False`（`tests/test_meta_labeling.py:401`，本机缓存的最后一版数据上 meta 门放行了一条一级规则）。所以本机 `python -m pytest tests/ -q -p no:cacheprovider` 是 **1363 passed / 1 failed**，去掉这一条是 **1363 passed / 0 failed**。
+
+> 2026-10-01 复测（§4.7 检查点保留改动后，代码冻结）：`python -m pytest tests/ -q -p no:cacheprovider` 连续两次 **1379 passed / 0 failed**（240.96s / 237.74s；新增 `tests/test_ga_checkpoint_resume.py` 13 条 + `tests/test_ga_symbols.py` 2 条），`test_meta_labeling.py::test_real_primary_rules_are_refused_by_the_meta_gate` 两次都通过（该失败依赖当时缓存的数据版本）。`python -m compileall -q app core web db scripts tools` 退出码 0。
 
 **干净克隆的隐含前提**：`data/` 全部 gitignore，所以没有任何缓存历史的克隆直接跑全量**不是全绿**——`tests/test_engine_parity_variants.py` 的 7 个真实数据变体依赖 `2026-05-25..2026-05-31` 的 BTCUSDT + ETHUSDT 1h 缓存（`DATE_START` / `DATE_END` / `SYMBOLS` 就在该文件头部），缺数据时以同一句 `NO_MARKET_DATA_MESSAGE` 失败（`tests/test_hybrid_equivalence.py` 同类用例会 skip）。CI 或新机器先下这段历史即可（下面这条会写 `data/market/`，本次未执行）：
 

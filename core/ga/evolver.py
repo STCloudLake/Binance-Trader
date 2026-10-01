@@ -31,6 +31,17 @@ from core.ga.benchmark import (
 from core.strategy.loader import StrategyLoader
 
 
+class CheckpointWindowMismatchError(RuntimeError):
+    """A ``resume=True`` whose window differs from the checkpoint's window.
+
+    Named — not a bare ``RuntimeError`` — so the refusal is machine-readable:
+    ``scripts/ga_worker.py`` records ``error_type`` in the job's result file, so
+    "refused: wrong window" can be told apart from a crash without parsing text.
+    A resume must never silently evolve a population on a window it was never
+    scored on.
+    """
+
+
 def _inherit_genes_by_name(genes_a: list, genes_b: list) -> list:
     """One child gene per NAME present in either parent, randomly inherited.
 
@@ -76,6 +87,16 @@ class GARunConfig:
     #: operator's config.  Set by ``scripts/ga_worker.py`` from a validated job
     #: field, so a job can pin the mode per run.
     benchmark_mode: str | None = None
+    #: Keep the checkpoint after a **clean** completion?  ``True`` (this default,
+    #: and the shipped ``ga.keep_checkpoint: true``) means a finished run leaves
+    #: ``data/ga_checkpoint.pkl`` behind so evolution can be continued later
+    #: (e.g. another 20 generations on top of a 12-generation run); ``False``
+    #: restores the pre-field behaviour (checkpoint deleted on completion).
+    #: Every layer defaults to **retention**: an absent job field falls through
+    #: to ``config.ga.keep_checkpoint`` and finally to this ``True``.  A run that
+    #: was stopped (or crashed) always keeps its checkpoint — that is the
+    #: pre-existing crash-resume path and is not affected by this flag.
+    keep_checkpoint: bool = True
 
 
 def dsr_trial_counts(prior_trials: int, ledger_total: int, population: int,
@@ -141,6 +162,16 @@ class GAStrategyEvolver:
         self._prior_trials = 0
         #: Trials performed by THIS run's generations so far (the ledger floor).
         self._trials_this_run = 0
+        #: ``ga.keep_checkpoint`` / the job field of the same name.  ``True`` =
+        #: a cleanly completed run keeps its checkpoint for a later resume.
+        self._keep_checkpoint = bool(getattr(self.config, "keep_checkpoint", True))
+        #: Generation this run resumed from (``None`` = a fresh run).
+        self._resumed_from_generation: int | None = None
+        #: What the checkpoint said (window/hash/trials/symbols), so the resumed
+        #: run's provenance can prove what it continued from.
+        self._checkpoint_meta: dict = {}
+        #: The basket this run evolves on (recorded with the checkpoint).
+        self._run_symbols: list = []
         self._checkpoint_path = Path(loader.strategies_dir).parent / "data" / "ga_checkpoint.pkl"
         #: P6-D: one lazily-built volume context per run (None while the
         #: executability model is off for the whole population).
@@ -200,6 +231,9 @@ class GAStrategyEvolver:
         cfg = self.config
         t_start = time.time()
         self._run_t_start = t_start
+        # The evaluated basket — stored with the checkpoint and reported in the
+        # provenance, so a resumed run proves which symbols it continued on.
+        self._run_symbols = list(symbols)
 
         # ── Determinism: seed from the job before anything random happens ──
         import numpy as np
@@ -252,14 +286,35 @@ class GAStrategyEvolver:
                     f"generations={cfg.generations}, "
                     f"train={date_start}~{train_end}"
                     + (f", validate={validation_start}~{date_end}" if has_validation else "")
-                    + f", prior_trials={self._prior_trials}")
+                    + f", prior_trials={self._prior_trials}"
+                    + f", keep_checkpoint={self._keep_checkpoint}")
 
         # ── Initialize or resume ──
-        if resume and self.load_checkpoint():
+        if resume and self.load_checkpoint(expected_window_key=self._window_key):
             # Resume from checkpoint — skip initialization
             self._stagnation_count = 0
+            self._resumed_from_generation = int(self._generation)
+            # ── Trial-count continuity (DSR honesty across a resume) ──
+            # The checkpoint carries the interrupted run's trial accounting
+            # (``prior_trials + trials_this_run`` at its last saved generation).
+            # The resumed segment's DSR must be deflated by those trials, so the
+            # carry is a FLOOR on ``_prior_trials`` (``max``): it can only raise
+            # the count, never lower it — including when the ledger file
+            # (``data/ga_trials.json``) was pruned between the two runs.  The
+            # resumed segment's own trials start at 0 exactly like a fresh run's.
+            _ckpt_trials = int(self._checkpoint_meta.get("trials_total") or 0)
+            self._prior_trials = max(int(self._prior_trials or 0), _ckpt_trials)
+            _ckpt_pop = int(self._checkpoint_meta.get("population_size") or 0)
+            if _ckpt_pop and _ckpt_pop != int(cfg.population_size):
+                logger.warning(
+                    f"GA resume: the checkpoint holds {_ckpt_pop} genomes but "
+                    f"this job asks for population_size={cfg.population_size} — "
+                    f"the continued generation is resized to the job's size")
             logger.info(f"GA resuming from generation {self._generation} "
-                        f"(window {getattr(self, '_window_key', '')})")
+                        f"(window {getattr(self, '_window_key', '')}, "
+                        f"checkpoint trials={_ckpt_trials}, "
+                        f"prior_trials={self._prior_trials}, "
+                        f"population_hash={self._checkpoint_meta.get('population_hash')})")
         else:
             self._population = self._init_population(seed_strategies)
             self._generation = 0
@@ -267,6 +322,7 @@ class GAStrategyEvolver:
             self._best_chromosome = None
             self._stagnation_count = 0
             self._history = []
+            self._resumed_from_generation = None
 
         # ── Confine the whole population to the job's timeframe pool ──
         # Covers a resumed checkpoint, a seeded strategy and any genome created
@@ -276,7 +332,18 @@ class GAStrategyEvolver:
                 confine_timeframe_gene(chrom, timeframe_pool)
 
         # ── Evolution loop ──
-        for gen in range(cfg.generations):
+        # The loop's START is the checkpoint's generation (0 for a fresh run):
+        # a resumed run continues at g+1 and the upper bound stays the JOB's
+        # ``generations``.  ``generations: 32`` resumed from a checkpoint at 12
+        # therefore runs 13..32 and reports 32; it no longer re-numbers the
+        # loaded population from generation 1.
+        _first_gen = int(self._generation or 0)
+        if _first_gen >= int(cfg.generations):
+            logger.warning(
+                f"GA resume: checkpoint is already at generation {_first_gen} "
+                f">= generations={cfg.generations} — nothing left to evolve; "
+                f"the checkpointed champion is published as-is")
+        for gen in range(_first_gen, cfg.generations):
             if not self._running:
                 break
 
@@ -418,8 +485,32 @@ class GAStrategyEvolver:
         self._running = False
         elapsed = time.time() - t_start
 
+        # ── Checkpoint retention (``keep_checkpoint``) ──
+        # A CLEAN completion (a champion exists and the run was not asked to
+        # stop) used to unconditionally delete the checkpoint, so a finished job
+        # left nothing to resume from.  Retention is now the default; only an
+        # explicit ``keep_checkpoint: false`` reproduces the old behaviour.
+        # A stopped run always keeps it — that is the crash-resume path.
+        checkpoint_note = ""
         if self._best_chromosome and not self._stop_after_gen:
-            self.clear_checkpoint()  # clean completion — no resume needed
+            if self._keep_checkpoint:
+                checkpoint_note = (f"checkpoint kept at {self._checkpoint_path} "
+                                   f"(generation {self._generation})")
+            else:
+                self.clear_checkpoint()
+                checkpoint_note = (f"checkpoint cleared at {self._checkpoint_path} "
+                                   f"(generation {self._generation})")
+            logger.info(f"GA {checkpoint_note}")
+        elif self._checkpoint_path.exists():
+            # No champion (nothing scored above the floor) or a graceful stop:
+            # both keep the checkpoint so the run remains resumable — the old
+            # code left it in place here too.
+            why = ("run stopped, resumable" if self._stop_after_gen
+                   else "no champion scored, resumable")
+            checkpoint_note = (f"checkpoint kept at {self._checkpoint_path} "
+                               f"(generation {self._generation}) — {why}")
+            logger.info(f"GA {checkpoint_note}")
+        checkpoint_kept = self._checkpoint_path.exists()
 
         if self._best_chromosome:
             champion_config = chromosome_to_strategy(
@@ -515,6 +606,49 @@ class GAStrategyEvolver:
                 "population_size": cfg.population_size,
                 "n_trials": n_trials,
                 "prior_trials": int(getattr(self, "_prior_trials", 0)),
+                # ── Checkpoint retention + resume identity ──────────────────
+                # Whether a cleanly completed run kept ``data/ga_checkpoint.pkl``
+                # (the job's ``keep_checkpoint`` / ``ga.keep_checkpoint``) and
+                # what a resumed run continued FROM, so the continuation is
+                # auditable from the champion YAML alone.
+                "keep_checkpoint": bool(self._keep_checkpoint),
+                "resumed_from_generation": self._resumed_from_generation,
+                "checkpoint": {
+                    "path": str(self._checkpoint_path),
+                    "kept": bool(checkpoint_kept),
+                    "keep_checkpoint": bool(self._keep_checkpoint),
+                    "generation": int(self._generation),
+                    "window_key": getattr(self, "_window_key", ""),
+                    "resumed": self._resumed_from_generation is not None,
+                    "resumed_from_generation": self._resumed_from_generation,
+                    "resumed_population_hash": self._checkpoint_meta.get(
+                        "population_hash"),
+                    "resumed_trials": self._checkpoint_meta.get("trials_total"),
+                    "resumed_symbols": list(self._checkpoint_meta.get("symbols") or []),
+                    "resumed_timeframe_pool": list(
+                        self._checkpoint_meta.get("timeframe_pool") or []),
+                    "resumed_population_size": self._checkpoint_meta.get(
+                        "population_size"),
+                    "population_hash": self.population_hash(),
+                    "population_size": cfg.population_size,
+                    "symbols": list(symbols),
+                    "timeframe_pool": (list(cfg.timeframe_pool)
+                                       if cfg.timeframe_pool else None),
+                    "trials_this_run": int(getattr(self, "_trials_this_run", 0) or 0),
+                },
+                # ── Trial accounting across a resume (DSR honesty) ──────────
+                # ``prior_trials`` = everything performed BEFORE this invocation
+                # (the ledger, floored by the checkpoint's carry on a resume);
+                # ``trials_this_run`` = the generations THIS invocation actually
+                # performed (on a resume: the 13..32 segment, not 1..32);
+                # ``n_trials`` above is ``prior_trials + trials_this_run`` = the
+                # cumulative count the deployment's DSR was deflated by.
+                "trials": {
+                    "prior_trials": int(getattr(self, "_prior_trials", 0)),
+                    "trials_this_run": int(getattr(self, "_trials_this_run", 0) or 0),
+                    "resumed_trials": self._checkpoint_meta.get("trials_total"),
+                    "n_trials": int(n_trials),
+                },
                 "fitness_components": {
                     "fitness": train_result.get("fitness"),
                     "fitness_base": train_result.get("fitness_base"),
@@ -603,6 +737,14 @@ class GAStrategyEvolver:
                 "enabled": published,
                 "seed": provenance["seed"],
                 "timeframe_pool": provenance["timeframe_pool"],
+                # Checkpoint retention + what this run continued from, at the
+                # top level of the result as well as inside ``provenance``
+                # (``scripts/ga_worker.py`` logs it and the status CLI reads it).
+                "keep_checkpoint": provenance["keep_checkpoint"],
+                "resumed_from_generation": provenance["resumed_from_generation"],
+                "checkpoint": provenance["checkpoint"],
+                "checkpoint_note": checkpoint_note,
+                "trials": provenance["trials"],
                 # The benchmark this run's gate consumed + the full report.
                 "benchmark_mode": provenance["benchmark"]["mode"],
                 "benchmark": provenance["benchmark"],
@@ -922,6 +1064,37 @@ class GAStrategyEvolver:
 
     # ── Checkpoint / Resume ────────────────────────────────────────
 
+    def population_hash(self) -> str:
+        """``sha256`` (first 16 hex) of the population's gene content.
+
+        Order-sensitive (the population IS fitness-sorted after every
+        generation), so a resumed run's provenance can prove which population it
+        continued from.  Genes are reduced to ``(name, value)`` / structural
+        genes to their conditions — a hash of the pickle itself would move with
+        interpreter details for identical content.
+        """
+        import hashlib
+
+        def _values(genes):
+            return tuple(sorted(
+                (str(getattr(g, "name", "")), repr(getattr(g, "value", None)))
+                for g in genes or []))
+
+        items = []
+        for chrom in self._population:
+            items.append((
+                str(chrom.get("name", "")),
+                str(chrom.get("condition_logic", "")),
+                _values(chrom.get("continuous")),
+                _values(chrom.get("categorical")),
+                _values(chrom.get("indicator_genes")),
+                tuple(sorted(
+                    (str(getattr(g, "name", "")),
+                     tuple(getattr(g, "conditions", None) or []))
+                    for g in chrom.get("structural", []) or [])),
+            ))
+        return hashlib.sha256(repr(items).encode("utf-8")).hexdigest()[:16]
+
     def _save_checkpoint(self):
         """Save current GA state to disk for resume."""
         try:
@@ -935,6 +1108,22 @@ class GAStrategyEvolver:
                 "config": self.config,
                 "window_key": getattr(self, "_window_key", ""),
                 "seed": getattr(self, "_seed", 0),
+                # ── Trial accounting (DSR honesty across a resume) ──
+                # Everything the resumed segment must be deflated by.  Before
+                # this the checkpoint carried NO trial count, so a resume whose
+                # ledger was pruned restarted the DSR's N at the job's
+                # population instead of the trials actually performed.
+                "prior_trials": int(getattr(self, "_prior_trials", 0) or 0),
+                "trials_this_run": int(getattr(self, "_trials_this_run", 0) or 0),
+                # ── Identity: what a resumed run continues from ──
+                "population_hash": self.population_hash(),
+                "symbols": list(getattr(self, "_run_symbols", []) or []),
+                "timeframe_pool": (list(self.config.timeframe_pool)
+                                   if getattr(self.config, "timeframe_pool", None)
+                                   else []),
+                "resumed_from_generation": self._resumed_from_generation,
+                "keep_checkpoint": bool(self._keep_checkpoint),
+                "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             }
             self._checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self._checkpoint_path, "wb") as f:
@@ -942,23 +1131,69 @@ class GAStrategyEvolver:
         except Exception as e:
             logger.warning(f"GA checkpoint save failed: {e}")
 
-    def load_checkpoint(self) -> bool:
-        """Load saved GA state. Returns True if checkpoint was loaded."""
+    def load_checkpoint(self, expected_window_key: str | None = None) -> bool:
+        """Load saved GA state. Returns True if checkpoint was loaded.
+
+        Parameters
+        ----------
+        expected_window_key : str | None
+            The window this run is about to evolve on.  When given and the
+            checkpoint records a **different, non-empty** window the resume is
+            REFUSED with :class:`CheckpointWindowMismatchError` — continuing
+            would silently evolve a population on a window it was never scored
+            on, publishing a champion whose provenance claims the old window.
+            The check runs outside the loader's ``except Exception`` so a refusal
+            can never be swallowed into a quiet "no checkpoint".
+        """
+        import pickle
         try:
-            import pickle
             if not self._checkpoint_path.exists():
                 return False
             with open(self._checkpoint_path, "rb") as f:
                 state = pickle.load(f)
+        except Exception as e:
+            logger.warning(f"GA checkpoint load failed: {e}")
+            return False
+
+        ckpt_window = str(state.get("window_key", "") or "")
+        requested = str(expected_window_key or "")
+        if requested and ckpt_window and ckpt_window != requested:
+            raise CheckpointWindowMismatchError(
+                f"checkpoint {self._checkpoint_path} belongs to window "
+                f"'{ckpt_window}' but this run requested '{requested}' — "
+                f"refusing to resume on a different window (start a fresh run "
+                f"without resume=True, or use the checkpoint's window)")
+
+        try:
             self._population = state["population"]
             self._generation = state["generation"]
             self._best_fitness = state["best_fitness"]
             self._best_chromosome = state["best_chromosome"]
             self._history = state["history"]
-            self._window_key = state.get("window_key", getattr(self, "_window_key", ""))
+            if ckpt_window:
+                # Only a NON-EMPTY checkpoint window may overwrite the run's
+                # window; an empty one (pre-``window_key`` checkpoint) leaves the
+                # run's own key intact.
+                self._window_key = ckpt_window
+            self._checkpoint_meta = {
+                "generation": int(state.get("generation", 0) or 0),
+                "window_key": ckpt_window,
+                "population_hash": state.get("population_hash"),
+                "prior_trials": int(state.get("prior_trials", 0) or 0),
+                "trials_this_run": int(state.get("trials_this_run", 0) or 0),
+                # The number the resumed segment's DSR must be floored by.
+                "trials_total": (int(state.get("prior_trials", 0) or 0)
+                                 + int(state.get("trials_this_run", 0) or 0)),
+                "symbols": list(state.get("symbols", []) or []),
+                "timeframe_pool": list(state.get("timeframe_pool", []) or []),
+                "population_size": len(state.get("population") or []),
+                "saved_at": state.get("saved_at"),
+            }
             logger.info(f"GA checkpoint loaded: gen={self._generation}, "
                        f"best_fitness={self._best_fitness:.2f}, "
-                       f"window={self._window_key}")
+                       f"window={self._window_key}, "
+                       f"trials={self._checkpoint_meta['trials_total']}, "
+                       f"population_hash={self._checkpoint_meta['population_hash']}")
             return True
         except Exception as e:
             logger.warning(f"GA checkpoint load failed: {e}")

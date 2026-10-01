@@ -232,12 +232,31 @@ def job_benchmark_mode(job: dict) -> str | None:
     return parse_benchmark_mode(raw)
 
 
-def ga_run_config(job: dict, pop_size: int, generations: int, seed: int):
+def job_keep_checkpoint(job: dict, config=None) -> bool:
+    """``keep_checkpoint`` for this job — retention unless explicitly disabled.
+
+    Precedence: the job field → ``config.ga_keep_checkpoint`` (shipped ``true``)
+    → ``True``.  **An absent field means retention**, so a cleanly completed run
+    keeps ``data/ga_checkpoint.pkl`` for a later ``resume: true``; only an
+    explicit ``false`` (job field or config key) deletes it on completion.  A run
+    that is stopped/crashed keeps its checkpoint regardless.
+    """
+    raw = job.get("keep_checkpoint", None)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        raw = getattr(config, "ga_keep_checkpoint", True)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def ga_run_config(job: dict, pop_size: int, generations: int, seed: int,
+                  config=None):
     """The ``GARunConfig`` for this job — one construction point for GA and WF.
 
     Carries the validated ``timeframe_pool`` through to the evolver (which
-    confines the timeframe gene to it), alongside the job's worker count/seed
-    and its validated ``benchmark_mode`` (``None`` = the config's mode).
+    confines the timeframe gene to it), alongside the job's worker count/seed,
+    its validated ``benchmark_mode`` (``None`` = the config's mode) and its
+    ``keep_checkpoint`` choice (job field → ``ga.keep_checkpoint`` → retention).
     """
     from core.ga.evolver import GARunConfig
 
@@ -250,6 +269,7 @@ def ga_run_config(job: dict, pop_size: int, generations: int, seed: int):
         seed=seed,
         timeframe_pool=job_timeframe_pool(job),
         benchmark_mode=job_benchmark_mode(job),
+        keep_checkpoint=job_keep_checkpoint(job, config),
     )
 
 
@@ -293,7 +313,7 @@ def run_ga(job: dict, job_file: str):
     pop_size = min(job.get("population_size", 60), 120)
     generations = min(job.get("generations", 20), 50)
 
-    ga_cfg = ga_run_config(job, pop_size, generations, seed)
+    ga_cfg = ga_run_config(job, pop_size, generations, seed, config)
     timeframe_pool = ga_cfg.timeframe_pool
     if timeframe_pool:
         logger.info(f"[ga_worker] timeframe_pool={','.join(timeframe_pool)} "
@@ -348,6 +368,19 @@ def run_ga(job: dict, job_file: str):
     result["timeframe_pool"] = timeframe_pool
     # ... and which benchmark its gate consumed.
     result["benchmark_mode"] = benchmark_mode
+    # Checkpoint retention, on the job log (tail-able without the UI) and in the
+    # result.  The evolver logs the same decision; this line ties it to the job.
+    checkpoint = result.get("checkpoint") or {}
+    if checkpoint:
+        logger.info(
+            f"[ga_worker] checkpoint "
+            f"{'kept' if checkpoint.get('kept') else 'cleared'} at "
+            f"{checkpoint.get('path')} (generation "
+            f"{checkpoint.get('generation')})"
+            + (f" resumed_from_generation="
+               f"{result.get('resumed_from_generation')}"
+               if result.get("resumed_from_generation") else ""))
+    result["keep_checkpoint"] = bool(ga_cfg.keep_checkpoint)
     write_result(job_file, result)
 
 
@@ -389,7 +422,7 @@ def run_walkforward(job: dict, job_file: str):
     pop_size = min(job.get("population_size", 60), 120)
     generations = min(job.get("generations", 20), 50)
 
-    ga_cfg = ga_run_config(job, pop_size, generations, seed)
+    ga_cfg = ga_run_config(job, pop_size, generations, seed, config)
     timeframe_pool = ga_cfg.timeframe_pool
     if timeframe_pool:
         logger.info(f"[ga_worker] timeframe_pool={','.join(timeframe_pool)} "
@@ -470,6 +503,9 @@ def run_walkforward(job: dict, job_file: str):
         "report": report.to_dict(),
         "seed": seed,
         "timeframe_pool": timeframe_pool,
+        # Each window's GA keeps its checkpoint after a clean completion when
+        # this is true (the walk-forward's own resume state is separate).
+        "keep_checkpoint": bool(ga_cfg.keep_checkpoint),
         "benchmark_mode": (ga_cfg.benchmark_mode
                            or getattr(config, "ga_benchmark_mode", None)),
     })

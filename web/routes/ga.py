@@ -255,6 +255,10 @@ _ga_state = {
     # already rendered them — the DSR/WF block was dead UI) ──
     "validation": None, "dsr": None, "provenance": None,
     "published": None, "rejection_reasons": [], "seed": 0,
+    # ── Checkpoint retention: the ``keep_checkpoint`` the job was started with,
+    # the result's checkpoint block (path/kept/generation) and whether a resume
+    # would continue the run — so the panel can offer Resume truthfully ──
+    "keep_checkpoint": True, "checkpoint": None, "resumable": False,
     # ── The job's timeframe whitelist (``None``/``[]`` = unrestricted); the
     # worker re-publishes the effective pool in its progress payload ──
     "timeframe_pool": None,
@@ -298,6 +302,12 @@ def register(app: FastAPI, ctx) -> None:
         max_workers = _int_param(body, "max_workers", 1, minimum=1, maximum=16)  # clamp 1-16
         seed_strategies = _list_param(body, "seed_strategies")
         resume = _bool_param(body, "resume", False)
+        # ── Checkpoint retention (job field ``keep_checkpoint``) ──
+        # Absent → True (retention): a cleanly completed run keeps
+        # ``data/ga_checkpoint.pkl`` so it can be resumed later.  The worker
+        # falls back to ``config.ga_keep_checkpoint`` and then to True, so an old
+        # job file without the field means retention too.
+        keep_checkpoint = _bool_param(body, "keep_checkpoint", True)
         # ── Reproducibility: every job carries a seed ──
         # 0/absent → a fresh seed (recorded in the job file and the provenance
         # block), so a caller can replay the exact same run.
@@ -352,6 +362,7 @@ def register(app: FastAPI, ctx) -> None:
             "spread_pct": spread_pct,
             "resume": resume,
             "seed": seed,
+            "keep_checkpoint": keep_checkpoint,
         }
         # Only written when the operator restricted the cycles: a default job
         # file stays byte-identical to the pre-``timeframe_pool`` payload.
@@ -389,6 +400,9 @@ def register(app: FastAPI, ctx) -> None:
             "eval_equivalent": 0.0, "avg_fitness": 0,
             "progress_updated_at": None, "progress": None,
             "history": [], "error": None, "stopped": False, "resumable": False,
+            # Whether a clean completion keeps the checkpoint (job field →
+            # `ga.keep_checkpoint`), plus the result's checkpoint block.
+            "checkpoint": None, "keep_checkpoint": keep_checkpoint,
             "checkpoint_gen": 0, "job_file": job_file,
             "validation": None, "dsr": None, "provenance": None,
             "published": None, "rejection_reasons": [], "seed": seed,
@@ -401,6 +415,7 @@ def register(app: FastAPI, ctx) -> None:
                 "symbols": symbols,
                 "seed": seed,
                 "timeframe_pool": list(timeframe_pool),
+                "keep_checkpoint": keep_checkpoint,
                 "mode": "ga",
             },
         })
@@ -448,6 +463,16 @@ def register(app: FastAPI, ctx) -> None:
                                     "rejection_reasons", []) or []
                                 _ga_state["seed"] = result.get(
                                     "seed", _ga_state.get("seed", 0))
+                                # Checkpoint retention: `resumable` was declared
+                                # in this state dict and never set, so the panel's
+                                # Resume button could never appear.  A kept
+                                # checkpoint means a resume really can continue
+                                # (at generation g+1), so it is set from the
+                                # result the evolver wrote.
+                                _ckpt = result.get("checkpoint") or {}
+                                _ga_state["checkpoint"] = _ckpt or None
+                                _ga_state["resumable"] = bool(_ckpt.get("kept"))
+                                _ga_state["checkpoint_gen"] = _ckpt.get("generation", 0)
                         else:
                             _ga_state["running"] = False
                             _ga_state["error"] = f"Worker exited with code {poll_result}"
@@ -536,6 +561,9 @@ def register(app: FastAPI, ctx) -> None:
         generations = _int_param(body, "generations", 20, maximum=50)
         max_workers = _int_param(body, "max_workers", 1, minimum=1, maximum=16)  # clamp 1-16
         resume = _bool_param(body, "resume", False)
+        # Same job field as ``/api/ga/evolve``: each window's GA keeps its
+        # checkpoint after a clean completion unless this is false.
+        keep_checkpoint = _bool_param(body, "keep_checkpoint", True)
 
         # ── Timeframe whitelist (shared with the GA endpoint / the same panel) ──
         try:
@@ -575,6 +603,7 @@ def register(app: FastAPI, ctx) -> None:
             "taker_fee_pct": taker_fee_pct,
             "spread_pct": spread_pct,
             "resume": resume,
+            "keep_checkpoint": keep_checkpoint,
         }
         if timeframe_pool:
             job_data["timeframe_pool"] = list(timeframe_pool)
@@ -606,6 +635,7 @@ def register(app: FastAPI, ctx) -> None:
             "completed": [], "report": None, "error": None,
             "started": t0, "elapsed_seconds": 0, "phase": "init",
             "job_file": job_file,
+            "keep_checkpoint": keep_checkpoint,
             "params": {
                 "date_start": date_start, "date_end": date_end,
                 "train_months": train_months, "val_months": val_months,
@@ -614,6 +644,7 @@ def register(app: FastAPI, ctx) -> None:
                 "max_workers": max_workers,
                 "symbols": symbols,
                 "timeframe_pool": list(timeframe_pool),
+                "keep_checkpoint": keep_checkpoint,
                 "mode": "walkforward",
             },
         })

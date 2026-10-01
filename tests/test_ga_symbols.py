@@ -373,3 +373,57 @@ def test_worker_fallback_without_a_usable_db(monkeypatch):
     monkeypatch.setattr(worker, "_watchlist_fallback", lambda config: [])
     assert worker.job_symbols({}, SimpleNamespace(db_path="unused.db")) == \
         worker.DEFAULT_FALLBACK_SYMBOLS
+
+
+# ======================================================================
+# checkpoint retention (`keep_checkpoint`) reaches the job file
+# ======================================================================
+def test_evolve_writes_keep_checkpoint_defaulting_to_retention(trader_client):
+    """An absent field means ``true`` — a completed run keeps its checkpoint."""
+    response = trader_client.post("/api/ga/evolve", json={
+        "symbols": ["ADAUSDT"], "population_size": 4, "generations": 2})
+    assert response.status_code == 200, response.text
+    job = _job(routes_ga._ga_state["job_file"])
+    assert job["keep_checkpoint"] is True
+    assert routes_ga._ga_state["params"]["keep_checkpoint"] is True
+    assert routes_ga._ga_state["keep_checkpoint"] is True
+
+    # An explicit false is honoured (and is the only way to opt out).
+    response = trader_client.post("/api/ga/evolve", json={
+        "symbols": ["ADAUSDT"], "population_size": 4, "generations": 2,
+        "keep_checkpoint": False})
+    assert response.status_code == 200, response.text
+    assert _job(routes_ga._ga_state["job_file"])["keep_checkpoint"] is False
+
+    # The walk-forward route carries the same field.
+    response = trader_client.post("/api/ga/walkforward", data={
+        "symbols": "ADAUSDT", "population_size": "4", "generations": "2",
+        "keep_checkpoint": "false"})
+    assert response.status_code == 200, response.text
+    assert _job(routes_ga._wf_state["job_file"])["keep_checkpoint"] is False
+
+
+def test_worker_resolves_keep_checkpoint_field_config_then_default():
+    """job field → ``config.ga_keep_checkpoint`` → retention (``True``)."""
+    worker = _worker_module()
+    assert worker.job_keep_checkpoint({}) is True                       # default
+    assert worker.job_keep_checkpoint({}, SimpleNamespace()) is True
+    assert worker.job_keep_checkpoint({}, SimpleNamespace(
+        ga_keep_checkpoint=False)) is False
+    assert worker.job_keep_checkpoint({"keep_checkpoint": False},
+                                      SimpleNamespace(ga_keep_checkpoint=True)) is False
+    assert worker.job_keep_checkpoint({"keep_checkpoint": True},
+                                      SimpleNamespace(ga_keep_checkpoint=False)) is True
+    # Form-field strings from the panel behave like booleans; a blank field
+    # falls through to the config (it is not an explicit "off").
+    assert worker.job_keep_checkpoint({"keep_checkpoint": "false"}) is False
+    assert worker.job_keep_checkpoint({"keep_checkpoint": "true"}) is True
+    assert worker.job_keep_checkpoint({"keep_checkpoint": "  "},
+                                      SimpleNamespace(ga_keep_checkpoint=False)) is False
+    # The GARunConfig the worker builds carries it through to the evolver.
+    cfg = worker.ga_run_config({"population_size": 4, "generations": 2,
+                                "keep_checkpoint": False}, 4, 2, 7,
+                               SimpleNamespace(ga_keep_checkpoint=True))
+    assert cfg.keep_checkpoint is False
+    assert cfg.population_size == 4 and cfg.generations == 2
+

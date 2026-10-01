@@ -191,7 +191,7 @@ class WalkForwardRunner:
         Returns:
             WFReport with per-window results and aggregate metrics.
         """
-        from core.ga.evolver import GAStrategyEvolver
+        from core.ga.evolver import GAStrategyEvolver, CheckpointWindowMismatchError
 
         windows = self.compute_windows(date_start, date_end, wf_config)
         if not windows:
@@ -253,14 +253,34 @@ class WalkForwardRunner:
             bars = self._assert_window(val_start, val_end, symbols)
             logger.info(f"WF window {i + 1}: OOS {val_start}~{val_end} = {bars} bars")
 
-            champion = evolver.evolve(
-                symbols, tr_start, val_end,
-                seed_strategies=seed_strategies,
-                validation_start=val_start,
-                resume=resume,
-                seed=getattr(ga_config, "seed", 0) or None,
-                window_key=f"{tr_start}~{tr_end}|{val_start}~{val_end}",
-            )
+            window_key = f"{tr_start}~{tr_end}|{val_start}~{val_end}"
+
+            def _run_window_ga(resume_ga: bool) -> dict:
+                return evolver.evolve(
+                    symbols, tr_start, val_end,
+                    seed_strategies=seed_strategies,
+                    validation_start=val_start,
+                    resume=resume_ga,
+                    seed=getattr(ga_config, "seed", 0) or None,
+                    window_key=window_key,
+                )
+
+            # ── GA-level resume belongs to the FIRST window of this WF run ──
+            # ``evolve(resume=True)`` loads the one fixed checkpoint
+            # (``data/ga_checkpoint.pkl``).  That file survives a clean
+            # completion now (``keep_checkpoint`` defaults to retention), so from
+            # the second window of a resumed walk-forward on it belongs to the
+            # PREVIOUS window and the evolver refuses the mismatch by name.  The
+            # refusal is correct for a GA job and wrong for walk-forward (whose
+            # own resume state is ``ga_wf_state.json``): log it and start this
+            # window's GA fresh rather than failing the whole run.
+            try:
+                champion = _run_window_ga(bool(resume) and i == start_window)
+            except CheckpointWindowMismatchError as exc:
+                logger.warning(
+                    f"WF window {i + 1}: the GA checkpoint belongs to another "
+                    f"window — starting this window's GA fresh ({exc})")
+                champion = _run_window_ga(False)
 
             val_data = champion.get("validation", {}) or {}
             result = WindowResult(

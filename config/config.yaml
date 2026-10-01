@@ -87,6 +87,18 @@ ga:
   # Jensen-style alpha and the per-trade net edge are recorded in the champion
   # provenance (reported, never gated).
   benchmark_mode: exposure_matched
+  # Keep `data/ga_checkpoint.pkl` after a GA run that completed CLEANLY, so
+  # evolution can be continued later (`resume: true`, e.g. another 20
+  # generations on top of a 12-generation run).  true = retention: the
+  # checkpoint records its generation, `window_key`, population hash, symbols,
+  # timeframe pool and the DSR trial count, and `scripts/ga_job_status.py`
+  # prints them.  false = the previous behaviour (deleted on completion, so only
+  # a stopped or crashed run leaves one).  A run that is STOPPED keeps its
+  # checkpoint either way.  Precedence: `keep_checkpoint` job field (the GA
+  # panel checkbox) -> this key -> code default true.  A resume whose window
+  # differs from the checkpoint's `window_key` is refused with the named
+  # `CheckpointWindowMismatchError`.
+  keep_checkpoint: true
 binance:
   # Trading/account client (orders, balances). testnet.binance.vision is reachable.
   testnet: true

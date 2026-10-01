@@ -718,6 +718,15 @@ class Config:
         # instead of silently selecting a different gate.
         from core.ga.benchmark import parse_benchmark_mode
         self.ga_benchmark_mode = parse_benchmark_mode(ga_cfg.get("benchmark_mode"))
+        # Keep ``data/ga_checkpoint.pkl`` after a GA run that completed CLEANLY
+        # (``ga.keep_checkpoint``, shipped ``true``).  Retention is the default at
+        # every layer — this key, the ``keep_checkpoint`` job field and
+        # ``GARunConfig.keep_checkpoint`` all fall back to ``True`` — so a
+        # finished run can be continued later (e.g. another 20 generations on top
+        # of 12).  ``false`` restores the old behaviour (checkpoint deleted on
+        # completion); a stopped/crashed run keeps it either way.  Read by
+        # ``scripts/ga_worker.py::job_keep_checkpoint``.
+        self.ga_keep_checkpoint = _as_bool(ga_cfg.get("keep_checkpoint"), True)
 
         # Simulated-account cost model (docs/overhaul/TRADE_PAGE_API.md §五之二).
         # Deliberately separate from `backtest.cost_model` above: the backtest model

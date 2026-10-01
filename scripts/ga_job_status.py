@@ -7,7 +7,9 @@
 
 Prints the progress JSON, wall-clock elapsed time, the worker processes
 (CPU seconds + RSS, matched by command line), the job log's mtime / size /
-line count and the last log lines.
+line count, the last log lines, and the GA **checkpoint** this job would resume
+from (``data/ga_checkpoint.pkl``: whether it exists, its generation, window_key
+and mtime — ``--checkpoint-file`` overrides the path).
 
 Exit codes
     0  job running and its progress file is fresh
@@ -105,6 +107,55 @@ def tail_lines(path: Path, n: int) -> list:
     except Exception:
         return []
     return lines[-n:]
+
+
+# ── GA checkpoint (what a ``resume: true`` job would continue from) ─────────
+
+def checkpoint_path_for(args) -> Path:
+    """The evolver's checkpoint: a sibling of the jobs directory.
+
+    Mirrors ``GAStrategyEvolver._checkpoint_path``
+    (``<data_dir>/data/ga_checkpoint.pkl``): ``data/ga_jobs/x.json`` →
+    ``data/ga_checkpoint.pkl``.  ``--checkpoint-file`` overrides it.
+    """
+    if args.checkpoint_file:
+        return Path(args.checkpoint_file)
+    jobs_dir = Path(args.jobs_dir) if args.jobs_dir else DEFAULT_JOBS_DIR
+    return jobs_dir.parent / "ga_checkpoint.pkl"
+
+
+def checkpoint_stats(path: Path) -> dict:
+    """exists / mtime / generation / window_key / hash of *path* (read-only).
+
+    The generation lives inside the evolver's pickle, written by
+    ``GAStrategyEvolver._save_checkpoint`` and read here with ``pickle.load``
+    (this tool only ever reads the files the app itself produced).  Every
+    metadata field is optional, so a checkpoint written by an older build still
+    reports its file stats; an unreadable one reports why instead of raising.
+    """
+    out = {"path": str(path), "exists": path.exists()}
+    if not out["exists"]:
+        return out
+    st = path.stat()
+    out["mtime"] = st.st_mtime
+    out["mtime_iso"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(st.st_mtime))
+    out["size"] = st.st_size
+    try:
+        import pickle
+        with open(path, "rb") as f:
+            state = pickle.load(f)
+        if isinstance(state, dict):
+            out["generation"] = state.get("generation")
+            out["window_key"] = state.get("window_key")
+            out["population_hash"] = state.get("population_hash")
+            out["population_size"] = len(state.get("population") or [])
+            out["prior_trials"] = state.get("prior_trials")
+            out["trials_this_run"] = state.get("trials_this_run")
+            out["keep_checkpoint"] = state.get("keep_checkpoint")
+            out["saved_at"] = state.get("saved_at")
+    except Exception as e:
+        out["read_error"] = f"{type(e).__name__}: {e}"
+    return out
 
 
 # ── process inventory (matched by command line) ─────────────────────────────
@@ -277,6 +328,10 @@ def collect(args) -> dict:
     log = file_stats(log_file)
     log["tail"] = tail_lines(log_file, args.tail)
 
+    checkpoint = checkpoint_stats(checkpoint_path_for(args))
+    result = read_json(result_file)
+    result = result if isinstance(result, dict) else {}
+
     return {
         "found": True,
         "job_file": str(job_file),
@@ -290,7 +345,11 @@ def collect(args) -> dict:
         "processes": procs,
         "running": running,
         "log": log,
+        "checkpoint": checkpoint,
         "result_file_exists": result_file.exists(),
+        "result_keep_checkpoint": result.get("keep_checkpoint"),
+        "result_resumed_from_generation": result.get("resumed_from_generation"),
+        "result_checkpoint": result.get("checkpoint"),
         "now": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
 
@@ -309,8 +368,40 @@ def render(info: dict, tail: int) -> str:
     out.append(f"job params     : pop={job.get('population_size')} "
                f"gens={job.get('generations')} workers={job.get('max_workers')} "
                f"tf_pool={pool or 'unrestricted'} "
+               f"keep_ckpt={job.get('keep_checkpoint', 'default(true)')} "
                f"window={job.get('date_start')}~{job.get('date_end')} "
                f"symbols={len(job.get('symbols') or [])}")
+    ckpt = info.get("checkpoint") or {}
+    if ckpt.get("exists"):
+        detail = f"generation={ckpt.get('generation')}"
+        if ckpt.get("window_key"):
+            detail += f" window={ckpt['window_key']}"
+        if ckpt.get("population_hash"):
+            detail += (f" pop={ckpt.get('population_size')}"
+                       f" hash={ckpt['population_hash']}")
+        if ckpt.get("prior_trials") is not None:
+            trials = int(ckpt.get("prior_trials") or 0) + int(
+                ckpt.get("trials_this_run") or 0)
+            detail += f" trials={trials}"
+        if ckpt.get("saved_at"):
+            detail += f" saved={ckpt['saved_at']}"
+        out.append(f"checkpoint     : {ckpt['path']} exists=True "
+                   f"mtime={ckpt['mtime_iso']} size={ckpt.get('size')}B {detail}")
+        out.append(f"checkpoint note: a resume:true job continues at "
+                   f"generation {int(ckpt.get('generation') or 0) + 1} "
+                   f"(window must match)")
+    else:
+        out.append(f"checkpoint     : {ckpt.get('path')} exists=False "
+                   f"(nothing to resume from)")
+    if ckpt.get("read_error"):
+        out.append(f"checkpoint note: unreadable — {ckpt['read_error']}")
+    if info["result_file_exists"]:
+        rc = info.get("result_checkpoint") or {}
+        out.append(f"last result    : keep_checkpoint="
+                   f"{info.get('result_keep_checkpoint')} "
+                   f"checkpoint_kept={rc.get('kept')} "
+                   f"resumed_from_generation="
+                   f"{info.get('result_resumed_from_generation')}")
     out.append(f"progress file  : {info['progress_file']}")
     out.append(f"progress JSON  : {json.dumps(info['progress'])}")
     age = info["progress_age_s"]
@@ -361,6 +452,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--jobs-dir", help=f"job directory (default {DEFAULT_JOBS_DIR})")
     p.add_argument("--progress-file", help="override the progress path (tests)")
     p.add_argument("--log-file", help="override the log path (tests)")
+    p.add_argument("--checkpoint-file",
+                   help="override the GA checkpoint path "
+                        "(default <jobs-dir>/../ga_checkpoint.pkl)")
     p.add_argument("--stale-minutes", type=float, default=5.0,
                    help="progress mtime older than this is stale (default 5)")
     p.add_argument("--tail", type=int, default=8, help="log lines to print (default 8)")

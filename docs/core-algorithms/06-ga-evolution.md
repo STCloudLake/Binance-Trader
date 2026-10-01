@@ -331,6 +331,50 @@ provenance:
   （旧代码会在评估时对未映射币种查询实时深度，等于让 2025 年的回测依赖今天的行情与网络。）
 - 检查点里保存 `window_key`，`resume` 标志真正转发到 `evolve(resume=True)`。
 
+## 检查点保留与续跑（`keep_checkpoint` / `resume`）
+
+检查点路径固定为 `<data_dir>/data/ga_checkpoint.pkl`（`GAStrategyEvolver._checkpoint_path`）。
+每一代结束时写一次（`_save_checkpoint`）。**旧行为**：干净完成时 `clear_checkpoint()`
+无条件删除它，于是"完成的任务"没有任何东西可以续跑，`resume=True` 只对崩溃/手动停止有效。
+
+现在：
+
+1. **保留规则**。`GARunConfig.keep_checkpoint`（缺省 `True`）决定**干净完成**后是否保留。
+   优先级：job 字段 `keep_checkpoint` → `config.ga.keep_checkpoint`（`config/config.yaml` 出货
+   `true`，带注释）→ 代码缺省 `True`；即**字段缺失 = 保留**，只有显式 `false` 才回到
+   "完成即删除"。`stop()`/崩溃的运行两条路径都保留（原有的崩溃续跑语义不变）。worker 与
+   evolver 都打日志：`checkpoint kept at <path> (generation g)` / `checkpoint cleared at <path>`，
+   并把决定写进 result 与冠军 `provenance.keep_checkpoint` / `provenance.checkpoint.kept`。
+2. **续跑是"接着跑"，不是"重跑"**。旧代码
+   `for gen in range(cfg.generations): self._generation = gen + 1` **忽略**检查点里的代数：
+   载入第 12 代的种群后从"第 1 代"重新编号并再评估 `generations` 代。现在循环起点是
+   `_first_gen = int(self._generation or 0)`（新任务为 0），
+   `for gen in range(_first_gen, cfg.generations)`：`generations: 32` 从第 12 代续跑只评估
+   13..32 代，`history` 为 1..32，`result["generations"] == 32`，
+   `result["resumed_from_generation"] == 12`。检查点代数已 ≥ job 的 `generations` 时循环为空，
+   只发警告并把检查点里的冠军按原样走发布门。
+3. **DSR 试错计数跨续跑连续**。`_save_checkpoint` 保存 `prior_trials`（本次运行开始时
+   `ga_trials.json` 的账）与 `trials_this_run`（本次运行已评估的代数×种群）；`load_checkpoint`
+   把二者之和放进 `_checkpoint_meta["trials_total"]`，`evolve()` 用它给 `_prior_trials` 取
+   **下限**（`max`，只升不降）——所以即使台账被清掉，续跑段的第 1 代仍按"已经试过 N 次"去膨胀
+   DSR，而不是从本次 population 重新计数；台账完好时 `max` 也不会重复计数。冠军的 `n_trials`
+   仍是 `prior_trials + trials_this_run`（D-18 的同一个公式），并写进
+   `provenance.trials{prior_trials,trials_this_run,resumed_trials,n_trials}`。
+4. **窗口/身份守卫**。检查点记录 `window_key`、`population_hash`、`symbols`、`timeframe_pool`。
+   续跑请求的窗口与检查点不一致时抛**具名** `CheckpointWindowMismatchError`（不吞进
+   "没有检查点"的分支；worker 的 result 里 `error_type` 同名），拒绝在另一个窗口上静默续跑。
+   空 `window_key` 的旧检查点不阻拦续跑，且不会覆盖本次运行的窗口。续跑后的冠军 provenance
+   记录 `resumed_from_generation` / `resumed_population_hash` / `resumed_trials` /
+   `resumed_symbols` / `resumed_timeframe_pool`，即"从什么继续"。
+   `WalkForwardRunner` 只对本次 WF 运行的第一窗口转发 `resume`，并且把跨窗口的检查点拒绝
+   降级为"该窗口的 GA 从零开始"（WF 自己的续跑状态是 `ga_wf_state.json`），不会因为保留下来
+   的上一个窗口的检查点而让整个 walk-forward 失败。
+5. **可见性**。`scripts/ga_job_status.py` 打印检查点行（路径、`exists`、**generation**、
+   **mtime**、窗口、population hash、试错数、`resume` 会从第 g+1 代继续），`--checkpoint-file`
+   可覆盖路径，`--json` 里同样有 `checkpoint` 块；GA 面板有 **Keep checkpoint** 勾选框
+   （默认勾选，job 字段同名），完成后状态行显示检查点代数并显示 Resume 按钮
+   （`_ga_state.resumable` 由 result 的 `checkpoint.kept` 驱动——此前该字段从未被赋值）。
+
 ## 多进程评估失败降级
 
 `evaluate_population_multiprocess` 的某个 chunk 崩溃时，先用

@@ -53,7 +53,16 @@
                 <input type="number" id="ga-seed" value="0" min="0" step="1"
                        class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-white text-sm">
             </div>
-            <div class="flex items-end">
+            <div class="flex items-end gap-3">
+                <!-- Job field `keep_checkpoint`: retention (the default, and the
+                     shipped `ga.keep_checkpoint: true`) means a cleanly
+                     completed run keeps data/ga_checkpoint.pkl, so Resume
+                     continues at checkpoint-generation+1 instead of starting
+                     over.  Unticking reproduces the old delete-on-completion. -->
+                <label class="flex items-center gap-1 text-xs text-slate-300">
+                    <input type="checkbox" id="ga-keep-checkpoint" class="accent-sky-500" checked>
+                    {{ _("Keep checkpoint") }}
+                </label>
                 <span class="text-xs text-slate-500">
                     {{ _("Same seed + same data = identical champions (reproducible)") }}
                 </span>
@@ -620,6 +629,7 @@ function startGA() {
         cost_enabled: true,
         taker_fee_pct: parseFloat(document.getElementById('ga-cost-fee').value) || 0.04,
         seed: parseInt(document.getElementById('ga-seed').value) || 0,
+        keep_checkpoint: document.getElementById('ga-keep-checkpoint').checked,
         spread_pct: {
             BTCUSDT: parseFloat(document.getElementById('ga-spread-btc').value) || 0.01,
             ETHUSDT: parseFloat(document.getElementById('ga-spread-eth').value) || 0.02,
@@ -674,7 +684,7 @@ function toggleWFConfig() {
 
 // ── Lock/unlock all GA inputs when job is running ──
 var _gaInputIds = ['ga-pop-size', 'ga-generations', 'ga-workers', 'ga-date-start', 'ga-date-end',
-    'ga-val-start', 'ga-seed', 'ga-wf-enabled', 'ga-wf-train-mo', 'ga-wf-val-mo', 'ga-wf-step-mo',
+    'ga-val-start', 'ga-seed', 'ga-keep-checkpoint', 'ga-wf-enabled', 'ga-wf-train-mo', 'ga-wf-val-mo', 'ga-wf-step-mo',
     'ga-cost-fee', 'ga-spread-btc', 'ga-spread-eth', 'ga-spread-bnb', 'ga-spread-sol', 'ga-spread-xrp',
     'ga-symbol-search'];
 
@@ -699,6 +709,9 @@ function restoreParams(params) {
     if (params.generations) document.getElementById('ga-generations').value = params.generations;
     if (params.max_workers) document.getElementById('ga-workers').value = params.max_workers;
     if (params.seed) document.getElementById('ga-seed').value = params.seed;
+    if (params.keep_checkpoint !== undefined && params.keep_checkpoint !== null) {
+        document.getElementById('ga-keep-checkpoint').checked = !!params.keep_checkpoint;
+    }
     if (params.timeframe_pool) {
         var wanted = params.timeframe_pool;
         document.querySelectorAll('.ga-tf-pool').forEach(function(el) {
@@ -758,6 +771,7 @@ function resumeGA() {
             seed_strategies: ['mean_reversion_rsi_bollinger_bands'],
             timeframe_pool: gaTimeframePool(),
             resume: true,
+            keep_checkpoint: document.getElementById('ga-keep-checkpoint').checked,
             cost_enabled: true,
             taker_fee_pct: parseFloat(document.getElementById('ga-cost-fee').value) || 0.04,
             spread_pct: {
@@ -849,7 +863,12 @@ function pollGAStatus() {
                 document.getElementById('ga-status-text').textContent = '{{ _("Checkpoint saved, can resume") }}';
             } else {
                 document.getElementById('ga-phase-text').textContent = '{{ _("Complete") }}';
-                document.getElementById('ga-status-text').textContent = '{{ _("Evolution finished") }}';
+                var _ck = s.checkpoint;
+                document.getElementById('ga-status-text').textContent =
+                    (_ck && _ck.kept)
+                        ? '{{ _("Evolution finished — checkpoint kept at generation") }} '
+                          + _ck.generation
+                        : '{{ _("Evolution finished") }}';
             }
             clearInterval(_gaPollTimer);
             resetUI();
