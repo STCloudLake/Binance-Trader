@@ -58,6 +58,7 @@
 5. [Meta-labelling（P4）](#5-meta-labellingp4)
 6. [微观结构（P4）](#6-微观结构-p4)
 7. [Regime 门控（P4）](#7-regime-门控-p4)
+   - 7.7 [组合体评估：编排器 + 子策略（P7-S4）](#77-组合体评估编排器--子策略p7-s4)
 8. [执行真实性（P6-A）](#8-执行真实性p6-a)
 9. [数据完整性（横切）](#9-数据完整性横切-data-integrity)
 10. [什么没有实现 / 什么被证伪](#10-什么没有实现--什么被证伪-what-is-not-implemented--what-is-falsified)
@@ -1342,6 +1343,105 @@ $$(\texttt{hmm\_present} \wedge \neg\,\texttt{causal\_hmm}) \Rightarrow \text{ra
 6. `classify_regimes` 写入 `attrs`（`:660-664`）：默认 `causal_hmm=True, hmm_present=False`；加了 HMM 列时 `causal_hmm = bool(fit.get("causal"))`。`NonCausalRegimeError` 由 `tests/test_p34_audit_fixes.py:167-183` 钉住。
 7. **死代码**：`_hmm_forward_last`（`:407-425`）无任何调用者（§11 D-26）。
 8. **未验证**：我没有跑 `hmm_two_state_causal`（3 000 bar 需 2–3 s；本次没跑）；上述准确率是**代码 docstring 记录的实测**（B 级），不是我这次的读数。合成表的 tercile/trend 准确率列（doc 11:258-262）是 doc-only。
+
+---
+
+### 7.7 组合体评估：编排器 + 子策略（P7-S4）
+
+> 代码：`core/ai/composite.py`（契约）、`core/ai/holdout.py`（一次性计数器）、
+> `tools/p7_composite_measure.py`（测量）、`core/ai/orchestrator.py`（S3 交付的编排对象，未改）。
+> 实测数字与命令：`docs/overhaul/P7_REGIME_EVIDENCE.md` §S4（本轮 2026-10-02，工作树 `7b4e234`）。
+
+**为什么需要一个新的评估单位.** P7-S1 评的是**单个**被条件化的策略，P7-S3 交付的是**上层**
+决策对象，两者都不能回答“上层 + 状态专用子策略作为一个整体值不值”。S4 定义的就是这个整体：
+一个**固定权重**的组合体，权重与编排规则**只在训练窗上定**，样本外只评一次。
+
+**（1）权重规则（训练窗，固定）.** 对每个入选子策略 $s$：
+
+$$w_s=\operatorname{clip}\!\left(\frac{\operatorname{mean}_{t\in \text{train trades}(s)}\texttt{amount\_usdt}_t}{\text{initial\_balance}},\,0,\,1\right),\qquad
+\hat w_s=\frac{w_s}{\sum_{s'}w_{s'}}$$
+
+即**已部署资金份额**——与 `core/ga/benchmark.py` 的 `capital` 口径同一个定义（从成交里**量出来**的
+相对暴露，不是假设的）。没有可用 notional 的子策略退化为交易币种集合上的等权，并在
+`CompositeSpec.sources` 里标为 `equal_share`。样本外**不重算、不重新归一化**；产物同时记录
+`weight_concentration`（`max_weight`、Herfindahl、`effective_strategies`），
+因为“一个子策略占 96 %”的组合体其实是一次单策略评估，必须看得见（首个 S4 运行里 ETH 就出现过
+`max_weight=0.9638 / effective=1.075`，最终运行是 `0.3428 / 2.9988`）。
+
+**（2）组合体资金曲线.** 记 $e_s(t)$ 为子策略 $s$ 自己的 equity（它自己的现金都在里面），
+$\text{dep}_s(t)\in\{0,1\}$ 为它是否**在册**：持仓 bar（`[opened_at, closed_at]` 区间）
+**加上平仓后的第一根 bar**。后者的必要性是实测出来的：平仓那一根 bar 的 equity 还是**盯市**值，
+已实现现金要到下一根才进 equity；不把那一根算进来，子策略的已实现盈亏就永远进不了组合体
+（首版实现把“有空仓就回到初始资金”，结论会系统性偏负）。于是
+
+$$r_s(t)=\frac{e_s(t)}{e_s(t-1)}-1,\qquad
+E(t)=\sum_s \hat w_s\,\text{dep}_s(t),\qquad
+\text{ret}(t)=\begin{cases}\dfrac{\sum_s \hat w_s\,\text{dep}_s(t)\,r_s(t)}{E(t)} & E(t)>0\\[4pt] 0 & E(t)=0\end{cases}$$
+
+$$C(t)=C(t-1)\bigl(1+\text{ret}(t)\bigr),\qquad C(0)=\text{initial\_balance}$$
+
+未在册的子策略贡献 **0 %（现金）**，权重既不参与收益也不被重新归一化——所有子策略都平仓时，
+组合体**保留**已经赚到的净值，空闲期收益恒为 0 %（与 `exposure_matched` 的“空闲现金不生息”同口径）。
+`composite_return()` 就是这个 $\text{ret}(t)$ 的独立实现，`composite_fund()` 的 $C(t)$ 必须能被它
+复合回去逐点相等（`tests/test_p7_composite.py` 钉相对误差 $<10^{-9}$），这是计划 S4 的
+“组合体契约可复算”验收项。
+
+**（3）与组合体自身持仓区间匹配的基准（复用，不另造）.** 把组合体展平后的成交表喂给
+`build_benchmark('exposure_matched', …)`——区间是**组合体自己的**持仓区间并集、权重是它自己测出的
+资金份额（$\sum w \approx 0.0585$ 量级，因为组合体的 deployed share 只有约 2 %）。第二个基准
+`buy_hold_over_intervals()` 用**同一篮子、同一区间**但**区间内满仓**（权重不乘 deployed share），
+`intervals_return()` 也直接复用。于是三个数必须一起读：
+
+$$\text{alpha}_{em}=R_{\text{composite}}-R_{\text{exposure\_matched}},\qquad
+\text{alpha}_{bh}=R_{\text{composite}}-R_{\text{buy\_hold(matched)}}$$
+
+两者都是**窗口总收益之差（百分点，非年化）**，与项目其它 alpha 同口径；当 $\sum w \ll 1$ 时
+$\text{alpha}_{em}$ 天然是“小敞口上的大百分比”，不能与 $\text{alpha}_{bh}$ 并列。
+
+**（4）试验计数（DSR 的分母）.** `CompositeTrials` 把**每一个被试过的变体**都记进去：
+
+$$N = N_{\text{candidates}}\times N_{\text{windows}} + N_{\text{arms}} + N_{\text{orchestrator configs}}$$
+
+- $N_{\text{candidates}}$ = 每币候选基因组数 × 币数 × 门标签数（训练窗的**选择**也是搜索，且同一批候选
+  在训练窗与样本外窗各评一次，所以 ×2）；
+- $N_{\text{arms}}$ = 常开 + 编排器 + 每个随机种子一个；
+- $N_{\text{orchestrator configs}}$ = 训练窗上被比较过的编排器规则集（5 个单标签 + 每策略最优标签对 + 全标签 + 永不允许 = 8）。
+
+本轮 $N=60\times2+5+8=\mathbf{133}$。DSR 用 `core/ga/fitness.py::deflated_sharpe_ratio`
+（同一实现），`observation_periods` = 组合体自己的**日收益**个数（119）。
+注意该函数的**定义域**：观测 Sharpe ≤ 0 或 $T<20$ 时 DSR **定义为 0.0**，即“不估计”，
+工具用 `dsr_estimated` 把“未估计”和“估出 0”分开（§1.5、§11 D-15 的同类纪律）。
+
+**（5）对照与可用性门.** 三变体同窗口/同成本/同权重，只有 enable 时间线不同：
+常开、**随机 start/stop**（固定种子，每策略按训练窗允许 bar 占比独立抽样，从而匹配编排器的曝光，
+使比较隔离“选择”而非“少交易”）、编排器。可用性门明写为
+
+$$\text{usable}\iff \#\text{trades}\ge 100\ \wedge\ \text{DSR}>0$$
+
+（100 取 `ml.gate_min_trades`；低于该数一律如实标 `insufficient_trades`，即便 Sharpe 很高）。
+**实测判决（本轮，BTC+ETH+SOL 1h，训练 2025-11-01~2026-02-01，样本外 2026-02-01~2026-06-01）**：
+常开 **+0.5206 %** / 在场 37.95 % / DSR **−0.232771**；随机 7/8/9 = **+0.4389 / +0.3111 / +0.5033**；
+编排器 **+0.4425 %** / 最大回撤 **0.4238 %（五变体最低）** / DSR **−0.237314**；
+`E[\max]=0.286689 > ` 所有观测 Sharpe ⇒ **五个变体 DSR 全负、无一可用**，
+且编排器**没有**打败常开（−0.0781 个百分点）或最优随机臂（−0.0608），
+而随机种子自身的跨度（0.3111–0.5033）比这个差额更大。组合体 717 笔的**已实现 PnL 合计 −3.10 USDT**
+（`trend_down` 544 笔 −75.02 / `trend_up` 127 笔 +48.33 / `range_mid` 38 笔 +20.70 / `range_low` 8 笔 +2.89；
+按**入场 bar** 的因果标签归属）——即正收益来自区间内的净值路径与短曝光，**不是每笔优势**。
+
+**（6）一次性 holdout.** `core/ai/holdout.py`：窗口键 = `(holdout_id, start, end, timeframe)`，
+每次评估追加一条带 `at`/`revision`/`rules_fingerprint`/`reuse_index` 的记录；
+**第二次评估同一窗口默认抛 `HoldoutRefusal`**，只有显式 `allow_reuse=True` 才继续并把 `reuse=True`
+写进产物（账本 `data/p7_holdout.json`，被 `.gitignore` 的 `data/` 覆盖）。
+**本轮该窗口被打开 3 次**（第一次的随机对照因份额计算按 bar 而非按标签集合而失效；
+后两次是修 bug 后的重跑，两次有效运行七个头条指标逐位一致）——这一点已如实记入证据文件 §S4.6/§S4.9，
+因为它确实消耗了窗口的“新鲜度”。
+
+**已知局限.** (a) 本轮所有策略共享**第一个币**的状态时钟（一币一策略时即各自的状态），
+多币共享时钟是工具级的简化，已在产物 `orchestrator` 块写明；
+(b) 编排器的选择只用训练窗（未使用计划允许的独立 `validation_start`），是更严的 holdout；
+(c) P7-S4 只在一个样本外窗口上评过一次（加两次修复性重跑），**没有**多窗口重复；
+(d) 组合体的绝对收益很小（≈0.44 % / 4 个月）主要因为子策略的 deployed share 只有约 2 %，
+这是从成交量出来的事实，不是口径选择。
 
 ---
 

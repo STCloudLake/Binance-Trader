@@ -314,7 +314,15 @@ def evaluate_chromosome(
         # P7-S2 (additive audit key): the basket this genome was SCORED on — one
         # symbol in ``symbol_mode: per_symbol``.  No number above depends on it.
         score["symbols_evaluated"] = list(symbols)
-        score.update(benchmark_result_fields(stats, score))
+        # Read the benchmark block off the SCORED dict, never the raw ``stats``:
+        # ``score_stats`` writes ``alpha_vs_benchmark_pct`` (and the other
+        # benchmark scalars it derives) into its own copy and returns it, so the
+        # raw dict does not carry them.  Passing ``stats`` here overwrote the
+        # single-chromosome path's real alpha with 0.0 while the batch paths —
+        # which rebind ``stats = score_stats(...)`` — kept it.  ``score`` is that
+        # copy (``dict(stats)`` plus the scorer's fields), so every benchmark
+        # field now agrees with the batch paths.
+        score.update(benchmark_result_fields(score))
         return score
 
     except UnevaluableConditionError as e:
