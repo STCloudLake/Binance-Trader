@@ -131,6 +131,21 @@ def _timeframe_pool_param(payload) -> list:
     return parse_timeframe_pool(value) or []  # raises TimeframePoolError
 
 
+def _symbol_mode_param(payload) -> str:
+    """``symbol_mode`` job field → ``"pooled"`` / ``"per_symbol"`` (P7-S2).
+
+    ``"pooled"`` (the default, and what an absent/blank field means) evolves one
+    population over the whole basket; ``"per_symbol"`` evolves one independent
+    population per symbol and publishes one champion per symbol, each restricted
+    to its own symbol.  Validation reuses the canonical parser, so a typo is a
+    **400 on the request** naming the offender
+    (``core.ga.evolver.UnknownSymbolModeError``).
+    """
+    from core.ga.evolver import parse_symbol_mode
+
+    return parse_symbol_mode(payload.get("symbol_mode"))
+
+
 def _spread_param(payload, default: dict) -> dict:
     """Per-symbol spread override map (dict, or a JSON string from a form).
 
@@ -322,6 +337,12 @@ def register(app: FastAPI, ctx) -> None:
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
 
+        # ── P7-S2 search shape (job field; absent = the historical ``pooled``) ──
+        try:
+            symbol_mode = _symbol_mode_param(body)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
         # ── Runtime cost model params (override config.yaml) ──
         cost_enabled = _bool_param(body, "cost_enabled", True)
         taker_fee_pct = _float_param(body, "taker_fee_pct", 0.04)
@@ -368,6 +389,11 @@ def register(app: FastAPI, ctx) -> None:
         # file stays byte-identical to the pre-``timeframe_pool`` payload.
         if timeframe_pool:
             job_data["timeframe_pool"] = list(timeframe_pool)
+        # Same discipline for the search shape: only a non-default ``per_symbol``
+        # is written, so a default job file stays byte-identical to the pre-S2
+        # payload (an absent field means ``pooled`` in the worker).
+        if symbol_mode != "pooled":
+            job_data["symbol_mode"] = symbol_mode
         with open(job_file, "w") as f:
             json.dump(job_data, f)
 
@@ -407,6 +433,7 @@ def register(app: FastAPI, ctx) -> None:
             "validation": None, "dsr": None, "provenance": None,
             "published": None, "rejection_reasons": [], "seed": seed,
             "timeframe_pool": list(timeframe_pool),
+            "symbol_mode": symbol_mode,
             "params": {
                 "date_start": date_start, "date_end": date_end,
                 "validation_start": validation_start,
@@ -416,6 +443,7 @@ def register(app: FastAPI, ctx) -> None:
                 "seed": seed,
                 "timeframe_pool": list(timeframe_pool),
                 "keep_checkpoint": keep_checkpoint,
+                "symbol_mode": symbol_mode,
                 "mode": "ga",
             },
         })
@@ -571,6 +599,12 @@ def register(app: FastAPI, ctx) -> None:
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
 
+        # ── P7-S2 search shape, same job field as ``/api/ga/evolve`` ──
+        try:
+            symbol_mode = _symbol_mode_param(body)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
         # Apply cost model overrides
         cost_enabled = _bool_param(body, "cost_enabled", True)
         taker_fee_pct = _float_param(body, "taker_fee_pct", 0.04)
@@ -607,6 +641,8 @@ def register(app: FastAPI, ctx) -> None:
         }
         if timeframe_pool:
             job_data["timeframe_pool"] = list(timeframe_pool)
+        if symbol_mode != "pooled":
+            job_data["symbol_mode"] = symbol_mode
         with open(job_file, "w") as f:
             json.dump(job_data, f)
 
@@ -645,6 +681,7 @@ def register(app: FastAPI, ctx) -> None:
                 "symbols": symbols,
                 "timeframe_pool": list(timeframe_pool),
                 "keep_checkpoint": keep_checkpoint,
+                "symbol_mode": symbol_mode,
                 "mode": "walkforward",
             },
         })

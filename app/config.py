@@ -429,6 +429,8 @@ class ExperimentalConfig(BaseModel):
     meta_labeling_enabled: bool = False
     # ── microstructure (`core/market_data/microstructure.py`) ──
     microstructure_enabled: bool = False
+    # ── upper-layer orchestrator (`core/ai/orchestrator.py`, P7-S3) ──
+    regime_orchestrator_live: bool = False
 
 
 #: `experimental:` key → ``(module, CONSTANT)`` it flips.  This table **is** the
@@ -447,6 +449,8 @@ EXPERIMENTAL_FLAG_TARGETS: dict[str, tuple[str, str]] = {
     "meta_labeling_enabled": ("core.ml.meta", "META_LABELING_ENABLED"),
     "microstructure_enabled": (
         "core.market_data.microstructure", "MICROSTRUCTURE_ENABLED"),
+    "regime_orchestrator_live": (
+        "core.strategy.engine", "REGIME_ORCHESTRATOR_LIVE_ENABLED"),
 }
 
 #: The `experimental:` block grouped by the layer each switch belongs to, in the
@@ -459,6 +463,8 @@ EXPERIMENTAL_LAYERS: dict[str, tuple[str, ...]] = {
     "meta-labelling (core/ml/meta.py)": ("meta_labeling_enabled",),
     "microstructure (core/market_data/microstructure.py)": (
         "microstructure_enabled",),
+    "upper-layer orchestrator (core/ai/orchestrator.py)": (
+        "regime_orchestrator_live",),
 }
 
 #: One line per switch: what it does, what it does **not** do, and whether its own
@@ -493,6 +499,14 @@ EXPERIMENTAL_KEY_NOTES: dict[str, str] = {
     "microstructure_enabled":
         "microstructure-feature master switch — NO production reader and NO wiring "
         "seam anywhere in the pipeline: enabling it changes nothing reachable.",
+    "regime_orchestrator_live":
+        "let the live StrategyEngine ask a REGISTERED RegimeOrchestrator before "
+        "publishing an entry (never the side, never a size). Needs BOTH "
+        "ai.orchestrator.enabled: true and a caller to "
+        "wire_regime_orchestrator(); no production caller registers one, so alone "
+        "it changes nothing. GATED: causal labels only (an in-sample HMM label is "
+        "refused by name); disabled, decide() is allow for every bar and reads no "
+        "vol/breadth series.",
 }
 
 
@@ -845,6 +859,26 @@ class Config:
             "strategy_optimization": ai_tasks.get("strategy_optimization_minutes", 1440) * 60,
             "risk_adjustment": ai_tasks.get("risk_adjustment_minutes", 1440) * 60,
         }
+        # ── P7-S3: the upper-layer regime orchestrator (OFF by default) ──────
+        # `ai.orchestrator` is the FIXED rule set of
+        # `core.ai.orchestrator.RegimeOrchestrator` — the regime→strategy mapping,
+        # the consecutive-loss kill switch, the volatility gate and the
+        # market-breadth gate.  `enabled: false` (the shipped value) makes the
+        # object return "allow" for every (strategy, bar) **without reading the
+        # regime context, the vol series or the breadth series**, so a disabled
+        # orchestrator cannot change any signal, size or route.
+        #
+        # Parsed here — at config load — so an unknown key, an unknown regime
+        # label or an in-sample `calm`/`stressed` label raises the NAMED
+        # `OrchestratorConfigError` where the operator can see it instead of
+        # being silently ignored halfway through a backtest.  The thresholds are
+        # a fixed rule set and must never be tuned on the evaluation window
+        # (S4 locks them out-of-sample; see config.yaml and P7_REGIME_PLAN §3 S3).
+        from core.ai.orchestrator import (
+            orchestrator_config_from_raw as _orchestrator_from_raw)
+        self.ai_orchestrator = _orchestrator_from_raw(
+            ai.get("orchestrator") if isinstance(ai, dict) else None)
+        self.ai_orchestrator_enabled = bool(self.ai_orchestrator.enabled)
 
         hard = self._get("hard_limits", {})
         if not hard:

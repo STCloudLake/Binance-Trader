@@ -311,6 +311,9 @@ def evaluate_chromosome(
         score["alpha_pct"] = round(_finite(stats["alpha_pct"]), 4)
         score["observations"] = int(stats["observations"])
         score["spread_sources"] = metrics.get("spread_sources", {})
+        # P7-S2 (additive audit key): the basket this genome was SCORED on — one
+        # symbol in ``symbol_mode: per_symbol``.  No number above depends on it.
+        score["symbols_evaluated"] = list(symbols)
         score.update(benchmark_result_fields(stats, score))
         return score
 
@@ -1384,6 +1387,10 @@ def evaluate_population_batch(
                 "short_trades": int(stats["short_trades"]),
                 "flag": stats.get("flag", ""),
                 "strategy_name": config.name,
+                # P7-S2 (additive audit key): the basket this genome was SCORED
+                # on — exactly one symbol in ``symbol_mode: per_symbol``, which is
+                # what its selection and its published ``symbols`` agree on.
+                "symbols_evaluated": list(symbols),
                 **benchmark_result_fields(stats),
             }
 
@@ -1611,6 +1618,11 @@ def _mp_worker(worker_args: dict) -> list:
             "short_trades": int(stats["short_trades"]),
             "flag": stats.get("flag", ""),
             "strategy_name": config_obj.name,
+            # P7-S2 (additive audit key): the basket this genome was SCORED on.
+            # In ``per_symbol`` mode it is exactly one symbol, which is what the
+            # genome's selection and its published ``StrategyConfig.symbols``
+            # must agree with.  No number above depends on it.
+            "symbols_evaluated": list(worker_args.get("symbols") or []),
             **benchmark_result_fields(stats),
         }))
         # One tick per fully scored genome of this chunk (the parent turns these

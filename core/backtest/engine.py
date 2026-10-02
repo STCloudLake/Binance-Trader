@@ -253,7 +253,8 @@ class BacktestEngine:
                                   spread_overrides: dict | None = None,
                                   use_live_spread: bool = True,
                                   per_genome_ledger: bool | None = None,
-                                  benchmark_mode: str | None = None):
+                                  benchmark_mode: str | None = None,
+                                  orchestrator=None):
         """Full backtest with ML predictions, signal fusion, and risk controls.
 
         Args:
@@ -290,6 +291,16 @@ class BacktestEngine:
                 never touch the price cache: they reuse the legacy
                 ``metrics["buy_hold_pct"]`` verbatim, so the default path stays
                 byte-identical to the pre-``benchmark_mode`` behaviour.
+            orchestrator: an optional P7-S3
+                ``core.ai.orchestrator.RegimeOrchestrator``.  When given (and only
+                when its own ``enabled`` is true) the entry path asks it, per bar
+                and per strategy, whether that strategy may be enabled, and an
+                ``enabled=False`` verdict refuses the entry exactly like a
+                ``regime_filter`` mismatch.  ``None`` — the default — skips the
+                import, the per-bar call and the metrics key entirely, so the
+                default run is bit-identical to the pre-S3 build
+                (``tests/test_p7_orchestrator.py`` pins a ``git worktree`` at
+                ``d9849a2``).  The orchestrator **never** sizes or routes.
         """
         t0 = time.time()
         if per_genome_ledger is None:
@@ -350,6 +361,15 @@ class BacktestEngine:
             use_hybrid = False
 
         if use_hybrid:
+            if orchestrator is not None:
+                # The P7-S3 seam lives in the legacy/isolated loop below.  The
+                # hybrid engine has no such seam, and silently ignoring a passed
+                # orchestrator would make an "orchestrated" run an always-on run
+                # wearing the same label — refuse instead of mislabelling.
+                raise ValueError(
+                    "orchestrator= is not supported by the hybrid engine; the "
+                    "P7-S3 seam is implemented in the legacy/isolated path "
+                    "(run with backtest_engine_mode='legacy')")
             # engine_hybrid/EventDrivenExecutor read the spread table off the
             # config object; expose the run's derived per-symbol spreads for the
             # duration of the call only (restored in `finally`).
@@ -687,19 +707,101 @@ class BacktestEngine:
         # cleanly for the callers that never evaluate a regime filter, and bound
         # to a local so the per-bar gate below is one dict-free call.
         from core.strategy.regime_causal import build_regime_context, regime_allows
-        #: P7-S1 accounting: ``{strategy name: {"gated", "allowed", "labels"}}``
-        #: for the strategies whose ``regime_filter`` is non-empty.  Populated by
-        #: the entry gate below and returned under
-        #: ``metrics["regime_conditioning"]``, so a conditioned evaluation can
-        #: report the sample it was actually restricted to (and a run with no
-        #: filter reports nothing at all — the dict stays empty).
+        #: P7-S1/S3 accounting: ``{strategy name: {"gated", "allowed", "labels"}}``
+        #: for every strategy whose entry was decided by the causal regime label —
+        #: P7-S1's declared ``regime_filter`` and/or the P7-S3 orchestrator.  One
+        #: shape, one reader: an empty dict means the run reported nothing at all.
         _regime_accounting: dict = {}
+        #: P7-S3 accounting: ``{strategy name: {"gated", "allowed", "reasons"}}``
+        #: for the strategies the upper-layer orchestrator actually decided.
+        _orchestrator_accounting: dict = {}
+        #: ``None`` unless the caller passed an orchestrator whose own master
+        #: switch is on: a passed-but-disabled object is the documented no-op.
+        _orchestrator = orchestrator if getattr(orchestrator, "enabled", False) else None
+        #: P7-S3 volatility input, computed **only** for an active orchestrator
+        #: whose ``vol.multiple`` is on.  One causal EWMA series per
+        #: ``(symbol, timeframe)`` (``core.ml.volatility.ewma_vol_series``: entry
+        #: ``i`` uses returns ``≤ i`` only), built lazily and looked up by
+        #: ``searchsorted`` — so the per-bar cost after the first touch is one
+        #: array index and the number is identical for every strategy trading
+        #: that pair.  ``None`` (unmeasurable) is passed through verbatim; the
+        #: orchestrator turns it into its ``vol.missing_action``, never into a
+        #: fabricated zero.
+        _vol_series_cache: dict = {}
+
+        def _bar_vol_for(sym: str, tf: str, ts):
+            """The causal per-bar volatility at *ts* for ``(sym, tf)``, or ``None``."""
+            if _orchestrator is None or not _orchestrator.config.vol.active:
+                return None
+            key = (sym, tf)
+            series = _vol_series_cache.get(key, False)
+            if series is False:
+                series = None
+                try:
+                    from core.ml.volatility import ewma_vol_series
+                    frame = feeder.get_all_data_for_symbol(sym, tf)
+                    if frame is not None and len(frame) > 2:
+                        returns = frame["close"].pct_change()
+                        # ``ewma_vol_series`` drops the non-finite returns (the
+                        # first bar), so the series is ONE observation shorter
+                        # than the frame: its index must be the timestamps of the
+                        # returns it consumed, or every lookup below is off by a
+                        # bar (an off-by-one in a causal gate is a look-ahead).
+                        finite = np.isfinite(returns.to_numpy(dtype=float))
+                        series = (ewma_vol_series(returns,
+                                                  index=frame.index[finite]),
+                                  frame.index[finite])
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning(f"P7 orchestrator vol series unavailable for "
+                                   f"{sym} {tf} ({exc})")
+                    series = None
+                _vol_series_cache[key] = series
+            if series is None:
+                return None
+            values, index = series
+            if index is None or not len(index):
+                return None
+            cut = int(index.searchsorted(ts, side="right"))
+            if cut <= 0:
+                return None
+            value = values.iloc[cut - 1] if hasattr(values, "iloc") else values[cut - 1]
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return None
+            return value if value == value else None
+
+        def _orchestrator_fingerprint(machine):
+            """``rules_fingerprint`` of the active orchestrator, or ``None``.
+
+            Recorded with the run metrics so "the orchestrator was fixed before
+            the window was opened" is checkable after the fact (S4 locks the rule
+            set out-of-sample; the fingerprint is what ties a number to a rule
+            set).
+            """
+            if machine is None:
+                return None
+            try:
+                from core.ai.orchestrator import rules_fingerprint
+                return rules_fingerprint(machine.config)
+            except Exception:  # pragma: no cover - defensive
+                return None
+
+        #: Keys the regime label is needed for: P7-S1's declared filters **plus**
+        #: every (symbol, primary timeframe) of an active orchestrator run.  With
+        #: no filter and no orchestrator this set is empty, nothing is read and
+        #: the run is bit-identical to the pre-P7 engine.
         _regime_keys = {
             (sym, tf)
             for s_cfg in strategy_configs
             for sym in (getattr(s_cfg, "symbols", None) or symbols)
             if getattr(s_cfg, "regime_filter", None)
             for tf in (s_cfg.timeframes or [])}
+        if _orchestrator is not None:
+            for s_cfg in strategy_configs:
+                for sym in (getattr(s_cfg, "symbols", None) or symbols):
+                    for tf in (s_cfg.timeframes or [])[:1]:
+                        _regime_keys.add((sym, tf))
         if _regime_keys:
             try:
                 _frames = {key: feeder.get_all_data_for_symbol(key[0], key[1])
@@ -1350,6 +1452,32 @@ class BacktestEngine:
                             continue
                         _counter["allowed"] += 1
 
+                    # ── P7-S3: the upper-layer orchestrator (no-op when absent) ──
+                    # `_orchestrator` is None unless a caller passed an enabled
+                    # RegimeOrchestrator, so the default run evaluates one `is not
+                    # None` and nothing else.  The verdict can only refuse the
+                    # entry (`continue`); it never touches the side, the size or
+                    # the route.  The orchestrator's own regime lookup uses the
+                    # same causal context the S1 filter uses — an unmeasured bar
+                    # is `None`, which the orchestrator reads as UNKNOWN, never as
+                    # "allow because we could not tell".
+                    if _orchestrator is not None:
+                        _o_label = (_regime_context.lookup(sym, primary_tf, ts)
+                                    if _regime_context is not None else None)
+                        _o_decision = _orchestrator.decide(
+                            strategy.name, at=ts, label=_o_label,
+                            vol=_bar_vol_for(sym, primary_tf, ts),
+                            vol_key=f"{sym}|{primary_tf}")
+                        _o_counter = _orchestrator_accounting.setdefault(
+                            strategy.name, {"gated": 0, "allowed": 0, "reasons": {}})
+                        _o_counter["gated"] += 1
+                        _o_key = str(_o_decision.reason)
+                        _o_counter["reasons"][_o_key] = (
+                            _o_counter["reasons"].get(_o_key, 0) + 1)
+                        if not _o_decision.enabled:
+                            continue
+                        _o_counter["allowed"] += 1
+
                     # ── Shared Kernel: Signal fusion ──
                     ml_key = f"{strategy.name}|{sym}"
                     ml_conf = ml_predictions.get(ml_key, 0.5)
@@ -1660,6 +1788,25 @@ class BacktestEngine:
                             "labels": {str(k): int(v) for k, v in
                                        sorted(counts["labels"].items())}}
                 for name, counts in _regime_accounting.items()}
+        # P7-S3: what the upper-layer orchestrator actually did (empty unless a
+        # caller passed an ENABLED orchestrator).  Same "report, never gate"
+        # discipline as P7-S1 above: the evaluated sample is the per-genome
+        # trades/equity curve, and this block is the accounting of the refusals.
+        if _orchestrator_accounting:
+            metrics["regime_orchestrator"] = {
+                "rules_fingerprint": _orchestrator_fingerprint(_orchestrator),
+                "strategies": {
+                    str(name): {
+                        "gated": int(counts["gated"]),
+                        "allowed": int(counts["allowed"]),
+                        "allowed_pct": round(
+                            counts["allowed"] / counts["gated"] * 100.0, 4)
+                        if counts["gated"] else 0.0,
+                        "reasons": {str(k): int(v) for k, v in
+                                    sorted(counts["reasons"].items())},
+                    }
+                    for name, counts in _orchestrator_accounting.items()},
+            }
 
         # ── Per-genome ledgers (isolated GA evaluation) ──
         # ``trades`` is append-only and therefore chronological, so slicing it per

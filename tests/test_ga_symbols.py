@@ -403,6 +403,40 @@ def test_evolve_writes_keep_checkpoint_defaulting_to_retention(trader_client):
     assert _job(routes_ga._wf_state["job_file"])["keep_checkpoint"] is False
 
 
+def test_evolve_writes_the_symbol_mode_only_when_it_is_requested(trader_client):
+    """P7-S2: ``symbol_mode`` is a **job field**, absent = the historical pooled.
+
+    A default job file must stay byte-identical to the pre-S2 payload (the field
+    is only written when the operator asked for ``per_symbol``), and a typo must
+    be a 400 on the request rather than a silently different search.
+    """
+    response = trader_client.post("/api/ga/evolve", json={
+        "symbols": ["ADAUSDT", "XRPUSDT"], "population_size": 4, "generations": 2})
+    assert response.status_code == 200, response.text
+    job = _job(routes_ga._ga_state["job_file"])
+    assert "symbol_mode" not in job
+    assert routes_ga._ga_state["params"]["symbol_mode"] == "pooled"
+
+    response = trader_client.post("/api/ga/evolve", json={
+        "symbols": ["ADAUSDT", "XRPUSDT"], "population_size": 4, "generations": 2,
+        "symbol_mode": "per_symbol"})
+    assert response.status_code == 200, response.text
+    assert _job(routes_ga._ga_state["job_file"])["symbol_mode"] == "per_symbol"
+    assert routes_ga._ga_state["params"]["symbol_mode"] == "per_symbol"
+
+    bad = trader_client.post("/api/ga/evolve", json={
+        "symbols": ["ADAUSDT"], "symbol_mode": "per-symbol"})
+    assert bad.status_code == 400
+    assert "per-symbol" in bad.json()["error"]
+
+    # The walk-forward route carries the same job field.
+    response = trader_client.post("/api/ga/walkforward", data={
+        "symbols": "ADAUSDT,XRPUSDT", "population_size": 4, "generations": 2,
+        "symbol_mode": "per_symbol"})
+    assert response.status_code == 200, response.text
+    assert _job(routes_ga._wf_state["job_file"])["symbol_mode"] == "per_symbol"
+
+
 def test_worker_resolves_keep_checkpoint_field_config_then_default():
     """job field → ``config.ga_keep_checkpoint`` → retention (``True``)."""
     worker = _worker_module()

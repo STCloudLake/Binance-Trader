@@ -65,9 +65,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 #: The revision the bit-identity proof compares against.  Frozen instead of
 #: ``HEAD`` on purpose: once this change is committed, ``HEAD`` *contains* the
-#: switch layer, so the baseline has to be the pre-change tree.  ``3a140cf`` is
-#: the HEAD this work was developed on; override with ``BT_EXPERIMENTAL_BASELINE``.
-BASELINE_REVISION = os.environ.get("BT_EXPERIMENTAL_BASELINE", "3a140cf")
+#: switch layer, so the baseline has to be the pre-change tree.  ``3a140cf`` was
+#: the HEAD the switch layer was developed on; P7-S3 moved the default to
+#: ``d9849a2`` (the revision the orchestrator work was developed on, which
+#: already carries all eight P4/P6 switches *and* the P7-S1 causal-regime layer),
+#: so the two compared trees differ only by this change.  Override with
+#: ``BT_EXPERIMENTAL_BASELINE``.
+BASELINE_REVISION = os.environ.get("BT_EXPERIMENTAL_BASELINE", "d9849a2")
 
 
 @pytest.fixture
@@ -345,8 +349,17 @@ def load_config():
     return cfg
 
 
-def flag_values():
-    """Read the eight module constants (the pre-change tree has no table)."""
+def flag_values(keys=None):
+    """Read the module constants (the pre-change tree has no table).
+
+    ``keys`` (optional) restricts the reading to the switches **both** compared
+    revisions know about.  The bit-identity harness runs unchanged in two trees,
+    and P7-S3 added one switch to the table: without the filter the flags block —
+    and therefore the digest — would differ by that one *additive* key even though
+    every signal and every size is byte-identical.  The comparison is still
+    exhaustive for every pre-existing switch (and
+    ``test_every_experimental_key_has_a_reader`` pins the full table).
+    """
     import app.config as config_module
 
     targets = getattr(config_module, "EXPERIMENTAL_FLAG_TARGETS", None)
@@ -365,6 +378,8 @@ def flag_values():
             "microstructure_enabled": (
                 "core.market_data.microstructure", "MICROSTRUCTURE_ENABLED"),
         }
+    if keys is not None:
+        targets = {key: value for key, value in targets.items() if key in set(keys)}
     return {key: bool(getattr(importlib.import_module(mod), attr))
             for key, (mod, attr) in sorted(targets.items())}
 
@@ -413,7 +428,8 @@ def sizing():
     return out
 
 
-payload = {"flags": flag_values(), "signals": asyncio.run(signals()),
+payload = {"flags": flag_values(sys.argv[2].split(",") if len(sys.argv) > 2 else None),
+           "signals": asyncio.run(signals()),
            "sizing": sizing()}
 text = json.dumps(payload, sort_keys=True, default=str, indent=1)
 sys.stdout.write(hashlib.sha256(text.encode("utf-8")).hexdigest() + "\n")
@@ -422,12 +438,45 @@ with open(sys.argv[1], "w", encoding="utf-8", newline="\n") as handle:
 '''
 
 
-def _run_harness(tree: Path, tmp_path: Path, name: str):
-    """Run the identity harness with ``tree`` as the import root."""
+def _baseline_flag_keys(tree: Path) -> list[str]:
+    """The experimental switch names the frozen baseline revision knows about.
+
+    Run in the baseline worktree (not imported into this process — the two trees
+    must not share a module cache), so the identity comparison covers exactly the
+    switches that existed on both sides.
+    """
+    probe = (
+        "import sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "import app.config as config_module\n"
+        "targets = getattr(config_module, 'EXPERIMENTAL_FLAG_TARGETS', None)\n"
+        "if targets is None:\n"
+        "    targets = {'engine_regime_diagnostics': 1, 'engine_meta_filter': 1,\n"
+        "               'engine_pairs_signals': 1, 'regime_gating': 1,\n"
+        "               'regime_diagnostics': 1, 'pairs_enabled': 1,\n"
+        "               'meta_labeling_enabled': 1, 'microstructure_enabled': 1}\n"
+        "print(','.join(sorted(targets)))\n")
+    proc = subprocess.run([sys.executable, "-c", probe, str(tree)],
+                          cwd=str(tree), capture_output=True, text=True, timeout=300)
+    assert proc.returncode == 0, f"cannot read the baseline switch table:\n{proc.stderr}"
+    return [key for key in proc.stdout.strip().split(",") if key]
+
+
+def _run_harness(tree: Path, tmp_path: Path, name: str,
+                 flag_keys: set | None = None):
+    """Run the identity harness with ``tree`` as the import root.
+
+    ``flag_keys`` restricts the flags block to the switches both compared trees
+    know about (see :func:`flag_values`); the signals and sizing blocks are never
+    restricted.
+    """
     harness = tmp_path / "identity_harness.py"
     harness.write_text(_IDENTITY_HARNESS, encoding="utf-8", newline="\n")
     out = tmp_path / f"{name}.json"
-    proc = subprocess.run([sys.executable, str(harness), str(out)], cwd=str(tree),
+    argv = [sys.executable, str(harness), str(out)]
+    if flag_keys is not None:
+        argv.append(",".join(sorted(flag_keys)))
+    proc = subprocess.run(argv, cwd=str(tree),
                           capture_output=True, text=True, timeout=900)
     assert proc.returncode == 0, f"harness failed in {tree}:\n{proc.stderr}"
     return out.read_bytes(), proc.stdout.strip()
@@ -449,8 +498,13 @@ def test_signals_and_sizing_are_bit_identical_to_the_head_worktree(tmp_path):
         pytest.skip(f"cannot create a HEAD worktree at {BASELINE_REVISION}: "
                     f"{add.stderr.strip()}")
     try:
-        head_bytes, head_digest = _run_harness(worktree, tmp_path, "head")
-        tree_bytes, tree_digest = _run_harness(ROOT, tmp_path, "working")
+        # Both trees report the switches the BASELINE knows about, so a switch
+        # added after the baseline cannot move the digest by itself (its own
+        # inertness is pinned by test_every_experimental_key_has_a_reader and by
+        # tests/test_p7_orchestrator.py's own worktree proof).
+        head_keys = set(_baseline_flag_keys(worktree))
+        head_bytes, head_digest = _run_harness(worktree, tmp_path, "head", head_keys)
+        tree_bytes, tree_digest = _run_harness(ROOT, tmp_path, "working", head_keys)
     finally:
         subprocess.run(["git", "worktree", "remove", "--force", str(worktree)],
                        cwd=str(ROOT), capture_output=True, text=True, timeout=600)
@@ -461,13 +515,20 @@ def test_signals_and_sizing_are_bit_identical_to_the_head_worktree(tmp_path):
     assert head_bytes == tree_bytes, "the harness output differs byte-for-byte"
 
     payload = json.loads(tree_bytes.decode("utf-8"))
-    # The comparison is only meaningful if it really covered the seams.
-    assert set(payload["flags"]) == set(EXPERIMENTAL_FLAG_TARGETS)
+    # The comparison is only meaningful if it really covered the seams: every
+    # switch the BASELINE knows about is present and false.  (P7-S3's
+    # `regime_orchestrator_live` is deliberately outside the compared set — it did
+    # not exist at the baseline, and its own inertness is pinned by its reader
+    # test and by tests/test_p7_orchestrator.py.)
+    assert set(payload["flags"]) == set(head_keys)
+    assert head_keys <= set(EXPERIMENTAL_FLAG_TARGETS)
     assert set(payload["flags"].values()) == {False}, payload["flags"]
     assert len(payload["signals"]) == 2
     assert len(payload["sizing"]) == 10
     for entry in payload["signals"].values():
         assert "p4" not in entry, "an experimental payload key leaked into the default cache"
+        assert "orchestrator" not in entry, (
+            "a P7-S3 payload key leaked into the default cache")
     assert hashlib.sha256(tree_bytes).hexdigest() == \
         hashlib.sha256(head_bytes).hexdigest()
 
@@ -487,7 +548,7 @@ def test_notice_lists_exactly_the_enabled_switches():
     messages = experimental_notices(experiment)
     assert len(messages) == 1
     text = messages[0]
-    assert "EXPERIMENTAL FEATURES ENABLED (2 of 8)" in text
+    assert f"EXPERIMENTAL FEATURES ENABLED (2 of {len(EXPERIMENTAL_FLAG_TARGETS)})" in text
     assert "gated by its OWN acceptance test" in text
     for key in enabled:
         assert f"experimental.{key}" in text
@@ -498,7 +559,9 @@ def test_notice_lists_exactly_the_enabled_switches():
 
     all_on = experimental_notices(
         ExperimentalConfig(**{key: True for key in EXPERIMENTAL_FLAG_TARGETS}))
-    assert "EXPERIMENTAL FEATURES ENABLED (8 of 8)" in all_on[0]
+    assert (f"EXPERIMENTAL FEATURES ENABLED "
+            f"({len(EXPERIMENTAL_FLAG_TARGETS)} of "
+            f"{len(EXPERIMENTAL_FLAG_TARGETS)})") in all_on[0]
     for key in EXPERIMENTAL_FLAG_TARGETS:
         assert f"experimental.{key}" in all_on[0]
     # Every layer the YAML groups by is a heading in the notice, so the operator
@@ -530,7 +593,7 @@ def test_startup_logs_the_notice_and_the_reader_less_switches(monkeypatch):
     assert cfg.experimental.engine_pairs_signals is True
     assert cfg.experimental.pairs_enabled is True
     joined = "\n".join(captured)
-    assert "EXPERIMENTAL FEATURES ENABLED (2 of 8)" in joined
+    assert f"EXPERIMENTAL FEATURES ENABLED (2 of {len(EXPERIMENTAL_FLAG_TARGETS)})" in joined
     assert "experimental.engine_pairs_signals" in joined
     assert "experimental.pairs_enabled" in joined
     assert "NO production reader" in joined          # the honest note

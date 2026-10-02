@@ -258,6 +258,26 @@ def job_benchmark_mode(job: dict) -> str | None:
     return parse_benchmark_mode(raw)
 
 
+def job_symbol_mode(job: dict) -> str:
+    """Validated ``symbol_mode`` job field — ``"pooled"`` unless asked (P7-S2).
+
+    ``"pooled"`` (the default, and what an absent/blank field means) evolves ONE
+    population over the whole basket — the historical search.  ``"per_symbol"``
+    evolves **one independent population per symbol**, scores every candidate only
+    on its own symbol and publishes one champion per symbol restricted to it.
+
+    Validation reuses ``core.ga.evolver.parse_symbol_mode`` and raises the named
+    ``UnknownSymbolModeError`` (= the same "fail at load" contract as
+    ``job_timeframe_pool``/``job_benchmark_mode``): a typo can never silently
+    select the other search shape.  This is a **job field and not a config key**
+    — there is deliberately no ``ga.symbol_mode``, so no operator inherits a
+    different GA shape from a config edit.
+    """
+    from core.ga.evolver import parse_symbol_mode
+
+    return parse_symbol_mode(job.get("symbol_mode"))
+
+
 def job_keep_checkpoint(job: dict, config=None) -> bool:
     """``keep_checkpoint`` for this job — retention unless explicitly disabled.
 
@@ -283,6 +303,9 @@ def ga_run_config(job: dict, pop_size: int, generations: int, seed: int,
     confines the timeframe gene to it), alongside the job's worker count/seed,
     its validated ``benchmark_mode`` (``None`` = the config's mode) and its
     ``keep_checkpoint`` choice (job field → ``ga.keep_checkpoint`` → retention).
+    Its validated ``symbol_mode`` (``"pooled"`` unless the job asks otherwise)
+    decides whether the evolver runs one population over the basket or one
+    independent population per symbol.
     """
     from core.ga.evolver import GARunConfig
 
@@ -296,6 +319,7 @@ def ga_run_config(job: dict, pop_size: int, generations: int, seed: int,
         timeframe_pool=job_timeframe_pool(job),
         benchmark_mode=job_benchmark_mode(job),
         keep_checkpoint=job_keep_checkpoint(job, config),
+        symbol_mode=job_symbol_mode(job),
     )
 
 
@@ -361,6 +385,21 @@ def run_ga(job: dict, job_file: str):
         f"({'job field' if ga_cfg.benchmark_mode else 'config'}) "
         f"— the publication gate compares against it")
 
+    # ── P7-S2: which search shape this job runs ──
+    # A job field (no config key): ``pooled`` (the default) = one population over
+    # the whole basket; ``per_symbol`` = one independent population per symbol,
+    # each champion restricted to its own symbol.
+    from core.ga.evolver import PER_SYMBOL
+    symbol_mode = ga_cfg.symbol_mode
+    logger.info(
+        f"[ga_worker] symbol_mode={symbol_mode} (job field) "
+        + ("— one independent GA population per symbol; every candidate is scored "
+           "only on its own symbol and each champion is restricted to it"
+           if symbol_mode == PER_SYMBOL else
+           "— one population scored on the whole basket (the pre-S2 search)"))
+    if symbol_mode == PER_SYMBOL:
+        update_progress(job_file, {"symbol_mode": symbol_mode})
+
     evolver = GAStrategyEvolver(engine, loader, ga_cfg)
 
     # One reporter fills the progress file for every shape the evolver emits
@@ -394,6 +433,9 @@ def run_ga(job: dict, job_file: str):
     result["timeframe_pool"] = timeframe_pool
     # ... and which benchmark its gate consumed.
     result["benchmark_mode"] = benchmark_mode
+    # ... and which search shape it ran (additive audit key; ``pooled`` is what
+    # an absent job field means, so the GA numbers are unchanged).
+    result["symbol_mode"] = symbol_mode
     # Checkpoint retention, on the job log (tail-able without the UI) and in the
     # result.  The evolver logs the same decision; this line ties it to the job.
     checkpoint = result.get("checkpoint") or {}
@@ -534,6 +576,10 @@ def run_walkforward(job: dict, job_file: str):
         "keep_checkpoint": bool(ga_cfg.keep_checkpoint),
         "benchmark_mode": (ga_cfg.benchmark_mode
                            or getattr(config, "ga_benchmark_mode", None)),
+        # P7-S2: the search shape every window's GA ran (per-window champions of a
+        # per-symbol job are restricted to their own symbol; the window row here
+        # reports the best per-symbol champion of that window).
+        "symbol_mode": ga_cfg.symbol_mode,
     })
 
 
@@ -563,6 +609,11 @@ def main():
         # running the whole evolution against a different gate.  ``None``
         # (field absent) = follow ``config.ga_benchmark_mode``.
         job["benchmark_mode"] = job_benchmark_mode(job)
+
+        # ── Job-load validation: a bad symbol_mode fails HERE too (P7-S2) ──
+        # ``job_symbol_mode`` raises the named ``UnknownSymbolModeError``; an
+        # absent field = ``"pooled"``, the historical whole-basket search.
+        job["symbol_mode"] = job_symbol_mode(job)
 
         # A run's FIRST progress record: ``fresh_run=True`` clears the previous
         # run's terminal keys (cancellation/crash/completion) so relaunching the

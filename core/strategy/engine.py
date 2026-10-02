@@ -26,6 +26,12 @@ P4_REGIME_DIAGNOSTICS_ENABLED = False
 P4_META_FILTER_ENABLED = False
 #: Let a registered pairs provider override a strategy's indicator signal.
 P4_PAIRS_SIGNALS_ENABLED = False
+#: P7-S3: let a registered ``RegimeOrchestrator`` veto an entry before it is
+#: published (it can only *suppress*, never change the side or the size).  Off by
+#: default, and it also needs ``ai.orchestrator.enabled: true`` **and** a caller
+#: that registered an orchestrator, so the shipped build reads no orchestration
+#: state at all.
+REGIME_ORCHESTRATOR_LIVE_ENABLED = False
 
 
 class StrategyEngine:
@@ -55,6 +61,14 @@ class StrategyEngine:
         #: ``P(primary trade hits its profit barrier)``.
         self._p4_meta_labeler = None
         self._p4_meta_probability = None
+        #: P7-S3 seam: the upper-layer ``RegimeOrchestrator`` (see
+        #: :mod:`core.ai.orchestrator`).  ``None`` = the seam is inert; it is only
+        #: ever read while :data:`REGIME_ORCHESTRATOR_LIVE_ENABLED` is true *and*
+        #: the object's own ``ai.orchestrator.enabled`` is true.
+        self._regime_orchestrator = None
+        #: P7-S3 seam: ``label_fn(symbol, interval, df) -> label | None`` — the
+        #: caller-owned causal label source (``None`` ⇒ every bar is UNKNOWN).
+        self._regime_orchestrator_label = None
 
     # ── P4 wiring (explicit, opt-in, no effect until a flag is enabled) ──
 
@@ -79,6 +93,63 @@ class StrategyEngine:
         """
         self._p4_meta_labeler = labeler
         self._p4_meta_probability = probability_fn
+
+    def wire_regime_orchestrator(self, orchestrator, label_fn=None) -> None:
+        """Register the P7-S3 upper-layer orchestrator (no effect until enabled).
+
+        The orchestrator is asked **before an entry signal is published** and its
+        answer can only suppress that entry — it never changes the side, the
+        size, the stop or the route.  It is read only while
+        :data:`REGIME_ORCHESTRATOR_LIVE_ENABLED` is true *and* the object's own
+        ``config.enabled`` is true, so a registered-but-disabled orchestrator is
+        inert by construction.
+
+        ``orchestrator`` is a ``core.ai.orchestrator.RegimeOrchestrator``.
+        ``label_fn(symbol, interval, df) -> label | None`` supplies the **causal**
+        regime label of the current bar; the caller owns it because only the
+        caller knows which cached frame is causal.  It is optional, and its
+        absence is meaningful rather than fatal: every bar is then
+        ``UNKNOWN`` and follows ``ai.orchestrator.regime.missing_regime_action``
+        (shipped: ``allow``), which the YAML documents.  The engine does **not**
+        build the orchestrator, the regime context or the breadth series —
+        constructing them is the caller's decision, which is why no production
+        component does it today.
+        """
+        self._regime_orchestrator = orchestrator
+        self._regime_orchestrator_label = label_fn
+
+    def _p7_orchestrator_decision(self, symbol: str, interval: str, strategy, df):
+        """The orchestrator's verdict for one bar, or ``None`` when the seam is off.
+
+        Three conditions must hold *before* anything is read: the module constant
+        (``experimental.regime_orchestrator_live``) is true, a caller registered
+        an orchestrator, and the orchestrator's own master switch is on.  Any of
+        them failing returns ``None`` immediately — the default build never calls
+        into :mod:`core.ai.orchestrator` at all.
+
+        The bar timestamp is the frame's last index label (never a wall clock), so
+        the live seam and a replay look up the same causal label for the same bar.
+        A registry failure is swallowed into ``None`` (the historically-allowing
+        direction) but logged, exactly like the other P4 seams: a broken
+        orchestrator must not stop signal production.
+        """
+        if not REGIME_ORCHESTRATOR_LIVE_ENABLED or self._regime_orchestrator is None:
+            return None
+        try:
+            if not getattr(self._regime_orchestrator, "enabled", False):
+                return None
+            at = df.index[-1] if df is not None and len(df.index) else None
+            label = None
+            if self._regime_orchestrator_label is not None:
+                label = self._regime_orchestrator_label(symbol, interval, df)
+            return self._regime_orchestrator.decide(strategy.name, at=at,
+                                                    label=label)
+        except Exception:
+            from loguru import logger
+            logger.exception(
+                f"P7 orchestrator failed for {strategy.name} {symbol} {interval} — "
+                f"entry kept (the documented allowing direction)")
+            return None
 
     def _p4_pairs_indicator(self, symbol: str, interval: str) -> float | None:
         """The pairs provider's ``indicator_signal``, or ``None`` when inert."""
@@ -379,6 +450,13 @@ class StrategyEngine:
         )
 
         key = f"{strategy.name}|{symbol}"
+        # ── P7-S3 seam: the upper-layer orchestrator (default-off) ──────────
+        # Asked once per evaluation, at the SAME seam as the P4 seams above.  It
+        # can only keep an entry from being published; `None` means the seam is
+        # off (the constant, the absence of a registered object, or the object's
+        # own master switch), which is the shipped state and reads no
+        # orchestration state beyond one boolean.
+        orch_decision = self._p7_orchestrator_decision(symbol, interval, strategy, df)
         self._signal_cache[key] = {
             "strategy": strategy.name,
             "symbol": symbol,
@@ -408,13 +486,29 @@ class StrategyEngine:
                 "regime": p4_regime, "meta": p4_meta,
                 "pairs_indicator": pairs_indicator,
             }
+        # The orchestrator's verdict is attached only when the seam actually
+        # produced one, so the default cache payload keeps its exact key set.
+        if orch_decision is not None:
+            self._signal_cache[key]["orchestrator"] = orch_decision.as_dict()
 
         # Signal publishing — only when driven by real-time klines
         if not publish:
             return
 
+        # ── P7-S3: the orchestrator veto (only ever suppresses an ENTRY) ────
+        # A disabled strategy is not an exited one: reduce/exit handling below
+        # runs exactly as before, so an orchestrated session can still flatten a
+        # position it was already holding when the upper layer turned it off.
+        entry_vetoed = orch_decision is not None and not orch_decision.enabled
+        if entry_vetoed:
+            from loguru import logger
+            logger.info(
+                f"ENTRY VETOED by regime orchestrator: {strategy.name} "
+                f"{entry_side.upper()} {symbol} @ {interval} "
+                f"reason={orch_decision.reason} label={orch_decision.label}")
+
         # Publish entry signal — exit only blocks same-side entry when position exists
-        if abs(final_score) >= 0.5 and not exit_blocks_entry:
+        if abs(final_score) >= 0.5 and not exit_blocks_entry and not entry_vetoed:
             price = self.market_data.get_current_price(symbol)
             if not price and df is not None and len(df) > 0:
                 price = float(df["close"].iloc[-1])

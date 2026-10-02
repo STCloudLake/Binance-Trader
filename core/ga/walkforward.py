@@ -191,7 +191,9 @@ class WalkForwardRunner:
         Returns:
             WFReport with per-window results and aggregate metrics.
         """
-        from core.ga.evolver import GAStrategyEvolver, CheckpointWindowMismatchError
+        from core.ga.evolver import (GAStrategyEvolver,
+                                     CheckpointWindowMismatchError,
+                                     CheckpointSymbolModeMismatchError)
 
         windows = self.compute_windows(date_start, date_end, wf_config)
         if not windows:
@@ -280,6 +282,17 @@ class WalkForwardRunner:
                 logger.warning(
                     f"WF window {i + 1}: the GA checkpoint belongs to another "
                     f"window — starting this window's GA fresh ({exc})")
+                champion = _run_window_ga(False)
+            except CheckpointSymbolModeMismatchError as exc:
+                # P7-S2: the GA checkpoint was written by the OTHER symbol_mode
+                # (a previous job with a different search shape).  Same treatment
+                # as a cross-window checkpoint: start this window fresh rather
+                # than failing the whole walk-forward.  Unreachable while both
+                # sides are the default `pooled`.
+                logger.warning(
+                    f"WF window {i + 1}: the GA checkpoint was written by a "
+                    f"different symbol_mode — starting this window's GA fresh "
+                    f"({exc})")
                 champion = _run_window_ga(False)
 
             val_data = champion.get("validation", {}) or {}

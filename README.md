@@ -226,6 +226,7 @@ slippage_usdt = |fill − price| × quantity；cost_usdt = fee + slippage_usdt
 | **波动率目标化** | `risk.vol_targeting.enabled: false` | 完全 opt-in；关闭时仓位与止损宽度与固定比例实现**逐位一致**。该块里 `barrier_vol_multiple` / `barrier_min_pct` / `barrier_max_pct` 是 **RESERVED/惰性**键（无生产调用方，设成非默认值只在启动时打 WARNING），不要当成生效配置 |
 | **`risk.liquidity`（成交量/冲击）** | `enabled: false`、`impact_k: 0.0` | 关闭时 `PositionSizer` 不调用参与度钩子，回测成本保持审计过的 `fees + spread/2` 逐位不变（`tests/test_liquidity.py` 守护）。`impact_k` 在配置里明确标注 **ILLUSTRATIVE, NOT CALIBRATED** |
 | **P4 新能力** | 模块级常量全为 `False`：`META_LABELING_ENABLED`（`core/ml/meta.py`）、`PAIRS_ENABLED`（`core/strategy/pairs.py`）、`REGIME_GATING_ENABLED`（`core/strategy/regime.py`）、`MICROSTRUCTURE_ENABLED`（`core/market_data/microstructure.py`） | 已实现且有独立测试，但**未接入实时链路**（默认惰性、关闭时全放行）；在真实 1h 主流币数据上配对与 meta-label 门**拒绝**全部被测一级规则——这是有效结论，不是缺陷。这些常量现在有配置开关，见 §4.4 |
+| **上层编排器（P7-S3）** | `ai.orchestrator.enabled: false`；实盘还需 `experimental.regime_orchestrator_live: true` **且**调用方注册（生产链路无注册者） | 已实现、有独立测试，规则**固定不学习**；实测样本外它**降低回撤也降低收益**（见 §4.8），且两臂 DSR 都是 0——没有可发表的优势，因此默认关闭 |
 
 `core/` 里仍有 GA、AI（DeepSeek 控制器 + 策略生命周期）、新闻情绪、代币启发式筛查（`core/market_data/screener.py`）在链路上；`experimental/` 是**不在交易链路上**的死代码存档（见 [`experimental/ml/README.md`](experimental/ml/README.md)）。
 
@@ -239,6 +240,7 @@ P4 那批能力此前只能改 Python 常量；现在一个能力一个开关，
 | `engine_meta_filter` / `engine_pairs_signals` | `P4_META_FILTER_ENABLED` / `P4_PAIRS_SIGNALS_ENABLED`：已注册的 MetaLabeler / pairs provider 可过滤或替换信号，但生产链路**尚未注册**（`wire_meta_filter` / `wire_pairs_provider` 无调用者），单开无效 |
 | `regime_gating` / `regime_diagnostics` | `REGIME_GATING_ENABLED` 切到因果 HMM 并启用门；`REGIME_DIAGNOSTICS_ENABLED` **无生产读取者** |
 | `pairs_enabled` / `meta_labeling_enabled` / `microstructure_enabled` | `PAIRS_ENABLED` / `META_LABELING_ENABLED` / `MICROSTRUCTURE_ENABLED`：**均无生产读取者**（microstructure 连**接线缝隙都没有**），打开不改变任何可达行为 |
+| `regime_orchestrator_live` | `REGIME_ORCHESTRATOR_LIVE_ENABLED`（`core/strategy/engine.py`，P7-S3）：允许实盘在**发布入场前**询问已注册的上层编排器（只可能**否决入场**，永不改方向/仓位）。需要**三道锁**同时成立——本开关 + `ai.orchestrator.enabled: true` + 调用方 `wire_regime_orchestrator(...)` 注册；生产链路没有注册者，故单开本开关不改变任何可达行为。关闭时 `decide()` 恒为 allow 且**不读**波动率/广度序列 |
 
 每个开关只打开**那道缝**，能力自身的验收门仍会拒绝：真实 1h 主流币配对 **0/30** 通过协整检验、meta 门 **10/10** 拒绝一级规则、regime 只接受因果 HMM 标签。**诚实预期**：这些开关提高的是**可测量性与纪律**（能否复现、能否 A/B），**不增加预测优势**。启动时会打一条 WARNING 逐项列出已开启的开关（`experimental_notices`，与 `inert_barrier_key_warnings` 同型），未知键也会被点名而不是静默忽略。
 
@@ -282,6 +284,39 @@ P4 那批能力此前只能改 Python 常量；现在一个能力一个开关，
 | **试错计数（DSR 诚实性）** | 检查点保存 `prior_trials` + `trials_this_run`，续跑时把二者之和作为**下限**并入 `prior_trials`：即使 `data/ga_trials.json` 被清掉，第 13 代的 DSR 也仍以"已试过的 36 次"去膨胀，而不是从本次 population 重新计数；不会重复计数（`max`，不是相加） |
 | **可审计** | 检查点内含 generation / `window_key` / population hash / symbols / `timeframe_pool` / 试错计数；续跑后的冠军 `provenance` 记录 `keep_checkpoint`、`resumed_from_generation`、`checkpoint{path,kept,generation,window_key,resumed_*,population_hash,symbols,timeframe_pool}` 与 `trials{prior_trials,trials_this_run,resumed_trials,n_trials}`；完成日志 `GA checkpoint kept at <path> (generation g)`（worker 再打一条 `[ga_worker] checkpoint kept/cleared at ...`） |
 | **可见性** | `python scripts/ga_job_status.py`（最新任务或 `--job-id`）打印检查点行：路径、是否存在、**代数、mtime**、窗口、population hash、试错数与"续跑将从第 g+1 代继续"；`--checkpoint-file` 可指向别处。GA 面板新增 **Keep checkpoint** 勾选框（默认勾选），完成的运行还会在状态行显示 "checkpoint kept at generation g" 并显示 Resume 按钮 |
+
+### 4.8 上层编排器（`ai.orchestrator`，P7-S3，默认关闭）
+
+**它解决的问题.** P7-S1 让**每个策略**自己声明"我只在哪些状态交易"。实测结论是否证：条件化**没有**带来风险调整后的 alpha（样本外 `dsr > 0` 的单元 0/8 与 0/40），但它**一致地把曝光削掉一大截**（成交中位 141.5 → 19.5、在场时间 24.0 % → 2.1 %）。操作者的读法是：**"什么可以跑"应该由一层上层引擎决定**，而不是每个策略自己管——那层就是 `core/ai/orchestrator.py::RegimeOrchestrator`。
+
+**它是"一个对象、一个决策点"**：逐 bar 回答"策略 `s` 现在允不允许被启用"，输入 = **因果**状态标签（`core/strategy/regime_causal.py`；样本内 HMM 标签按名**拒绝**，抛 `InSampleRegimeLabelError`）+ 波动率状态（`core/ml/volatility.py` 的因果 EWMA）+ **市场广度**（`core/market_data/breadth.py`，P6-C 建好但从未接线；缺失/过期按配置回退，shipped `allow`）+ 策略自己的**连亏记录**。它**不选币、不定仓、不下单、不学习**。
+
+| 规则 | 公式 / 语义 | 配置键（shipped 值） |
+|---|---|---|
+| **1 状态映射** | `eligible = r(t) ∈ L(s)`；未列出的策略按 `default_action`；`range_unknown`（序列头部 31 根）按 `unknown_label_action`；整个系列缺失按 `missing_regime_action` | `regime.allowed`（`{}`）、`default_action`/`missing_regime_action`/`unknown_label_action`（全 `allow`） |
+| **2 连亏熔断** | 同一状态段内连续 `N` 笔 `pnl < loss_threshold` ⇒ 锁死到本段结束；**状态变化**即清零解锁 | `kill_switch.consecutive_losses`（`0` = 关闭）、`loss_threshold`（`0.0`）、`reset_on_regime_change`（只能 `true`） |
+| **3 波动率门** | `v(t) > m · med(t)`，`med` = **t 之前**尾部 `window` 个样本的中位数（样本不足 ⇒ 按 `missing_action`） | `vol.multiple`（`0.0` = 关闭）、`vol.window`（`200`）、`vol.min_samples`（`30`）、`deny_on_high_vol`（`true`） |
+| **4 广度门** | `up_share < min_up_share` 或 `coverage < min_coverage` ⇒ 拒绝；过期/缺失按 `stale_action`/`missing_action` | `breadth.min_up_share`/`min_coverage`（未设 = 关闭）、`max_staleness_ms`（`1800000`）、`sample_ms`（`0`） |
+
+**决策顺序** 状态 → 熔断 → 波动率 → 广度；`reason` 是第一条命中的规则，`blocked_reasons` 列出全部，`enabled ≡ (blocked_reasons == ())`——**规则只能拦、不能放行**。配置在**加载时**校验：未知键、未知标签、`calm`/`stressed`、非法 action 都抛具名 `OrchestratorConfigError`。确定性由 `RegimeOrchestrator.replay`（S4 入口）保证：同规则 + 同事件流 ⇒ 逐位相同的时间线。
+
+**⚠ 阈值是固定规则，不得在评估窗口上调.** S4 的纪律是"只用训练窗选/锁规则，样本外只评一次"（`--holdout`）；看着样本外改 `ai.orchestrator` 就等于把 S4 的数字变成样本内——这正是 S1 已经付过学费的失败模式。
+
+**实测（真实缓存，样本外 2026-02-01~2026-06-01，BTC+ETH 1h，30 个变体，DSR 试验数 30）**
+
+```powershell
+python tools/p7_orchestrator_measure.py --genomes 3 --symbols BTCUSDT ETHUSDT `
+    --timeframe 1h --trials 30 --out $env:TEMP\p7_orchestrator_measure.json
+```
+
+| 臂 | 成交 | 收益 % | 最大回撤 % | 在场时间 % | Sharpe | DSR |
+|---|---|---|---|---|---|---|
+| always-on | 1407 | −1.7600 | 2.5145 | 70.6944 | −2.7402 | 0.0 |
+| orchestrated | 1229 | −2.0030 | 2.2615 | 66.7361 | −4.2916 | 0.0 |
+
+被拒成交 178 笔、合计 PnL **+24.30 USDT**（79 胜 / 97 负；按规则：熔断 98 笔 / +1.93，状态映射 80 笔 / +22.37，波动率门 0 笔）。**诚实结论：编排器把回撤和在场时间都压低了，也把收益与 Sharpe 压低了——它拒掉的是净盈利的敞口，而不是净亏损的敞口；两臂 DSR 都是 0.0。** 这与 S1 一致：**削曝光是稳的，削对曝光不是**。这是 S4 的预览，不是 S4（组合体资金曲线契约、同口径对照与 `--holdout` 一次性计数仍是 S4 的交付物）。
+
+**关闭即不变.** `ai.orchestrator.enabled: false` 时 `decide()` 恒为 allow 且**不读**波动率/广度序列；回测引擎只在调用方显式传 `orchestrator=` 时读取，实盘还要 `experimental.regime_orchestrator_live: true` 且调用方注册。逐位一致由 `tests/test_p7_orchestrator.py` 用 `git worktree` 在 `d9849a2` 上比对成交、逐点资金曲线与指标键集合（43 项测试）。
 
 ---
 

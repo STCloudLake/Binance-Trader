@@ -7,6 +7,83 @@ ai:
     market_assessment_minutes: 60
     risk_adjustment_minutes: 1440
     strategy_optimization_minutes: 1440
+  # ── P7-S3: the upper-layer regime orchestrator (OFF by default) ──────────
+  # `core/ai/orchestrator.py::RegimeOrchestrator` decides which strategies may
+  # be ENABLED at each bar, from the CAUSAL regime label
+  # (`core/strategy/regime_causal.py` — an in-sample HMM label is refused by
+  # name), the volatility state, the market-breadth series
+  # (`core/market_data/breadth.py`) and each strategy's own lifecycle outcome
+  # (the consecutive-loss kill switch below).
+  #
+  # `enabled: false` (shipped) ⇒ the object returns "allow" for every
+  # (strategy, bar) WITHOUT reading the regime context, the vol series or the
+  # breadth series, so a disabled orchestrator cannot change any signal, size or
+  # route. A run is bit-identical to the pre-S3 build (pinned by
+  # tests/test_p7_orchestrator.py, including a `git worktree` at d9849a2).
+  #
+  # ⚠ These thresholds are a FIXED rule set, NOT fitted parameters. They must
+  # NEVER be tuned on the evaluation window: S4 chooses/locks them on the train
+  # window and evaluates once on the out-of-sample window
+  # (`--holdout` semantics, docs/overhaul/P7_REGIME_PLAN.md S4). Tuning them
+  # while looking at the test window turns S4's numbers into in-sample ones —
+  # the exact failure P7-S1 already paid for (conditioning cut trades
+  # 141.5 → 19.5 and time-in-market 24.0 % → 2.1 % with 0/40 out-of-sample
+  # `dsr > 0`).
+  #
+  # Rule 1 — regime mapping (per strategy, the causal 5-label vocabulary):
+  #   regime.allowed: {strategy_name: [trend_up, trend_down, range_low,
+  #                                    range_mid, range_high]}   or  ["all"]
+  #   A strategy NOT listed follows `default_action`; an unmeasured bar
+  #   (`unknown`) follows `missing_regime_action`. An empty list = "never".
+  #   Two "I do not know" cases are kept apart: `missing_regime_action` applies
+  #   when there is NO regime data at all for the symbol/interval, and
+  #   `unknown_label_action` applies to a bar the classifier labelled
+  #   `range_unknown` (the first 31 bars of any series, before the expanding
+  #   volatility terciles are measurable). `range_unknown` is never inside a
+  #   label list, so without `unknown_label_action` a `["all"]` mapping would
+  #   silently refuse the head of every series.
+  # Rule 2 — kill switch: after `kill_switch.consecutive_losses` consecutive
+  #   trades with `pnl < loss_threshold`, the strategy is disabled for the rest
+  #   of that regime stretch; a regime CHANGE resets the counter and the latch
+  #   (`reset_on_regime_change` must stay true — false is refused at load).
+  #   `consecutive_losses: 0` disables the rule.
+  # Rule 3 — vol gate: blocked when `vol > vol.multiple * trailing median`, the
+  #   median taken over the `vol.window` samples strictly before the bar
+  #   (`vol.min_samples` floor; below it the gate is unmeasurable and follows
+  #   `vol.missing_action`). `multiple: 0` disables the rule.
+  # Rule 4 — breadth gate: blocked when `up_share < breadth.min_up_share` or
+  #   `coverage < breadth.min_coverage`. Breadth is a FORWARD-ONLY series
+  #   (the endpoint has no history), so an absent/stale series follows
+  #   `breadth.missing_action` / `breadth.stale_action`; both ship `allow`
+  #   because "no breadth data" must not silently disable the book (set them to
+  #   `deny` for a hard guard). Unset floors disable that half of the rule.
+  # Unknown keys and unknown values (including `calm`/`stressed`) raise
+  # `OrchestratorConfigError` at config load — a rule typo cannot be ignored.
+  orchestrator:
+    enabled: false
+    regime:
+      allowed: {}
+      default_action: allow
+      missing_regime_action: allow
+      unknown_label_action: allow
+    kill_switch:
+      consecutive_losses: 0
+      loss_threshold: 0.0
+      reset_on_regime_change: true
+    vol:
+      multiple: 0.0
+      window: 200
+      min_samples: 30
+      deny_on_high_vol: true
+      missing_action: allow
+    breadth:
+      min_up_share: null
+      min_coverage: null
+      max_staleness_ms: 1800000
+      sample_ms: 0
+      stale_action: allow
+      missing_action: allow
+      deny_on_low_up_share: true
 auth:
   jwt_secret: ''
   session_hours: 24
@@ -136,6 +213,8 @@ core_position:
 #     meta_labeling_enabled / microstructure_enabled）：打开它们本身不改变任何可达
 #     路径，注释已逐条写明。engine_pairs_signals / engine_meta_filter 有缝但需要
 #     调用方 wire_pairs_provider() / wire_meta_filter() 注册组件，生产链路尚未注册。
+#     regime_orchestrator_live（P7-S3）同样有缝、同样**没有调用方注册**编排器，且
+#     还要求 `ai.orchestrator.enabled: true`。
 # 启动时会打一条 WARNING 列出所有已开启项并提醒"各自受验收门约束"
 #（experimental_notices，与 inert_barrier_key_warnings / liquidity_key_warnings 同型）。
 experimental:
@@ -173,6 +252,17 @@ experimental:
   # 接线缝隙**（没有 wire_microstructure 之类），打开它不改变任何可达行为；即便接线，
   # 特征取自毫秒级过期的盘口，改善的是**测量**而不是方向判断。
   microstructure_enabled: false
+  # ── 上层编排器（P7-S3，core/ai/orchestrator.py）──
+  # REGIME_ORCHESTRATOR_LIVE_ENABLED：允许实盘 StrategyEngine 在**发布入场信号前**
+  # 询问已注册的 RegimeOrchestrator（`StrategyEngine.wire_regime_orchestrator`）。
+  # 有两道锁，缺一不可：本开关为 true **且** `ai.orchestrator.enabled: true`；再
+  # 加上调用方必须显式注册编排器（生产链路目前**没有**任何调用方注册），因此单开
+  # 本开关不改变任何可达信号/仓位。第三道锁是该对象自己的 `enabled`。
+  # 门：编排器只消费**因果**标签（样本内 HMM 标签按名拒绝，抛
+  # InSampleRegimeLabelError 而不是"放行"）；关闭时 `decide` 恒为 allow，且**不读**
+  # 波动率序列与广度序列（`tests/test_p7_orchestrator.py` 与 HEAD 工作树逐字节比对）。
+  # ⚠ `ai.orchestrator` 的阈值是固定规则，**不得在评估窗口上调整**（见该块注释）。
+  regime_orchestrator_live: false
 language: zh
 ml:
   # ── ML credibility gate (docs/overhaul/ALGO_UPGRADE_PLAN.md §二 P2) ──

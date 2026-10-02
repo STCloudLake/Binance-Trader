@@ -272,6 +272,112 @@ Jensen 式 alpha/beta（OLS，年度化）、扣费后每笔净边际（`trade["
 `tests/test_ga_benchmark_mode.py::test_enabling_a_champion_can_only_trade_its_recorded_basket`
 用真实 `StrategyEngine.evaluate_all_now()` 钉住这一点。
 
+## 每币种独立进化（job 字段 `symbol_mode`，P7-S2）
+
+缺省仍是**整篮子池化**（`pooled`）：一个种群，每个基因组在**整篮子**上评分（一条池化资金曲线）。
+动机（实测）：一个只在某个币上有效的信号会被其他币**平均掉**；`symbol_mode: "per_symbol"` 让 GA
+变成**每个币一套独立种群**——每个候选**只在它自己的币上评分**，每个币各出一个冠军。
+
+| 关注点 | 约定 |
+|---|---|
+| **开关** | **job 字段** `symbol_mode`（`"pooled"`（缺省）/ `"per_symbol"`），**不是配置键**：`config/config.yaml` 没有 `ga.symbol_mode`，`Config` 也没有该属性（`tests/test_p7_symbol_mode.py::test_there_is_no_config_key_for_the_mode` 守护）——任何配置改动都不会改变 GA 的搜索形状 |
+| **校验** | `core/ga/evolver.py::parse_symbol_mode`；未知取值抛具名 `UnknownSymbolModeError`：接口 **HTTP 400**、worker **加载即失败**（`scripts/ga_worker.py::job_symbol_mode`，与 `timeframe_pool`/`benchmark_mode` 同型）；字段缺失/空白 = `pooled` |
+| **为什么是"独立种群"而不是"一个种群 + 受限 `symbol` 基因"** | 混合种群里的锦标赛选择会比较**在不同币上测得的适应度**——胜者取决于哪个币的适应度地形更容易，而不是策略更好；而且混合种群仍然池化搜索。独立种群让"一币一冠军"和试错计数成为**定义**而不是约定 |
+| **评分** | 每个臂走同一套评估路径（`evaluate_population_batch` / `evaluate_population_multiprocess`），只是 `symbols=[该币]`；`core/ga/fitness.py` 在每条基因结果里追加**只读**审计键 `symbols_evaluated`（不影响任何数字） |
+| **冠军** | 每币一个冠军 YAML：`ga_champion_<币>_<时间戳>`，`champion_config.symbols == [该币]`（执行路径本来就按它限制交易，见上一节）；`provenance.symbol_mode / champion_symbol / n_symbols`；result 里是 `champions[]`（按 `symbols` 顺序）**加**顶层镜像（适应度最高的那个臂，旧消费方读的键与取值口径不变） |
+| **成本** | 墙钟时间≈不变：每个 per-symbol 候选只在 1 个币上评分，N 个臂 ≈ 一个池化臂的成本 |
+
+### 试错计数（DSR 诚实性，P7-S2 的硬要求）
+
+per-symbol 运行实际执行了 `len(symbols) × population × generations` 次评估，所以 DSR 的 N 必须按
+这个数去膨胀（`core/ga/evolver.py::dsr_trial_counts` + `data/ga_trials.json` 台账）：
+
+1. **代内**：每个臂的每一代照旧 `record_trials(population)` 累加台账，于是**第 k 个臂的第 g 代**看到的
+   `prior_trials` = 之前所有臂与代**实际执行**的试验数——臂之间不共享种群，但共享**搜索的账**。
+2. **冠军**：`evolve()` 在**所有臂跑完之后**只算一次 `n_trials`（`prior_trials + trials_this_run`），
+   再传给每个臂的发布路径（`_publish_arm`），因此**每个** per-symbol 冠军的 DSR 都用"整轮运行真正
+   试过的变体数"，而不是它自己那一份 population。冠军 YAML 自述口径：
+   `provenance.trials.search{evaluations_this_arm, evaluations_whole_run, arm_population}`。
+3. **这是保守的**：同算力下 per-symbol 的 N 严格大于 pooled 的 N（多了 `len(symbols)` 倍），
+   所以它的 DSR 门槛**更高**——任何"per-symbol 更好"的结论必须先过这道更高的门。
+4. `pooled` 的算术与 HEAD 逐位一致（仍是 `population × generations`）。
+   `tests/test_p7_symbol_mode.py::test_the_trial_counter_counts_every_evaluation_not_the_population`
+   用打桩评分器断言：调用序列的 `prior_trials` = `population×k`、每个冠军 `n_trials` = `4×3×3 = 36`，
+   且**不等于** per-symbol 的 population（4）、也不等于一个臂的代数积（12）。
+
+### 检查点身份（两种形状不可互续）
+
+检查点记录 `symbol_mode` 与 `arm_symbol`。跨形状续跑抛具名 `CheckpointSymbolModeMismatchError`
+（pooled 的种群是在整篮子上评分的，per-symbol 的只在一个币上）；per-symbol 续跑只续**检查点所属的
+那个臂**，其余臂从零开始，且 `evolve()` 在臂循环**之前只读一次**检查点（否则第一个臂写回检查点会
+覆盖掉后面的臂要续的状态）。
+
+### 默认关闭的逐位一致
+
+字段缺失或 `"pooled"` 时与 HEAD 逐位一致：同 seed 下种群哈希、每一代 `prior_trials`/`batch_trials`、
+冠军基因、发布门结论与 result 载荷全部相同（**真实评分器**上：
+`tests/test_p7_symbol_mode.py::test_absent_and_pooled_are_byte_identical_on_the_real_scorer`；
+打桩评分器上：`test_absent_and_pooled_are_byte_identical_with_a_stub_scorer`），并且在
+**`git worktree` d9849a2** 里跑同一 harness 逐字节相同
+（`test_pooled_is_byte_identical_to_the_head_worktree`）。唯一被有意排除在比对之外的是**加法审计键**
+`symbols_evaluated` 与时间戳/文件名。
+
+### 实测：池化 vs 每币种（真实缓存数据，允许结论是"没用"）
+
+`tools/p7_symbol_mode_measure.py` 用**同一窗口/币种/种子**跑两臂（`pooled` 与 `per_symbol`），两者都
+走真实的 `GAStrategyEvolver.evolve`（不打桩），门基准是出货的 `exposure_matched`；每个冠军用**它自己的
+评估篮子**在样本外窗口上重新评分（`n_trials` = 该轮运行的诚实试错数），并把池化冠军**逐币单独**再评分一次
+（同币种对照）。命令、窗口、种子与全部数字写进 `--out` 的 JSON：
+
+```powershell
+python tools/p7_symbol_mode_measure.py --population 4 --generations 3 `
+    --symbols BTCUSDT ETHUSDT --timeframe 1h `
+    --train-start 2025-11-01 --train-end 2026-02-01 `
+    --oos-start 2026-02-01 --oos-end 2026-06-01 `
+    --seeds 20261011 20261012 20261013 --split-pooled `
+    --out $env:TEMP\p7_symbol_mode.json
+```
+
+<!-- P7_S2_MEASUREMENT_TABLE -->
+**实测（2026-10-02，本机）**：2 个臂 × 2 个种子（`20261011`/`20261012`），每臂
+`population=8 × generations=4`，每臂独立冷启动（无历史台账）。**每臂 `n_trials` =
+实测评估数**：pooled 32、per_symbol 64（= 32 × 2 币），墙钟 200.8 s vs 226.1 s（≈ 不变）。
+
+| 指标（样本外 2026-02-01~2026-06-01，BTC+ETH 1h，`exposure_matched`） | pooled（篮子冠军，2 个） | per_symbol（每币冠军，4 个） |
+|---|---|---|
+| 样本外交易数（中位） | **147** | **81.5** |
+| 样本外 alpha（中位 / 均值，百分点） | **−0.526 / −0.526** | −0.3054 / −0.3392 |
+| 样本外 alpha > 0 的个数 | **0 / 2** | **0 / 4** |
+| 样本外 **DSR > 0 的个数** | **0 / 2** | **0 / 4** |
+| 在场时间占比（中位 %） | **42.48** | **21.68** |
+| 训练窗是否发布 | 2/2 未发布 | 4/4 未发布 |
+
+**同币成对对照**（pooled 冠军**逐币单独**评分 vs 该币的 per_symbol 冠军；4 对 = 2 种子 × 2 币）：
+Δalpha 中位 **0.0000**、均值 **−0.0754**、**1 好 / 1 坏**，Δ交易数中位 **0**、Δ在场时间中位
+**−8.0** 个百分点。**其中 2 对（两个种子的 BTC）是退化的**：per-symbol 的第一个臂与 pooled 臂
+同种子 ⇒ 同一初始种群，实测两个冠军 YAML **除了 name 之外逐行相同**（0 行差异），Δ 恒为 0，
+不提供信息；有信息的只有 2 对 ETH：种子 `20261011` 变差 0.3293 个百分点、种子 `20261012`
+变好 0.0276 个百分点——**符号随种子翻转**。
+
+**读法（允许结论是"没用"）**：本测量**不支持**"每币种专门化能改善样本外风险调整结果"这个假设：
+
+1. 两个臂、6 个冠军**没有一个样本外 DSR > 0**，也就是说没有任何候选能被"与数据挖掘区分开"；
+   全部 6 个冠军**都未通过发布门**。
+2. per_symbol 的中位 alpha（−0.3054）**看起来**好于 pooled 的篮子 alpha（−0.526），但两者**口径
+   不同**（前者是单币上的 alpha，后者是整篮子上的 alpha，且交易数中位 81.5 vs 147、在场时间
+   21.68 % vs 42.48 %）——这正是 S1 已经量到过的"少交易/少暴露把 alpha 拉向 0"的曝光效应，
+   不是选到了更好的时机。**同币成对**才是公平口径，而它是**一次好一次坏**。
+3. **per_symbol 的 DSR 门槛是 pooled 的 2 倍**（64 vs 32 次试验），所以"没有 DSR > 0"这个
+   否定结论对 per_symbol 是**保守**的：即使门槛相同，它也拿不出正 DSR。
+4. **机制本身是有效的**（合成检验）：在"只有某个币上有信号"的合成适应度地形上，per_symbol
+   找到了该币的信号、pooled 没有（见"测试"一节）。所以这里的结论是**真实数据上没有这个 alpha**，
+   而不是机制不工作——与 S1 的结论形状相同。
+
+**设计局限（如实记录，也是下次该修的地方）**：两臂同种子 ⇒ per-symbol 的第一个臂与 pooled 臂
+共享初始种群，实测其中 2/4 个成对单元因此退化（冠军是同一个 artefact）。要得到四个独立的
+成对单元，per-symbol 的各臂应当派生自己的种子（例如 `seed + 1000 + arm_index`）；本轮按任务
+要求"同窗口/同币种/同种子"运行，并把退化如实写在这里。
+
 ## 冠军 YAML 的 `provenance` 溯源块
 
 ```yaml

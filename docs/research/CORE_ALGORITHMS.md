@@ -2284,6 +2284,48 @@ $$\pi'=(c+\pi)f-c'\qquad(\text{gross}=c+\pi\ \text{不变，只按规模缩放})
 6. **live 缓存没有回填。** `data/market/BTCUSDT/1h.parquet` 至今仍是 5 列（A，§12.2），所以实盘路径与容量表仍在 $\text{volume}\times\text{close}$ 代理上，代理与 kline 字段 7 并不相等。
 7. **P6 的成本数字不能跨机器引用。** 本机在 7 个并发 Python 进程 / CPU 100 % 下测得整族 718.8 ms（cpu）、live 管线 5.250 s（cpu），而归档是 95.7 ms / 0.688 s（§12.1）——**归档值未验证**。
 
+### 12.8 上层编排器（P7-S3）
+
+**它是什么.** `core/ai/orchestrator.py::RegimeOrchestrator`：**一个**对象、**一个**决策点，逐 bar 回答"策略 $s$ 现在允不允许被启用"。输入是四条固定规则，输出是 `Decision(enabled, reason, blocked_reasons)`。它不选币、不定仓、不下单，也不学习——同一组规则 + 同一条事件流在每次重放上给出**逐位相同**的时间线（`RegimeOrchestrator.replay`，S4 的入口）。
+
+记 $t$ 时刻策略 $s$ 的**因果**复合标签为 $r(t)\in\{$`trend_up`,`trend_down`,`range_low`,`range_mid`,`range_high`$\}\cup\{$`range_unknown`$\}$（§7 的 `classify_regimes`，`with_hmm=False`；`calm`/`stressed` 这类**样本内** HMM 标签被**按名拒绝**，抛 `InSampleRegimeLabelError`，不返回 `False`）。
+
+**规则 1 — 状态映射**（`ai.orchestrator.regime.allowed: {策略: [标签]}`，`["all"]` = 五个标签全允许）：
+
+$$\text{eligible}(s,t)=\begin{cases}
+\mathbb 1[\texttt{missing\_regime\_action}=\text{allow}] & r(t)\ \text{无数据（label=None）}\\
+\mathbb 1[\texttt{unknown\_label\_action}=\text{allow}] & r(t)=\texttt{range\_unknown}\\
+\mathbb 1[\texttt{default\_action}=\text{allow}] & s\ \text{未列出}\\
+r(t)\in L(s) & s\ \text{已列出}\ (L(s)=\varnothing\Rightarrow \text{永不允许})
+\end{cases}$$
+
+`range_unknown` 是**序列头部 31 根**（扩张分位波动率三分位需要 `min_periods`）的标签，它**永远不在**任何标签列表里——把它和"整个系列缺失"分开，是因为 `["all"]` 否则会静默拒绝每条序列的头部（本次实测正是如此：30 个变体里 80 笔成交被 `range_unknown` 段拒掉，占被拒 PnL 的 22.37 USDT，见下表）。
+
+**规则 2 — 连亏熔断**（`kill_switch.consecutive_losses = N`、`loss_threshold`）：在**同一段状态**（标签的极大连续段）内，连续 $N$ 笔 $pnl<\text{threshold}$ 之后该策略被**锁死到本段结束**；标签**变化**时计数清零、锁清除（`reset_on_regime_change` 只能是 `true`，写 `false` 在加载时被拒）。$N=0$（shipped）关闭该规则。$pnl=0$ 视为平局，不算亏。
+
+**规则 3 — 波动率门**（`vol.multiple = m`）：以**因果**中位数 $med(t)$ 为参照（$t$ 之前已追加的尾部 `vol.window` 个样本的中位数，`vol.min_samples` 为下限）：
+
+$$\text{blocked}(t)=\big[\,v(t) > m\cdot med(t)\,\big]\quad(\texttt{deny\_on\_high\_vol=false}\ \text{时取反})$$
+
+$med(t)$ 在 $v(t)$ 追加**之前**计算，所以当前样本不会移动自己的门槛；样本不足 / 非有限 / $med\le 0$ ⇒ **不可测**，按 `vol.missing_action`（不把"无法测量"当成"比值无穷大"）。$m=0$（shipped）关闭。
+
+**规则 4 — 市场广度门**（`core/market_data/breadth.py`，P6-C 建好但从未接线）：取 $t$ 之前最近的一条观测（`sample_ms` 前向填充，0 = 只认同刻），当 `up_share < min_up_share` 或 `coverage < min_coverage` 时拒绝。超过 `max_staleness_ms` 的观测按 `stale_action`，**整条系列缺席**按 `missing_action`（两者 shipped 都是 `allow`：广度是**只能向前记录、无法回填**的序列，"没有数据"不该静默关掉整本仓；要硬保险就设成 `deny`）。阈值不设 ⇒ 该半边规则失效。
+
+**决策顺序**：状态 → 熔断 → 波动率 → 广度，`decision.reason` 是**第一条**命中的规则，`decision.blocked_reasons` 列出全部；`enabled ≡ (blocked_reasons == ())`，所以任何规则都**只能拦、不能放行**。所有阈值在**配置加载**时校验：未知键、未知标签、`calm`/`stressed`、非法 action 都抛**具名** `OrchestratorConfigError`，不会被静默忽略。
+
+**实测（A，本机；`tools/p7_orchestrator_measure.py`）.** 窗口 训练 `2025-11-01~2026-02-01` / 样本外 `2026-02-01~2026-06-01`，BTC+ETH 1h，固定种子 `20261007` 的 3 个基因组 × 5 个标签 × 2 币 = **30 个变体**（每个变体的 `regime_filter` 钉到它自己的标签），两臂**同一批成交、同一套成本**，DSR 试验数 **30**（所有变体 × 两臂），规则指纹 `63e841ffee5c3fb3`：
+
+| 臂 | 成交 | 收益 % | 最大回撤 % | 在场时间 % | Sharpe | DSR |
+|---|---|---|---|---|---|---|
+| always-on | 1407 | −1.7600 | 2.5145 | 70.6944 | −2.7402 | **0.0** |
+| orchestrated | 1229 | −2.0030 | 2.2615 | 66.7361 | −4.2916 | **0.0** |
+
+被拒成交 178 笔、合计 PnL **+24.30 USDT**（79 胜 / 97 负）：按规则分解 `kill_switch_consecutive_losses` 98 笔 / **+1.93**，`regime_not_allowed` 80 笔 / **+22.37**，`vol_above_threshold` **0 笔**（3× 中位数的门槛在这段窗口上从未触发）。
+
+**诚实结论.** 编排器**降低了回撤（2.5145 → 2.2615 %）与在场时间（70.69 → 66.74 %）**，但**也降低了收益（−1.76 → −2.00 %）和 Sharpe（−2.74 → −4.29）**：它拒掉的是**净盈利**的敞口（+24.3 USDT，胜率 44 %），而不是净亏损的敞口；两臂的 **DSR 都是 0.0**（不存在可发表的显著性）。这与 S1 的结论一致——**削曝光是稳的，削对曝光不是**。本条是 S4 的预览而非 S4：组合体资金曲线契约、对 `exposure_matched`/`buy_hold` 的同口径比较、`--holdout` 一次性访问计数都还是 S4 的交付物。
+
+**未接线 / 未启用.** `ai.orchestrator.enabled: false`（shipped）时 `decide` 恒为 allow 且**不读**波动率序列与广度序列；实盘 `StrategyEngine` 另需 `experimental.regime_orchestrator_live: true` **且**调用方 `wire_regime_orchestrator(...)` 注册（生产链路**没有**注册者）；回测引擎只在调用方显式传 `orchestrator=` 时读取。关闭路径的逐位一致由 `tests/test_p7_orchestrator.py` 用 `git worktree` 在 `d9849a2` 上比对成交、逐点资金曲线与指标键集合。
+
 ---
 
 ## 附录 A：本次会话实际运行的命令（可复现）

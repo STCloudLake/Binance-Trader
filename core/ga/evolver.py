@@ -42,6 +42,48 @@ class CheckpointWindowMismatchError(RuntimeError):
     """
 
 
+class CheckpointSymbolModeMismatchError(RuntimeError):
+    """A ``resume=True`` whose checkpoint belongs to the OTHER ``symbol_mode``.
+
+    A ``pooled`` population was scored on the whole basket and a ``per_symbol``
+    population on exactly one symbol, so continuing one as the other would
+    evolve genomes the checkpoint's fitness numbers never described.  Same
+    contract as :class:`CheckpointWindowMismatchError`: refuse, loudly.
+    """
+
+
+class UnknownSymbolModeError(ValueError):
+    """A ``symbol_mode`` that is neither ``pooled`` nor ``per_symbol``."""
+
+
+#: ``GARunConfig.symbol_mode`` — the two job-level search shapes (P7-S2).
+POOLED = "pooled"
+PER_SYMBOL = "per_symbol"
+SYMBOL_MODES = (POOLED, PER_SYMBOL)
+
+
+def parse_symbol_mode(value) -> str:
+    """Job field ``symbol_mode`` → :data:`POOLED` / :data:`PER_SYMBOL`.
+
+    ``None``/blank = :data:`POOLED` (the historical whole-basket search, so an
+    absent field is the pre-S2 behaviour).  Anything else outside
+    :data:`SYMBOL_MODES` raises the named :class:`UnknownSymbolModeError` **at
+    load time**, exactly like ``parse_benchmark_mode`` /
+    ``parse_timeframe_pool``: a typo must fail the job before hours of backtests,
+    never silently select a different search.
+    """
+    if value is None:
+        return POOLED
+    text = str(value).strip().lower()
+    if not text:
+        return POOLED
+    if text not in SYMBOL_MODES:
+        raise UnknownSymbolModeError(
+            f"unknown symbol_mode {value!r}: expected one of "
+            f"{', '.join(SYMBOL_MODES)} (absent = {POOLED!r})")
+    return text
+
+
 def _inherit_genes_by_name(genes_a: list, genes_b: list) -> list:
     """One child gene per NAME present in either parent, randomly inherited.
 
@@ -106,6 +148,32 @@ class GARunConfig:
     #: makes the backtest entry path evaluate each genome only on bars whose
     #: causal regime label is in its declaration.
     regime_conditioning: bool | None = None
+    #: P7-S2: is the population evolved **per symbol** or over the whole basket?
+    #:
+    #: * ``"pooled"`` (**the default**, and every pre-S2 caller) = ONE population
+    #:   whose candidates are each scored on the whole basket — the historical
+    #:   search, bit-identical to HEAD (an absent field is this value).
+    #: * ``"per_symbol"`` = **one independent evolution per symbol**, in
+    #:   ``symbols`` order.  Each arm builds, selects, crosses and mutates its own
+    #:   population (no genome and no parent ever crosses between symbols), every
+    #:   candidate is scored **only on its own symbol**, and each champion is
+    #:   written with exactly that one symbol in ``StrategyConfig.symbols`` — the
+    #:   field ``core/strategy/engine.py`` already enforces on the trading path
+    #:   (``core/strategy/engine.py:143,161-162,186``).
+    #:
+    #: Chosen over the alternative (one mixed population carrying a confined
+    #: ``symbol`` gene) because tournament selection would then compare fitness
+    #: values measured on **different symbols**: the winner is whoever drew the
+    #: symbol with the easiest fitness landscape, not the better strategy, and the
+    #: search would still be pooled.  Independent arms also make the trial count
+    #: exact and auditable — ``evaluations == len(symbols) × population_size ×
+    #: generations``, which is what the DSR is deflated by — while the wall-clock
+    #: cost is ≈ flat: a per-symbol candidate is scored on one symbol instead of
+    #: N, so N arms cost about what one pooled arm costs.  The same compute
+    #: therefore buys N× the scored variants **and** N× the multiple-testing
+    #: burden, which is the honest reading of the search (``symbol_mode`` is a job
+    #: field, not a config key: it is not a shipped default anyone inherits).
+    symbol_mode: str = POOLED
 
 
 def dsr_trial_counts(prior_trials: int, ledger_total: int, population: int,
@@ -195,6 +263,10 @@ class GAStrategyEvolver:
         #: direct operator call (a test crossing two chromosomes, say) should see.
         self._regime_conditioning = bool(
             getattr(self.config, "regime_conditioning", False))
+        #: P7-S2: ``pooled`` (the default) or ``per_symbol``.  Resolved by
+        #: :meth:`evolve` from the job field before a single genome exists; the
+        #: code default here is what a direct call (a test) should see.
+        self._symbol_mode = POOLED
 
     @property
     def generation(self) -> int:
@@ -245,6 +317,20 @@ class GAStrategyEvolver:
         window_key : str
             Walk-forward window identity, stored with the checkpoint so a
             resumed run can prove which window it belongs to.
+
+        Notes
+        -----
+        ``GARunConfig.symbol_mode`` decides the search shape.  ``pooled`` (the
+        default, and what an absent field means) evolves ONE population whose
+        candidates are each scored on the whole basket — the historical search.
+        ``per_symbol`` evolves ONE INDEPENDENT POPULATION PER SYMBOL: every
+        candidate is scored only on its own symbol, and one champion per symbol is
+        published with ``StrategyConfig.symbols`` set to that single symbol, which
+        is what makes the execution path trade it on that symbol alone
+        (``core/strategy/engine.py``).  A per-symbol run performs
+        ``len(symbols) × population_size × generations`` evaluations, and the DSR
+        of every champion it publishes is deflated by exactly that total
+        (P7-S2 trial accounting), not by the per-symbol population.
         """
         self._running = True
         cfg = self.config
@@ -309,6 +395,20 @@ class GAStrategyEvolver:
                " — no regime gene, every decoded genome has an empty filter "
                "(bit-identical to the pre-P7 search space)"))
 
+        # ── P7-S2: pooled basket or one independent search per symbol ──
+        # A JOB FIELD, not a config key: an absent field is ``pooled`` (the
+        # historical search), so no operator inherits a different GA shape and no
+        # config edit can turn specialisation on.
+        self._symbol_mode = parse_symbol_mode(getattr(cfg, "symbol_mode", None))
+        arms = ([[symbol] for symbol in symbols]
+                if self._symbol_mode == PER_SYMBOL else [list(symbols)])
+        logger.info(
+            f"GA symbol_mode={self._symbol_mode} "
+            + ("— one independent population per symbol, each scored only on its "
+               "own symbol and published restricted to it"
+               if self._symbol_mode == PER_SYMBOL else
+               "— one population scored on the whole basket (the pre-S2 search)"))
+
         # Training period: if validation_start is set, stop training there
         train_end = validation_start if validation_start else date_end
         has_validation = validation_start is not None
@@ -332,8 +432,140 @@ class GAStrategyEvolver:
                     + f", prior_trials={self._prior_trials}"
                     + f", keep_checkpoint={self._keep_checkpoint}")
 
+        # ── Evolve one independent population per arm ──────────────────────
+        # ``pooled`` → ONE arm with the job's whole basket: exactly HEAD's single
+        # pass, so the RNG draws, the engine calls, the ledger writes and the
+        # published champion are the pre-S2 ones.  ``per_symbol`` → one arm per
+        # symbol, in ``symbols`` order, each with its own fresh population scored
+        # only on its own symbol.
+        #
+        # A per-symbol resume reads the checkpoint ONCE here (window and mode are
+        # validated by the named refusals inside ``_read_checkpoint``) and hands
+        # the same state to the arm it belongs to: the first arm's own checkpoint
+        # write would otherwise overwrite the state a later arm must continue.
+        pending_checkpoint = None
+        if resume and self._symbol_mode == PER_SYMBOL:
+            pending_checkpoint = self._read_checkpoint(
+                expected_window_key=self._window_key,
+                expected_symbol_mode=self._symbol_mode)
+            if pending_checkpoint is not None:
+                logger.info(
+                    f"GA per-symbol resume: the checkpoint belongs to arm "
+                    f"'{pending_checkpoint.get('arm_symbol') or '(pooled)'}' "
+                    f"(generation {pending_checkpoint.get('generation')})")
+        arm_runs: list[dict] = []
+        for arm_index, arm_symbols in enumerate(arms):
+            if arm_index and self._stop_after_gen:
+                logger.info(f"GA stop requested — skipping the remaining "
+                            f"{len(arms) - arm_index} arm(s)")
+                break
+            arm_runs.append(self._evolve_arm(
+                arm_symbols, date_start, date_end, train_end, validation_start,
+                has_validation, seed_strategies, resume,
+                pending_checkpoint=pending_checkpoint))
+
+        # ── Final champion ──
+        self._running = False
+        elapsed = time.time() - t_start
+
+        # ── Publication, once every trial of the whole run was performed ────
+        # Multiple-testing count for the DSR / gate.  `prior` is the count of
+        # trials the run has ACTUALLY performed (the ledger, floored by
+        # `prior_trials + trials_this_run`) — the same formula and therefore the
+        # same number the last generation was scored against, never a smaller one
+        # (audit D-18).  In ``per_symbol`` mode the ledger holds EVERY arm's
+        # generations by now, so each per-symbol champion is deflated by
+        # ``len(symbols) × population_size × generations``: the variants the run
+        # really tried, not the per-symbol population (P7-S2).
+        n_trials, _ = dsr_trial_counts(
+            self._prior_trials, total_trials(_data_dir, 0),
+            cfg.population_size, self._trials_this_run)
+
+        arm_results = [
+            self._publish_arm(
+                arm, n_trials=n_trials, date_start=date_start, date_end=date_end,
+                train_end=train_end, validation_start=validation_start,
+                has_validation=has_validation, alpha_weight=_alpha_weight,
+                job_benchmark_mode=_job_mode, benchmark_label=_benchmark_mode,
+                elapsed=elapsed, n_symbols=len(symbols))
+            for arm in arm_runs]
+
+        if not arm_results:
+            return {"error": "No valid champion found"}
+        if self._symbol_mode == POOLED:
+            # Default-off identity: an absent/``pooled`` mode returns exactly the
+            # dict HEAD returned — no extra keys, no extra evaluations, no extra
+            # RNG draw.
+            return arm_results[0]
+        return self._combine_symbol_results(
+            arm_results, [arm["symbols"] for arm in arm_runs])
+
+    def _evolve_arm(self, arm_symbols, date_start, date_end, train_end,
+                    validation_start, has_validation, seed_strategies,
+                    resume, pending_checkpoint: dict | None = None) -> dict:
+        """Evolve ONE independent population and return its raw run state.
+
+        One call == one search population.  ``pooled`` mode makes exactly one
+        call with the job's basket; ``per_symbol`` makes one call per symbol whose
+        candidates are scored only on that symbol.
+
+        ``pending_checkpoint`` (per-symbol resumes only) is the state ``evolve``
+        read before the arm loop; the arm it belongs to restores from it even
+        after another arm has overwritten the checkpoint file.  ``None`` = the
+        pooled path, which reads the file itself exactly as it always has.
+
+        The champion is deliberately **not** published here: a per-symbol run
+        must deflate every champion's DSR by the trials the WHOLE run performed,
+        so publication happens in :meth:`evolve` after the last arm is scored
+        (:meth:`_publish_arm`).
+        """
+        cfg = self.config
+        arm_t_start = time.time()
+        # The ledger helpers are imported HERE (as ``evolve`` does) rather than at
+        # module level, so a caller/test that patches ``core.ga.trial_counter``
+        # is still honoured at call time.
+        from core.ga.trial_counter import record_trials, total_trials
+        # Values the moved body used to read from ``evolve``'s locals.
+        _data_dir = (str(Path(self.loader.strategies_dir).parent)
+                     if hasattr(self.loader, 'strategies_dir') else "data")
+        _alpha_weight = getattr(getattr(self.engine, 'config', None),
+                                "ga_alpha_weight", None)
+        _job_mode = getattr(cfg, "benchmark_mode", None)
+        timeframe_pool = list(getattr(cfg, "timeframe_pool", None) or [])
+        _arm_trials_start = int(getattr(self, "_trials_this_run", 0) or 0)
+        # This arm's identity, stored with its checkpoint: a resumed per-symbol
+        # run can prove which symbol the loaded population was scored on.
+        self._run_symbols = list(arm_symbols)
+        # Per-arm state.  The run-level trial ledger, seed, window key, progress
+        # clock and stop flag deliberately stay shared across arms.
+        self._population = []
+        self._generation = 0
+        self._best_fitness = -999
+        self._best_chromosome = None
+        self._stagnation_count = 0
+        self._history = []
+        self._resumed_from_generation = None
+        self._checkpoint_meta = {}
+
         # ── Initialize or resume ──
-        if resume and self.load_checkpoint(expected_window_key=self._window_key):
+        # The checkpoint is tagged with the arm it belongs to, so a per-symbol
+        # resume only ever continues the symbol whose population was scored, and
+        # a pooled checkpoint can never be continued as a per-symbol arm (or the
+        # reverse): the two shapes score genomes on different baskets.
+        _arm_symbol = (arm_symbols[0]
+                       if self._symbol_mode == PER_SYMBOL
+                       and len(arm_symbols) == 1 else None)
+        if resume and pending_checkpoint is not None:
+            # Per-symbol resume: only the arm the checkpoint belongs to continues.
+            resumed = (str(pending_checkpoint.get("arm_symbol", "") or "")
+                       == str(_arm_symbol or "")
+                       and self._restore_checkpoint(pending_checkpoint))
+        else:
+            resumed = bool(resume) and self.load_checkpoint(
+                expected_window_key=self._window_key,
+                expected_symbol_mode=self._symbol_mode,
+                arm_symbol=_arm_symbol)
+        if resumed:
             # Resume from checkpoint — skip initialization
             self._stagnation_count = 0
             self._resumed_from_generation = int(self._generation)
@@ -419,7 +651,7 @@ class GAStrategyEvolver:
                 # Multi-process: each worker creates its own engine (avoids TA-Lib thread crash)
                 from core.ga.fitness import evaluate_population_multiprocess
                 self._population = evaluate_population_multiprocess(
-                    self._population, symbols, date_start, train_end,
+                    self._population, arm_symbols, date_start, train_end,
                     initial_balance=10000.0,
                     max_workers=cfg.max_workers,
                     weights=_calibrated_weights,
@@ -435,7 +667,7 @@ class GAStrategyEvolver:
                     benchmark_mode=_job_mode,
                     # P6-D: None unless the executability model is on for some genome.
                     volume_context=self.volume_context_for(
-                        symbols, date_start, train_end),
+                        arm_symbols, date_start, train_end),
                     progress_callback=lambda c, t: self._report_progress(self._generation or 1, c, t),
                     # Sub-chunk liveness: this branch reports a chunk only when
                     # the WHOLE chunk has been evaluated (one engine pass over
@@ -451,7 +683,7 @@ class GAStrategyEvolver:
                 # Single-process: use existing threaded batch evaluation
                 from core.ga.fitness import evaluate_population_batch
                 self._population = evaluate_population_batch(
-                    self._population, symbols, date_start, train_end,
+                    self._population, arm_symbols, date_start, train_end,
                     self.engine, self.loader,
                     ga_loader=self.ga_loader,
                     batch_size=cfg.population_size,
@@ -464,7 +696,7 @@ class GAStrategyEvolver:
                     benchmark_mode=_job_mode,
                     # P6-D: None unless the executability model is on for some genome.
                     volume_context=self.volume_context_for(
-                        symbols, date_start, train_end),
+                        arm_symbols, date_start, train_end),
                     progress_callback=lambda c, t: self._report_progress(self._generation or 1, c, t))
 
             # Count this generation's trials for the DSR ledger.
@@ -533,10 +765,6 @@ class GAStrategyEvolver:
             if gen < cfg.generations - 1:
                 self._population = self._next_generation()
 
-        # ── Final champion ──
-        self._running = False
-        elapsed = time.time() - t_start
-
         # ── Checkpoint retention (``keep_checkpoint``) ──
         # A CLEAN completion (a champion exists and the run was not asked to
         # stop) used to unconditionally delete the checkpoint, so a finished job
@@ -563,246 +791,346 @@ class GAStrategyEvolver:
                                f"(generation {self._generation}) — {why}")
             logger.info(f"GA {checkpoint_note}")
         checkpoint_kept = self._checkpoint_path.exists()
+        return {
+            "symbols": list(arm_symbols),
+            "population_hash": self.population_hash(),
+            "generation": int(self._generation),
+            "best_chromosome": self._best_chromosome,
+            "history": self._history,
+            "resumed_from_generation": self._resumed_from_generation,
+            "checkpoint_note": checkpoint_note,
+            "checkpoint_kept": self._checkpoint_path.exists(),
+            "checkpoint_meta": dict(self._checkpoint_meta),
+            # Trials THIS arm performed (its generations are in the ledger too).
+            "evaluations": int(self._trials_this_run) - _arm_trials_start,
+            "elapsed_seconds": time.time() - arm_t_start,
+        }
 
-        if self._best_chromosome:
-            champion_config = chromosome_to_strategy(
-                self._best_chromosome, timeframe_pool=cfg.timeframe_pool or None)
-            champion_config.name = f"ga_champion_{int(time.time())}"
-            train_result = dict(self._best_chromosome.get("fitness_result", {}) or {})
+    def _publish_arm(self, arm: dict, *, n_trials: int, date_start: str,
+                     date_end: str, train_end: str, validation_start,
+                     has_validation: bool, alpha_weight, job_benchmark_mode,
+                     benchmark_label: str, elapsed: float, n_symbols: int) -> dict:
+        """Score and publish ONE arm's champion; return its result dict.
 
-            # ── Out-of-sample validation (BEFORE publishing) ──
-            validation = None
-            # Multiple-testing count for the DSR / gate.  `prior` is the count of
-            # trials the run has ACTUALLY performed (the ledger, floored by
-            # `prior_trials + trials_this_run`) — the same formula and therefore
-            # the same number the last generation was scored against, never a
-            # smaller one (audit D-18).
-            n_trials, _ = dsr_trial_counts(
-                self._prior_trials, total_trials(_data_dir, 0),
-                cfg.population_size, self._trials_this_run)
-            if has_validation:
-                logger.info(f"GA: validating champion on {validation_start}~{date_end}")
-                from core.ga.fitness import evaluate_chromosome
-                val_result = evaluate_chromosome(
-                    self._best_chromosome, symbols,
-                    validation_start, date_end,
-                    self.engine, self.loader,
-                    ga_loader=self.ga_loader,
-                    n_trials=n_trials,
-                    alpha_weight=_alpha_weight,
-                    benchmark_mode=_job_mode)
-                validation = {
-                    "sharpe": val_result.get("sharpe", 0),
-                    "win_rate": val_result.get("win_rate", 0),
-                    "trade_count": val_result.get("trade_count", 0),
-                    "total_return": val_result.get("total_return", 0),
-                    "profit_factor": val_result.get("profit_factor", 0),
-                    "max_dd": val_result.get("max_dd", 0),
-                    "dsr": val_result.get("dsr", 0),
-                    "buy_hold_pct": val_result.get("buy_hold_pct"),
-                    # The selected benchmark's own OOS numbers (reported only).
-                    "benchmark_mode": val_result.get("benchmark_mode"),
-                    "benchmark_pct": val_result.get("benchmark_pct"),
-                    "alpha_vs_benchmark_pct": val_result.get("alpha_vs_benchmark_pct"),
-                    "benchmark_sharpe": val_result.get("benchmark_sharpe"),
-                    "benchmark_max_dd": val_result.get("benchmark_max_dd"),
-                    "benchmark_time_in_market_pct": val_result.get(
-                        "benchmark_time_in_market_pct"),
-                    "start": validation_start, "end": date_end,
-                }
-                logger.info(
-                    f"GA validation: sharpe={validation['sharpe']:.2f} "
-                    f"DSR={validation['dsr']:.2f} trades={validation['trade_count']} "
-                    f"(train sharpe={train_result.get('sharpe', 0):.2f})")
-
-            # ── Publication gate ──────────────────────────────────────────
-            # A non-empty population used to be enough to write an ENABLED
-            # champion (a published artefact had fitness -42.3 with 0 trades).
-            # Metrics now decide: failing genomes are still written, but with
-            # ``enabled: false`` and a machine-readable rejection list.
-            published, rejection_reasons = self._publication_decision(
-                train_result, validation)
-            champion_config.enabled = published
-            # ── Evaluation/execution consistency ──────────────────────────
-            # The champion was SCORED on the job's basket, while the live
-            # watcher only honours a strategy's own ``symbols`` list
-            # (``core/strategy/engine.py`` skips a symbol outside it in
-            # ``_on_kline``/``evaluate_all_now``).  The YAML used to ship
-            # ``symbols: []`` = "every symbol the watchlist holds", so an
-            # enabled champion would have traded pairs it was never evaluated
-            # on.  The evaluated basket is written here, and the engine's
-            # existing restriction + startup log line
-            # (``Strategy '<name>' restricted to symbols: [...]``) is what makes
-            # evaluation and execution agree.  An empty basket (an old job file
-            # with no symbols) keeps the historical "all symbols" behaviour.
-            champion_config.symbols = list(symbols)
-            self.loader.save(champion_config)
-
-            # ── Provenance + gate metadata on the YAML ──
-            provenance = {
-                "seed": int(getattr(self, "_seed", 0)),
-                "window": {
-                    "train_start": date_start, "train_end": train_end,
-                    "validation_start": validation_start, "validation_end": date_end,
-                    "key": getattr(self, "_window_key", ""),
-                },
-                "symbols": list(symbols),
-                "timeframes": list(champion_config.timeframes),
-                # The job's timeframe whitelist: ``None`` = unrestricted.  Makes
-                # a champion's timeframe constraint auditable afterwards.
-                "timeframe_pool": list(cfg.timeframe_pool) if cfg.timeframe_pool else None,
-                # The evolved entry structure, so a champion's AND/OR gene is
-                # traceable without parsing the strategy body.
-                "condition_logic": champion_config.condition_logic,
-                "generations": self._generation,
-                "population_size": cfg.population_size,
-                "n_trials": n_trials,
-                "prior_trials": int(getattr(self, "_prior_trials", 0)),
-                # ── Checkpoint retention + resume identity ──────────────────
-                # Whether a cleanly completed run kept ``data/ga_checkpoint.pkl``
-                # (the job's ``keep_checkpoint`` / ``ga.keep_checkpoint``) and
-                # what a resumed run continued FROM, so the continuation is
-                # auditable from the champion YAML alone.
-                "keep_checkpoint": bool(self._keep_checkpoint),
-                "resumed_from_generation": self._resumed_from_generation,
-                "checkpoint": {
-                    "path": str(self._checkpoint_path),
-                    "kept": bool(checkpoint_kept),
-                    "keep_checkpoint": bool(self._keep_checkpoint),
-                    "generation": int(self._generation),
-                    "window_key": getattr(self, "_window_key", ""),
-                    "resumed": self._resumed_from_generation is not None,
-                    "resumed_from_generation": self._resumed_from_generation,
-                    "resumed_population_hash": self._checkpoint_meta.get(
-                        "population_hash"),
-                    "resumed_trials": self._checkpoint_meta.get("trials_total"),
-                    "resumed_symbols": list(self._checkpoint_meta.get("symbols") or []),
-                    "resumed_timeframe_pool": list(
-                        self._checkpoint_meta.get("timeframe_pool") or []),
-                    "resumed_population_size": self._checkpoint_meta.get(
-                        "population_size"),
-                    "population_hash": self.population_hash(),
-                    "population_size": cfg.population_size,
-                    "symbols": list(symbols),
-                    "timeframe_pool": (list(cfg.timeframe_pool)
-                                       if cfg.timeframe_pool else None),
-                    "trials_this_run": int(getattr(self, "_trials_this_run", 0) or 0),
-                },
-                # ── Trial accounting across a resume (DSR honesty) ──────────
-                # ``prior_trials`` = everything performed BEFORE this invocation
-                # (the ledger, floored by the checkpoint's carry on a resume);
-                # ``trials_this_run`` = the generations THIS invocation actually
-                # performed (on a resume: the 13..32 segment, not 1..32);
-                # ``n_trials`` above is ``prior_trials + trials_this_run`` = the
-                # cumulative count the deployment's DSR was deflated by.
-                "trials": {
-                    "prior_trials": int(getattr(self, "_prior_trials", 0)),
-                    "trials_this_run": int(getattr(self, "_trials_this_run", 0) or 0),
-                    "resumed_trials": self._checkpoint_meta.get("trials_total"),
-                    "n_trials": int(n_trials),
-                },
-                "fitness_components": {
-                    "fitness": train_result.get("fitness"),
-                    "fitness_base": train_result.get("fitness_base"),
-                    "fitness_alpha": train_result.get("fitness_alpha"),
-                    "sharpe": train_result.get("sharpe"),
-                    "deflated_sharpe": train_result.get("dsr"),
-                    "max_dd": train_result.get("max_dd"),
-                    "trade_count": train_result.get("trade_count"),
-                    "profit_factor": train_result.get("profit_factor"),
-                    "raw_profit_factor": train_result.get("raw_profit_factor"),
-                    "buy_hold_pct": train_result.get("buy_hold_pct"),
-                    "alpha_vs_buy_hold_pct": train_result.get("alpha_vs_buy_hold_pct"),
-                    # The selected benchmark (additive; the keys above are the
-                    # pre-``benchmark_mode`` contract and do not move).
-                    "benchmark_mode": train_result.get("benchmark_mode"),
-                    "benchmark_pct": train_result.get("benchmark_pct"),
-                    "alpha_vs_benchmark_pct": train_result.get(
-                        "alpha_vs_benchmark_pct"),
-                },
-                # ── Benchmark provenance (``ga.benchmark_mode``) ──────────
-                # Only the mode's alpha GATES; everything else is reported so a
-                # published champion can be risk-compared afterwards.  Before
-                # this, the YAML kept the raw buy & hold return and nothing
-                # else, so no exposure/risk comparison was possible at all.
-                "benchmark": {
-                    "mode": (train_result.get("benchmark_mode")
-                             or _benchmark_mode),
-                    "buy_hold_pct": train_result.get("buy_hold_pct"),
-                    "benchmark_pct": train_result.get("benchmark_pct"),
-                    "alpha_vs_benchmark_pct": train_result.get(
-                        "alpha_vs_benchmark_pct"),
-                    "alpha_vs_buy_hold_pct": train_result.get(
-                        "alpha_vs_buy_hold_pct"),
-                    # The benchmark's OWN risk numbers.
-                    "benchmark_sharpe": train_result.get("benchmark_sharpe"),
-                    "benchmark_max_dd_pct": train_result.get("benchmark_max_dd"),
-                    "benchmark_time_in_market_pct": train_result.get(
-                        "benchmark_time_in_market_pct"),
-                    # Strategy side of the same comparison (reported, not gated).
-                    "strategy_time_in_market_pct": train_result.get(
-                        "strategy_time_in_market_pct"),
-                    "information_ratio": train_result.get("information_ratio"),
-                    "jensen_alpha_annual_pct": train_result.get(
-                        "jensen_alpha_annual_pct"),
-                    "benchmark_beta": train_result.get("benchmark_beta"),
-                    "net_edge_per_trade": train_result.get("net_edge_per_trade"),
-                    "net_edge_per_trade_pct": train_result.get(
-                        "net_edge_per_trade_pct"),
-                    "strategy_risk_matched_pct": train_result.get(
-                        "strategy_risk_matched_pct"),
-                    # The full report (weights, per-mode notes, availability).
-                    "report": train_result.get("benchmark") or {},
-                },
-                "validation": validation,
-                "published": published,
-                "rejection_reasons": rejection_reasons,
-                "eval": {"engine_mode": "legacy", "use_live_spread": False},
-                "written_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            }
-            self._append_provenance(champion_config.name, provenance)
-
-            logger.info(
-                f"GA complete: {self._generation} gens in {elapsed:.0f}s | "
-                f"champion={champion_config.name} published={published} "
-                f"fitness={train_result.get('fitness',0):.2f} "
-                f"sharpe={train_result.get('sharpe',0):.2f}"
-                + (f" rejected={rejection_reasons}" if rejection_reasons else ""))
-
-            return {
-                "champion_name": champion_config.name,
-                "champion_config": champion_config.model_dump(),
-                "fitness": train_result.get("fitness", 0),
-                "sharpe": train_result.get("sharpe", 0),
-                "win_rate": train_result.get("win_rate", 0),
-                "trade_count": train_result.get("trade_count", 0),
-                "generations": self._generation,
-                "elapsed_seconds": elapsed,
-                "history": self._history,
-                "validation": validation,
-                "dsr": train_result.get("dsr_detail") or (
-                    {"dsr": train_result.get("dsr", 0),
-                     "n_trials": provenance["n_trials"]}),
-                "provenance": provenance,
-                "published": published,
-                "rejection_reasons": rejection_reasons,
-                "enabled": published,
-                "seed": provenance["seed"],
-                "timeframe_pool": provenance["timeframe_pool"],
-                # Checkpoint retention + what this run continued from, at the
-                # top level of the result as well as inside ``provenance``
-                # (``scripts/ga_worker.py`` logs it and the status CLI reads it).
-                "keep_checkpoint": provenance["keep_checkpoint"],
-                "resumed_from_generation": provenance["resumed_from_generation"],
-                "checkpoint": provenance["checkpoint"],
-                "checkpoint_note": checkpoint_note,
-                "trials": provenance["trials"],
-                # The benchmark this run's gate consumed + the full report.
-                "benchmark_mode": provenance["benchmark"]["mode"],
-                "benchmark": provenance["benchmark"],
-            }
-        else:
+        For a single arm (``pooled``) this is the pre-S2 publication path, with
+        the arm's own symbols/population/history substituted for the run-level
+        attributes it used to read.  ``n_trials`` is a parameter because in
+        ``per_symbol`` mode every champion must be deflated by the trials of the
+        WHOLE run, which are only known once the last arm has been scored.
+        """
+        cfg = self.config
+        _benchmark_mode = benchmark_label
+        best_chromosome = arm["best_chromosome"]
+        arm_symbols = list(arm["symbols"])
+        arm_generation = int(arm["generation"])
+        arm_history = arm["history"]
+        arm_resumed_from = arm["resumed_from_generation"]
+        ckpt_meta = dict(arm.get("checkpoint_meta") or {})
+        arm_population_hash = arm["population_hash"]
+        arm_checkpoint_kept = bool(arm["checkpoint_kept"])
+        arm_checkpoint_note = arm["checkpoint_note"]
+        if not best_chromosome:
             return {"error": "No valid champion found"}
+
+        champion_config = chromosome_to_strategy(
+            best_chromosome, timeframe_pool=cfg.timeframe_pool or None)
+        _stamp = int(time.time())
+        champion_config.name = (
+            f"ga_champion_{_stamp}"
+            if self._symbol_mode == POOLED or len(arm_symbols) != 1
+            else f"ga_champion_{arm_symbols[0]}_{_stamp}")
+        train_result = dict(best_chromosome.get("fitness_result", {}) or {})
+
+        # ── Out-of-sample validation (BEFORE publishing) ──
+        validation = None
+        if has_validation:
+            logger.info(f"GA: validating champion on {validation_start}~{date_end}")
+            from core.ga.fitness import evaluate_chromosome
+            val_result = evaluate_chromosome(
+                best_chromosome, arm_symbols,
+                validation_start, date_end,
+                self.engine, self.loader,
+                ga_loader=self.ga_loader,
+                n_trials=n_trials,
+                alpha_weight=alpha_weight,
+                benchmark_mode=job_benchmark_mode)
+            validation = {
+                "sharpe": val_result.get("sharpe", 0),
+                "win_rate": val_result.get("win_rate", 0),
+                "trade_count": val_result.get("trade_count", 0),
+                "total_return": val_result.get("total_return", 0),
+                "profit_factor": val_result.get("profit_factor", 0),
+                "max_dd": val_result.get("max_dd", 0),
+                "dsr": val_result.get("dsr", 0),
+                "buy_hold_pct": val_result.get("buy_hold_pct"),
+                # The selected benchmark's own OOS numbers (reported only).
+                "benchmark_mode": val_result.get("benchmark_mode"),
+                "benchmark_pct": val_result.get("benchmark_pct"),
+                "alpha_vs_benchmark_pct": val_result.get("alpha_vs_benchmark_pct"),
+                "benchmark_sharpe": val_result.get("benchmark_sharpe"),
+                "benchmark_max_dd": val_result.get("benchmark_max_dd"),
+                "benchmark_time_in_market_pct": val_result.get(
+                    "benchmark_time_in_market_pct"),
+                "start": validation_start, "end": date_end,
+            }
+            logger.info(
+                f"GA validation: sharpe={validation['sharpe']:.2f} "
+                f"DSR={validation['dsr']:.2f} trades={validation['trade_count']} "
+                f"(train sharpe={train_result.get('sharpe', 0):.2f})")
+
+        # ── Publication gate ──────────────────────────────────────────
+        # A non-empty population used to be enough to write an ENABLED
+        # champion (a published artefact had fitness -42.3 with 0 trades).
+        # Metrics now decide: failing genomes are still written, but with
+        # ``enabled: false`` and a machine-readable rejection list.
+        published, rejection_reasons = self._publication_decision(
+            train_result, validation)
+        champion_config.enabled = published
+        # ── Evaluation/execution consistency ──────────────────────────
+        # The champion was SCORED on the job's basket, while the live
+        # watcher only honours a strategy's own ``symbols`` list
+        # (``core/strategy/engine.py`` skips a symbol outside it in
+        # ``_on_kline``/``evaluate_all_now``).  The YAML used to ship
+        # ``symbols: []`` = "every symbol the watchlist holds", so an
+        # enabled champion would have traded pairs it was never evaluated
+        # on.  The evaluated basket is written here, and the engine's
+        # existing restriction + startup log line
+        # (``Strategy '<name>' restricted to symbols: [...]``) is what makes
+        # evaluation and execution agree.  An empty basket (an old job file
+        # with no symbols) keeps the historical "all symbols" behaviour.
+        champion_config.symbols = list(arm_symbols)
+        self.loader.save(champion_config)
+
+        # ── Provenance + gate metadata on the YAML ──
+        provenance = {
+            "seed": int(getattr(self, "_seed", 0)),
+            "window": {
+                "train_start": date_start, "train_end": train_end,
+                "validation_start": validation_start, "validation_end": date_end,
+                "key": getattr(self, "_window_key", ""),
+            },
+            "symbols": list(arm_symbols),
+            "timeframes": list(champion_config.timeframes),
+            # The job's timeframe whitelist: ``None`` = unrestricted.  Makes
+            # a champion's timeframe constraint auditable afterwards.
+            "timeframe_pool": list(cfg.timeframe_pool) if cfg.timeframe_pool else None,
+            # The evolved entry structure, so a champion's AND/OR gene is
+            # traceable without parsing the strategy body.
+            "condition_logic": champion_config.condition_logic,
+            "generations": arm_generation,
+            "population_size": cfg.population_size,
+            "n_trials": n_trials,
+            "prior_trials": int(getattr(self, "_prior_trials", 0)),
+            # ── Checkpoint retention + resume identity ──────────────────
+            # Whether a cleanly completed run kept ``data/ga_checkpoint.pkl``
+            # (the job's ``keep_checkpoint`` / ``ga.keep_checkpoint``) and
+            # what a resumed run continued FROM, so the continuation is
+            # auditable from the champion YAML alone.
+            "keep_checkpoint": bool(self._keep_checkpoint),
+            "resumed_from_generation": arm_resumed_from,
+            "checkpoint": {
+                "path": str(self._checkpoint_path),
+                "kept": bool(arm_checkpoint_kept),
+                "keep_checkpoint": bool(self._keep_checkpoint),
+                "generation": int(arm_generation),
+                "window_key": getattr(self, "_window_key", ""),
+                "resumed": arm_resumed_from is not None,
+                "resumed_from_generation": arm_resumed_from,
+                "resumed_population_hash": ckpt_meta.get(
+                    "population_hash"),
+                "resumed_trials": ckpt_meta.get("trials_total"),
+                "resumed_symbols": list(ckpt_meta.get("symbols") or []),
+                "resumed_timeframe_pool": list(
+                    ckpt_meta.get("timeframe_pool") or []),
+                "resumed_population_size": ckpt_meta.get(
+                    "population_size"),
+                "population_hash": arm_population_hash,
+                "population_size": cfg.population_size,
+                "symbols": list(arm_symbols),
+                "timeframe_pool": (list(cfg.timeframe_pool)
+                                   if cfg.timeframe_pool else None),
+                "trials_this_run": int(getattr(self, "_trials_this_run", 0) or 0),
+            },
+            # ── Trial accounting across a resume (DSR honesty) ──────────
+            # ``prior_trials`` = everything performed BEFORE this invocation
+            # (the ledger, floored by the checkpoint's carry on a resume);
+            # ``trials_this_run`` = the generations THIS invocation actually
+            # performed (on a resume: the 13..32 segment, not 1..32);
+            # ``n_trials`` above is ``prior_trials + trials_this_run`` = the
+            # cumulative count the deployment's DSR was deflated by.
+            "trials": {
+                "prior_trials": int(getattr(self, "_prior_trials", 0)),
+                "trials_this_run": int(getattr(self, "_trials_this_run", 0) or 0),
+                "resumed_trials": ckpt_meta.get("trials_total"),
+                "n_trials": int(n_trials),
+            },
+            "fitness_components": {
+                "fitness": train_result.get("fitness"),
+                "fitness_base": train_result.get("fitness_base"),
+                "fitness_alpha": train_result.get("fitness_alpha"),
+                "sharpe": train_result.get("sharpe"),
+                "deflated_sharpe": train_result.get("dsr"),
+                "max_dd": train_result.get("max_dd"),
+                "trade_count": train_result.get("trade_count"),
+                "profit_factor": train_result.get("profit_factor"),
+                "raw_profit_factor": train_result.get("raw_profit_factor"),
+                "buy_hold_pct": train_result.get("buy_hold_pct"),
+                "alpha_vs_buy_hold_pct": train_result.get("alpha_vs_buy_hold_pct"),
+                # The selected benchmark (additive; the keys above are the
+                # pre-``benchmark_mode`` contract and do not move).
+                "benchmark_mode": train_result.get("benchmark_mode"),
+                "benchmark_pct": train_result.get("benchmark_pct"),
+                "alpha_vs_benchmark_pct": train_result.get(
+                    "alpha_vs_benchmark_pct"),
+            },
+            # ── Benchmark provenance (``ga.benchmark_mode``) ──────────
+            # Only the mode's alpha GATES; everything else is reported so a
+            # published champion can be risk-compared afterwards.  Before
+            # this, the YAML kept the raw buy & hold return and nothing
+            # else, so no exposure/risk comparison was possible at all.
+            "benchmark": {
+                "mode": (train_result.get("benchmark_mode")
+                         or _benchmark_mode),
+                "buy_hold_pct": train_result.get("buy_hold_pct"),
+                "benchmark_pct": train_result.get("benchmark_pct"),
+                "alpha_vs_benchmark_pct": train_result.get(
+                    "alpha_vs_benchmark_pct"),
+                "alpha_vs_buy_hold_pct": train_result.get(
+                    "alpha_vs_buy_hold_pct"),
+                # The benchmark's OWN risk numbers.
+                "benchmark_sharpe": train_result.get("benchmark_sharpe"),
+                "benchmark_max_dd_pct": train_result.get("benchmark_max_dd"),
+                "benchmark_time_in_market_pct": train_result.get(
+                    "benchmark_time_in_market_pct"),
+                # Strategy side of the same comparison (reported, not gated).
+                "strategy_time_in_market_pct": train_result.get(
+                    "strategy_time_in_market_pct"),
+                "information_ratio": train_result.get("information_ratio"),
+                "jensen_alpha_annual_pct": train_result.get(
+                    "jensen_alpha_annual_pct"),
+                "benchmark_beta": train_result.get("benchmark_beta"),
+                "net_edge_per_trade": train_result.get("net_edge_per_trade"),
+                "net_edge_per_trade_pct": train_result.get(
+                    "net_edge_per_trade_pct"),
+                "strategy_risk_matched_pct": train_result.get(
+                    "strategy_risk_matched_pct"),
+                # The full report (weights, per-mode notes, availability).
+                "report": train_result.get("benchmark") or {},
+            },
+            "validation": validation,
+            "published": published,
+            "rejection_reasons": rejection_reasons,
+            "eval": {"engine_mode": "legacy", "use_live_spread": False},
+            "written_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        if self._symbol_mode == PER_SYMBOL:
+            provenance["symbol_mode"] = PER_SYMBOL
+            provenance["champion_symbol"] = (
+                arm_symbols[0] if len(arm_symbols) == 1 else None)
+            provenance["n_symbols"] = int(n_symbols)
+            # The DSR basis, stated on the artefact itself: n_trials is
+            # the WHOLE run's evaluations (every per-symbol arm), not this
+            # arm's population (P7-S2 trial accounting).
+            provenance["trials"]["search"] = {
+                "symbol_mode": PER_SYMBOL,
+                "arm_symbol": (arm_symbols[0]
+                               if len(arm_symbols) == 1 else None),
+                "arm_population": int(cfg.population_size),
+                "evaluations_this_arm": int(arm.get("evaluations", 0) or 0),
+                "evaluations_whole_run": int(n_trials),
+            }
+            # Which arm a resume continued from (pooled provenance is unchanged,
+            # so the pre-S2 YAML stays byte-identical).
+            provenance["checkpoint"]["resumed_symbol_mode"] = ckpt_meta.get(
+                "symbol_mode")
+            provenance["checkpoint"]["resumed_arm_symbol"] = ckpt_meta.get(
+                "arm_symbol")
+        self._append_provenance(champion_config.name, provenance)
+
+        logger.info(
+            f"GA complete: {arm_generation} gens in {elapsed:.0f}s | "
+            f"champion={champion_config.name} published={published} "
+            f"fitness={train_result.get('fitness',0):.2f} "
+            f"sharpe={train_result.get('sharpe',0):.2f}"
+            + (f" rejected={rejection_reasons}" if rejection_reasons else ""))
+
+        result = {
+            "champion_name": champion_config.name,
+            "champion_config": champion_config.model_dump(),
+            "fitness": train_result.get("fitness", 0),
+            "sharpe": train_result.get("sharpe", 0),
+            "win_rate": train_result.get("win_rate", 0),
+            "trade_count": train_result.get("trade_count", 0),
+            "generations": arm_generation,
+            "elapsed_seconds": elapsed,
+            "history": arm_history,
+            "validation": validation,
+            "dsr": train_result.get("dsr_detail") or (
+                {"dsr": train_result.get("dsr", 0),
+                 "n_trials": provenance["n_trials"]}),
+            "provenance": provenance,
+            "published": published,
+            "rejection_reasons": rejection_reasons,
+            "enabled": published,
+            "seed": provenance["seed"],
+            "timeframe_pool": provenance["timeframe_pool"],
+            # Checkpoint retention + what this run continued from, at the
+            # top level of the result as well as inside ``provenance``
+            # (``scripts/ga_worker.py`` logs it and the status CLI reads it).
+            "keep_checkpoint": provenance["keep_checkpoint"],
+            "resumed_from_generation": provenance["resumed_from_generation"],
+            "checkpoint": provenance["checkpoint"],
+            "checkpoint_note": arm_checkpoint_note,
+            "trials": provenance["trials"],
+            # The benchmark this run's gate consumed + the full report.
+            "benchmark_mode": provenance["benchmark"]["mode"],
+            "benchmark": provenance["benchmark"],
+        }
+        if self._symbol_mode == PER_SYMBOL:
+            result["symbol_mode"] = PER_SYMBOL
+            result["champion_symbol"] = (
+                arm_symbols[0] if len(arm_symbols) == 1 else None)
+            result["n_symbols"] = int(n_symbols)
+            result["evaluations"] = int(arm.get("evaluations", 0) or 0)
+            result["symbols_evaluated"] = list(arm_symbols)
+        return result
+
+    def _combine_symbol_results(self, arm_results: list[dict],
+                                arm_symbols: list[list]) -> dict:
+        """Wrap N per-symbol champion results into ONE run result.
+
+        ``champions`` keeps the ``symbols`` order (reproducible), while the
+        top-level keys mirror the BEST arm by train fitness, so every existing
+        consumer (the worker's result file, the status CLI, the UI) keeps reading
+        the keys it has always read.
+        """
+        champions = []
+        errors = []
+        for symbols, result in zip(arm_symbols, arm_results):
+            symbol = symbols[0] if len(symbols) == 1 else ",".join(symbols)
+            entry = dict(result)
+            entry["symbol"] = symbol
+            entry.setdefault("symbol_mode", PER_SYMBOL)
+            entry.setdefault("champion_symbol", symbol)
+            champions.append(entry)
+            if "error" in entry:
+                errors.append({"symbol": symbol, "error": entry["error"]})
+        scored = [c for c in champions if "error" not in c]
+        if not scored:
+            return {"error": "No valid champion found",
+                    "symbol_mode": PER_SYMBOL, "n_symbols": len(champions),
+                    "champions": champions, "errors": errors}
+        best = max(scored, key=lambda c: float(c.get("fitness") or -999))
+        combined = dict(best)
+        combined["symbol_mode"] = PER_SYMBOL
+        combined["n_symbols"] = len(champions)
+        combined["champions"] = champions
+        combined["champion_names"] = [c.get("champion_name") for c in champions]
+        combined["champion_symbols"] = [c.get("symbol") for c in champions]
+        if errors:
+            combined["errors"] = errors
+        return combined
+
 
     # ── Publication gate ──────────────────────────────────────────────
 
@@ -1179,6 +1507,17 @@ class GAStrategyEvolver:
                 # ── Identity: what a resumed run continues from ──
                 "population_hash": self.population_hash(),
                 "symbols": list(getattr(self, "_run_symbols", []) or []),
+                # P7-S2: which SEARCH SHAPE (and which arm) this population is.
+                # A resume refuses to cross the two shapes (see
+                # ``load_checkpoint``) because they score genomes on different
+                # baskets; ``arm_symbol`` is the single symbol a per-symbol arm
+                # was scored on (``""`` for a pooled population).
+                "symbol_mode": str(getattr(self, "_symbol_mode", POOLED)),
+                "arm_symbol": (list(getattr(self, "_run_symbols", []) or [""])[0]
+                               if getattr(self, "_symbol_mode", POOLED)
+                               == PER_SYMBOL
+                               and len(getattr(self, "_run_symbols", []) or []) == 1
+                               else ""),
                 "timeframe_pool": (list(self.config.timeframe_pool)
                                    if getattr(self.config, "timeframe_pool", None)
                                    else []),
@@ -1192,7 +1531,9 @@ class GAStrategyEvolver:
         except Exception as e:
             logger.warning(f"GA checkpoint save failed: {e}")
 
-    def load_checkpoint(self, expected_window_key: str | None = None) -> bool:
+    def load_checkpoint(self, expected_window_key: str | None = None,
+                        expected_symbol_mode: str | None = None,
+                        arm_symbol: str | None = None) -> bool:
         """Load saved GA state. Returns True if checkpoint was loaded.
 
         Parameters
@@ -1205,16 +1546,51 @@ class GAStrategyEvolver:
             on, publishing a champion whose provenance claims the old window.
             The check runs outside the loader's ``except Exception`` so a refusal
             can never be swallowed into a quiet "no checkpoint".
+        expected_symbol_mode : str | None
+            P7-S2: the search shape this run is about to evolve with.  A
+            checkpoint written by the OTHER shape is REFUSED with
+            :class:`CheckpointSymbolModeMismatchError`: a ``pooled`` population
+            was scored on the whole basket and a ``per_symbol`` one on a single
+            symbol, so continuing one as the other would evolve genomes whose
+            carried fitness numbers describe a different evaluation.  A
+            pre-``symbol_mode`` checkpoint has no mode recorded and is therefore
+            accepted as ``pooled`` (it is one by definition).
+        arm_symbol : str | None
+            P7-S2: the symbol of the arm asking to resume.  When given and the
+            checkpoint belongs to a **different** arm, this returns ``False``
+            (start THAT arm fresh) instead of continuing another symbol's
+            population.  ``None`` = do not check (the pooled path).
+        """
+        state = self._read_checkpoint(expected_window_key, expected_symbol_mode)
+        if state is None:
+            return False
+        ckpt_arm = str(state.get("arm_symbol", "") or "")
+        if arm_symbol is not None and ckpt_arm != str(arm_symbol or ""):
+            logger.info(
+                f"GA checkpoint belongs to arm '{ckpt_arm or '(pooled)'}', not "
+                f"'{arm_symbol}' — this arm starts fresh")
+            return False
+        return self._restore_checkpoint(state)
+
+    def _read_checkpoint(self, expected_window_key: str | None = None,
+                         expected_symbol_mode: str | None = None) -> dict | None:
+        """Unpickle the checkpoint and validate its identity (named refusals).
+
+        Split out of :meth:`load_checkpoint` because a per-symbol run reads the
+        file **once**, before its arm loop: the first arm's own checkpoint write
+        would otherwise overwrite the very state a later arm is supposed to
+        continue from (see the ``pending_checkpoint`` argument of
+        :meth:`_evolve_arm`).
         """
         import pickle
         try:
             if not self._checkpoint_path.exists():
-                return False
+                return None
             with open(self._checkpoint_path, "rb") as f:
                 state = pickle.load(f)
         except Exception as e:
             logger.warning(f"GA checkpoint load failed: {e}")
-            return False
+            return None
 
         ckpt_window = str(state.get("window_key", "") or "")
         requested = str(expected_window_key or "")
@@ -1225,6 +1601,20 @@ class GAStrategyEvolver:
                 f"refusing to resume on a different window (start a fresh run "
                 f"without resume=True, or use the checkpoint's window)")
 
+        # ── P7-S2: never cross the two search shapes ──
+        ckpt_mode = str(state.get("symbol_mode", "") or "")
+        wanted_mode = str(expected_symbol_mode or "")
+        if wanted_mode and ckpt_mode and ckpt_mode != wanted_mode:
+            raise CheckpointSymbolModeMismatchError(
+                f"checkpoint {self._checkpoint_path} was written by a "
+                f"symbol_mode={ckpt_mode!r} run but this run is "
+                f"symbol_mode={wanted_mode!r} — refusing to continue a population "
+                f"whose fitness was measured on a different basket")
+        return state
+
+    def _restore_checkpoint(self, state: dict) -> bool:
+        """Populate this evolver from an already read checkpoint *state*."""
+        ckpt_window = str(state.get("window_key", "") or "")
         try:
             self._population = state["population"]
             self._generation = state["generation"]
@@ -1246,6 +1636,8 @@ class GAStrategyEvolver:
                 "trials_total": (int(state.get("prior_trials", 0) or 0)
                                  + int(state.get("trials_this_run", 0) or 0)),
                 "symbols": list(state.get("symbols", []) or []),
+                "symbol_mode": str(state.get("symbol_mode", "") or POOLED),
+                "arm_symbol": str(state.get("arm_symbol", "") or ""),
                 "timeframe_pool": list(state.get("timeframe_pool", []) or []),
                 "population_size": len(state.get("population") or []),
                 "saved_at": state.get("saved_at"),
