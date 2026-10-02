@@ -30,13 +30,36 @@ def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
 
-def update_progress(job_file: str, data: dict, merge: bool = True):
+#: Keys a run's TERMINAL state leaves behind in ``<job>.progress``: a cancellation
+#: record (``reason``/``cancelled_at``), a crash (``error``/``error_type``) or a
+#: completion stamp.  ``update_progress(..., fresh_run=True)`` drops them before
+#: merging a new run's first payload, so the file always describes exactly one
+#: run.  Measured on the real ``data/ga_jobs/ga_run3_32gens.json.progress``:
+#: relaunching the job left the PREVIOUS cancellation's
+#: ``reason="stopped after ~2 minutes …"`` and ``cancelled_at`` next to the NEW
+#: run's ``phase``/``generation``, because the merge only ever added keys.
+STALE_RUN_KEYS = frozenset({
+    "reason", "cancelled", "cancelled_at", "cancelled_by", "cancel_reason",
+    "stopped", "stopped_at", "stopped_by",
+    "finished_at", "completed_at",
+    "error", "error_type", "error_at", "exit_code", "failed_at",
+})
+
+
+def update_progress(job_file: str, data: dict, merge: bool = True,
+                    fresh_run: bool = False):
     """Write progress atomically.
 
     ``merge=True`` (the default) folds ``data`` into whatever is already on disk
     instead of replacing it.  Replacing used to drop the generation/best-so-far
     fields every time an intra-generation tick arrived, so the UI lost the
     generation it had already been told about.
+
+    ``fresh_run=True`` — used for a run's FIRST write — additionally drops the
+    previous run's :data:`STALE_RUN_KEYS` before merging, so a relaunch cannot
+    leave one run's terminal state describing another run.  Every field that must
+    accumulate within a run (generation, eval counters, timestamps, best/avg) is
+    still merged exactly as before.
     """
     payload = data
     if merge:
@@ -44,6 +67,9 @@ def update_progress(job_file: str, data: dict, merge: bool = True):
             with open(job_file + ".progress") as f:
                 existing = json.load(f)
             if isinstance(existing, dict):
+                if fresh_run:
+                    existing = {k: v for k, v in existing.items()
+                                if k not in STALE_RUN_KEYS}
                 payload = {**existing, **data}
         except Exception:
             payload = data
@@ -538,13 +564,16 @@ def main():
         # (field absent) = follow ``config.ga_benchmark_mode``.
         job["benchmark_mode"] = job_benchmark_mode(job)
 
+        # A run's FIRST progress record: ``fresh_run=True`` clears the previous
+        # run's terminal keys (cancellation/crash/completion) so relaunching the
+        # same job file cannot describe two runs at once.
         update_progress(args.job_file, {
             "phase": "starting",
             "job_type": args.job_type,
             "started_at": _now_iso(),
             "updated_at": _now_iso(),
             "elapsed_s": 0.0,
-        })
+        }, fresh_run=True)
 
         if args.job_type == "ga":
             run_ga(job, args.job_file)

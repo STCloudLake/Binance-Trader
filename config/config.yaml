@@ -87,6 +87,20 @@ ga:
   # Jensen-style alpha and the per-trade net edge are recorded in the champion
   # provenance (reported, never gated).
   benchmark_mode: exposure_matched
+  # ── P7-S1: causal regime conditioning (OFF by default) ─────────────────
+  # true  = a GA genome may carry a `regime_filter` gene (`""` = no filter, or
+  #         one of trend_up / trend_down / range_low / range_mid / range_high)
+  #         and the backtest entry path evaluates that strategy ONLY on bars
+  #         whose CAUSAL regime label is in its declaration
+  #         (`core/strategy/regime_causal.py`: the causal composite classifier —
+  #         expanding volatility terciles + EMA trend — never the whole-sample
+  #         HMM; an in-sample label is refused by name).
+  # false = the gene is not created at all, so the population, the RNG stream,
+  #         every evaluation and every decoded champion are bit-identical to the
+  #         pre-P7 build.  The hypothesis this switch exists to test — "regime
+  #         sensitivity is what the strategies lack" — is measured, not assumed:
+  #         see `docs/overhaul/P7_REGIME_PLAN.md` S1.
+  regime_conditioning: false
   # Keep `data/ga_checkpoint.pkl` after a GA run that completed CLEANLY, so
   # evolution can be continued later (`resume: true`, e.g. another 20
   # generations on top of a 12-generation run).  true = retention: the

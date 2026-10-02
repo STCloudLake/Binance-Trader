@@ -8,8 +8,11 @@
 Prints the progress JSON, wall-clock elapsed time, the worker processes
 (CPU seconds + RSS, matched by command line), the job log's mtime / size /
 line count, the last log lines, and the GA **checkpoint** this job would resume
-from (``data/ga_checkpoint.pkl``: whether it exists, its generation, window_key
-and mtime — ``--checkpoint-file`` overrides the path).
+from (``data/ga_checkpoint.pkl``: whether it exists, its mtime / size, and the
+generation, window key, population size + hash, trial counters,
+``keep_checkpoint`` and ``saved_at`` the pickle itself stores — an unreadable
+one is reported as an error with its reason and never as "generation 1";
+``--checkpoint-file`` overrides the path).
 
 Exit codes
     0  job running and its progress file is fresh
@@ -37,6 +40,19 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
 DEFAULT_JOBS_DIR = PROJECT_ROOT / "data" / "ga_jobs"
+
+# ``pickle.load`` rebuilds the evolver's state by IMPORTING the classes it names
+# (the checkpoint holds ``core.ga.evolver.GARunConfig`` and ``core.ga.genome.*``
+# objects), so unpickling only works when this repository is importable.  A
+# script run as ``python scripts/ga_job_status.py`` has ``<repo>/scripts`` -- not
+# the repository root -- as ``sys.path[0]``, and the failure is in-process (the
+# pickle's module lookup), not a subprocess or a cwd change.  Measured on the real
+# ``data/ga_checkpoint.pkl`` before this line existed: ``generation=None`` plus
+# ``checkpoint note: unreadable — ModuleNotFoundError: No module named 'core'``.
+# The root comes from ``__file__``, so the tool works from any cwd; the insert
+# mirrors ``scripts/ga_worker.py`` (the classes must come from THIS checkout).
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 #: Exit codes (documented in the module docstring).
 RC_OK, RC_NO_JOB, RC_STALE, RC_NOT_RUNNING = 0, 1, 2, 3
@@ -125,13 +141,16 @@ def checkpoint_path_for(args) -> Path:
 
 
 def checkpoint_stats(path: Path) -> dict:
-    """exists / mtime / generation / window_key / hash of *path* (read-only).
+    """exists / mtime / size + everything the checkpoint stores (read-only).
 
     The generation lives inside the evolver's pickle, written by
     ``GAStrategyEvolver._save_checkpoint`` and read here with ``pickle.load``
     (this tool only ever reads the files the app itself produced).  Every
     metadata field is optional, so a checkpoint written by an older build still
-    reports its file stats; an unreadable one reports why instead of raising.
+    reports its file stats; a checkpoint that cannot be read reports
+    ``read_error`` with the reason (``ModuleNotFoundError`` for the class import
+    if the repository is not importable, ``UnpicklingError`` for a corrupt file,
+    …) instead of raising or inventing a generation.
     """
     out = {"path": str(path), "exists": path.exists()}
     if not out["exists"]:
@@ -144,15 +163,20 @@ def checkpoint_stats(path: Path) -> dict:
         import pickle
         with open(path, "rb") as f:
             state = pickle.load(f)
-        if isinstance(state, dict):
-            out["generation"] = state.get("generation")
-            out["window_key"] = state.get("window_key")
-            out["population_hash"] = state.get("population_hash")
-            out["population_size"] = len(state.get("population") or [])
-            out["prior_trials"] = state.get("prior_trials")
-            out["trials_this_run"] = state.get("trials_this_run")
-            out["keep_checkpoint"] = state.get("keep_checkpoint")
-            out["saved_at"] = state.get("saved_at")
+        if not isinstance(state, dict):
+            out["read_error"] = (
+                f"unexpected checkpoint payload {type(state).__name__} "
+                f"(expected the evolver's state dict)")
+            return out
+        out["generation"] = state.get("generation")
+        out["window_key"] = state.get("window_key")
+        out["population_hash"] = state.get("population_hash")
+        out["population_size"] = len(state.get("population") or [])
+        out["prior_trials"] = state.get("prior_trials")
+        out["trials_this_run"] = state.get("trials_this_run")
+        out["keep_checkpoint"] = state.get("keep_checkpoint")
+        out["saved_at"] = state.get("saved_at")
+        out["resumed_from_generation"] = state.get("resumed_from_generation")
     except Exception as e:
         out["read_error"] = f"{type(e).__name__}: {e}"
     return out
@@ -373,28 +397,47 @@ def render(info: dict, tail: int) -> str:
                f"symbols={len(job.get('symbols') or [])}")
     ckpt = info.get("checkpoint") or {}
     if ckpt.get("exists"):
-        detail = f"generation={ckpt.get('generation')}"
+        gen = ckpt.get("generation")
+        # ``generation=None`` means "the checkpoint does not record one" (an
+        # older build, or an unreadable file) — printing it as 0/1 would be a
+        # claim the file does not support, so it is spelled out instead.
+        detail = f"generation={gen if gen is not None else '<not recorded>'}"
         if ckpt.get("window_key"):
             detail += f" window={ckpt['window_key']}"
         if ckpt.get("population_hash"):
             detail += (f" pop={ckpt.get('population_size')}"
                        f" hash={ckpt['population_hash']}")
         if ckpt.get("prior_trials") is not None:
-            trials = int(ckpt.get("prior_trials") or 0) + int(
-                ckpt.get("trials_this_run") or 0)
-            detail += f" trials={trials}"
+            prior = int(ckpt.get("prior_trials") or 0)
+            this_run = int(ckpt.get("trials_this_run") or 0)
+            detail += f" trials={prior + this_run}"
+            detail += f" (prior={prior}+this_run={this_run})"
+        if ckpt.get("keep_checkpoint") is not None:
+            detail += f" keep_checkpoint={ckpt['keep_checkpoint']}"
+        if ckpt.get("resumed_from_generation") is not None:
+            detail += f" resumed_from={ckpt['resumed_from_generation']}"
         if ckpt.get("saved_at"):
             detail += f" saved={ckpt['saved_at']}"
         out.append(f"checkpoint     : {ckpt['path']} exists=True "
                    f"mtime={ckpt['mtime_iso']} size={ckpt.get('size')}B {detail}")
-        out.append(f"checkpoint note: a resume:true job continues at "
-                   f"generation {int(ckpt.get('generation') or 0) + 1} "
-                   f"(window must match)")
+        if ckpt.get("read_error"):
+            # The old code printed "continues at generation 1" here (it read the
+            # missing generation as 0) — actively misleading now that resume is a
+            # feature (9f86e63).  An unreadable checkpoint claims NO resume point.
+            out.append(f"checkpoint note: unreadable — {ckpt['read_error']}")
+            out.append("checkpoint note: no resume point can be derived from an "
+                       "unreadable checkpoint (NOT generation 1)")
+        elif gen is not None:
+            out.append(f"checkpoint note: a resume:true job continues at "
+                       f"generation {int(gen) + 1} "
+                       f"(window must match)")
+        else:
+            out.append("checkpoint note: this checkpoint records no generation "
+                       "(written by an older build), so resume would start at "
+                       "generation 1")
     else:
         out.append(f"checkpoint     : {ckpt.get('path')} exists=False "
                    f"(nothing to resume from)")
-    if ckpt.get("read_error"):
-        out.append(f"checkpoint note: unreadable — {ckpt['read_error']}")
     if info["result_file_exists"]:
         rc = info.get("result_checkpoint") or {}
         out.append(f"last result    : keep_checkpoint="

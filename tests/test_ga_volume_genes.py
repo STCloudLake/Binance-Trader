@@ -506,7 +506,20 @@ def test_pre_p6_chromosome_decodes_to_the_frozen_head_config():
     # by executing HEAD's own ``core/ga/genome.py`` (``git show HEAD:...``) on the
     # same input, so it is a measurement, not a guess.  The P6-D additions (the
     # sandwich key, the filter conjuncts) must not appear.
-    assert _config_hash(config) == "809ddf7ba45af011"
+    #
+    # P7-S1 re-pin, and it is *provable* rather than a new number: adding the
+    # ``regime_filter: list[str] = []`` field to ``StrategyConfig`` moves the
+    # full-dump hash by exactly that one key, and the same dump with that key
+    # removed still hashes to the frozen value below — so the decoded pre-P7
+    # genome is unchanged except for one empty, inert field.  The full argument
+    # lives in ``tests/test_p7_regime_s1.py``
+    # (``test_the_regime_field_is_purely_additive_to_the_frozen_config``).
+    assert _config_hash(config) == "4d40f95abe61d7e2"
+    assert hashlib.sha256(json.dumps(
+        {k: v for k, v in config.model_dump().items() if k != "regime_filter"},
+        sort_keys=True, default=str).encode()).hexdigest()[:16] \
+        == "809ddf7ba45af011"
+    assert config.regime_filter == []
     assert G.VOLUME_GENE_INDICATOR_KEY not in config.indicators
     assert config.entry_conditions == {"long": ["rsi < 30"],
                                        "short": ["rsi > 70"]}

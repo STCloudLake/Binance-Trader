@@ -718,6 +718,16 @@ class Config:
         # instead of silently selecting a different gate.
         from core.ga.benchmark import parse_benchmark_mode
         self.ga_benchmark_mode = parse_benchmark_mode(ga_cfg.get("benchmark_mode"))
+        # ── P7-S1: causal regime conditioning (OFF by default) ──────────────
+        # `ga.regime_conditioning: true` lets a genome carry a `regime_filter`
+        # gene and makes the backtest entry path evaluate a strategy only on bars
+        # whose CAUSAL regime label is in its declaration
+        # (`core/strategy/regime_causal.py`).  `false` — the shipped value — means
+        # the gene is never created and every decoded genome has an empty filter,
+        # so the population, the RNG stream and every evaluation are bit-identical
+        # to the pre-P7 build (pinned by `tests/test_p7_regime_s1.py`).
+        self.ga_regime_conditioning = _as_bool(
+            ga_cfg.get("regime_conditioning"), False)
         # Keep ``data/ga_checkpoint.pkl`` after a GA run that completed CLEANLY
         # (``ga.keep_checkpoint``, shipped ``true``).  Retention is the default at
         # every layer — this key, the ``keep_checkpoint`` job field and

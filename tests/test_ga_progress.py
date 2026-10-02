@@ -15,6 +15,9 @@ These tests pin the fix:
     ``gen_complete`` payload with ``total_generations``;
 (b) the worker's progress reporter handles both the dict and the tuple form and
     writes the enriched, merged payload (plus one log line per generation);
+(b2) a run's FIRST write drops the previous run's terminal keys
+    (``reason``/``cancelled_at``/``error``…) so a relaunch cannot describe two
+    runs at once, while the accumulating fields are still merged;
 (c) ``scripts/ga_job_status.py`` renders a fixture progress file and flags
     staleness without any live process;
 (d) the GA itself is unchanged: no listener → no progress channel, the chunk
@@ -27,6 +30,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -250,6 +254,105 @@ def test_update_progress_merges_by_default(tmp_path, ga_worker):
     # merge=False still replaces (used nowhere in production, kept explicit).
     ga_worker.update_progress(job_file, {"phase": "x"}, merge=False)
     assert json.loads(Path(job_file + ".progress").read_text()) == {"phase": "x"}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# (b2) a fresh run must not inherit the previous run's terminal state
+# ══════════════════════════════════════════════════════════════════════════
+
+#: The record measured on ``data/ga_jobs/ga_run3_32gens.json.progress``: the
+#: cancelled 32-generation run's terminal keys, left in place while the NEW run's
+#: ``phase``/``generation`` were merged on top of them.
+_CANCELLED_RUN = {
+    "phase": "gen_complete", "job_type": "ga",
+    "reason": "stopped after ~2 minutes so the 32-generation run can be "
+              "relaunched with checkpoint retention",
+    "cancelled_at": "2026-10-01T20:18:38",
+    "generation": 32, "total_generations": 32,
+    "eval_completed": 20, "eval_total": 20, "eval_equivalent": 20.0,
+    "best_fitness": -0.627, "avg_fitness": -43.89956666666667,
+    "best_sharpe": 3.9649, "best_win_rate": 57.48, "best_trades": 127,
+    "started_at": "2026-10-01T20:46:32", "updated_at": "2026-10-01T23:06:48",
+    "elapsed_s": 8416.7,
+}
+
+
+def test_a_fresh_run_clears_the_previous_runs_terminal_keys(tmp_path, ga_worker):
+    """The relaunch defect: stale cancellation keys beside the new run's fields.
+
+    ``update_progress(..., fresh_run=True)`` — what ``ga_worker.main()`` writes as
+    a run's first record — drops the previous run's terminal state, while the
+    fields that must accumulate (generation, eval counters, timestamps, best/avg)
+    keep being merged.
+    """
+    job_file = str(tmp_path / "ga_relaunch.json")
+    progress_file = Path(job_file + ".progress")
+    progress_file.write_text(json.dumps(_CANCELLED_RUN))
+
+    ga_worker.update_progress(job_file, {
+        "phase": "starting", "job_type": "ga",
+        "started_at": "2026-10-02T00:00:00", "updated_at": "2026-10-02T00:00:00",
+        "elapsed_s": 0.0,
+    }, fresh_run=True)
+
+    payload = json.loads(progress_file.read_text())
+    assert "reason" not in payload, payload
+    assert "cancelled_at" not in payload, payload
+    assert payload["phase"] == "starting"
+    assert payload["started_at"] == "2026-10-02T00:00:00"
+    assert payload["elapsed_s"] == 0.0
+    # …but the accumulate-in-run fields are still merged, not replaced.
+    assert payload["generation"] == 32 and payload["eval_completed"] == 20
+    assert payload["best_fitness"] == -0.627 and payload["best_trades"] == 127
+
+    # A later tick of the SAME run keeps merging exactly as before.
+    ga_worker.update_progress(job_file, {"phase": "evolving", "generation": 1,
+                                         "eval_completed": 3})
+    payload = json.loads(progress_file.read_text())
+    assert payload["phase"] == "evolving" and payload["generation"] == 1
+    assert payload["eval_completed"] == 3 and payload["best_trades"] == 127
+    assert "reason" not in payload and "cancelled_at" not in payload
+
+    # Every documented terminal key — not just the two measured in the wild —
+    # goes, and the run's own fresh fields survive.
+    killed = {"reason": "r", "cancelled": True, "cancelled_at": "t",
+              "cancelled_by": "cli", "cancel_reason": "r", "stopped": True,
+              "stopped_at": "t", "stopped_by": "cli", "finished_at": "t",
+              "completed_at": "t", "error": "boom", "error_type": "OSError",
+              "error_at": "t", "exit_code": 1, "failed_at": "t"}
+    assert set(killed) == set(ga_worker.STALE_RUN_KEYS)
+    progress_file.write_text(json.dumps({**killed, "generation": 5}))
+    ga_worker.update_progress(job_file, {"phase": "starting"}, fresh_run=True)
+    payload = json.loads(progress_file.read_text())
+    assert payload == {"phase": "starting", "generation": 5}, payload
+
+
+def test_worker_start_call_site_passes_fresh_run(tmp_path, monkeypatch,
+                                                 ga_worker):
+    """``ga_worker.main()`` really is the fresh start (not just the helper).
+
+    Relaunching ``python scripts/ga_worker.py --job-type ga --job-file <f>`` on a
+    file whose ``.progress`` still holds a cancellation record is exactly how the
+    stale keys got in; ``run_ga`` is stubbed so only the start write runs.
+    """
+    job_file = tmp_path / "ga_relaunch2.json"
+    job_file.write_text(json.dumps({"population_size": 4, "generations": 1,
+                                    "symbols": ["BTCUSDT"]}))
+    progress_file = Path(str(job_file) + ".progress")
+    progress_file.write_text(json.dumps(_CANCELLED_RUN))
+
+    monkeypatch.setattr(sys, "argv", ["ga_worker.py", "--job-type", "ga",
+                                      "--job-file", str(job_file)])
+    ran: list = []
+    monkeypatch.setattr(ga_worker, "run_ga",
+                        lambda job, jf: ran.append((job, jf)))
+    ga_worker.main()
+
+    assert ran and ran[0][1] == str(job_file)
+    payload = json.loads(progress_file.read_text())
+    assert "reason" not in payload and "cancelled_at" not in payload, payload
+    assert payload["phase"] == "starting" and payload["job_type"] == "ga"
+    assert payload["elapsed_s"] == 0.0
 
 
 # ══════════════════════════════════════════════════════════════════════════

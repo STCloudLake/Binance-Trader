@@ -18,16 +18,24 @@ sub-second runtime):
     with the named ``CheckpointWindowMismatchError`` (and leaves the checkpoint
     intact);
 (e) ``scripts/ga_job_status.py`` renders the checkpoint line (exists, generation,
-    mtime) for a fixture job, and says so when it is missing.
+    mtime) for a fixture job, says so when it is missing, reports a genuinely
+    unreadable checkpoint as an unreadable file with its reason (never as
+    "generation 1"), and reads a checkpoint the REAL evolver wrote when the CLI
+    runs as a **script** (``python scripts/ga_job_status.py``), where the
+    repository root — needed to import the ``core.ga.*`` classes the pickle
+    names — is not on ``sys.path``.
 
 Every artefact lives under ``tmp_path`` (``<tmp>/data/...`` mirrors the real
 ``<data_dir>/data/...`` layout), so no test writes the operator's ``data/``.
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import pickle
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -561,3 +569,109 @@ def test_status_cli_prints_the_last_result_checkpoint_decision(tmp_path,
     assert rc == 0
     assert "last result    : keep_checkpoint=True checkpoint_kept=True " \
            "resumed_from_generation=2" in out, out
+
+
+def test_status_cli_reads_a_real_evolver_checkpoint_in_a_subprocess(tmp_path):
+    """The regression: the CLI must unpickle a checkpoint the evolver wrote.
+
+    Run as ``python scripts/ga_job_status.py`` the process has
+    ``<repo>/scripts`` — never the repository root — as ``sys.path[0]``, so
+    ``pickle.load`` could not import the ``core.ga.evolver.GARunConfig`` /
+    ``core.ga.genome.*`` classes the checkpoint names.  Measured before the fix
+    on the real ``data/ga_checkpoint.pkl``:
+    ``generation=None`` + ``unreadable — ModuleNotFoundError: No module named
+    'core'`` (and the misleading "continues at generation 1").  The fixture here
+    is a checkpoint the REAL evolver produced under ``tmp_path``, so the object
+    graph is the operator's.
+    """
+    _, _, _ = _run(tmp_path, population=3, generations=2,
+                   window_key="2026-01-01~2026-02-01")
+    checkpoint = _checkpoint_path(tmp_path)
+    assert checkpoint.exists(), "the stubbed run must leave a checkpoint"
+    with open(checkpoint, "rb") as f:
+        state = pickle.load(f)
+    assert state["generation"] and state["window_key"] \
+        and state["population_hash"]
+
+    job_file, progress_file, log_file, _ = _fixture_job(tmp_path)
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "ga_job_status.py"),
+         "--job-file", str(job_file), "--progress-file", str(progress_file),
+         "--log-file", str(log_file), "--checkpoint-file", str(checkpoint),
+         "--no-process-check"],
+        capture_output=True, text=True, cwd=str(tmp_path))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, out
+    assert "ModuleNotFoundError" not in out, out
+    assert "unreadable" not in out, out
+    # Every value is the one the pickle stores, not a placeholder.
+    assert f"generation={state['generation']}" in out, out
+    assert f"window={state['window_key']}" in out, out
+    assert f"hash={state['population_hash']}" in out, out
+    assert f"pop={len(state['population'])}" in out, out
+    assert f"trials={state['prior_trials'] + state['trials_this_run']}" in out, out
+    assert f"size={checkpoint.stat().st_size}B" in out, out
+    assert f"keep_checkpoint={state['keep_checkpoint']}" in out, out
+    assert f"continues at generation {state['generation'] + 1}" in out, out
+
+
+def test_status_cli_calls_an_unreadable_checkpoint_unreadable(tmp_path,
+                                                              job_status,
+                                                              capsys):
+    """A corrupt checkpoint is an ERROR with its reason — never "generation 1".
+
+    The old renderer read the missing generation as 0 and printed "a resume:true
+    job continues at generation 1", which is actively misleading now that resume
+    continues at g+1 (9f86e63).
+    """
+    job_file, progress_file, log_file, checkpoint = _fixture_job(tmp_path)
+    checkpoint.write_bytes(b"this is not a pickle at all\n" * 3)
+    argv = ["--job-file", str(job_file), "--progress-file", str(progress_file),
+            "--log-file", str(log_file), "--checkpoint-file", str(checkpoint),
+            "--no-process-check"]
+
+    assert job_status.main(argv) == 0
+    out = capsys.readouterr().out
+    assert "exists=True" in out and f"size={checkpoint.stat().st_size}B" in out
+    assert "generation=<not recorded>" in out, out
+    assert "checkpoint note: unreadable — UnpicklingError" in out, out
+    assert "continues at generation" not in out, out
+    assert "NOT generation 1" in out, out
+
+    # The machine-readable form invents no generation either.
+    assert job_status.main(argv + ["--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "generation" not in payload["checkpoint"], payload["checkpoint"]
+    assert payload["checkpoint"]["read_error"].startswith("UnpicklingError")
+
+
+def test_the_real_checkpoint_on_this_machine_is_readable_and_untouched(
+        job_status):
+    """The operator's own ``data/ga_checkpoint.pkl``: read, never written.
+
+    Skips only when there is no checkpoint on this machine (a fresh clone); when
+    one exists its stored values must be what the status tool reports, and the
+    byte digest must be identical before and after (read-only tool).
+    """
+    real = ROOT / "data" / "ga_checkpoint.pkl"
+    if not real.exists():
+        pytest.skip("no live GA checkpoint on this machine")
+    before = hashlib.sha256(real.read_bytes()).hexdigest()
+    st_before = real.stat()
+    info = job_status.checkpoint_stats(real)
+    after = hashlib.sha256(real.read_bytes()).hexdigest()
+    assert (before, real.stat().st_mtime_ns) == (after, st_before.st_mtime_ns), \
+        "checkpoint_stats() modified data/ga_checkpoint.pkl"
+
+    assert "read_error" not in info, info
+    with open(real, "rb") as f:
+        state = pickle.load(f)
+    assert info["generation"] == state["generation"]
+    assert info["window_key"] == state["window_key"]
+    assert info["population_hash"] == state["population_hash"]
+    assert info["population_size"] == len(state["population"])
+    assert info["prior_trials"] == state["prior_trials"]
+    assert info["trials_this_run"] == state["trials_this_run"]
+    assert info["keep_checkpoint"] == state["keep_checkpoint"]
+    assert info["size"] == st_before.st_size and info["mtime"] == st_before.st_mtime
+    assert info["mtime_iso"] and info["saved_at"]

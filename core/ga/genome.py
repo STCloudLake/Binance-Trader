@@ -280,6 +280,104 @@ MODE_OPTIONS = ["trend", "range", "scalp", "momentum"]
 TIMEFRAME_OPTIONS = list(DEFAULT_INTERVALS)
 
 
+# ── P7-S1: the regime filter gene (INERT while the switch is off) ───────
+#
+# A strategy may declare the causal regimes it is allowed to enter in
+# (``StrategyConfig.regime_filter``, delivered by ``core.strategy.regime_causal``
+# and enforced by the backtest entry path).  This gene lets the GA evolve that
+# declaration.
+#
+# **The gene is created / read / written only while the switch is ON.**  That is
+# the strongest form of the "disabled by default ⇒ bit-identical" requirement:
+# with the shipped `ga.regime_conditioning: false` the chromosome has no
+# ``regime_filter`` categorical gene at all, so `random_chromosome` draws exactly
+# the same Gaussian/uniform/choice stream it drew before this feature existed
+# (a gene that were merely *pinned* to "off" would still consume RNG draws), the
+# decoded `StrategyConfig` has no filter, and no evaluation builds a
+# `RegimeContext`.
+#
+# The gene's value is a **comma-joined** label list (like the ``timeframes``
+# gene), so it round-trips through the one `CategoricalGene` type with no new
+# gene class; ``""`` (the single empty option) means "no filter", i.e. the
+# pre-P7 behaviour.  S1 confines the choice set to ``""`` or ONE regime — five
+# labels plus neutral — deliberately: the per-symbol × per-regime product already
+# multiplies the search space, and the DSR trial counter must include every
+# variant tried (see `docs/overhaul/P7_REGIME_PLAN.md` §3 risk 3).
+
+#: Master switch (module default ``False``; the GA run sets it from
+#: ``ga.regime_conditioning`` / ``GARunConfig.regime_conditioning``).
+REGIME_CONDITIONING_ENABLED = False
+
+#: Neutral gene value = no filter.
+REGIME_FILTER_OFF = ""
+
+
+def regime_conditioning_active(regime_conditioning: bool | None = None) -> bool:
+    """Effective switch: an explicit argument, else the module constant."""
+    if regime_conditioning is None:
+        return bool(REGIME_CONDITIONING_ENABLED)
+    return bool(regime_conditioning)
+
+
+def regime_gene_options() -> list[str]:
+    """The regime gene's choices: neutral, then one option per gate label."""
+    from core.strategy.regime_causal import GATE_REGIME_LABELS
+
+    return [REGIME_FILTER_OFF, *GATE_REGIME_LABELS]
+
+
+def confine_regime_filter(value, regime_conditioning: bool | None = None) -> str:
+    """*value* as a stored regime gene — never raises, never invents a label.
+
+    ``""``/``None`` ⇒ ``""`` (no filter).  With the switch OFF the result is
+    always ``""``, so a checkpoint or a hand-written chromosome carrying
+    ``"trend_up"`` cannot smuggle a filter into a run that did not ask for one.
+    An unknown or in-sample label is dropped rather than passed through: the
+    decoded ``StrategyConfig.regime_filter`` must never be able to raise on a
+    value the GA itself produced.
+    """
+    if not regime_conditioning_active(regime_conditioning):
+        return REGIME_FILTER_OFF
+    from core.strategy.regime_causal import GATE_REGIME_LABELS
+
+    allowed = set(GATE_REGIME_LABELS)
+    # Accept BOTH the gene's comma-joined string and the config's list form, so
+    # ``confine_regime_filter(config.regime_filter)`` is the same call as
+    # ``confine_regime_filter(gene.value)`` — a list that were stringified whole
+    # ("['trend_down']") would silently confine to "no filter".
+    if isinstance(value, (list, tuple, set, frozenset)):
+        pieces = [str(piece) for entry in value for piece in str(entry).split(",")]
+    else:
+        pieces = str(value or "").split(",")
+    kept = [piece.strip() for piece in pieces
+            if piece.strip() and piece.strip() in allowed]
+    return ",".join(kept)
+
+
+def confine_regime_gene(chromosome: dict,
+                        regime_conditioning: bool | None = None) -> None:
+    """Rewrite a chromosome's regime gene in place (idempotent).
+
+    With the switch OFF the gene is **removed**, so a checkpoint written by a
+    conditioned run, or a chromosome built by hand, decodes exactly like a
+    pre-P7 genome once the operator turns the switch back off.
+    """
+    genes = chromosome.get("categorical", None) or []
+    active = regime_conditioning_active(regime_conditioning)
+    kept = []
+    for gene in genes:
+        if getattr(gene, "name", "") != "regime_filter":
+            kept.append(gene)
+            continue
+        if not active:
+            continue
+        gene.value = confine_regime_filter(getattr(gene, "value", ""), active)
+        gene.options = regime_gene_options()
+    if not active:
+        chromosome["categorical"] = kept
+
+
+
 # ── Per-job timeframe whitelist (``timeframe_pool``) ───────────────────
 #
 # The timeframe gene is part of the genome, so an unconstrained population
@@ -957,12 +1055,20 @@ def _randomise_volume_genes(chrom: dict) -> None:
 
 
 def strategy_to_chromosome(config: StrategyConfig,
-                           timeframe_pool: list[str] | None = None) -> dict:
+                           timeframe_pool: list[str] | None = None,
+                           regime_conditioning: bool | None = None) -> dict:
     """Encode a StrategyConfig into a chromosome dict.
 
     ``timeframe_pool`` (a job's whitelist, ``None`` = unrestricted) confines the
     timeframe gene's value *and* options to the pool, so a seeded strategy — an
     existing YAML that trades ``1m`` — cannot inject a cycle the run excluded.
+
+    ``regime_conditioning`` (``None`` = the module switch
+    :data:`REGIME_CONDITIONING_ENABLED`, whose default is ``False``) decides
+    whether the ``regime_filter`` gene exists at all: with the switch off the
+    returned chromosome has no such gene, so encoding a config that carries a
+    filter drops it (the gene is inert, not merely neutral — see the block above
+    :data:`REGIME_CONDITIONING_ENABLED`).
 
     Returns a dict with keys: continuous, categorical, structural
     that can be mutated and decoded back.
@@ -1106,6 +1212,17 @@ def strategy_to_chromosome(config: StrategyConfig,
         CategoricalGene("timeframes", timeframes_value,
                         timeframe_gene_options(timeframe_pool)))
 
+    # ── P7-S1: the regime filter gene (present ONLY while the switch is on) ──
+    # Added after ``timeframes`` and before the structural genes so a conditioned
+    # genome's gene order is stable; with the switch off nothing is appended, so
+    # the chromosome (and the RNG stream that produced it) is unchanged.
+    if regime_conditioning_active(regime_conditioning):
+        categorical.append(CategoricalGene(
+            "regime_filter",
+            confine_regime_filter(getattr(config, "regime_filter", None),
+                                  regime_conditioning),
+            regime_gene_options()))
+
     # ── Evolvable entry logic (OR = looser, AND = stricter) ──
     # A first-class ``StrategyConfig`` field (schema-level), so the chromosome
     # gene survives into the published YAML and the reloaded strategy is
@@ -1152,17 +1269,28 @@ def strategy_to_chromosome(config: StrategyConfig,
 
 
 def chromosome_to_strategy(chromosome: dict,
-                           timeframe_pool: list[str] | None = None) -> StrategyConfig:
+                           timeframe_pool: list[str] | None = None,
+                           regime_conditioning: bool | None = None) -> StrategyConfig:
     """Decode a chromosome dict back into a StrategyConfig.
 
     ``timeframe_pool`` (a job's whitelist, ``None`` = unrestricted) makes the
     decoded strategy's own ``timeframes`` non-empty and inside the pool — belt
     and braces on top of the gene confinement, covering a checkpoint written
     before the pool existed.
+
+    ``regime_conditioning`` (``None`` = the module switch) decides whether the
+    chromosome's ``regime_filter`` gene is honoured.  With the switch off the
+    decoded ``regime_filter`` is ``[]`` for every chromosome, so a checkpoint
+    written by a conditioned run cannot leak a filter into an unconditioned one;
+    with it on, the gene value is confined to
+    :data:`~core.strategy.regime_causal.GATE_REGIME_LABELS` before it reaches the
+    config (`StrategyConfig`'s validator would refuse anything else).
     """
     cont = {g.name: g.value for g in chromosome["continuous"]}
     cat = {g.name: g.value for g in chromosome["categorical"]}
     struct = {g.name: g.conditions for g in chromosome["structural"]}
+    regime_filter = confine_regime_filter(
+        cat.get("regime_filter", ""), regime_conditioning)
 
     # Read indicator boolean genes (backward compat: all True if missing)
     ind_genes_list = chromosome.get("indicator_genes", [])
@@ -1311,6 +1439,10 @@ def chromosome_to_strategy(chromosome: dict,
         # post-load trading alike.  An unknown gene value warns and falls back
         # to "or" inside the model validator.
         condition_logic=chromosome.get("condition_logic", "or"),
+        # ── P7-S1: the causal regime declaration the entry path enforces ──
+        # ``[]`` while the switch is off (and for every pre-P7 chromosome), which
+        # is the historical "trade every regime" behaviour.
+        regime_filter=list(regime_filter.split(",")) if regime_filter else [],
         exit_conditions={
             "long": exit_long,
             "short": exit_short,
@@ -1336,13 +1468,22 @@ def chromosome_to_strategy(chromosome: dict,
 # ── Random initialization ─────────────────────────────────────────────
 
 def random_chromosome(name: str = "ga_strategy",
-                      timeframe_pool: list[str] | None = None) -> dict:
+                      timeframe_pool: list[str] | None = None,
+                      regime_conditioning: bool | None = None) -> dict:
     """Create a random strategy chromosome with diverse indicator selection.
 
     ``timeframe_pool`` (a job's whitelist, ``None`` = unrestricted) confines the
     sampled timeframes to the pool, so no genome of a pooled run can pick a cycle
     the operator excluded.  Without it the sampling — and therefore the RNG
     stream, the population and the champion — is bit-identical to before.
+
+    ``regime_conditioning`` (``None`` = the module switch, default ``False``)
+    decides whether the sampled chromosome carries a ``regime_filter`` gene.  With
+    the switch off **no draw is taken for it**, so the population is bit-identical
+    to the pre-P7 one (the acceptance criterion in
+    ``docs/overhaul/P7_REGIME_PLAN.md`` S1); with it on, the gene is sampled from
+    ``["", *GATE_REGIME_LABELS]`` with the neutral value weighted equally, so the
+    search explores conditioning without being forced into it.
     """
     mode = random.choice(MODE_OPTIONS)
     if timeframe_pool:
@@ -1370,13 +1511,34 @@ def random_chromosome(name: str = "ga_strategy",
             confidence_threshold=random.uniform(0.55, 0.75),
         ),
     )
-    chrom = strategy_to_chromosome(config, timeframe_pool=timeframe_pool)
+    chrom = strategy_to_chromosome(config, timeframe_pool=timeframe_pool,
+                                   regime_conditioning=regime_conditioning)
     # indicator_genes are already set by strategy_to_chromosome based on config.indicators
     # Evolvable entry logic: random init explores both OR and AND.
     chrom["condition_logic"] = random.choice(["or", "or", "and"])
     # P6-D volume genes: random init explores them, half the time neutral.
     _randomise_volume_genes(chrom)
+    # P7-S1 regime gene: only drawn while the switch is on (see the docstring) —
+    # when the switch is off this block must consume no RNG at all.
+    if regime_conditioning_active(regime_conditioning):
+        _randomise_regime_gene(chrom)
     return chrom
+
+
+def _randomise_regime_gene(chrom: dict) -> None:
+    """Random non-neutral value for the regime gene (neutral 1/6 of the time).
+
+    Only ever called while the switch is on, so the OFF path keeps its exact
+    RNG stream.  ``random.choice`` over the five gate labels gives each regime
+    (and — via the explicit neutral draw — "no filter") the same prior.
+    """
+    from core.strategy.regime_causal import GATE_REGIME_LABELS
+
+    value = random.choice([REGIME_FILTER_OFF, *GATE_REGIME_LABELS])
+    for gene in chrom.get("categorical", []) or []:
+        if getattr(gene, "name", "") == "regime_filter":
+            gene.value = value
+            gene.options = regime_gene_options()
 
 
 def _random_indicators() -> dict:

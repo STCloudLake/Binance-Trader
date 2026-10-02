@@ -67,6 +67,15 @@ class StrategyConfig(BaseModel):
     #: exact structure it was scored under (:meth:`entry_sides` is the single
     #: evaluation path).
     condition_logic: str = CONDITION_LOGIC_OR
+    #: P7-S1: the causal regimes this strategy is allowed to ENTER in.  Empty
+    #: (the default) = no filter, i.e. the strategy trades every regime exactly
+    #: as it did before the field existed.  The labels are the composite causal
+    #: ones (``core.strategy.regime_causal.GATE_REGIME_LABELS``); an in-sample
+    #: HMM label is refused **by name** at model construction
+    #: (``InSampleRegimeLabelError``), so a YAML cannot condition on look-ahead
+    #: labels.  Enforced on the backtest/GA entry path in S1; the live engine is
+    #: S3's decision (see ``docs/overhaul/P7_REGIME_PLAN.md``).
+    regime_filter: list[str] = []
     exit_conditions: dict[str, list[str]] = {}
     reduce_conditions: dict[str, list[dict]] = {}
     ml_config: MLConfig | None = None
@@ -76,6 +85,21 @@ class StrategyConfig(BaseModel):
     @classmethod
     def _coerce_condition_logic(cls, value: Any) -> str:
         return normalize_condition_logic(value, warn=True)
+
+    @field_validator("regime_filter", mode="before")
+    @classmethod
+    def _coerce_regime_filter(cls, value: Any) -> list[str]:
+        """Validate the regime declaration at load (see :func:`parse_regime_filter`).
+
+        Imported lazily so ``loader`` keeps no hard dependency on the regime
+        module for the callers that never evaluate a condition (routes, workers).
+        Anything that is not a label of the causal gate vocabulary raises — a
+        named refusal, not a silent drop — while ``None``/empty stays ``[]``
+        (no filter), which is what every pre-P7 YAML carries by omission.
+        """
+        from core.strategy.regime_causal import parse_regime_filter
+
+        return parse_regime_filter(value)
 
     def entry_sides(self, df) -> tuple[bool, bool]:
         """``(long_active, short_active)`` for the last (closed) bar of *df*.

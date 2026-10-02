@@ -22,7 +22,7 @@ from loguru import logger
 
 from core.ga.genome import (
     strategy_to_chromosome, chromosome_to_strategy,
-    random_chromosome, confine_timeframe_gene,
+    random_chromosome, confine_timeframe_gene, confine_regime_gene,
     ContinuousGene, CategoricalGene, StructuralGene,
 )
 from core.ga.benchmark import (
@@ -97,6 +97,15 @@ class GARunConfig:
     #: was stopped (or crashed) always keeps its checkpoint — that is the
     #: pre-existing crash-resume path and is not affected by this flag.
     keep_checkpoint: bool = True
+    #: P7-S1: evolve the causal regime filter gene (``ga.regime_conditioning``)?
+    #: ``None`` = **follow ``config.ga_regime_conditioning``** (code default
+    #: ``False``), so an absent job field can never turn conditioning on.  While
+    #: this resolves to ``False`` the genome carries no ``regime_filter`` gene,
+    #: no evaluation builds a regime context and the whole run is bit-identical
+    #: to the pre-P7 build.  ``True`` makes the gene part of the search space and
+    #: makes the backtest entry path evaluate each genome only on bars whose
+    #: causal regime label is in its declaration.
+    regime_conditioning: bool | None = None
 
 
 def dsr_trial_counts(prior_trials: int, ledger_total: int, population: int,
@@ -176,6 +185,16 @@ class GAStrategyEvolver:
         #: P6-D: one lazily-built volume context per run (None while the
         #: executability model is off for the whole population).
         self._volume_context = None
+        #: P7-S1: the effective regime-conditioning switch.  ``evolve`` resolves
+        #: it from the job field (``GARunConfig.regime_conditioning``) and then
+        #: from ``config.ga_regime_conditioning`` (code default ``False``) before
+        #: the population exists, and mirrors it into
+        #: ``core.ga.genome.REGIME_CONDITIONING_ENABLED`` — the genome module owns
+        #: the flag because gene creation, decoding and random init must agree on
+        #: it.  Pre-resolution the value is the code default, which is what a
+        #: direct operator call (a test crossing two chromosomes, say) should see.
+        self._regime_conditioning = bool(
+            getattr(self.config, "regime_conditioning", False))
 
     @property
     def generation(self) -> int:
@@ -266,6 +285,30 @@ class GAStrategyEvolver:
                     f"({'job field' if _job_mode else 'config'})"
                     f" — the publication gate compares against it")
 
+        # ── P7-S1: causal regime conditioning — resolved ONCE per run ──
+        # The genome module owns the switch (``REGIME_CONDITIONING_ENABLED``)
+        # because gene creation, decoding and random init must all agree on it;
+        # the run sets it here from the job field (``GARunConfig``) and finally
+        # from ``config.ga_regime_conditioning`` (code default ``False``).  A
+        # ``False`` run therefore creates no regime gene, draws no extra RNG and
+        # decodes every genome with an empty filter — bit-identical to pre-P7.
+        from core.ga import genome as _genome_mod
+
+        _job_regime = getattr(cfg, "regime_conditioning", None)
+        self._regime_conditioning = bool(
+            _job_regime if _job_regime is not None
+            else getattr(getattr(self.engine, "config", None),
+                         "ga_regime_conditioning", False))
+        _genome_mod.REGIME_CONDITIONING_ENABLED = self._regime_conditioning
+        logger.info(
+            f"GA regime_conditioning={self._regime_conditioning} "
+            f"({'job field' if _job_regime is not None else 'config'})"
+            + (" — the regime_filter gene is evolved and the entry path "
+               "evaluates each genome only on its allowed causal regimes"
+               if self._regime_conditioning else
+               " — no regime gene, every decoded genome has an empty filter "
+               "(bit-identical to the pre-P7 search space)"))
+
         # Training period: if validation_start is set, stop training there
         train_end = validation_start if validation_start else date_end
         has_validation = validation_start is not None
@@ -330,6 +373,15 @@ class GAStrategyEvolver:
         if timeframe_pool:
             for chrom in self._population:
                 confine_timeframe_gene(chrom, timeframe_pool)
+
+        # ── P7-S1: confine (or strip) every genome's regime gene ──
+        # Unconditional, and for the same reason: a checkpoint written by a
+        # conditioned run, a seeded YAML carrying ``regime_filter`` or a
+        # hand-built chromosome must all agree with THIS run's switch before a
+        # single backtest is scored.  While the switch is off this strips the
+        # gene, so the decoded genome is the pre-P7 one.
+        for chrom in self._population:
+            confine_regime_gene(chrom, self._regime_conditioning)
 
         # ── Evolution loop ──
         # The loop's START is the checkpoint's generation (0 for a fresh run):
@@ -906,7 +958,11 @@ class GAStrategyEvolver:
         for i in range(needed):
             population.append(random_chromosome(
                 f"ga_rand_{i}",
-                timeframe_pool=getattr(cfg, "timeframe_pool", None)))
+                timeframe_pool=getattr(cfg, "timeframe_pool", None),
+                # P7-S1: passed explicitly (not left to the module flag), so a
+                # direct ``_init_population`` call — a test, a resumed run — gets
+                # the gene this evolver's switch implies.
+                regime_conditioning=getattr(self, "_regime_conditioning", None)))
 
         return population
 
@@ -943,7 +999,8 @@ class GAStrategyEvolver:
         for i in range(cfg.immigrant_count):
             new_pop.append(random_chromosome(
                 f"ga_immigrant_{i}",
-                timeframe_pool=getattr(cfg, "timeframe_pool", None)))
+                timeframe_pool=getattr(cfg, "timeframe_pool", None),
+                regime_conditioning=getattr(self, "_regime_conditioning", None)))
 
         # Trim to exact population size
         return new_pop[:cfg.population_size]
@@ -1042,6 +1099,10 @@ class GAStrategyEvolver:
         # The timeframe gene is re-confined on every mutation, so a gene
         # inherited from a pre-pool checkpoint can never leave the job's pool.
         confine_timeframe_gene(chrom, getattr(self.config, "timeframe_pool", None))
+        # P7-S1: the regime gene is re-confined on every mutation too, and REMOVED
+        # while the run's switch is off — so a checkpoint written by a conditioned
+        # run cannot leak a filter into an unconditioned one.
+        confine_regime_gene(chrom, getattr(self, "_regime_conditioning", None))
         chrom["fitness_result"] = {}
         return chrom
 

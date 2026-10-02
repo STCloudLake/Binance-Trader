@@ -672,6 +672,50 @@ class BacktestEngine:
             self.config.hard_limits, self.config.soft_params,
             self.config.core_capital_pct, self.config.satellite_capital_pct)
 
+        # ── P7-S1: the causal regime context (built ONLY when a genome filters) ──
+        # A strategy may declare the causal regimes it is allowed to enter in
+        # (``StrategyConfig.regime_filter``); the entry path below refuses an entry
+        # on a bar whose causal label is not in that declaration.  The labels come
+        # from ``core.strategy.regime_causal`` — the composite volatility-tercile /
+        # trend classifier, which is causal by construction and never computes the
+        # whole-sample HMM.  Building the context is a per-(symbol, interval) cost
+        # of a few ms per 6 000 bars; with every genome's filter empty (the shipped
+        # default) ``_regime_keys`` is empty, nothing is read and the run is
+        # bit-identical to the pre-P7 engine.
+        _regime_context = None
+        # Imported here (not at module scope) so the engine keeps importing
+        # cleanly for the callers that never evaluate a regime filter, and bound
+        # to a local so the per-bar gate below is one dict-free call.
+        from core.strategy.regime_causal import build_regime_context, regime_allows
+        #: P7-S1 accounting: ``{strategy name: {"gated", "allowed", "labels"}}``
+        #: for the strategies whose ``regime_filter`` is non-empty.  Populated by
+        #: the entry gate below and returned under
+        #: ``metrics["regime_conditioning"]``, so a conditioned evaluation can
+        #: report the sample it was actually restricted to (and a run with no
+        #: filter reports nothing at all — the dict stays empty).
+        _regime_accounting: dict = {}
+        _regime_keys = {
+            (sym, tf)
+            for s_cfg in strategy_configs
+            for sym in (getattr(s_cfg, "symbols", None) or symbols)
+            if getattr(s_cfg, "regime_filter", None)
+            for tf in (s_cfg.timeframes or [])}
+        if _regime_keys:
+            try:
+                _frames = {key: feeder.get_all_data_for_symbol(key[0], key[1])
+                           for key in sorted(_regime_keys)}
+                _regime_context = build_regime_context(_frames)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(f"P7 regime context unavailable ({exc}) — "
+                               f"regime-filtered entries will be refused")
+                _regime_context = None
+            logger.info(
+                "P7 regime conditioning: "
+                + (f"{len(_regime_context or [])} (symbol, interval) label series "
+                   f"for {len(_regime_keys)} requested key(s)"
+                   if _regime_context else
+                   "no usable regime data -- filtered strategies cannot enter"))
+
         # Signal weights — dynamically adjustable to simulate AI market assessment.
         # In live trading, the DeepSeek AI can change these hourly. The backtest
         # re-evaluates weights periodically based on detected market regime.
@@ -1285,6 +1329,27 @@ class BacktestEngine:
 
                     entry_side = "long" if indicator_signal > 0 else "short"
 
+                    # ── P7-S1: the regime filter (no-op for an empty filter) ──
+                    # A strategy that declares its regimes trades ONLY on bars whose
+                    # causal label is in the declaration; ``regime_allows`` raises
+                    # ``InSampleRegimeLabelError`` if the label is an in-sample HMM
+                    # one, so this call site can never consume a look-ahead label.
+                    # An unmeasured bar (no cached label) is not allowed — the
+                    # conservative direction — and ``[]`` (the default, and every
+                    # pre-P7 genome) short-circuits to True without touching the
+                    # context, which is what keeps the OFF path bit-identical.
+                    if getattr(strategy, "regime_filter", None):
+                        _label = (_regime_context.lookup(sym, primary_tf, ts)
+                                  if _regime_context is not None else None)
+                        _counter = _regime_accounting.setdefault(
+                            strategy.name, {"gated": 0, "allowed": 0, "labels": {}})
+                        _counter["gated"] += 1
+                        _key = "unknown" if _label is None else str(_label)
+                        _counter["labels"][_key] = _counter["labels"].get(_key, 0) + 1
+                        if not regime_allows(strategy.regime_filter, _label):
+                            continue
+                        _counter["allowed"] += 1
+
                     # ── Shared Kernel: Signal fusion ──
                     ml_key = f"{strategy.name}|{sym}"
                     ml_conf = ml_predictions.get(ml_key, 0.5)
@@ -1581,6 +1646,20 @@ class BacktestEngine:
         metrics["buy_hold_pct"] = round(buy_hold_pct, 4) if buy_hold_pct is not None else None
         metrics["spread_sources"] = dict(
             (getattr(self, "_run_state", {}) or {}).get("spread_sources") or {})
+        # P7-S1: what the regime filter actually did (empty when no genome
+        # declared one).  Reported, never gated: the DSR/trade-count criteria
+        # consume the CONDITIONAL sample through the per-genome trades and equity
+        # curve above, which is the point.
+        if _regime_accounting:
+            metrics["regime_conditioning"] = {
+                str(name): {"gated": int(counts["gated"]),
+                            "allowed": int(counts["allowed"]),
+                            "allowed_pct": round(
+                                counts["allowed"] / counts["gated"] * 100.0, 4)
+                            if counts["gated"] else 0.0,
+                            "labels": {str(k): int(v) for k, v in
+                                       sorted(counts["labels"].items())}}
+                for name, counts in _regime_accounting.items()}
 
         # ── Per-genome ledgers (isolated GA evaluation) ──
         # ``trades`` is append-only and therefore chronological, so slicing it per

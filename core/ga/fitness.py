@@ -278,6 +278,13 @@ def evaluate_chromosome(
                                           initial_balance)
                 stats["executability"] = modelled["summary"]
         stats["buy_hold_pct"] = metrics.get("buy_hold_pct")
+        # P7-S1: the genome's own regime declaration — reported next to the
+        # measured effect (``benchmark_result_fields`` pairs the two).
+        if stats.get("regime_conditioning") is None:
+            _regime = (metrics.get("regime_conditioning") or {}).get(config.name)
+            if _regime:
+                stats["regime_conditioning"] = _regime
+        stats["regime_filter"] = list(getattr(config, "regime_filter", []) or [])
         # The selected benchmark (`ga.benchmark_mode`) for THIS genome, computed
         # by the engine next to its own ledger (core.ga.benchmark).
         _bench = (per_eq or {}).get("benchmark") or {}
@@ -412,6 +419,23 @@ def chromosome_volume_filter_rvol(chromosome: dict | None) -> float:
     if value != value or value in (float("inf"), float("-inf")):
         return 0.0
     return max(0.0, min(5.0, value))
+
+
+def chromosome_regime_filter(chromosome: dict | None) -> list[str]:
+    """P7-S1 ``regime_filter`` gene as a label list (``[]`` = no filter).
+
+    Reads the comma-joined categorical gene; a pre-P7 chromosome (no such gene)
+    and a run whose switch is off both answer ``[]``, which is exactly the
+    filter the decode produced.  Confined to the gate vocabulary, so a malformed
+    gene value can never reach a comparison or a report as a label it invented.
+    """
+    from core.ga.genome import confine_regime_filter
+
+    for gene in (chromosome or {}).get("categorical", []) or []:
+        if getattr(gene, "name", "") == "regime_filter":
+            confined = confine_regime_filter(getattr(gene, "value", ""), True)
+            return [piece for piece in confined.split(",") if piece]
+    return []
 
 
 def volume_size_factor(rvol, k: float,
@@ -1073,6 +1097,11 @@ def score_stats(stats: dict, chromosome: dict | None = None,
     else:
         stats_out["alpha_vs_benchmark_pct"] = _total_return - _finite(_bench)
     stats_out["insufficient_data"] = trades < MIN_TRADES_GATE
+    # P7-S1: carry the regime declaration and its measured effect through the ONE
+    # scoring function, so a caller that stops at ``score_stats`` (the research
+    # tools, the tests) sees the same conditioning block the GA result dict does.
+    stats_out["regime_filter"] = (list(stats.get("regime_filter") or []) or None)
+    stats_out["regime_conditioning"] = stats.get("regime_conditioning") or None
     if trades == 0:
         stats_out["flag"] = "no_trades"
     elif trades < MIN_TRADES_GATE:
@@ -1099,11 +1128,20 @@ def benchmark_result_fields(stats: dict, score: dict | None = None) -> dict:
     alpha = stats.get("alpha_vs_benchmark_pct")
     sharpe = (score if score is not None else stats).get("sharpe")
     comparison = strategy_vs_benchmark(report, _finite(sharpe))
+    regime = stats.get("regime_conditioning") or None
     return {
         "benchmark_mode": mode,
         "benchmark_pct": (round(_finite(bench), 4) if bench is not None else None),
         "alpha_vs_benchmark_pct": round(_finite(alpha), 4),
         "benchmark": report,
+        # ── P7-S1: what the causal regime filter restricted this genome to ──
+        # ``regime_filter`` is the declaration, ``regime_conditioning`` the
+        # measured effect (bars gated / allowed and the label histogram).  Both
+        # are ``None`` for a genome with no filter — the shipped case — so a
+        # downstream reader can tell "conditioned" from "not conditioned" without
+        # guessing.
+        "regime_filter": (list(stats.get("regime_filter") or []) or None),
+        "regime_conditioning": regime,
         "benchmark_sharpe": comparison["benchmark_sharpe"],
         "benchmark_max_dd": comparison["benchmark_max_dd_pct"],
         "benchmark_time_in_market_pct": comparison["benchmark_time_in_market_pct"],
@@ -1163,6 +1201,15 @@ def stats_from_engine_result(result: dict, strategy_name: str,
         stats["executability"] = modelled["summary"]
     metrics = result.get("metrics", {}) or {}
     stats["buy_hold_pct"] = metrics.get("buy_hold_pct")
+    # P7-S1: what the regime filter restricted this genome to (reported, never
+    # gated).  Absent for every genome whose filter is empty — the shipped case —
+    # so the key's presence is itself the evidence that conditioning happened.
+    _regime = (metrics.get("regime_conditioning") or {}).get(strategy_name)
+    if _regime:
+        stats["regime_conditioning"] = _regime
+    # The declaration itself (``[]`` for every pre-P7 / unconditioned genome), so
+    # the reported block can pair "what it declared" with "what that did".
+    stats["regime_filter"] = list(getattr(config, "regime_filter", []) or [])
     # The selected benchmark (`ga.benchmark_mode`) the engine computed next to
     # this genome's own ledger.  Absent (an older engine / a hand-built result)
     # ⇒ the legacy buy & hold, exactly as before.
