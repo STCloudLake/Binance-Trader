@@ -12,7 +12,7 @@ data-api.binance.vision (REST) / data-stream.binance.vision (WS) → MarketDataP
 ```
 
 > **状态**：`VERSION` **2.0.1** · Python **3.12**（实测 3.12.10）· Windows / Linux · 默认只监听 `127.0.0.1:8899`
-> **测试**：**1364** 项收集（`python -m pytest tests/ --collect-only -q`）；全量基线要求 `1364 passed, 0 failed`。见 [§5.1](#51-测试)。
+> **测试**：**1505** 项收集（`python -m pytest tests/ --collect-only -q -p no:cacheprovider`）；全量基线要求 `1505 passed, 0 failed`——本机 HEAD 当前实测 **1504 passed / 1 failed**（单条证据索引守卫，见 [§5.1](#51-测试)）。
 > 本 README 只写**当前代码事实**，每个数字旁给出发它的命令；与代码冲突时以代码为准。
 
 ---
@@ -318,6 +318,33 @@ python tools/p7_orchestrator_measure.py --genomes 3 --symbols BTCUSDT ETHUSDT `
 
 **关闭即不变.** `ai.orchestrator.enabled: false` 时 `decide()` 恒为 allow 且**不读**波动率/广度序列；回测引擎只在调用方显式传 `orchestrator=` 时读取，实盘还要 `experimental.regime_orchestrator_live: true` 且调用方注册。逐位一致由 `tests/test_p7_orchestrator.py` 用 `git worktree` 在 `d9849a2` 上比对成交、逐点资金曲线与指标键集合（43 项测试）。
 
+### 4.9 GA 逐币种独立进化（job 字段 `symbol_mode`，P7-S2）
+
+**它解决的问题.** 池化 GA 在**整篮子**上评一个种群，一个只在某个币上有效的信号会被其他币的表现**平均掉**。`symbol_mode: "per_symbol"` 让 GA 变成**每个币一套独立种群**：每个候选**只在它自己的币上**评分，每个币各出一个冠军。**缺省 `"pooled"` 与改前逐字节一致。**
+
+| 关注点 | 约定 |
+|---|---|
+| **开关是 job 字段，不是配置键** | `symbol_mode`（`"pooled"`（缺省）/ `"per_symbol"`）；`config/config.yaml` 里**没有** `ga.symbol_mode`，`Config` 也没有该属性（`tests/test_p7_symbol_mode.py::test_there_is_no_config_key_for_the_mode` 守护）——**任何配置改动都不会改变 GA 的搜索形状** |
+| **缺省逐字节一致** | 字段缺失或 `"pooled"` 时与 HEAD **逐位一致**：同 seed 下种群哈希、每代 `prior_trials`/`batch_trials`、冠军基因、发布门结论与 result 载荷全部相同。真实评分器、打桩评分器、以及 `git worktree d9849a2` 里跑同一 harness 三种口径都做了逐字节比对（唯一被有意排除的是加法审计键 `symbols_evaluated` 与时间戳/文件名） |
+| **校验** | `core/ga/evolver.py::parse_symbol_mode`；未知取值抛具名 `UnknownSymbolModeError` ⇒ **接口 HTTP 400**、worker **job 加载即失败**（`scripts/ga_worker.py::job_symbol_mode`，与 `timeframe_pool`/`benchmark_mode` 同型）；缺失/空白 = `pooled` |
+| **冠军** | **每币一个冠军** YAML（`ga_champion_<币>_<时间戳>`），且 `champion_config.symbols == [该币]`——记录的是**这个臂实际评估的币**（执行路径本来就只交易 `strategy.symbols` 里的币，见 §4.6）；`provenance.symbol_mode / champion_symbol / n_symbols`；result 是 `champions[]` **加**顶层镜像（旧消费方读的键与取值口径不变） |
+| **试错计数（DSR 诚实性）** | per-symbol 一轮实际执行 `len(symbols) × population × generations` 次评估（本机实测 pooled 32 / per_symbol 64），所有臂共享同一本搜索账；`evolve()` 在**所有臂跑完后只算一次** `n_trials`，所以**每个**冠军的 DSR 都用**整轮**真正试过的变体数，而不是它自己那一份 population；冠军 YAML 自述 `provenance.trials.search{evaluations_this_arm, evaluations_whole_run, arm_population}`。这是保守口径：per_symbol 的 N 严格大于 pooled 的 N |
+| **检查点身份** | 检查点记录 `symbol_mode` 与 `arm_symbol`；**跨形状续跑**（pooled ↔ per_symbol）抛具名 `CheckpointSymbolModeMismatchError`；per-symbol 续跑只续检查点所属的那个臂，其余臂从零开始 |
+| **成本** | 墙钟时间≈不变：每个 per-symbol 候选只在 1 个币上评分，N 个臂 ≈ 一个池化臂的成本（实测 200.8 s vs 226.1 s） |
+
+**实测（真实缓存，样本外 2026-02-01~2026-06-01，BTC+ETH 1h，门基准是出货的 `exposure_matched`；逐冠军用它自己的评估篮子重新评分）**
+
+| 指标 | `pooled`（篮子冠军，2 个） | `per_symbol`（每币冠军，4 个） |
+|---|---|---|
+| 样本外交易数（中位） | **147** | **81.5** |
+| 样本外 alpha（中位 / 均值，百分点） | **−0.526 / −0.526** | **−0.3054 / −0.3392** |
+| 样本外 alpha > 0 | 0 / 2 | 0 / 4 |
+| 样本外 **DSR > 0** | **0 / 2** | **0 / 4** |
+| 在场时间占比（中位 %） | **42.48** | **21.68** |
+| 训练窗发布 | 2/2 未发布 | 4/4 未发布 |
+
+**判定：假设不成立（hypothesis not supported）.** `per_symbol` 的中位 alpha 看起来更好，但两者**口径不同**（单币 alpha vs 整篮子 alpha，且交易数中位 81.5 vs 147、在场时间 21.68 % vs 42.48 %）——这正是 S1 已经量到过的**曝光效应**（少交易/少暴露把 alpha 拉向 0），不是选到了更好的时机。同币成对才是公平口径，而它**一好一坏**：4 对里 **2 对退化**（per-symbol 的第一个臂与 pooled 臂同种子 ⇒ 共享初始种群，两个冠军 YAML 除名字外逐行相同，Δ 恒为 0，不提供信息），有信息的 2 对（ETH）一个变差 **0.3293**、一个变好 **0.0276** 个百分点——**符号随种子翻转**。6 个冠军**没有一个样本外 DSR > 0**（且 per_symbol 的门槛是 pooled 的 2 倍：64 vs 32 次试验，所以这个否定对 per_symbol 是**保守**的）。机制本身在合成地形上是有效的（信号只在单一币存在时 per_symbol 找得到、pooled 找不到），因此结论是**真实数据上没有这个 alpha**，而不是机制不工作。
+
 ---
 
 ## 5. 运维
@@ -325,7 +352,7 @@ python tools/p7_orchestrator_measure.py --genomes 3 --symbols BTCUSDT ETHUSDT `
 ### 5.1 测试
 
 ```bash
-python -m pytest tests/ --collect-only -q -p no:cacheprovider   # 末行: 1379 tests collected
+python -m pytest tests/ --collect-only -q -p no:cacheprovider   # 末行: 1505 tests collected
 python -m pytest tests/ -q -p no:cacheprovider                  # 全量
 python -m pytest tests/ -q -m "not slow"                        # 跳过慢测
 ```
@@ -337,6 +364,8 @@ python -m pytest tests/ -q -m "not slow"                        # 跳过慢测
 另一条**与本机环境/缓存有关、与本次改动无关**的失败：`tests/test_meta_labeling.py::test_real_primary_rules_are_refused_by_the_meta_gate`。它在**改动前的 `ba8c212` worktree**（`git worktree add --detach <tmp> ba8c212`，并把本仓库的 `data/market` 以 junction 接进去）用同一份缓存**同样失败**：直接跑是 joblib/loky 的 `_count_physical_cores_win32` 探测（本机没有 `wmic`）抛 `WinError 2` + 解码异常；加 `LOKY_MAX_CPU_COUNT=8` 绕过探测后失败原因变成它自己的断言 `assert gate["allowed"] is False`（`tests/test_meta_labeling.py:401`，本机缓存的最后一版数据上 meta 门放行了一条一级规则）。所以本机 `python -m pytest tests/ -q -p no:cacheprovider` 是 **1363 passed / 1 failed**，去掉这一条是 **1363 passed / 0 failed**。
 
 > 2026-10-01 复测（§4.7 检查点保留改动后，代码冻结）：`python -m pytest tests/ -q -p no:cacheprovider` 连续两次 **1379 passed / 0 failed**（240.96s / 237.74s；新增 `tests/test_ga_checkpoint_resume.py` 13 条 + `tests/test_ga_symbols.py` 2 条），`test_meta_labeling.py::test_real_primary_rules_are_refused_by_the_meta_gate` 两次都通过（该失败依赖当时缓存的数据版本）。`python -m compileall -q app core web db scripts tools` 退出码 0。
+
+> 2026-10-02 复测（P7 文档整合完成后，改动冻结时的全量运行）：`python -m pytest tests/ -q -p no:cacheprovider` → **1504 passed / 1 failed**（484.20 s），`python -m compileall -q app core web db scripts tools` 退出 0。唯一失败是 `tests/test_reaudit_fixes.py::test_evidence_index_reports_the_current_revision_and_a_current_chain`——它要求 `docs/overhaul/ALGO_UPGRADE_EVIDENCE.md` §8 的提交链补上 `f7cd14b`（HEAD，改了 `core/ai/**`），而该文件由 Lead 维护提交链、本轮未触碰；**这是一条在改动前就已存在的守卫失败，与本次文档改动无关**（该测试只读 `ALGO_UPGRADE_EVIDENCE.md` 与 git 历史，不读本轮改动的三个文件）。
 
 **干净克隆的隐含前提**：`data/` 全部 gitignore，所以没有任何缓存历史的克隆直接跑全量**不是全绿**——`tests/test_engine_parity_variants.py` 的 7 个真实数据变体依赖 `2026-05-25..2026-05-31` 的 BTCUSDT + ETHUSDT 1h 缓存（`DATE_START` / `DATE_END` / `SYMBOLS` 就在该文件头部），缺数据时以同一句 `NO_MARKET_DATA_MESSAGE` 失败（`tests/test_hybrid_equivalence.py` 同类用例会 skip）。CI 或新机器先下这段历史即可（下面这条会写 `data/market/`，本次未执行）：
 

@@ -336,3 +336,64 @@ S1（属性 + 基因 + 执法 + 假设测量）✅
 5. 证据汇总在 `docs/overhaul/P7_REGIME_EVIDENCE.md`：每阶段提交、命令、实测数字、测试钉，
    以及**假设检验的结论**（含"没有帮助"这种结论）。
 6. 不写 `data/binance_trader.db`，不写 `strategies/`；不为跑分而改数据或改门。
+
+---
+
+## 状态与偏差（as-built）
+
+> 本节是 P7 四个阶段全部合并后的**追加对账**（写入时 HEAD `f7cd14b`）。§0–§6 的阶段定义**保持冻结、
+> 一字未改**；本节只记录每阶段**实际交付**了什么、与规划差在哪里，以及实测出来的每一个负号。
+> 所有数字都取自已提交的实测记录（本仓 `P7_REGIME_EVIDENCE.md`、`docs/core-algorithms/06-ga-evolution.md`、
+> `docs/research/CORE_ALGORITHMS.md`）；**本节不改门、不改任何数字**。
+
+### 一、逐阶段交付与偏差
+
+| 阶段 | 提交 | 规划（§3） | 实际交付 | 偏差 |
+|---|---|---|---|---|
+| S1 | `1b33f81` | 因果状态作为一等属性 + 基因 + 引擎执法 + 默认关闭 + 成对测量 | **按规划交付**：`StrategyConfig.regime_filter`（第 13 字段）、`regime_filter` 基因、`core/strategy/regime_causal.py`、`ga.regime_conditioning`（默认 `false`）、`tools/p7_regime_conditioning_measure.py` | 无：默认关闭，且"关闭即逐位一致"可证（见下） |
+| S2 | `9c44749` | 状态基因的**子集/析取搜索空间** + 逐变体 DSR 试验计数 | **改为逐币种进化**：job 字段 `symbol_mode: pooled\|per_symbol`（默认 `pooled`，与改前逐字节一致）；per_symbol = 每币一套独立种群、只在自币评分、每币一个冠军 | 交付物**不是** plan 原文的 "regime-gene subsets"；试验计数要求**改落在 per-symbol 的乘数上**：`n_trials = len(symbols) × population × generations`，每个冠军的 DSR 都用**整轮**计数并在 `provenance.trials.search` 自述；`pooled` 路径的算术与 HEAD 逐位一致 |
+| S3 | `9c44749` | `experimental.regime_conditioning_live` + **每策略声明表** | `core/ai/orchestrator.py::RegimeOrchestrator`：regime→策略集映射 + 连亏熔断 + 因果波动率门 + 广度门；可重放、带规则指纹 | 开关**改名**为 `experimental.regime_orchestrator_live`；规则不是"每策略声明表"，而是一个**配置驱动的 `regime.allowed` 映射**（外加 `default_action`/`missing_regime_action`/`unknown_label_action`），全部在 `ai.orchestrator` 下 |
+| S4 | `f7cd14b` | 组合体样本外评估 + `tools/p7_composite_oos.py` | `core/ai/composite.py`（组合体契约）、`core/ai/holdout.py`（**一次性 holdout 计数器——规划时并不存在**）、`tools/p7_composite_measure.py` | 工具**改名**为 `p7_composite_measure.py`；"一次性访问计数"从规划要求变成**已交付的产物**（`HoldoutRefusal` + `allow_reuse` 显式开关） |
+
+### 二、S1（按规划交付）：假设否证
+
+- 因果状态成为一等属性，默认关闭（`ga.regime_conditioning: false`）；关闭时基因组连该基因都不创建（RNG 流不变）。可加性证明：整 dump 哈希 `4d40f95abe61d7e2`，**去掉 `regime_filter` 后的同一 dump = P6 冻结值 `809ddf7ba45af011`**。
+- **假设为负**：条件化把样本外交易数中位 **141.5 → 19.5**、在场时间 **24.0 % → 2.1 %**；无过滤 8 个单元与条件化 40 个单元里，样本外 `dsr > 0` 的都是 **0 个**（0/8、0/40）——**没有任何一臂达到 DSR > 0**。
+- 成对 Δalpha 均值在三个窗口上是 **+0.2142 / −0.4699 / +0.2717** 个百分点——**符号随窗口翻转**。三处稳定复现的只有两条：`dsr > 0` 的单元数为 0，以及交易数与在场时间一致大幅下降。
+
+### 三、S2（改为逐币种进化）：假设不支持
+
+- pooled 2 个冠军：alpha 中位 **−0.526 pp** / **147** 笔；per_symbol 4 个冠军：**−0.3054 pp** / **81.5** 笔；样本外 `dsr > 0` 为 **0/2** 与 **0/4**。
+- per_symbol 的 DSR 门槛是 pooled 的 **2 倍**（实测试验数 64 vs 32），因此"没有 DSR > 0"这个否定对 per_symbol 是**保守**的。
+- 4 对同币成对单元里 **2 对退化**：per-symbol 的第一个臂与 pooled 臂同种子 ⇒ 共享初始种群，两个冠军 YAML 除名字外逐行相同，不提供信息；有信息的 2 对（ETH）**一好一坏**（变差 0.3293 / 变好 0.0276 个百分点）。
+- 合成检验证明机制本身有效（信号只在单一币上时 per_symbol 找得到、pooled 找不到）——所以结论是"**真实数据上没有这个 alpha**"，不是机制不工作。
+
+### 四、S3（改名 + 配置化规则）：降回撤也降收益
+
+实测：样本外 2026-02-01~2026-06-01，BTC+ETH 1h，30 个变体，DSR 试验数 30：
+
+| 臂 | 成交 | 收益 % | 最大回撤 % | 在场时间 % | DSR |
+|---|---|---|---|---|---|
+| always-on | 1407 | −1.76 | 2.5145 | 70.69 | 0.0 |
+| orchestrated | 1229 | −2.00 | 2.2615 | 66.74 | 0.0 |
+
+- 被拒成交 178 笔、合计 **+24.30 USDT 净盈利**（熔断 98 笔 / +1.93；状态映射 80 笔 / +22.37；波动率门 0 笔，门槛在这段窗口上从未触发）。
+- 编排器**把回撤与在场时间压低了，也把收益压低了**：它拒绝的是净盈利的敞口。与 S1 同一教训——**削曝光是稳的，削对曝光不是**。
+
+### 五、S4（工具改名 + holdout 计数器落地）：不可用
+
+5 个变体（always-on、随机 seed 7/8/9、orchestrated）在样本外 2026-02-01~2026-06-01 上，`N = 133` 次试验：
+
+| 变体 | 成交 | 收益 % | 最大回撤 % | DSR |
+|---|---|---|---|---|
+| always-on | 1398 | +0.5206 | 0.5583 | −0.232771 |
+| 随机 seed 9（最好的对照） | 684 | +0.5033 | 0.4997 | −0.233703 |
+| **orchestrated** | 717 | +0.4425 | **0.4238** | **−0.237314** |
+
+- 编排器**没有打败任一对照**：对 always-on **−0.0781 pp**、对最优随机臂（seed 9）**−0.0608 pp**；而三个随机种子自身的跨度（0.3111 ~ 0.5033）比这个差额更大。**0/5 达到 `DSR > 0`**，可用性门 **`usable = false`**。
+- 组合体 717 笔成交的**已实现 PnL 只有 −3.10 USDT**（按入场 bar 因果标签分解），所以 +0.4425 % 是**曝光路径**的结果，不是每笔优势。
+
+### 六、两条随交付一并披露的局限
+
+1. **广度数据在本机不存在。** 广度是只能向前记录、无法回填的序列；本机缓存在这些窗口上是空的，因此 S3 的广度门**只跑了缺失分支**（`missing_action: allow`，出货值），广度规则从未被真正触发——见 `tools/p7_orchestrator_measure.py:89-96` 的原注释。任何"广度门有效"的说法目前都没有证据。
+2. **S4 这个 holdout 窗口的"新鲜度"已经花掉。** 窗口被打开 3 次：第 1 次是**无效测量**（`--rules_from_mapping` 的 enable 份额按 bar 计数而不是按标签集合计算，导致任何"≥2 个标签"的规则被算成 100 %，三个随机对照与 always-on **逐位相同**——`0.5206 / 0.5583 / DSR −0.232771`），第 2、3 次是在看过样本外数字之后为修 bug 重跑的（第 2、3 次七个头条指标逐位一致）。方向性结论不受影响，但 `p7-s4-composite-oos|2026-02-01|2026-06-01|1h` 应记为**已用**；将来要一次真正干净的一次性评估，必须换一个从未看过的窗口。详见 `P7_REGIME_EVIDENCE.md` §S4.6。

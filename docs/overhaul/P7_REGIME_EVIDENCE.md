@@ -461,3 +461,25 @@ python tools/p7_composite_measure.py --symbols BTCUSDT ETHUSDT SOLUSDT `
    （本轮所有策略共享第一个币的状态时钟，工具 docstring 与产物 `orchestrator` 块已写明）、
    多窗口重复（本轮只有一个样本外窗口）。这些都是**成本换强度**的选项，不是缺陷。
 
+---
+
+## P7 总结论（四阶段合并后）
+
+> 四个阶段的**头条数字**并排放在一起，全部取自上文与已提交的实测记录
+> （S2 细节：`docs/core-algorithms/06-ga-evolution.md` §每币种独立进化；S3 细节：`docs/research/CORE_ALGORITHMS.md` §12.8）。
+> 本表不新增任何测量。
+
+| 阶段 | 交付（提交） | 样本外头条 | 结论 |
+|---|---|---|---|
+| **S1** 因果状态作为一等属性 | `regime_filter`（第 13 字段）+ 基因 + 因果执法 + 默认关闭（`1b33f81`） | 交易数中位 **141.5 → 19.5**、在场 **24.0 % → 2.1 %**；`dsr > 0` **0/8 与 0/40**；三窗成对 Δalpha 均值 **+0.2142 / −0.4699 / +0.2717** pp | **否证**（符号随窗口翻转） |
+| **S2** 逐币种进化（代替规划的"状态基因子集"） | job 字段 `symbol_mode: pooled\|per_symbol`；`n_trials = len(symbols) × population × generations`（`9c44749`） | pooled alpha 中位 **−0.526** pp / **147** 笔；per_symbol **−0.3054** pp / **81.5** 笔；`dsr > 0` **0/2 与 0/4**；4 对里 **2 对退化** | **不支持** |
+| **S3** 可重放编排器（开关 `experimental.regime_orchestrator_live`） | `core/ai/orchestrator.py`（规则在 `ai.orchestrator`），默认关闭（`9c44749`） | always-on **1407** 笔 / **−1.76 %** / DD **2.5145 %** / 在场 **70.69 %** / DSR **0.0**；orchestrated **1229** / **−2.00 %** / DD **2.2615 %** / **66.74 %** / DSR **0.0**；拒掉 **+24.30 USDT** 净盈利敞口 | **不支持**（降回撤也降收益） |
+| **S4** 组合体样本外 | `core/ai/composite.py` + `core/ai/holdout.py`（一次性计数器，新增）+ `tools/p7_composite_measure.py`（`f7cd14b`） | `N = 133`：always-on **1398** 笔 / **+0.5206 %** / DSR **−0.232771**；orchestrated **717** / **+0.4425 %** / DD **0.4238 %** / DSR **−0.237314**；对常开 **−0.0781** pp、对最优随机 **−0.0608** pp；**0/5** DSR > 0；`usable = false`；已实现 PnL **−3.10 USDT** | **否证**（曝光路径，不是每笔优势） |
+
+**结论：P7 的四个阶段没有任何一个产生能被自己的门接受（样本外 `DSR > 0`）的结果，因此 P7 不宣称任何有效性，所有开关保持 shipped 关闭值。**
+
+> ⚠️ **常态警告**：编排器（以及任何状态门）的阈值**永远不得在评估窗口上调参**——看着样本外改规则
+> 等于把该窗口变成样本内，S4 那个一次性 holdout 窗口的"新鲜度"已经因此被花掉一次（§S4.6）。
+> **所有开关保持关闭**：`ga.regime_conditioning: false`、`ai.orchestrator.enabled: false`、
+> `experimental.regime_orchestrator_live: false`；`symbol_mode` 缺省 `pooled`。
+
