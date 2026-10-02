@@ -1,502 +1,169 @@
 # Binance Trader
 
-> # ⚠️ 警告：这是研究平台，不是盈利系统
->
-> **本仓库是研究（research）与测量（measurement）平台。里面没有任何一个策略经过实盘验证；
-> 每一个能力都以关闭状态出货（shipped disabled）。** 在 1.5 年现货缓存上做的六条独立
-> 搜索线**没有找到任何稳健的短周期优势**，而且**在每一个被测窗口里，"直接持有这个篮子"
-> 在对齐风险之后都打败了演化出来的策略**（实测：七个出货冠军在四个窗口的原始收益是
-> **−4.07 % / −2.46 % / −1.59 % / −4.91 %，年化波动率 1.2–2.8 %**——
-> 它们几乎一直待在现金里）。
->
-> **任何考虑用真金白银运行本项目的人：不要把它当成一个能盈利的交易系统。**
-> 它已经证明的价值是**测量、风险控制与执行纪律**，不是 alpha 生成能力。
->
-> 📄 完整实测报告与全部数字的来源：[**`docs/research/FINDINGS.md`**](docs/research/FINDINGS.md)
-> （含：六条搜索线的逐项结果、每一条被自己的门槛拒绝的方式、以及"什么会改变这个结论"）。
+面向币安现货的 Python 3.12 加密交易策略研究与测量平台。数据管道把公开行情落成本地 parquet 缓存并检查缺口，回测引擎按手续费、价差与滑点建模，遗传搜索（GA）演化策略，ML 与 GA 各有一套可信度门，FastAPI + ECharts 的 Web 控制台把行情、下单、回测、GA 进度放在同一批页面里，`/manual` 把仓库里的 markdown 当站内手册读。
 
-面向币安现货的 Python 3.12 自动化交易系统。asyncio 事件总线把 **行情 → 策略信号 → 风控 → 下单 → 持仓守护** 串成一条可观测流水线，配套 FastAPI + aiosqlite + ECharts 的 Web 控制台。模拟盘带真实成本模型（手续费分档 + 半价差 + 滑点），账本恒等式有专门的回归测试守护；回测有 legacy / hybrid 两套引擎，共用同一个评估内核。
-
-**架构一段话**：`core/market_data/provider.py` 从 `data-api.binance.vision`（REST）与 `data-stream.binance.vision`（WS）取行情，落 `data/market/<SYM>/<tf>.parquet` 并抛 `MARKET_KLINE`；`app/event_bus.py` 的单个消费协程把事件分发给 `StrategyEngine`（可选 `MLPredictor` / `NewsAnalyzer` / `AlertManager`）；**所有**信号评估走唯一的 `core/strategy/evaluation_kernel.py`（实时与两套回测共用同一内核与同一组阈值），产出 `STRATEGY_SIGNAL`；`core/risk/manager.py::check_signal()` 按 熔断 → 总敞口 → 仓位规模 → 杠杆 → 止损 → 同币去重 → 最大笔数 **七步**过滤后发 `ORDER_REQUEST`；`core/executor/executor.py` 按 `--mode` 走 sim（本地成交，成本模型改写成交价）或 live（testnet 真实下单）；`core/risk/position_guard.py` 以 15s 轮询执行止损/追踪/紧急平仓，`db/database.py::atomic_adjust_balance()` 是账本**唯一**写入点。
-
-```
-data-api.binance.vision (REST) / data-stream.binance.vision (WS) → MarketDataProvider
-  ─ MARKET_KLINE → EventBus → StrategyEngine / ML / News → evaluation_kernel
-  ─ STRATEGY_SIGNAL → RiskManager (7 步) → OrderExecutor (sim | live)
-  ─ ORDER_UPDATE → PositionGuard + SQLite + Web → POSITION_EXIT → atomic_adjust_balance()
-```
-
-> **状态**：`VERSION` **2.0.1** · Python **3.12**（实测 3.12.10）· Windows / Linux · 默认只监听 `127.0.0.1:8899`
-> **测试**：**1505** 项收集（`python -m pytest tests/ --collect-only -q -p no:cacheprovider`）；全量基线要求 `1505 passed, 0 failed`——本机 HEAD 当前实测 **1504 passed / 1 failed**（单条证据索引守卫，见 [§5.1](#51-测试)）。
-> 本 README 只写**当前代码事实**，每个数字旁给出发它的命令；与代码冲突时以代码为准。
+`VERSION` 2.0.1 · Python 3.12（实测 3.12.10）· Windows / Linux · 默认只监听 `127.0.0.1:8899`。所有交易能力以关闭状态出货，默认 `--mode sim` 在本地模拟成交。
 
 ---
 
-## 目录
+## 研究警告
 
-0. [⚠️ 研究与免责声明](#️-研究与免责声明)（**先读这一节**）
-1. [环境约束（必读）](#1-环境约束必读)
-2. [安装与启动](#2-安装与启动)
-3. [Web 控制台](#3-web-控制台)
-4. [算法层](#4-算法层)
-5. [运维](#5-运维)
-6. [已知限制与残余](#6-已知限制与残余)
-7. [文档索引](#7-文档索引)
+这是一个研究与测量平台，里面没有任何一个策略经过实盘验证。六条独立搜索线在 1.5 年现货缓存（2025-04-01 ~ 2026-10-01）上都没有找到稳健的样本外优势：ML 门控、配对协整、meta-labeling、遗传算法、P7 行情状态与上层编排、P8 波动率目标化——没有一条通过它自己事先声明的门。
 
----
+最直观的一组数字：七个出货冠军在四个不重叠窗口上的原始收益是 −4.07 % / −2.46 % / −1.59 % / −4.91 %，年化波动率 1.2–2.8 %，它们几乎一直待在现金里。在每一个被测窗口里，对齐敞口之后"持有这个篮子"都打败了演化出来的策略。
 
-## ⚠️ 研究与免责声明
+请勿用真金白银运行本项目。它已经证明的价值是测量、风控与执行纪律，包括把 fitness 41.82 / Sharpe 9.01 / 382 笔 / 最大回撤 0.11 % 这样看起来很好的候选如实拒绝掉的能力。
 
-> **本节必须最先读。** 它不描述"未来可能做什么"，它描述**已经实测到的事实**。
-
-1. **这是一个研究（research）与测量（measurement）平台。** 它的核心产出是
-   *可复现的实验、诚实的门槛与审计过的证据*，而不是交易收益。
-   **它里面没有任何一个策略经过实盘验证（no strategy in it has been validated for live trading）。**
-2. **每一个能力都以关闭状态出货（every capability ships disabled）。**
-   `ml.enabled: false`、`risk.vol_targeting.enabled: false`、`risk.liquidity.enabled: false`、
-   `ga.regime_conditioning: false`、`ai.orchestrator.enabled: false`、
-   `experimental.*` 全 `false`、P4 四个模块常量全 `False`。
-   "打开开关"不等于"能力生效"，更不等于"有优势"——见 [§4.3](#43-默认关闭的能力不要以为它们在生效) 与 [§4.4](#44-实验性开关configyaml-的-experimental默认全关)。
-3. **实测结论：没有找到任何稳健的短周期优势，而且在每一个被测窗口里"持有篮子"在对齐风险之后都打败了演化出来的策略。**
-   六条独立搜索线（ML 门控 / 配对协整 / meta-labeling / 遗传算法 / P7 行情状态与上层编排 /
-   P8 波动率目标化）**没有一条**通过它自己事先声明的门。最直观的一组数字：
-   七个出货冠军在四个不重叠窗口上的原始收益是 **−4.07 % / −2.46 % / −1.59 % / −4.91 %，
-   年化波动率只有 1.2–2.8 %**——它们基本上一直待在现金里，既没吃到 beta 也没拿到 alpha。
-4. **任何考虑投入真实资金的人：不要把这个项目当成一个能盈利的交易系统。**
-   它已经证明的价值是**测量、风险控制与执行纪律**——包括把"看起来很好"的候选
-   （fitness 41.82 / Sharpe 9.01 / 382 笔 / 最大回撤 0.11 %）如实拒绝掉的能力。
-
-📄 **完整实测报告：[`docs/research/FINDINGS.md`](docs/research/FINDINGS.md)**——
-中英文混排的详细记录，含六条搜索线的逐项数字与出处、每一条被拒绝的方式、
-"什么会改变这个结论"（含**未验证的前提**：本会话**没有**验证资金费率数据的可达性）、
-以及这套方法论如何被复用到别处。
+完整实测报告与全部数字的出处：[`docs/research/FINDINGS.md`](docs/research/FINDINGS.md)——六条搜索线的逐项结果、每一条被自己的门槛拒绝的方式、证据的局限，以及什么会改变这个结论。
 
 ---
 
 ## 1. 环境约束（必读）
 
-### 1.1 主机可达性（实测 2026-09-30，`Invoke-WebRequest -TimeoutSec 8` 直连）
+本机只有 Binance 的公开镜像可达：`https://data-api.binance.vision`（REST 行情）与 `wss://data-stream.binance.vision`（实时 K 线流）可用，`https://testnet.binance.vision` 可用于下单与账户，而 `https://api.binance.com` 会挂到超时。真实资金交易在本机不可能完成，`--mode live` 实际打到 testnet，手续费档位也只能手动设置。
 
-| 主机 | 结果 | 用途 |
-|---|---|---|
-| `https://data-api.binance.vision` | ✅ HTTP 200 | **所有公开行情**：klines / ticker24h / depth / trades / exchangeInfo |
-| `wss://data-stream.binance.vision` | 配置目标（未做 socket 握手实测） | **实时 K 线流**；`provider.py` 把 socket 工厂指向它 |
-| `https://testnet.binance.vision` | ✅ HTTP 200 | **下单 / 账户 / 余额**——当前唯一的交易端点 |
-| `https://api.binance.com` | ❌ 8s 超时 | **不可用**（主网交易域名一律不可达） |
+行情一律走 `config.binance.market_data_host`，由 `core/market_data/data_client.py::MarketDataClient` 统管（15s 硬超时、连接池复用、失败抛 `MarketDataError`）。不要用裸 `AsyncClient.create()`：python-binance 默认打 `api.binance.com`，交易客户端必须显式传 `testnet=config.binance_testnet`。实时流还有一处刻意覆写：python-binance 的 `BinanceSocketManager` 硬编码了一个不可达的 socket 主机，`provider.py` 在创建 `bsm` 后覆写 `bsm._get_stream_url`，新增 socket 用法时不要绕过这一步。
 
-复现（三条命令只换 URL，结果分别为 200 / 200 / 超时）：
-
-```powershell
-Invoke-WebRequest -Uri https://data-api.binance.vision/api/v3/ping -TimeoutSec 8 -UseBasicParsing
-Invoke-WebRequest -Uri https://testnet.binance.vision/api/v3/ping   -TimeoutSec 8 -UseBasicParsing
-Invoke-WebRequest -Uri https://api.binance.com/api/v3/ping          -TimeoutSec 8 -UseBasicParsing
-```
-
-**为什么这是硬约束**：`api.binance.com` 的调用会挂到超时，把请求处理器一起拖死。行情**必须**走 `config.binance.market_data_host`（默认 `https://data-api.binance.vision`），由 `core/market_data/data_client.py::MarketDataClient` 统管（15s 硬超时、连接池复用、失败抛 `MarketDataError`）。这个镜像给的是**真实主网数据**；testnet 只有少量测试对、历史是合成的，用它做行情会看到不全的币种与缺失的 K 线。
-
-### 1.2 绝不要用裸 `AsyncClient.create()`
-
-```python
-# ❌ python-binance 默认打 api.binance.com，本机必然超时
-client = await AsyncClient.create()
-# ✅ 交易/账户客户端必须显式传 testnet（见 web/routes/market.py::_configured_client）
-client = await AsyncClient.create(api_key=..., api_secret=..., testnet=config.binance_testnet)
-```
-
-所有 K 线读取都走 `data_client`（绑定行情镜像）。`MarketDataProvider.start()` 里那次 `AsyncClient.create(...)` 是**交易**客户端，失败只记 warning 并以离线模式继续。
-
-### 1.3 实时流的 socket URL 被刻意覆写，Web 只绑本地
-
-python-binance 的 `BinanceSocketManager` 硬编码 `wss://stream.binance.com:9443/`（该主机不可用），`provider.py` 在创建 `bsm` 后覆写 `bsm._get_stream_url` 指向 `config.binance.market_stream_host`——**新增任何 socket 用法时不要绕过这一步**。另外 `app/main.py` 里是 `uvicorn.Config(host="127.0.0.1", ...)`，**没有 `--host` 参数**；要从别的机器访问请用 SSH 端口转发或反向代理 + HTTPS，不要把 host 改成 `0.0.0.0` 暴露到公网。
+Web 只绑 `127.0.0.1`，`app/main.py` 里没有 `--host` 参数；要从别的机器访问请用 SSH 端口转发或反向代理加 HTTPS，不要改成 `0.0.0.0` 暴露到公网。主机可达性的实测表与复现命令见 [`docs/operations.md`](docs/operations.md#1-环境约束必读)。
 
 ---
 
-## 2. 安装与启动
+## 2. 现在能用的东西
 
-### 2.1 依赖与凭据
+### 数据管道
+
+`core/market_data/provider.py` 从 `data-api.binance.vision`（REST）与 `data-stream.binance.vision`（WS）取行情，落成 `data/market/<SYM>/<tf>.parquet`，再抛 `MARKET_KLINE`。`scripts/download_history.py` 按 symbol / 周期 / 日期区间下载，`--merge` 做增量回填，`--backfill` 给已有文件补 `quote_volume` / `trade_count` 列。`scripts/check_data_integrity.py` 逐个文件报 bar 数、跨度与日历缺口，超过 1.5 × bar 长度即标 `GAP`；带缺口的序列会被波动率路径的 splice guard 拒绝，`--strict` 让脚本在有缺口时退出 1。
+
+### 回测引擎
+
+两套引擎共用一个评估内核。legacy（`core/backtest/engine.py`）逐 tick 遍历时间线，支持 LightGBM / TFT / PatchTST 与部分减仓条件；hybrid（`core/backtest/engine_hybrid.py`）先用 `SignalMatrixBuilder` 预生成信号矩阵再回放，不支持 ML，也不支持 `reduce_conditions`。`backtest.engine_mode: auto` 在策略数 ≥ 3 且无 ML、无减仓条件时选 hybrid，运行期异常会记 warning 并回退 legacy。legacy、hybrid 与信号矩阵三条路径在缺数据时报同一句 canonical 文案。成本模型把手续费分档、半价差与滑点作用到成交价或平仓价上，并在每次运行开始时冻结本次用到的每个 symbol 的价差，交易循环里不再做 I/O。
+
+![回测页](docs/images/backtest.png)
+
+*回测页：引擎选择与成本模型参数、进度、结果与历史记录。*
+
+### 可信度机器
+
+GA 与 ML 的发布门都消费 `core/ga/trial_counter.py` 记下的真实试错数，它包含续跑、walk-forward 与逐币种多臂的全部评估，因此 deflated Sharpe 用的是"这轮到底试过多少变体"，例如 pooled 32 次对 per_symbol 64 次、P7-S4 的 133 次。发布门的基准由 `core/ga/benchmark.py` 提供，出货配置是 `ga.benchmark_mode: exposure_matched`：同一篮子只在策略持仓期间持有，再按策略实际投入的保证金占比加权，比满仓买入持有更能回答"这笔风险敞口有没有换来东西"。`core/ai/holdout.py` 是一次性 holdout 计数器，键是 `(holdout_id, window_start, window_end, timeframe)`，同一窗口第二次评估默认抛 `HoldoutRefusal`。
+
+### 遗传搜索
+
+`core/ga/evolver.py` 的 GA 支持检查点续跑：完成的运行默认保留 `<data-dir>/data/ga_checkpoint.pkl`（`ga.keep_checkpoint: true`），`resume: true` 从第 g 代继续到本次 job 的 `generations`；续跑时把检查点里的 `prior_trials` 与本次 `trials_this_run` 取最大值并入搜索账，所以清掉 `data/ga_trials.json` 也不会让 DSR 变好看；换成别的窗口续跑抛 `CheckpointWindowMismatchError`。`timeframe_pool` 字段把周期基因限制在白名单内，默认可选 `1m/5m/15m/1h/4h`，面板默认勾 `15m/1h/4h`，因为 1m 的 bar 数是 1h 的 60 倍。`symbol_mode: per_symbol` 让每个币跑自己的种群、各出一个冠军，冠军 YAML 的 `symbols` 只写它被评估过的币。
+
+![GA 面板](docs/images/ga-panel.png)
+
+*GA 面板：逐代进度、评估次数、检查点状态与冠军门判定。*
+
+### 因果状态缝
+
+`core/strategy/regime_causal.py` 只接受因果 HMM 标签，样本内标签按名拒绝并抛 `InSampleRegimeLabelError`。`core/ai/orchestrator.py` 在这条缝上逐 bar 回答"某个策略现在允不允许被启用"，输入是因果状态、因果 EWMA 波动率、市场广度与策略自己的连亏记录；规则只能拦不能放行，`replay` 保证同规则加同事件流得到逐位相同的决策链。阈值出厂关闭，且不得在评估窗口上调。
+
+### Web 控制台与手册
+
+`web/` 是 FastAPI + Jinja2 + HTMX + Tailwind + ECharts。路由基线 121 条（`python scripts/regen_route_baseline.py --check` 报 121 / 121 / added 0 / removed 0）：120 个 HTTP 路由（GET 72 / POST 43 / DELETE 4 / PUT 1）加 1 个 WebSocket `/ws/alerts`，权威清单是 [`docs/overhaul/route-baseline.json`](docs/overhaul/route-baseline.json)。`/trade` 是现货交易页，`/market`、`/coin/{symbol}`、`/data`、`/audit` 是行情与筛查页，`/strategies`、`/backtest`、`/ai`、`/alerts`、`/settings`、`/db-manager`、`/users` 是运营页，三层角色 `admin` / `trader` / `viewer`，逐页权限见 [`docs/operations.md`](docs/operations.md#4-路由清单121)。
+
+![交易页](docs/images/dashboard.png)
+
+*交易页：K 线、盘口、下单面板、账户卡片与持仓在同一屏。*
+
+![策略页](docs/images/strategies.png)
+
+*策略页：策略清单与 CRUD、信号融合权重、风控参数与生命周期事件。*
+
+`/manual` 把 `docs/**/*.md` 与根 README 渲染成站内文档浏览器：目录树与筛选、页内目录、面包屑、上一篇与下一篇，文档内相对链接重写成手册路由，目标不在手册内时渲染为死链接而不是 404。渲染用 markdown-it-py（`html=False`），公式交给 KaTeX CDN，CDN 不可达时回退显示原始 LaTeX 源码。
+
+![手册](docs/images/manual.png)
+
+*手册：目录树、面包屑与页内标题。*
+
+![手册公式渲染](docs/images/manual-math.png)
+
+*手册里的公式由 KaTeX 渲染，CDN 不可达时回退原始 LaTeX 源码。*
+
+---
+
+## 3. 快速开始
+
+需要 Python 3.12（实测 3.12.10）。TA-Lib 要系统级预编译库，先按该库文档装好。
 
 ```bash
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1        # Windows PowerShell；Linux/macOS: source .venv/bin/activate
-pip install -r requirements.txt     # TA-Lib 需要系统级预编译库，见该库文档
-copy config\secrets.yaml.example config\secrets.yaml   # Linux: cp
+
+# Windows PowerShell
+.\.venv\Scripts\Activate.ps1
+# Linux / macOS
+source .venv/bin/activate
+
+pip install -r requirements.txt
+
+# Windows
+copy config\secrets.yaml.example config\secrets.yaml
+# Linux / macOS
+cp config/secrets.yaml.example config/secrets.yaml
 ```
 
-`requirements.txt` 含运行 + 测试依赖；`python-multipart` 是必需的（starlette 无条件导入它，缺了 FastAPI 起不来）。`config/secrets.yaml` 已 gitignore，可写 `binance.api_key` / `api_secret`、`deepseek.api_key`；`auth.jwt_secret` 留空时启动会生成随机密钥并写回该文件（POSIX 上 `chmod 600`），因此重启后旧 token 仍有效。也可以用环境变量（**优先级高于 YAML**）：`BINANCE_API_KEY`、`BINANCE_API_SECRET`、`DEEPSEEK_API_KEY`、`JWT_SECRET`。
+配置按 `config/config.yaml` → `config/risk_params.yaml` → `config/secrets.yaml` 顺序深合并，环境变量优先级最高。全部配置键、密钥写法和 GA job 字段见 [`docs/operations.md`](docs/operations.md)。
 
-**你必须自己提供策略 YAML**——仓库**没有跟踪任何策略文件**（`git ls-files strategies/` 输出为空；磁盘上只有被 gitignore 的 `strategies/ga_champion_*.yaml`，由 GA 生成）。干净克隆的**策略数是 0**：`GET /api/strategy-monitor` 返回空列表，`POST /api/backtest/run` 用任何名字都会得到 `Strategy '<name>' not found: Strategy file not found: ...`。策略 schema 就是 `core/strategy/loader.py::StrategyConfig` 的 pydantic 字段；自己写 YAML 放进 `strategies/`，或让 GA / 策略生命周期生成。
+下数据。`data/` 整体被 gitignore，干净克隆里没有历史缓存：
 
-### 2.2 数据与数据库
+```bash
+python scripts/download_history.py --symbols BTCUSDT,ETHUSDT --intervals 1h,4h --start 2025-04-01
+```
 
-| 路径 | 内容 |
-|---|---|
-| `data/binance_trader.db` | SQLite（WAL，v4 schema）。`--db` / `--data-dir` 可改 |
-| `data/market/<SYM>/<tf>.parquet` | K 线缓存（`index = close_time`(UTC)，列 `open, high, low, close, volume`，P6-B 后另加 `quote_volume` / `trade_count`）；历史用 `scripts/download_history.py` 下 |
-| `data/models/`、`data/backtest/`、`data/ga_jobs/`、`data/ga_strategies/` | ML 模型产物、回测结果、GA 任务与冠军 |
-| `config/config.yaml`、`config/risk_params.yaml` | 运行配置与风控阈值（深合并，`risk_params.yaml` 覆盖代码类默认值） |
-| `system_config` 表 | **数据库侧**设置：自选列表 `watchlist_symbols`、手续费档位 |
+策略 YAML 也要自己提供：仓库不跟踪任何策略文件，磁盘上只有被 gitignore 的 `strategies/ga_champion_*.yaml`。schema 是 `core/strategy/loader.py::StrategyConfig` 的 pydantic 字段。
 
-`data/` 整体被 gitignore，一个文件都没跟踪：干净克隆里既没有历史数据也没有模型。
-
-### 2.3 启动
+启动并打开 <http://127.0.0.1:8899>：
 
 ```bash
 python -m app.main --mode sim
 ```
 
-浏览器打开 <http://127.0.0.1:8899> → 未登录 302 到 `/login`。**首次启动**若 `users` 表为空，会自动创建 `admin` 并生成随机密码，密码**只打印到 stderr**（不写日志、bcrypt 存库、明文不可恢复），请立刻在 `/settings` 或用户管理页改掉；`users` 表非空时不会重建。ML 训练在 `uvicorn` 之前**串行**执行，所以启动后可能有一段时间端口尚未监听（训练抛异常只记 warning，不阻塞启动）。
+首次启动时若 `users` 表为空，会创建 `admin` 并把随机密码只打印到 stderr，请立刻在 `/settings` 改掉。`--mode live` 用 testnet 客户端真实下单；`--mode backtest` 不是回测，订单会被静默丢弃，真正的回测走 `/backtest` 页或 `POST /api/backtest/run`。
 
-### 2.4 CLI 参数（`python -m app.main --help` 全量）
+跑测试：
 
+```bash
+python -m pytest tests/ -q -p no:cacheprovider     # 1528 passed / 0 failed
 ```
-usage: main.py [-h] [--mode {sim,live,backtest}] [--port PORT] [--db DB]
-               [--data-dir DATA_DIR] [--config-dir CONFIG_DIR]
-```
-
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `--mode {sim,live,backtest}` | `sim` | 模式**只来自 CLI**（`config.yaml` 没有 `mode:` 键）。语义见 `executor.py::_on_order_request`：`sim` 本地成交（完整成本模型，不连交易所）；`live` 用 testnet 客户端真实下单；**`backtest` 不是回测**——不进入任何下单分支、订单被静默丢弃，真正的回测走 `/backtest` 页或 `POST /api/backtest/run` |
-| `--port N` | `8899` | Web 端口 |
-| `--db PATH` | `<project>/data/binance_trader.db` | SQLite 路径；优先级高于 `--data-dir`（后者默认 `<project>/data`） |
-| `--config-dir DIR` | `<project>/config` | 设置/密钥持久化目录。**冒烟测试请用它 + `--db` 指到临时目录，不要碰生产库** |
-
-### 2.5 关键配置项
-
-`app/config.py::_load` 依次深合并 `config/config.yaml` → `config/risk_params.yaml` → `config/secrets.yaml`，环境变量最高。
-
-| 键 | 默认 | 含义 |
-|---|---|---|
-| `web_port` / `language` | `8899` / `zh` | Web 端口与 UI 语言（`zh`/`en`） |
-| `binance.testnet` | `true` | **下单/账户**客户端是否打 testnet。**不控制行情** |
-| `binance.market_data_host` / `market_stream_host` | `.vision` 两个域名 | 行情 REST / WS 主机 |
-| `ai.mode` / `ai.model` | `full_auto` / `deepseek-v4-flash` | `semi_auto` / `full_auto`；LLM 模型名 |
-| `signal_weights.*` | `indicator 0.5 / ml 0.3 / news 0.2` | 信号融合权重 |
-| `backtest.engine_mode` / `ml_enabled` | `auto` / `false` | 引擎选择（非法值回退 `auto`）；false 时会就地关掉策略的 `ml_config.enabled` |
-| `sim.cost_model.*` | `enabled: true`、`fee_tier: VIP0`、`slippage_bps: 2` | 模拟盘成本模型（见 §4.2） |
-| `risk.*` | 全部 `enabled: false` | 波动率目标化 / 流动性，默认惰性（见 §4.3） |
-| `experimental.*` | 全部 `false` | P4 实验性能力开关（engine 缝 / regime / pairs / meta / microstructure，见 §4.4） |
-
-`config/risk_params.yaml` 给出 `hard_limits`（日/周回撤、日亏损、最大敞口、最大笔数、杠杆、追踪止损、紧急止损等）与 `soft_params`（仓位比例、止损、杠杆、三档止盈）；**以文件里的值为准**，本文不复制这张表。自选列表**不在 YAML 里**，存在数据库 `system_config.watchlist_symbols`（兜底 `BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT`，上限 30），改动**下次重启生效**（`POST /api/market/watchlist` 的响应带 `restart_required: true`）；手续费档位同理——本机读不到真实账户的 30 天交易量与 BNB 持仓，只能手动选择并持久化。
 
 ---
 
-## 3. Web 控制台
+## 4. 项目结构
 
-### 3.1 页面（与 `docs/overhaul/route-baseline.json` 的 GET 页面路由逐条对应）
-
-| 路径 | 用途 | 最低角色 |
-|---|---|---|
-| `/`、`/dashboard`、`/health` | 302 → `/trade`；`/health` 是 JSON 健康检查（认证后追加熔断/持仓/策略/mode） | 登录（`/health` 公开） |
-| `/trade` | **现货交易页**：行情条、订单簿 + 最新成交、ECharts K 线、买/卖下单（市价/限价、比例快捷键、止损%）、账户卡片、当前委托/持仓/成交历史/订单历史 | 登录 |
-| `/market` | 全币种行情：搜索 / 排序 / 分页、自选管理、本地数据标记 | 登录 |
-| `/coin/{symbol}` | 币种信息：交易规则、24h、盘口、周期表现、启发式风险评分与 flags、BTC 相关性 | 登录 |
-| `/data` | 全市场数据总览：涨跌榜、成交额榜、最活跃、波动率榜、价差榜 | 登录 |
-| `/audit` | 代币检测：启发式风险筛查（页面显著标注**非链上合约审计**） | 登录 |
-| `/strategies` | 策略监控与 CRUD、信号权重、风控参数展示、AI 策略推荐 | 登录（写操作 trader） |
-| `/backtest` | 回测配置 / 运行 / 进度 / 结果 / 历史列表 | **trader**（否则 302 → `/dashboard`） |
-| `/ai` | AI 面板：建议卡片、市场评估、AI 心跳、手动咨询、策略生命周期事件 | 登录（审批 trader） |
-| `/alerts` | 预警中心：告警列表、筛选、规则开关 | 登录 |
-| `/settings` | AI 模式与参数、Binance 凭据与 testnet 开关、风控阈值、熔断状态与重置、重启服务 | **trader**（否则 302 → `/trade`）；凭据/风控/重启写接口 **admin** |
-| `/db-manager`、`/users` | 表浏览/行删除/备份恢复/优化清理/CSV 导出；用户管理 | **admin**（否则 302 → `/trade`） |
-| `/manual`、`/manual/{doc_path}` | **手册**：`docs/**` 与根 README 的站内文档浏览器（目录树 / 渲染 / 跳转），见 §3.3 | 登录（只读，viewer 可读） |
-| `/login` | 登录页 | 公开 |
-
-授权检查目前在 handler 内部完成（`web/deps.py` 的 `_require_trader` / `_require_admin` 与等价内联判断），三层角色 `admin` / `trader` / `viewer`（admin 也是 trader）；`TODO(authz)` 标记了将来改成 FastAPI 依赖的位置。前端是 Jinja2 + HTMX + Tailwind CDN + ECharts，Jinja 环境开启 autoescape，导航在移动端真实可用。
-
-### 3.2 路由总数：121
-
-```bash
-python scripts/regen_route_baseline.py --check
-# old routes: 121 / new routes: 121 / added: 0 / removed: 0
 ```
-
-121 条 = **120 个 HTTP 路由**（GET 72 / POST 43 / DELETE 4 / PUT 1）+ **1 个 WebSocket**（`/ws/alerts`）。按模块分组的端点清单不必在 README 里维护：**`docs/overhaul/route-baseline.json` 是权威清单**，上面的脚本可从运行期路由表重新生成（`--check` 只报告不写；有路由消失时退出 1）。注意 `/docs`、`/redoc` 被显式关掉（404），但 `/openapi.json` 仍可访问。
-
-### 3.3 手册 `/manual`（站内文档浏览器）
-
-把仓库里已有的 markdown 文档做成站内手册，不再需要翻原始文件：`GET /manual`（落地页：简介 + 目录树 + 主要文档清单）、`GET /manual/{doc_path}`（单篇文档，`doc_path` 是**仓库相对路径**，如 `/manual/docs/overhaul/PLAN.md`）、`GET /api/manual/tree`（JSON 目录树，供侧栏筛选与工具使用）。三条路由与其他运营页同源鉴权（`AuthMiddleware`）：未登录访问页面 302 → `/login`，访问 `/api/manual/tree` 得 401。
-
-| 关注点 | 行为 |
-|---|---|
-| **收录规则**（代码与文档同一条） | 仅 `docs/**/*.md`（递归）+ 根 `README.md` / `README_EN.md`；路径任一段以 `.` 开头、符号链接、非 markdown、以及 `docs/` 之外的 markdown（如 `experimental/ml/README.md`）都不收录。因此 `docs/overhaul/route-baseline.json` 是**文档而非手册页面** |
-| **数据来源** | 请求时直接读取文件（不复制、不落库）；仅缓存渲染结果，缓存键为 `(路径, mtime_ns, size)`，改文件立即失效 |
-| **路径安全** | 请求路径先归一化并拒绝 `..` / 绝对路径 / 盘符 / NUL / 空段 / 百分号编码（含双重编码）穿越，再要求它属于上面的收录集合，最后校验 `resolve()` 后仍在允许根内且不是符号链接；其余一律 404 |
-| **渲染** | markdown-it-py（CommonMark + table 规则，`html=False`，文档里的原始 HTML 只当文本）+ KaTeX CDN 渲染 `$$…$$` / `$…$`（CDN 不可达时回退显示原始 LaTeX 源码） |
-| **导航** | 侧栏目录树按目录分组、可折叠、当前文档高亮、支持标题/路径筛选；页内目录（`##` 以下）、面包屑、上一篇/下一篇；文档内相对链接（同目录 / 上级 / 跨目录 / 目录链接 / `#锚点`）重写为手册路由，目标不在手册内时渲染为标记过的死链接（不跳转、不 404） |
-
-对应测试 `tests/test_manual_route.py`（收录完整性、200+标题、404、穿越拒绝、链接重写、鉴权、JSON 形状）。
+app/       进程入口、事件总线、配置加载（uvicorn 与各组件的启动/关停顺序）
+core/      交易内核：market_data / strategy / risk / executor / backtest / ga / ml / ai / news
+web/       FastAPI 应用：路由、Jinja 模板、静态资源、/manual 渲染
+db/        SQLite schema、迁移与账本唯一写入点 atomic_adjust_balance()
+scripts/   数据下载、缺口检查、账本对账、路由基线、GA worker 与状态查询
+tools/     一次性实验与测量脚本（只读，不在交易链路上）
+tests/     pytest 用例；pytest.ini 里 testpaths=tests、asyncio_mode=strict、markers=slow
+config/    config.yaml、risk_params.yaml、secrets.yaml.example
+data/      运行数据（gitignore）：SQLite、K 线缓存、模型产物、回测结果、GA 任务
+docs/      研究结论、算法拆解、分阶段证据、历史审计
+```
 
 ---
 
-## 4. 算法层
+## 5. 状态与限制
 
-公式与研究性描述**不在本 README**：算法总纲见 [`docs/research/CORE_ALGORITHMS.md`](docs/research/CORE_ALGORITHMS.md)；按子系统拆分的 **16** 篇（`00-ERRATA` + `01`–`15`，命令 `(Get-ChildItem docs/core-algorithms -Filter *.md).Count`）见 [`docs/core-algorithms/`](docs/core-algorithms/)。看公式前先读 [`00-ERRATA.md`](docs/core-algorithms/00-ERRATA.md)：它汇总 **22** 处文档与代码的差异（该表 24 行 = 表头 + 分隔行 + 22 条）。
-
-### 4.1 两套回测引擎，一个评估内核
-
-| | **legacy**（`core/backtest/engine.py`，逐 tick） | **hybrid**（`core/backtest/engine_hybrid.py`，向量化两阶段） |
-|---|---|---|
-| 结构 | 单循环遍历时间线 | `SignalMatrixBuilder` 预生成信号矩阵 → `EventDrivenExecutor` 回放 |
-| ML | 支持 LightGBM / TFT / PatchTST | **不支持**（`_select_engine` 直接抛 `ValueError`） |
-| 部分减仓 `reduce_conditions` | 支持 | **不支持** |
-
-两者共用 `core/strategy/evaluation_kernel.py` 与 `core/backtest/trade_book.py::close_position`。`backtest.engine_mode: auto`（默认）下：策略数 ≥ 3 且无 ML、无 `reduce_conditions` → hybrid，否则 legacy；hybrid 运行期抛异常会记 warning 并**回退 legacy**（结果可能与 hybrid 模式有差异）。legacy / hybrid / signal-matrix 三条路径在缺数据时报同一句 canonical 文案 `NO_MARKET_DATA_MESSAGE`。
-
-### 4.2 成本模型：两套，故意不合并
-
-| | **sim 成本模型** | **backtest 成本模型** |
-|---|---|---|
-| 代码 | `app/config.py::sim_cost_quote` | `core/backtest/cost_model.py::apply_trading_costs` |
-| 作用点 | **改写成交价本身**（买贵、卖便宜），`pnl` 存入即已扣净 | **平仓时**按往返一次性叠加成本，**不动入场价**（否则止损/止盈价位会级联变化） |
-| 价差来源 | `sim.cost_model.spread_pct.<SYM>` → `default` → `0.02` | override → live depth → `default_spread_pct`（`0.03`） |
-
-`spread_pct.<SYM>` 的语义是**完整买卖价差**（%，`BTCUSDT: 0.01` = 1 bp 盘口），成本模型**每边收一半**（`spread/2`）；sim 与 backtest 用同一约定。`sim_cost_quote` 是唯一实现，`GET /api/fee/estimate` 与真实成交共用：
-
-```
-edge_pct = 0                                     # 限价单，或 enabled=false
-         | spread_pct/2 + slippage_bps/100       # 市价单
-买入 fill = price × (1 + edge_pct/100)；卖出 fill = price × (1 − edge_pct/100)
-fee = quantity × fill × fee_pct/100              # 档位取 maker/taker，BNB 折扣 ×0.75
-slippage_usdt = |fill − price| × quantity；cost_usdt = fee + slippage_usdt
-```
-
-回测价差解析顺序固定为 `override → live（公开盘口，缓存 300s，失败结果不缓存）→ default`，并在每次运行开始时**冻结**本次用到的每个 symbol 的价差，交易循环里不再做 I/O。**两套兜底常量不一致**（0.03 vs 0.02）是已知的刻意口径分歧，见 §6。
-
-### 4.3 默认关闭的能力（不要以为它们在生效）
-
-| 能力 | 开关（当前值） | 为什么默认关 |
-|---|---|---|
-| **ML 门控** | `config.yaml` `ml.enabled: false`；门在 `core/ml/credibility.py::credibility_gate`（OOS AUC > 0.55 **且** 净成本期望 > 0），由 `core/ml/predictor.py::_gate_config` 消费 | 实测线上模型**差于多数类**（accuracy 0.41–0.47 vs 0.54–0.67，OOS AUC 0.396–0.447）且反校准（预测 0.91 → 实际 0.22），开启是**负贡献** |
-| **波动率目标化** | `risk.vol_targeting.enabled: false` | 完全 opt-in；关闭时仓位与止损宽度与固定比例实现**逐位一致**。该块里 `barrier_vol_multiple` / `barrier_min_pct` / `barrier_max_pct` 是 **RESERVED/惰性**键（无生产调用方，设成非默认值只在启动时打 WARNING），不要当成生效配置 |
-| **`risk.liquidity`（成交量/冲击）** | `enabled: false`、`impact_k: 0.0` | 关闭时 `PositionSizer` 不调用参与度钩子，回测成本保持审计过的 `fees + spread/2` 逐位不变（`tests/test_liquidity.py` 守护）。`impact_k` 在配置里明确标注 **ILLUSTRATIVE, NOT CALIBRATED** |
-| **P4 新能力** | 模块级常量全为 `False`：`META_LABELING_ENABLED`（`core/ml/meta.py`）、`PAIRS_ENABLED`（`core/strategy/pairs.py`）、`REGIME_GATING_ENABLED`（`core/strategy/regime.py`）、`MICROSTRUCTURE_ENABLED`（`core/market_data/microstructure.py`） | 已实现且有独立测试，但**未接入实时链路**（默认惰性、关闭时全放行）；在真实 1h 主流币数据上配对与 meta-label 门**拒绝**全部被测一级规则——这是有效结论，不是缺陷。这些常量现在有配置开关，见 §4.4 |
-| **上层编排器（P7-S3）** | `ai.orchestrator.enabled: false`；实盘还需 `experimental.regime_orchestrator_live: true` **且**调用方注册（生产链路无注册者） | 已实现、有独立测试，规则**固定不学习**；实测样本外它**降低回撤也降低收益**（见 §4.8），且两臂 DSR 都是 0——没有可发表的优势，因此默认关闭 |
-
-`core/` 里仍有 GA、AI（DeepSeek 控制器 + 策略生命周期）、新闻情绪、代币启发式筛查（`core/market_data/screener.py`）在链路上；`experimental/` 是**不在交易链路上**的死代码存档（见 [`experimental/ml/README.md`](experimental/ml/README.md)）。
-
-### 4.4 实验性开关（`config.yaml` 的 `experimental:`，默认全关）
-
-P4 那批能力此前只能改 Python 常量；现在一个能力一个开关，`app/config.py::apply_experimental_flags` 由 `app/main.py` 启动路径显式调用（配置全关时**不导入能力模块、不写任何常量**，信号与仓位与 HEAD **逐位一致**，`tests/test_experimental_switches.py` 用 `git worktree` 在 `3a140cf` 上逐字节比对）。
-
-| 开关（默认 `false`） | 常量 → 实际改动 |
-|---|---|
-| `engine_regime_diagnostics` | `P4_REGIME_DIAGNOSTICS_ENABLED`：把 regime 标签附进信号缓存（**只诊断，不改方向/仓位**）；这是唯一"单开即可达"的开关 |
-| `engine_meta_filter` / `engine_pairs_signals` | `P4_META_FILTER_ENABLED` / `P4_PAIRS_SIGNALS_ENABLED`：已注册的 MetaLabeler / pairs provider 可过滤或替换信号，但生产链路**尚未注册**（`wire_meta_filter` / `wire_pairs_provider` 无调用者），单开无效 |
-| `regime_gating` / `regime_diagnostics` | `REGIME_GATING_ENABLED` 切到因果 HMM 并启用门；`REGIME_DIAGNOSTICS_ENABLED` **无生产读取者** |
-| `pairs_enabled` / `meta_labeling_enabled` / `microstructure_enabled` | `PAIRS_ENABLED` / `META_LABELING_ENABLED` / `MICROSTRUCTURE_ENABLED`：**均无生产读取者**（microstructure 连**接线缝隙都没有**），打开不改变任何可达行为 |
-| `regime_orchestrator_live` | `REGIME_ORCHESTRATOR_LIVE_ENABLED`（`core/strategy/engine.py`，P7-S3）：允许实盘在**发布入场前**询问已注册的上层编排器（只可能**否决入场**，永不改方向/仓位）。需要**三道锁**同时成立——本开关 + `ai.orchestrator.enabled: true` + 调用方 `wire_regime_orchestrator(...)` 注册；生产链路没有注册者，故单开本开关不改变任何可达行为。关闭时 `decide()` 恒为 allow 且**不读**波动率/广度序列 |
-
-每个开关只打开**那道缝**，能力自身的验收门仍会拒绝：真实 1h 主流币配对 **0/30** 通过协整检验、meta 门 **10/10** 拒绝一级规则、regime 只接受因果 HMM 标签。**诚实预期**：这些开关提高的是**可测量性与纪律**（能否复现、能否 A/B），**不增加预测优势**。启动时会打一条 WARNING 逐项列出已开启的开关（`experimental_notices`，与 `inert_barrier_key_warnings` 同型），未知键也会被点名而不是静默忽略。
-
-### 4.5 GA 任务的周期白名单（job 字段 `timeframe_pool`）
-
-周期是**基因组的一部分**，所以不设限的 GA 会把大部分预算花在 `1m` 基因上：3 个月 × 3 币的 1m 回测每币 **~390 000** 根 bar，是 15m 的 **15×**、1h 的 **60×**（实测：pop 20 / 3 币 / 12 workers 的任务 25 分钟只评估完 20 个基因组中的 11 个）。`POST /api/ga/evolve` 与 `POST /api/ga/walkforward` 现在接受 job 字段 **`timeframe_pool`**（如 `["15m","1h","4h"]`），面板「Timeframes (GA gene pool)」默认勾选 `15m/1h/4h`（全部取消勾选 = 不写该字段 = 不限制）：
-
-| 关注点 | 约定 |
-|---|---|
-| **缺省** | 字段不存在 = **不限制**，与加入该字段之前**逐位一致**（`1m/5m/15m/1h/4h` 全部仍可选，`tests/test_ga_timeframe_pool.py` 守护） |
-| **校验** | 取值必须来自**唯一 interval registry** `core.market_data.provider.INTERVAL_SPEC`（`--list-intervals` 是可下载集合的超集，`1s`/`1M` 因无 bar 长度/ML 规格被拒绝）；非法周期 → 接口 **HTTP 400** 或 worker **加载即失败**（`UnknownTimeframeError`，错误信息点名非法值与可接受集合），不会先跑几小时 |
-| **基因约束** | `core/ga/genome.py` 的 `timeframes` 分类基因：随机初始化、变异可选集合、交叉/精英/`resume` 检查点（`confine_timeframe_gene`）、解码（`chromosome_to_strategy`）全都被限制在白名单内；解出的策略 `timeframes` **非空且 ⊆ 白名单** |
-| **可审计** | 启动日志 `GA timeframe_pool=15m,1h,4h`（不限制时为 `unrestricted`）、progress JSON 的 `timeframe_pool`、result 与冠军 YAML 的 `provenance.timeframe_pool`；`scripts/ga_job_status.py` 的 `job params` 行打印 `tf_pool=` |
-
-### 4.6 GA 发布门基准（`ga.benchmark_mode`）与"冠军只交易被评估过的币"
-
-发布门原来只用**满仓买入持有**（`metrics["buy_hold_pct"]`，同窗口同币种等权）当基准比**总收益**。对一个只在一小部分时间持仓、回撤 0.11 %、OOS Sharpe 5.69 的短周期策略，这个比较**没有做敞口/风险匹配**——它惩罚的是"拿着现金"。`ga.benchmark_mode` 选择发布门消费哪个基准（`core/ga/benchmark.py`）：
-
-| 取值 | 定义 | 说明 |
-|---|---|---|
-| **`buy_hold`**（**代码缺省**） | 满仓等权买入持有（历史行为） | 键不存在 = 该值；与加入该键之前**逐位一致**（`tests/test_ga_benchmark_mode.py` 用 HEAD worktree 逐字节比对） |
-| **`exposure_matched`**（`config/config.yaml` **已启用**，推荐） | 同一篮子**只在策略持仓期间**持有 | 用策略自己的成交（`opened_at`→`closed_at`，裁到窗口）重建每个币的**持仓区间并集**，算该币在这些区间上的买入持有收益（区间收益**复合** `Π(1+rᵢ)−1`，区间之间算现金 0 %），再按策略**实际投入的保证金占比** `wₛ = mean(amount_usdt)/initial_balance` 加权：`Σ wₛ·Rₛ`。没交易过的币权重为 0（不摊薄）；窗口结束时**未平仓**按窗口末裁剪；**零成交** ⇒ 基准 0、alpha = 策略收益（门仍以 `no_trades`/DSR/净期望拒绝）；区间内**缺 bar** ⇒ 该币剔除，全不可用 ⇒ 基准 `None`、门**跳过**该判据并在 provenance 记 `benchmark_available: false` |
-| `risk_matched` | 满仓基准按策略**已实现日波动率**缩放 | `buy_hold_pct × σ_strategy/σ_benchmark`（两条序列都是既有 `daily_returns`/`per_period_sharpe` 口径；`σ_benchmark = 0` 时退回原值并记 `risk_scale_fallback`），反向 `strategy_return × σ_benchmark/σ_strategy` 同时上报 |
-| `none` | 无基准 | **只**关闭基准判据；`dsr/psr` 与净期望仍然门控 |
-
-- **校验**：未知取值在**配置加载**（`Config.load`，`UnknownBenchmarkModeError`）与 **job 加载**（`scripts/ga_worker.py::job_benchmark_mode`，与 `timeframe_pool` 同型）都立刻失败并点名取值；缺省字段 = 跟 `config.ga_benchmark_mode`（不是 job 级默认覆盖）。
-- **上报（不门控）**：策略 vs 基准 Sharpe、信息比率、Jensen 式 alpha/beta、扣费后每笔净边际、在场时间占比；冠军 provenance 新增 `benchmark` 块（模式、`buy_hold_pct`、匹配后基准收益、基准**自身** Sharpe/最大回撤/在场时间占比等）。此前只记录一个买入持有收益，事后无法做风险比较。
-- **评估/执行一致性**：冠军 YAML 过去写 `symbols: []`（= 交易自选列表里的**全部**币），而 GA 只评估了 job 的篮子（如 3 币 vs 自选 5 币）。现在 `evolve()` 把**被评估的篮子**写进冠军的 `symbols:`，执行路径（`core/strategy/engine.py` 的 `_on_kline` / `evaluate_all_now`：`strategy.symbols` 非空时跳过表外币，启动日志 `Strategy '<name>' restricted to symbols: [...]`）因此只能交易它被评估过的币。**未**选择"拒绝启用不匹配的冠军"：限制交易是更安全、无副作用的一侧（老 YAML 的 `symbols: []` 仍表示"不限"，保持向后兼容）。
-- **对照表**：`python tools/ga_benchmark_modes_table.py`（只读：加载 `strategies/` 里的冠军 + 一个内存里新生成的候选，逐模式各跑一次真实回测并打印基准收益、alpha 与门结论）。
-
-### 4.7 GA 检查点保留与续跑（job 字段 `keep_checkpoint`）
-
-`core/ga/evolver.py` 过去在**干净完成**时调用 `clear_checkpoint()`（旧 `evolver.py:422`），所以跑完的任务**没有留下任何可续跑的东西**：检查点是 `<data_dir>/data/ga_checkpoint.pkl`（`evolver.py:144`），上一次运行后它并不存在，`resume=True` 只能救崩溃/手动停止的任务。现在：
-
-| 关注点 | 约定 |
-|---|---|
-| **缺省 = 保留** | job 字段 `keep_checkpoint` 缺失 → `config.ga_keep_checkpoint`（`config/config.yaml` 里 **`keep_checkpoint: true`**，带注释）→ 代码缺省 `True`：**完成的运行保留检查点**，可以稍后在此基础上继续演化（如 12 代之上再跑 20 代） |
-| **显式关闭** | `keep_checkpoint: false`（job 字段或配置键）= **旧行为**：干净完成时删除检查点。**停止/崩溃**的运行无论该键为何值都保留检查点（这是原有的崩溃续跑路径） |
-| **续跑语义** | `resume: true` 从检查点的第 g 代**继续到第 g+1 代**，上界仍是本次 job 的 `generations`：`generations: 32` 从第 12 代的检查点续跑 = 只评估 13..32 代，`result["generations"] == 32`。循环起点由 `evolve()` 里的 `for gen in range(_first_gen, cfg.generations)` 决定（`_first_gen` = 检查点代数，新任务为 0） |
-| **窗口守卫** | 检查点记录 `window_key`；续跑请求的窗口与它**不一致**时抛出**具名** `CheckpointWindowMismatchError`（worker 的 result 里 `error_type` 同名），**拒绝**在另一个窗口上静默续跑。窗口为空的旧检查点不阻拦续跑，且不会覆盖本次运行的窗口 |
-| **试错计数（DSR 诚实性）** | 检查点保存 `prior_trials` + `trials_this_run`，续跑时把二者之和作为**下限**并入 `prior_trials`：即使 `data/ga_trials.json` 被清掉，第 13 代的 DSR 也仍以"已试过的 36 次"去膨胀，而不是从本次 population 重新计数；不会重复计数（`max`，不是相加） |
-| **可审计** | 检查点内含 generation / `window_key` / population hash / symbols / `timeframe_pool` / 试错计数；续跑后的冠军 `provenance` 记录 `keep_checkpoint`、`resumed_from_generation`、`checkpoint{path,kept,generation,window_key,resumed_*,population_hash,symbols,timeframe_pool}` 与 `trials{prior_trials,trials_this_run,resumed_trials,n_trials}`；完成日志 `GA checkpoint kept at <path> (generation g)`（worker 再打一条 `[ga_worker] checkpoint kept/cleared at ...`） |
-| **可见性** | `python scripts/ga_job_status.py`（最新任务或 `--job-id`）打印检查点行：路径、是否存在、**代数、mtime**、窗口、population hash、试错数与"续跑将从第 g+1 代继续"；`--checkpoint-file` 可指向别处。GA 面板新增 **Keep checkpoint** 勾选框（默认勾选），完成的运行还会在状态行显示 "checkpoint kept at generation g" 并显示 Resume 按钮 |
-
-### 4.8 上层编排器（`ai.orchestrator`，P7-S3，默认关闭）
-
-**它解决的问题.** P7-S1 让**每个策略**自己声明"我只在哪些状态交易"。实测结论是否证：条件化**没有**带来风险调整后的 alpha（样本外 `dsr > 0` 的单元 0/8 与 0/40），但它**一致地把曝光削掉一大截**（成交中位 141.5 → 19.5、在场时间 24.0 % → 2.1 %）。操作者的读法是：**"什么可以跑"应该由一层上层引擎决定**，而不是每个策略自己管——那层就是 `core/ai/orchestrator.py::RegimeOrchestrator`。
-
-**它是"一个对象、一个决策点"**：逐 bar 回答"策略 `s` 现在允不允许被启用"，输入 = **因果**状态标签（`core/strategy/regime_causal.py`；样本内 HMM 标签按名**拒绝**，抛 `InSampleRegimeLabelError`）+ 波动率状态（`core/ml/volatility.py` 的因果 EWMA）+ **市场广度**（`core/market_data/breadth.py`，P6-C 建好但从未接线；缺失/过期按配置回退，shipped `allow`）+ 策略自己的**连亏记录**。它**不选币、不定仓、不下单、不学习**。
-
-| 规则 | 公式 / 语义 | 配置键（shipped 值） |
-|---|---|---|
-| **1 状态映射** | `eligible = r(t) ∈ L(s)`；未列出的策略按 `default_action`；`range_unknown`（序列头部 31 根）按 `unknown_label_action`；整个系列缺失按 `missing_regime_action` | `regime.allowed`（`{}`）、`default_action`/`missing_regime_action`/`unknown_label_action`（全 `allow`） |
-| **2 连亏熔断** | 同一状态段内连续 `N` 笔 `pnl < loss_threshold` ⇒ 锁死到本段结束；**状态变化**即清零解锁 | `kill_switch.consecutive_losses`（`0` = 关闭）、`loss_threshold`（`0.0`）、`reset_on_regime_change`（只能 `true`） |
-| **3 波动率门** | `v(t) > m · med(t)`，`med` = **t 之前**尾部 `window` 个样本的中位数（样本不足 ⇒ 按 `missing_action`） | `vol.multiple`（`0.0` = 关闭）、`vol.window`（`200`）、`vol.min_samples`（`30`）、`deny_on_high_vol`（`true`） |
-| **4 广度门** | `up_share < min_up_share` 或 `coverage < min_coverage` ⇒ 拒绝；过期/缺失按 `stale_action`/`missing_action` | `breadth.min_up_share`/`min_coverage`（未设 = 关闭）、`max_staleness_ms`（`1800000`）、`sample_ms`（`0`） |
-
-**决策顺序** 状态 → 熔断 → 波动率 → 广度；`reason` 是第一条命中的规则，`blocked_reasons` 列出全部，`enabled ≡ (blocked_reasons == ())`——**规则只能拦、不能放行**。配置在**加载时**校验：未知键、未知标签、`calm`/`stressed`、非法 action 都抛具名 `OrchestratorConfigError`。确定性由 `RegimeOrchestrator.replay`（S4 入口）保证：同规则 + 同事件流 ⇒ 逐位相同的时间线。
-
-**⚠ 阈值是固定规则，不得在评估窗口上调.** S4 的纪律是"只用训练窗选/锁规则，样本外只评一次"（`--holdout`）；看着样本外改 `ai.orchestrator` 就等于把 S4 的数字变成样本内——这正是 S1 已经付过学费的失败模式。
-
-**实测（真实缓存，样本外 2026-02-01~2026-06-01，BTC+ETH 1h，30 个变体，DSR 试验数 30）**
-
-```powershell
-python tools/p7_orchestrator_measure.py --genomes 3 --symbols BTCUSDT ETHUSDT `
-    --timeframe 1h --trials 30 --out $env:TEMP\p7_orchestrator_measure.json
-```
-
-| 臂 | 成交 | 收益 % | 最大回撤 % | 在场时间 % | Sharpe | DSR |
-|---|---|---|---|---|---|---|
-| always-on | 1407 | −1.7600 | 2.5145 | 70.6944 | −2.7402 | 0.0 |
-| orchestrated | 1229 | −2.0030 | 2.2615 | 66.7361 | −4.2916 | 0.0 |
-
-被拒成交 178 笔、合计 PnL **+24.30 USDT**（79 胜 / 97 负；按规则：熔断 98 笔 / +1.93，状态映射 80 笔 / +22.37，波动率门 0 笔）。**诚实结论：编排器把回撤和在场时间都压低了，也把收益与 Sharpe 压低了——它拒掉的是净盈利的敞口，而不是净亏损的敞口；两臂 DSR 都是 0.0。** 这与 S1 一致：**削曝光是稳的，削对曝光不是**。这是 S4 的预览，不是 S4（组合体资金曲线契约、同口径对照与 `--holdout` 一次性计数仍是 S4 的交付物）。
-
-**关闭即不变.** `ai.orchestrator.enabled: false` 时 `decide()` 恒为 allow 且**不读**波动率/广度序列；回测引擎只在调用方显式传 `orchestrator=` 时读取，实盘还要 `experimental.regime_orchestrator_live: true` 且调用方注册。逐位一致由 `tests/test_p7_orchestrator.py` 用 `git worktree` 在 `d9849a2` 上比对成交、逐点资金曲线与指标键集合（43 项测试）。
-
-### 4.9 GA 逐币种独立进化（job 字段 `symbol_mode`，P7-S2）
-
-**它解决的问题.** 池化 GA 在**整篮子**上评一个种群，一个只在某个币上有效的信号会被其他币的表现**平均掉**。`symbol_mode: "per_symbol"` 让 GA 变成**每个币一套独立种群**：每个候选**只在它自己的币上**评分，每个币各出一个冠军。**缺省 `"pooled"` 与改前逐字节一致。**
-
-| 关注点 | 约定 |
-|---|---|
-| **开关是 job 字段，不是配置键** | `symbol_mode`（`"pooled"`（缺省）/ `"per_symbol"`）；`config/config.yaml` 里**没有** `ga.symbol_mode`，`Config` 也没有该属性（`tests/test_p7_symbol_mode.py::test_there_is_no_config_key_for_the_mode` 守护）——**任何配置改动都不会改变 GA 的搜索形状** |
-| **缺省逐字节一致** | 字段缺失或 `"pooled"` 时与 HEAD **逐位一致**：同 seed 下种群哈希、每代 `prior_trials`/`batch_trials`、冠军基因、发布门结论与 result 载荷全部相同。真实评分器、打桩评分器、以及 `git worktree d9849a2` 里跑同一 harness 三种口径都做了逐字节比对（唯一被有意排除的是加法审计键 `symbols_evaluated` 与时间戳/文件名） |
-| **校验** | `core/ga/evolver.py::parse_symbol_mode`；未知取值抛具名 `UnknownSymbolModeError` ⇒ **接口 HTTP 400**、worker **job 加载即失败**（`scripts/ga_worker.py::job_symbol_mode`，与 `timeframe_pool`/`benchmark_mode` 同型）；缺失/空白 = `pooled` |
-| **冠军** | **每币一个冠军** YAML（`ga_champion_<币>_<时间戳>`），且 `champion_config.symbols == [该币]`——记录的是**这个臂实际评估的币**（执行路径本来就只交易 `strategy.symbols` 里的币，见 §4.6）；`provenance.symbol_mode / champion_symbol / n_symbols`；result 是 `champions[]` **加**顶层镜像（旧消费方读的键与取值口径不变） |
-| **试错计数（DSR 诚实性）** | per-symbol 一轮实际执行 `len(symbols) × population × generations` 次评估（本机实测 pooled 32 / per_symbol 64），所有臂共享同一本搜索账；`evolve()` 在**所有臂跑完后只算一次** `n_trials`，所以**每个**冠军的 DSR 都用**整轮**真正试过的变体数，而不是它自己那一份 population；冠军 YAML 自述 `provenance.trials.search{evaluations_this_arm, evaluations_whole_run, arm_population}`。这是保守口径：per_symbol 的 N 严格大于 pooled 的 N |
-| **检查点身份** | 检查点记录 `symbol_mode` 与 `arm_symbol`；**跨形状续跑**（pooled ↔ per_symbol）抛具名 `CheckpointSymbolModeMismatchError`；per-symbol 续跑只续检查点所属的那个臂，其余臂从零开始 |
-| **成本** | 墙钟时间≈不变：每个 per-symbol 候选只在 1 个币上评分，N 个臂 ≈ 一个池化臂的成本（实测 200.8 s vs 226.1 s） |
-
-**实测（真实缓存，样本外 2026-02-01~2026-06-01，BTC+ETH 1h，门基准是出货的 `exposure_matched`；逐冠军用它自己的评估篮子重新评分）**
-
-| 指标 | `pooled`（篮子冠军，2 个） | `per_symbol`（每币冠军，4 个） |
-|---|---|---|
-| 样本外交易数（中位） | **147** | **81.5** |
-| 样本外 alpha（中位 / 均值，百分点） | **−0.526 / −0.526** | **−0.3054 / −0.3392** |
-| 样本外 alpha > 0 | 0 / 2 | 0 / 4 |
-| 样本外 **DSR > 0** | **0 / 2** | **0 / 4** |
-| 在场时间占比（中位 %） | **42.48** | **21.68** |
-| 训练窗发布 | 2/2 未发布 | 4/4 未发布 |
-
-**判定：假设不成立（hypothesis not supported）.** `per_symbol` 的中位 alpha 看起来更好，但两者**口径不同**（单币 alpha vs 整篮子 alpha，且交易数中位 81.5 vs 147、在场时间 21.68 % vs 42.48 %）——这正是 S1 已经量到过的**曝光效应**（少交易/少暴露把 alpha 拉向 0），不是选到了更好的时机。同币成对才是公平口径，而它**一好一坏**：4 对里 **2 对退化**（per-symbol 的第一个臂与 pooled 臂同种子 ⇒ 共享初始种群，两个冠军 YAML 除名字外逐行相同，Δ 恒为 0，不提供信息），有信息的 2 对（ETH）一个变差 **0.3293**、一个变好 **0.0276** 个百分点——**符号随种子翻转**。6 个冠军**没有一个样本外 DSR > 0**（且 per_symbol 的门槛是 pooled 的 2 倍：64 vs 32 次试验，所以这个否定对 per_symbol 是**保守**的）。机制本身在合成地形上是有效的（信号只在单一币存在时 per_symbol 找得到、pooled 找不到），因此结论是**真实数据上没有这个 alpha**，而不是机制不工作。
+- **ML 门控实测是负贡献。** 线上模型 accuracy 0.41–0.47（多数类 0.54–0.67），OOS AUC 0.396–0.447，且反校准（预测 0.91 → 实际 0.22）。P7-S1 的条件化没有带来风险调整后 alpha（样本外 `dsr > 0` 的单元 0/8 与 0/40），P7-S3 编排器同时压低回撤、在场时间与收益，两臂 DSR 都是 0，P8 波动率目标化同样未过门。相关开关默认关闭，清单见 [`docs/operations.md`](docs/operations.md#6-默认关闭的能力与实验开关)。
+- **成本与杠杆口径有限。** sim 滑点是固定 `slippage_bps` 加每 symbol 固定半价差，不随订单大小与盘口深度变化；sim 与回测的价差兜底常量故意不一致（0.02 vs 0.03）。回测与 GA 是现金模型，`risk_params.yaml` 的 `max_leverage: 4` 只作用于实盘，两者的收益与风险指标不能直接对比。流动性冲击系数 `impact_k` 默认 0，配置里标注 ILLUSTRATIVE, NOT CALIBRATED。
+- **数据缓存不完整。** 实测 52 个 parquet 里 20 个带缺口（BTC / BNB / ETH / SOL / XRP 的 15m、1h、1m、5m），另有 3 个 symbol 只覆盖部分周期：ENAUSDT 只有 200 根 1h，MOVRUSDT 只有 500 根 5m，VTHOUSDT 有 1h 与 5m 各 200 / 500 根。实盘波动率路径只能看到最近 600 根 bar，更早的洞要跑 `scripts/check_data_integrity.py`。
+- **资金费率数据的可达性从未验证**，所以任何需要 funding 的成本或收益推断都还没有证据。
+- **代币检测是启发式的**，只读交易所公开行情，不读合约、持仓分布、mint 权限或转账税，无法发现蜜罐与 rug pull；干净评分只说明这个交易对的交易所市场看起来正常。仓位管理是固定比例法，不是真 Kelly，`docs/core-algorithms/04-position-sizing-kelly.md` 是研究性描述。
+- **安全面未加固。** 没有 CSRF token（只靠 `samesite=lax` cookie）、没有 HTTPS 与反代配置、没有操作审计日志，授权检查内联在 handler 里（`TODO(authz)`）。
+- `experimental/` 不被任何生产模块导入，删除它不影响交易行为。`docs/HANDOVER.md` 与 `docs/overhaul/REFACTOR_AUDIT.md` 描述的是大改之前的状态，当历史记录看，以代码为准。
 
 ---
 
-## 5. 运维
+## 6. 许可与免责
 
-### 5.1 测试
+仓库**没有 LICENSE 文件**（`git ls-files LICENSE` 为空），因此不附带任何显式开源许可；使用或分发前请先与仓库所有者 `STCloudLake` 确认授权方式。
 
-```bash
-python -m pytest tests/ --collect-only -q -p no:cacheprovider   # 末行: 1505 tests collected
-python -m pytest tests/ -q -p no:cacheprovider                  # 全量
-python -m pytest tests/ -q -m "not slow"                        # 跳过慢测
-```
+依赖与数据来源：python-binance、FastAPI + uvicorn、aiosqlite、ECharts + HTMX + Tailwind CSS、TA-Lib / LightGBM / XGBoost / PyTorch、loguru、DeepSeek。行情与交易数据来自 Binance 公开 API（`data-api.binance.vision` / `testnet.binance.vision`）。
 
-`pytest.ini`：`testpaths=tests`、`asyncio_mode=strict`、`markers=slow`。**没有安装 `pytest-timeout`**，所以 `--timeout=` 会直接报参数错误。
-
-唯一容易被机器负载误报的是 `tests/test_ml_credibility.py::test_feature_pipeline_cost_is_bounded`：它断言特征流水线耗时 `< 3.0 s`，并发压力下会超时失败（实测压力下整跑 1 failed / 1216 passed，同一用例单独运行 1.74s 通过）。看到只有这一条失败时，先单独重跑它再判断。
-
-另一条**与本机环境/缓存有关、与本次改动无关**的失败：`tests/test_meta_labeling.py::test_real_primary_rules_are_refused_by_the_meta_gate`。它在**改动前的 `ba8c212` worktree**（`git worktree add --detach <tmp> ba8c212`，并把本仓库的 `data/market` 以 junction 接进去）用同一份缓存**同样失败**：直接跑是 joblib/loky 的 `_count_physical_cores_win32` 探测（本机没有 `wmic`）抛 `WinError 2` + 解码异常；加 `LOKY_MAX_CPU_COUNT=8` 绕过探测后失败原因变成它自己的断言 `assert gate["allowed"] is False`（`tests/test_meta_labeling.py:401`，本机缓存的最后一版数据上 meta 门放行了一条一级规则）。所以本机 `python -m pytest tests/ -q -p no:cacheprovider` 是 **1363 passed / 1 failed**，去掉这一条是 **1363 passed / 0 failed**。
-
-> 2026-10-01 复测（§4.7 检查点保留改动后，代码冻结）：`python -m pytest tests/ -q -p no:cacheprovider` 连续两次 **1379 passed / 0 failed**（240.96s / 237.74s；新增 `tests/test_ga_checkpoint_resume.py` 13 条 + `tests/test_ga_symbols.py` 2 条），`test_meta_labeling.py::test_real_primary_rules_are_refused_by_the_meta_gate` 两次都通过（该失败依赖当时缓存的数据版本）。`python -m compileall -q app core web db scripts tools` 退出码 0。
-
-> 2026-10-02 复测（P7 文档整合完成后，改动冻结时的全量运行）：`python -m pytest tests/ -q -p no:cacheprovider` → **1504 passed / 1 failed**（484.20 s），`python -m compileall -q app core web db scripts tools` 退出 0。唯一失败是 `tests/test_reaudit_fixes.py::test_evidence_index_reports_the_current_revision_and_a_current_chain`——它要求 `docs/overhaul/ALGO_UPGRADE_EVIDENCE.md` §8 的提交链补上 `f7cd14b`（HEAD，改了 `core/ai/**`），而该文件由 Lead 维护提交链、本轮未触碰；**这是一条在改动前就已存在的守卫失败，与本次文档改动无关**（该测试只读 `ALGO_UPGRADE_EVIDENCE.md` 与 git 历史，不读本轮改动的三个文件）。
-
-**干净克隆的隐含前提**：`data/` 全部 gitignore，所以没有任何缓存历史的克隆直接跑全量**不是全绿**——`tests/test_engine_parity_variants.py` 的 7 个真实数据变体依赖 `2026-05-25..2026-05-31` 的 BTCUSDT + ETHUSDT 1h 缓存（`DATE_START` / `DATE_END` / `SYMBOLS` 就在该文件头部），缺数据时以同一句 `NO_MARKET_DATA_MESSAGE` 失败（`tests/test_hybrid_equivalence.py` 同类用例会 skip）。CI 或新机器先下这段历史即可（下面这条会写 `data/market/`，本次未执行）：
-
-```bash
-python scripts/download_history.py --symbols BTCUSDT,ETHUSDT --intervals 1h --start 2026-05-25 --end 2026-05-31
-```
-
-### 5.2 审计与完整性脚本（全部只读，可放进定时任务）
-
-```bash
-python scripts/audit_db.py [path\to\binance_trader.db]        # 账本对账
-python scripts/check_data_integrity.py                        # K 线缓存缺口
-python scripts/regen_route_baseline.py --check                # 路由基线奇偶校验
-python -m compileall -q app core web db scripts alerts        # 语法完整性
-```
-
-- **`audit_db.py`**：把库复制到临时目录再以 `mode=ro` 打开（**绝不写生产库**），输出账本恒等式逐项计算与 `delta`、`trades` 的 action 分布、每张表行数、索引清单。恒等式是 `10000 − Σ(open 行: quantity × entry_price) + Σ(close 行: pnl) == system_config.sim_balance`。退出码：`0` = 等式成立（`RESULT: IDENTITY HOLDS`）**或**空库/无 `sim_balance` 行（`FRESH DATABASE — NO LEDGER YET`，空库不是故障）；非 0 = 真有漂移或库文件不存在。
-- **`check_data_integrity.py`**：逐个 parquet 报 bar 数、跨度与日历缺口，超过阈值（默认 1.5 × bar 长度）即 `GAP`；`--strict` 在有缺口时退出 1。实测 **29** 个缓存文件里 **25** 个带缺口（2026-09-30 快照：`RESULT: 25/29 file(s) carry a gap beyond 1.5 x bar length`）。带缺口的序列会被波动率路径的 splice guard 拒绝，修法是按输出末尾给出的 `download_history.py ... --merge` 回填。
-- **`regen_route_baseline.py`**：用生产同构的 `create_app`（指向一次性临时 DB 与空 config 目录）枚举路由并与基线对比；`--check` 只报告不写。
-
-### 5.3 数据刷新
-
-```bash
-# 下载历史（这两个脚本的 --symbols / --intervals 是逗号分隔）
-python scripts/download_history.py --symbols BTCUSDT,SOLUSDT --intervals 1h,4h \
-    --start 2024-01-01 --end 2024-03-01 [--merge] [--concurrency 4] [--data-host URL]
-python scripts/download_history.py --backfill --symbols BTCUSDT   # 补 P6-B 的 quote_volume / trade_count 列（可续跑）
-python scripts/download_history.py --list-intervals               # 合法周期：1s…1M
-
-# ML 可信度测量（--symbols / --intervals 是 nargs="*"，必须空格分隔）
-python scripts/ml_credibility_measure.py --symbols BTCUSDT ETHUSDT --intervals 1h
-python tools/p6_volume_bars_experiment.py all --symbols BTCUSDT ETHUSDT SOLUSDT
-```
-
-> 两种 `--symbols` 写法**不能混**：`download_history.py` / `check_data_integrity.py` 收逗号分隔的字符串；`ml_credibility_measure.py` / `tools/p6_volume_bars_experiment.py` 是 `nargs="*"`，写成逗号会被当成**一个** symbol，随后 `FileNotFoundError`。
-
-下载落地到 `<data-dir>/market/<SYMBOL>/<interval>.parquet`，每页最多 1000 根，页间隔 0.12s 避免限频。Web 端等价入口是回测页的「获取数据」按钮（`POST /api/backtest/fetch-data`，trader）。
-
-### 5.4 备份 / 恢复 / 清理
-
-| 操作 | 方式 |
-|---|---|
-| 备份（下载文件） | `GET /api/db/backup`（admin）：先 `shutil.copy2` 到 `<db>_backup_<YYYYmmdd_HHMMSS>.db` 再以附件返回 |
-| 恢复 | `POST /api/db/restore`（admin，上传文件）：**校验前 16 字节必须是 `SQLite format 3\0`**，把当前库复制成 `<db>.pre_restore` 后再覆盖 |
-| 清理 | `POST /api/db/cleanup`（admin）：删 90 天前的 alerts / ai_suggestions 与 365 天前已实现 PnL 的 close/reduce 成交，然后 `VACUUM` |
-| 优化 / 导出 / 删行 | `POST /api/db/optimize`（`VACUUM` + `REINDEX`）、`GET /api/db/export/{table}` → CSV、`DELETE /api/db/row/{table}/{row_id}`（均 admin） |
-| **手工备份（推荐）** | **先停服务**，再复制 `data/binance_trader.db` **连同 `-wal` / `-shm`**（WAL 模式） |
-
-`ledger_reconciliation` 表记录每一次**人工账本修复**（修复前/后余额、delta、原因、备份路径、操作者）。
-
-### 5.5 日志与重启
-
-loguru 默认输出到 **stderr**，项目**没有配置文件 sink**；要留档就自己重定向（`run_logs/` 已 gitignore）：
-
-```bash
-python -m app.main --mode sim >> run_logs/service.log 2>&1   # PowerShell 用 *>> run_logs\service.log
-```
-
-`Ctrl+C` 按逆序关停各组件；持仓与余额本来就在 DB 里，关机时不需要落盘。重启后的状态：持仓从 `positions` 表恢复（含 basis 与止损）、余额以 `system_config.sim_balance` 为权威、挂单从 `pending_orders` 恢复（撮合器每 ~5s 跑一次）、自选列表与手续费档位从 `system_config` 生效、**会话在内存里所以全部失效需重新登录**（JWT 因密钥落盘仍有效）。优雅重启入口是 `POST /api/settings/restart`（admin）。
-
-### 5.6 常见故障
-
-| 现象 | 原因与处理 |
-|---|---|
-| 页面能开但 K 线/行情全空，日志刷 `REST kline fetch failed` | 行情主机不可达或被改回 `api.binance.com`。确认 `market_data_host` / `market_stream_host` 是 `.vision` 域名；日志里没有 `Kline #1:` 说明 WS 没通，此时 REST 兜底轮询每 30s 会补 |
-| 打开任何页面被踢回 `/login`，接口 401 | 会话在内存里，重启进程即失效（`session_hours` 默认 24h）。重新登录；API 客户端可用登录返回的 token 加 `Authorization: Bearer <token>` |
-| `403 {"error":"Forbidden"}` | 当前角色是 `viewer`，写操作需 `trader` / `admin` |
-| `Position already open for X` / `Max open trades N reached` / `Total exposure X% exceeds limit` / `Circuit breaker tripped` | 风控 7 步管线命中；平仓、调高阈值（`config/risk_params.yaml`），或 `POST /api/circuit-breaker/reset`（trader） |
-| `order_below_lot_size` / `order_below_min_notional` / `quantity ... rounds to 0` | 数量按 `step_size` 向下取整后为 0，或名义金额小于该 symbol 的 `minNotional`；加大下单金额 |
-| `database is locked` | WAL + 多短连接，或**同一个 DB 被两个进程打开**（含 pytest 与运行中的服务共用）。确认只有一个写进程，不要放网络盘；持续锁死就停服务 → 备份（含 `-wal`/`-shm`）→ `/api/db/optimize` |
-| 端口被占用（`Errno 10048`） | `python -m app.main --mode sim --port 8900`，或先找出占用进程 |
-
----
-
-## 6. 已知限制与残余
-
-- **主网交易 API 不可达。** `api.binance.com` 从本机超时，所以**真实资金交易在本机不可能完成**：`--mode live` 实际打到 testnet（打到哪由 `binance.testnet` 决定），行情是真实主网数据但下单不是。**手续费档位也只能手动设置**——本机读不到真实账户的 30 天交易量与 BNB 持仓。
-- **`--mode backtest` 不是回测**，订单被静默丢弃（见 §2.4）。
-- **sim 滑点是模型，不是事实。** 固定 `slippage_bps` + 每 symbol 固定半价差，不随订单大小、盘口深度、波动率变化；大单真实滑点会明显更高。且**两套价差兜底常量不一致**：回测 `default_spread_pct` = 0.03，sim `default` = 0.02。
-- **回测/GA 是现金模型，不含杠杆。** `leverage` 在 `core/ga/**` 与 `core/backtest/engine.py` 里出现 **0** 次（命令：`Get-ChildItem core/ga -Recurse -Filter *.py | Select-String '\bleverage\b'`），而 `risk_params.yaml` 的 `max_leverage: 4` / `soft_params.leverage: 2` 只作用于实盘——回测/GA 的收益与风险指标不能直接与带杠杆的实盘对比。
-- **流动性冲击系数未标定**：`risk.liquidity.impact_k` 默认 0（能力整体关闭，见 §4.3），配置里明确标注 ILLUSTRATIVE, NOT CALIBRATED；要开必须来自实测的冲击研究并注明来源。
-- **实盘波动率路径只能看到最近 600 根 bar。** live forecast path 的 splice guard 只能拒绝这个窗口内的缺口（如 −100、−300），更早的洞（如 −900）它看不见；全文件检查靠 `scripts/check_data_integrity.py`。**缓存仍有历史缺口**：实测 29 个 parquet 里 25 个带缺口（§5.2，2026-09-30 快照）——这是形状 + 时间戳，不是固定值。
-- **代币检测是启发式的，不是链上审计。** `core/market_data/screener.py` 只读交易所公开行情，不读合约、持仓分布、mint 权限、转账税、代理升级位、LP 锁；**无法**发现蜜罐、rug pull、冻结/黑名单函数、隐藏增发。干净评分只说明这个交易对的**交易所市场**看起来正常。
-- **仓位管理不是真 Kelly。** `core/risk/position_sizer.py` 是固定比例法（资本池 × 百分比，再被 `max_position_size_pct` 截断）；`docs/core-algorithms/04-position-sizing-kelly.md` 的 Kelly 公式只在回测的 Kelly-lite 分支部分体现，那份文档是研究性描述，**不要当成实现说明**。
-- **安全面**：没有 CSRF token（防护只靠 `samesite=lax` cookie）、没有 HTTPS/反代配置、没有"谁改了什么"的操作审计日志；授权是 handler 内联的（`TODO(authz)`）。
-- **`experimental/` 不被任何生产模块导入**，删除它不影响交易行为；仓库根可能残留一次性产物（如 `nonexistent.db`）。
-- **`docs/HANDOVER.md`、`docs/overhaul/REFACTOR_AUDIT.md` 描述的是大改之前的状态**（"实时链路断裂""AI 面板空转"等问题大部分已修）；把它们当历史记录，**以代码为准**。
+加密货币交易存在本金全部损失的风险。本系统默认运行模拟盘，任何切换到真实资金交易的决定、参数设置与后果都由使用者自行承担。`--mode live` 在当前环境下只会打到 Binance testnet，这不构成对任何未来配置变更的安全保证。
 
 ---
 
@@ -504,21 +171,11 @@ python -m app.main --mode sim >> run_logs/service.log 2>&1   # PowerShell 用 *>
 
 | 文档 | 内容 |
 |---|---|
-| [`docs/research/FINDINGS.md`](docs/research/FINDINGS.md) | **研究结论报告**（先读 [研究与免责声明](#️-研究与免责声明)）：六条独立搜索线的实测数字、每条被自己的门拒绝的方式、证据的局限、什么会改变结论、复用的方法论清单 |
-| [`docs/research/CORE_ALGORITHMS.md`](docs/research/CORE_ALGORITHMS.md) · [`docs/core-algorithms/`](docs/core-algorithms/) | 算法总纲；按子系统拆分的 16 篇（先看 [`00-ERRATA.md`](docs/core-algorithms/00-ERRATA.md) 的 22 处勘误） |
-| [`docs/HANDOVER.md`](docs/HANDOVER.md) · [`docs/development-roadmap.md`](docs/development-roadmap.md) | 接手评估报告（**改动前快照**）；开发路线图（**规划≠现状**） |
-| [`docs/overhaul/PLAN.md`](docs/overhaul/PLAN.md) · [`CHANGELOG.md`](docs/overhaul/CHANGELOG.md) | 长盘修复计划 S0–S7 与三轮审计的发现与处置；详细变更史（改了什么、验收程度、剩余项） |
-| [`docs/overhaul/ALGO_UPGRADE_PLAN.md`](docs/overhaul/ALGO_UPGRADE_PLAN.md) · [`ALGO_UPGRADE_EVIDENCE.md`](docs/overhaul/ALGO_UPGRADE_EVIDENCE.md) | P1–P4 算法升级的验收标准与逐阶段实测证据、未闭环清单 |
-| [`docs/overhaul/REFACTOR_AUDIT.md`](docs/overhaul/REFACTOR_AUDIT.md) · [`WEB_SPLIT.md`](docs/overhaul/WEB_SPLIT.md) | 四路只读审计；`web/server.py` 拆分记录与保留的不变量 |
-| [`docs/overhaul/TRADE_PAGE_API.md`](docs/overhaul/TRADE_PAGE_API.md) · [`MARKET_PAGES_API.md`](docs/overhaul/MARKET_PAGES_API.md) | `/trade` 与行情/币种/数据/代币检测页的接口契约（冻结版），后者含主机可达性前置事实 |
-| [`docs/overhaul/route-baseline.json`](docs/overhaul/route-baseline.json) | **路由权威清单**（当前 118 条），用于奇偶校验 |
-| [`docs/audit/`](docs/audit/) · [`docs/superpowers/`](docs/superpowers/) · [`experimental/ml/README.md`](experimental/ml/README.md) | 历史审计分报告 R1–R15 与严重度分级；设计规格与实施计划（唯一的设计史来源）；被移出生产链路的 ML 死码清单 |
-| `/manual`（站内手册） | 上表的站内渲染版本（§3.3）：目录树 + 筛选、页内目录与面包屑、相对链接重写、KaTeX 公式；只收录 `docs/**` 与根 README，`route-baseline.json` 等非 markdown 文件不在其中 |
-
-### 许可与致谢
-
-本项目**未附带显式开源许可证文件**（`LICENSE` 缺失）；如需使用/分发，请先与仓库所有者 `STCloudLake` 确认授权方式。
-
-依赖与数据来源：python-binance（交易所客户端）、FastAPI + uvicorn（Web）、aiosqlite（数据库）、ECharts + HTMX + Tailwind CSS（前端）、TA-Lib / LightGBM / XGBoost / PyTorch（指标与 ML）、loguru（日志）、DeepSeek（LLM）。行情与交易数据来自 Binance 公开 API（`data-api.binance.vision` / `testnet.binance.vision`）。
-
-> **风险提示**：加密货币交易存在本金全部损失的风险。本系统默认运行模拟盘；任何切换到真实资金交易的决定、参数设置与后果都由使用者自行承担。`--mode live` 在当前环境下只会打到 Binance **testnet**，但这不构成对任何未来配置变更的安全保证。
+| [`docs/research/FINDINGS.md`](docs/research/FINDINGS.md) | 研究结论报告：六条搜索线的实测数字、每条被自己的门拒绝的方式、证据的局限、什么会改变结论 |
+| [`docs/operations.md`](docs/operations.md) | 运维参考：CLI、配置键、路由清单、GA job 字段、实验开关、数据与数据库操作、故障处置、测试说明、算法层细节 |
+| [`docs/research/CORE_ALGORITHMS.md`](docs/research/CORE_ALGORITHMS.md) · [`docs/core-algorithms/`](docs/core-algorithms/) | 算法总纲；按子系统拆分的 16 篇，先读 [`00-ERRATA.md`](docs/core-algorithms/00-ERRATA.md) 里汇总的文档与代码差异 |
+| [`docs/overhaul/P6_VOLUME_EVIDENCE.md`](docs/overhaul/P6_VOLUME_EVIDENCE.md) · [`P7_REGIME_EVIDENCE.md`](docs/overhaul/P7_REGIME_EVIDENCE.md) · [`P8_BETA_HARVEST_EVIDENCE.md`](docs/overhaul/P8_BETA_HARVEST_EVIDENCE.md) | P6 成交量、P7 状态条件化、P8 波动率目标化的逐阶段实测证据与结论 |
+| [`docs/overhaul/ALGO_UPGRADE_PLAN.md`](docs/overhaul/ALGO_UPGRADE_PLAN.md) · [`ALGO_UPGRADE_EVIDENCE.md`](docs/overhaul/ALGO_UPGRADE_EVIDENCE.md) | P1–P4 算法升级的验收标准、逐阶段实测证据与未闭环清单 |
+| [`docs/overhaul/PLAN.md`](docs/overhaul/PLAN.md) · [`CHANGELOG.md`](docs/overhaul/CHANGELOG.md) | 长盘修复计划 S0–S7 与三轮审计的发现与处置；详细变更史 |
+| [`docs/audit/`](docs/audit/) · [`docs/superpowers/`](docs/superpowers/) | 历史审计分报告与严重度分级；设计规格与实施计划 |
+| `/manual`（站内） | 上表的站内渲染版本，只收录 `docs/**` 与根 README |
