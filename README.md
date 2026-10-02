@@ -1,5 +1,20 @@
 # Binance Trader
 
+> # ⚠️ 警告：这是研究平台，不是盈利系统
+>
+> **本仓库是研究（research）与测量（measurement）平台。里面没有任何一个策略经过实盘验证；
+> 每一个能力都以关闭状态出货（shipped disabled）。** 在 1.5 年现货缓存上做的六条独立
+> 搜索线**没有找到任何稳健的短周期优势**，而且**在每一个被测窗口里，"直接持有这个篮子"
+> 在对齐风险之后都打败了演化出来的策略**（实测：七个出货冠军在四个窗口的原始收益是
+> **−4.07 % / −2.46 % / −1.59 % / −4.91 %，年化波动率 1.2–2.8 %**——
+> 它们几乎一直待在现金里）。
+>
+> **任何考虑用真金白银运行本项目的人：不要把它当成一个能盈利的交易系统。**
+> 它已经证明的价值是**测量、风险控制与执行纪律**，不是 alpha 生成能力。
+>
+> 📄 完整实测报告与全部数字的来源：[**`docs/research/FINDINGS.md`**](docs/research/FINDINGS.md)
+> （含：六条搜索线的逐项结果、每一条被自己的门槛拒绝的方式、以及"什么会改变这个结论"）。
+
 面向币安现货的 Python 3.12 自动化交易系统。asyncio 事件总线把 **行情 → 策略信号 → 风控 → 下单 → 持仓守护** 串成一条可观测流水线，配套 FastAPI + aiosqlite + ECharts 的 Web 控制台。模拟盘带真实成本模型（手续费分档 + 半价差 + 滑点），账本恒等式有专门的回归测试守护；回测有 legacy / hybrid 两套引擎，共用同一个评估内核。
 
 **架构一段话**：`core/market_data/provider.py` 从 `data-api.binance.vision`（REST）与 `data-stream.binance.vision`（WS）取行情，落 `data/market/<SYM>/<tf>.parquet` 并抛 `MARKET_KLINE`；`app/event_bus.py` 的单个消费协程把事件分发给 `StrategyEngine`（可选 `MLPredictor` / `NewsAnalyzer` / `AlertManager`）；**所有**信号评估走唯一的 `core/strategy/evaluation_kernel.py`（实时与两套回测共用同一内核与同一组阈值），产出 `STRATEGY_SIGNAL`；`core/risk/manager.py::check_signal()` 按 熔断 → 总敞口 → 仓位规模 → 杠杆 → 止损 → 同币去重 → 最大笔数 **七步**过滤后发 `ORDER_REQUEST`；`core/executor/executor.py` 按 `--mode` 走 sim（本地成交，成本模型改写成交价）或 live（testnet 真实下单）；`core/risk/position_guard.py` 以 15s 轮询执行止损/追踪/紧急平仓，`db/database.py::atomic_adjust_balance()` 是账本**唯一**写入点。
@@ -19,6 +34,7 @@ data-api.binance.vision (REST) / data-stream.binance.vision (WS) → MarketDataP
 
 ## 目录
 
+0. [⚠️ 研究与免责声明](#️-研究与免责声明)（**先读这一节**）
 1. [环境约束（必读）](#1-环境约束必读)
 2. [安装与启动](#2-安装与启动)
 3. [Web 控制台](#3-web-控制台)
@@ -26,6 +42,34 @@ data-api.binance.vision (REST) / data-stream.binance.vision (WS) → MarketDataP
 5. [运维](#5-运维)
 6. [已知限制与残余](#6-已知限制与残余)
 7. [文档索引](#7-文档索引)
+
+---
+
+## ⚠️ 研究与免责声明
+
+> **本节必须最先读。** 它不描述"未来可能做什么"，它描述**已经实测到的事实**。
+
+1. **这是一个研究（research）与测量（measurement）平台。** 它的核心产出是
+   *可复现的实验、诚实的门槛与审计过的证据*，而不是交易收益。
+   **它里面没有任何一个策略经过实盘验证（no strategy in it has been validated for live trading）。**
+2. **每一个能力都以关闭状态出货（every capability ships disabled）。**
+   `ml.enabled: false`、`risk.vol_targeting.enabled: false`、`risk.liquidity.enabled: false`、
+   `ga.regime_conditioning: false`、`ai.orchestrator.enabled: false`、
+   `experimental.*` 全 `false`、P4 四个模块常量全 `False`。
+   "打开开关"不等于"能力生效"，更不等于"有优势"——见 [§4.3](#43-默认关闭的能力不要以为它们在生效) 与 [§4.4](#44-实验性开关configyaml-的-experimental默认全关)。
+3. **实测结论：没有找到任何稳健的短周期优势，而且在每一个被测窗口里"持有篮子"在对齐风险之后都打败了演化出来的策略。**
+   六条独立搜索线（ML 门控 / 配对协整 / meta-labeling / 遗传算法 / P7 行情状态与上层编排 /
+   P8 波动率目标化）**没有一条**通过它自己事先声明的门。最直观的一组数字：
+   七个出货冠军在四个不重叠窗口上的原始收益是 **−4.07 % / −2.46 % / −1.59 % / −4.91 %，
+   年化波动率只有 1.2–2.8 %**——它们基本上一直待在现金里，既没吃到 beta 也没拿到 alpha。
+4. **任何考虑投入真实资金的人：不要把这个项目当成一个能盈利的交易系统。**
+   它已经证明的价值是**测量、风险控制与执行纪律**——包括把"看起来很好"的候选
+   （fitness 41.82 / Sharpe 9.01 / 382 笔 / 最大回撤 0.11 %）如实拒绝掉的能力。
+
+📄 **完整实测报告：[`docs/research/FINDINGS.md`](docs/research/FINDINGS.md)**——
+中英文混排的详细记录，含六条搜索线的逐项数字与出处、每一条被拒绝的方式、
+"什么会改变这个结论"（含**未验证的前提**：本会话**没有**验证资金费率数据的可达性）、
+以及这套方法论如何被复用到别处。
 
 ---
 
@@ -460,6 +504,7 @@ python -m app.main --mode sim >> run_logs/service.log 2>&1   # PowerShell 用 *>
 
 | 文档 | 内容 |
 |---|---|
+| [`docs/research/FINDINGS.md`](docs/research/FINDINGS.md) | **研究结论报告**（先读 [研究与免责声明](#️-研究与免责声明)）：六条独立搜索线的实测数字、每条被自己的门拒绝的方式、证据的局限、什么会改变结论、复用的方法论清单 |
 | [`docs/research/CORE_ALGORITHMS.md`](docs/research/CORE_ALGORITHMS.md) · [`docs/core-algorithms/`](docs/core-algorithms/) | 算法总纲；按子系统拆分的 16 篇（先看 [`00-ERRATA.md`](docs/core-algorithms/00-ERRATA.md) 的 22 处勘误） |
 | [`docs/HANDOVER.md`](docs/HANDOVER.md) · [`docs/development-roadmap.md`](docs/development-roadmap.md) | 接手评估报告（**改动前快照**）；开发路线图（**规划≠现状**） |
 | [`docs/overhaul/PLAN.md`](docs/overhaul/PLAN.md) · [`CHANGELOG.md`](docs/overhaul/CHANGELOG.md) | 长盘修复计划 S0–S7 与三轮审计的发现与处置；详细变更史（改了什么、验收程度、剩余项） |
