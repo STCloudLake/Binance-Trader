@@ -159,11 +159,62 @@ docs/      研究结论、算法拆解、分阶段证据、历史审计
 
 ## 6. 许可与免责
 
-仓库**没有 LICENSE 文件**（`git ls-files LICENSE` 为空），因此不附带任何显式开源许可；使用或分发前请先与仓库所有者 `STCloudLake` 确认授权方式。
+本仓库以 **MIT** 许可发布，全文见 [`LICENSE`](LICENSE)：可以自由使用、修改与再分发（含商用），只需保留版权声明与许可全文，软件不附带任何担保。
 
-依赖与数据来源：python-binance、FastAPI + uvicorn、aiosqlite、ECharts + HTMX + Tailwind CSS、TA-Lib / LightGBM / XGBoost / PyTorch、loguru、DeepSeek。行情与交易数据来自 Binance 公开 API（`data-api.binance.vision` / `testnet.binance.vision`）。
+依赖与数据来源：python-binance、FastAPI + uvicorn、aiosqlite、ECharts + HTMX + Tailwind CSS、TA-Lib / LightGBM / XGBoost / PyTorch、loguru、DeepSeek。行情与交易数据来自 Binance 公开 API（`data-api.binance.vision` / `testnet.binance.vision`）。第三方组件仍各自遵循它们自己的许可，与本仓库的 MIT 许可无关，逐项清单见下文的第三方依赖表。
 
 加密货币交易存在本金全部损失的风险。本系统默认运行模拟盘，任何切换到真实资金交易的决定、参数设置与后果都由使用者自行承担。`--mode live` 在当前环境下只会打到 Binance testnet，这不构成对任何未来配置变更的安全保证。
+
+### 第三方依赖
+
+下表只列**直接依赖**及实测版本：Python 包的版本约束见 [`requirements.txt`](requirements.txt)，页面资源的版本见 `web/templates/`。许可取自本机已安装发行版自己的元数据（`importlib.metadata` 的 `License-Expression` / `License` / `Classifier`，元数据为空时读该发行版 `dist-info` 里的 LICENSE 全文），前端资源取自 CDN 上该版本自己的 `package.json`。传递依赖不在此表内，它们各自携带许可。
+
+**运行依赖**
+
+| 依赖 | 实测版本 | 许可 |
+|---|---|---|
+| python-binance | 1.0.36 | MIT |
+| pandas | 2.3.3 | BSD-3-Clause |
+| numpy | 2.3.3 | BSD-3-Clause |
+| pyarrow | 24.0.0 | Apache-2.0 |
+| TA-Lib | 0.6.8 | BSD-2-Clause |
+| scikit-learn | 1.7.2 | BSD-3-Clause |
+| scipy | 1.16.2 | BSD-3-Clause |
+| xgboost | 3.2.0 | Apache-2.0 |
+| lightgbm | 4.6.0 | MIT |
+| torch | 2.13.0.dev20260531+cu130 | BSD-3-Clause |
+| fastapi | 0.136.3 | MIT |
+| uvicorn[standard] | 0.47.0 | BSD-3-Clause |
+| jinja2 | 3.1.6 | BSD-3-Clause |
+| markdown-it-py | 4.0.0 | MIT |
+| pydantic | 2.13.1 | MIT |
+| pyyaml | 6.0.3 | MIT |
+| aiohttp | 3.13.2 | Apache-2.0 |
+| python-multipart | 0.0.29 | Apache-2.0 |
+| aiosqlite | 0.22.1 | MIT |
+| bcrypt | 5.0.0 | Apache-2.0 |
+| PyJWT | 2.13.0 | MIT |
+| loguru | 0.7.3 | MIT |
+| openai | 2.32.0 | Apache-2.0 |
+| httpx | 0.28.1 | BSD-3-Clause |
+
+**前端资源（CDN）**
+
+| 资源 | 模板里的版本 | 许可 |
+|---|---|---|
+| Tailwind CSS（`cdn.tailwindcss.com` Play CDN） | 3.4.17（模板未钉版本，取自 CDN 当前产物） | MIT |
+| HTMX（`base.html`） | 1.9.10 | BSD-2-Clause |
+| Apache ECharts（`base.html`） | 5.5.0 | Apache-2.0 |
+| KaTeX（`manual_doc.html`） | 0.16.11 | MIT |
+
+**开发与测试**
+
+| 依赖 | 实测版本 | 许可 |
+|---|---|---|
+| pytest | 9.0.3 | MIT |
+| pytest-asyncio | 1.3.0 | Apache-2.0 |
+
+另外三处导入是带 `try/except` 的可选探测，不在 `requirements.txt` 里，本机也未安装，许可未确认（`未确认`）：`core/ml/volatility.py` 的 `arch`（缺失时退回 scipy 的 GARCH 实现）、`core/strategy/pairs.py` 的 `statsmodels`（只用于交叉验证，生产路径用 numpy）、`scripts/ga_job_status.py` 的 `psutil`（缺失时退回 CIM / tasklist）。
 
 ---
 
