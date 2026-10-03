@@ -1,5 +1,7 @@
 # Binance Trader
 
+**中文** · [English](README_EN.md)
+
 面向币安现货的 Python 3.12 加密交易策略研究与测量平台。数据管道把公开行情落成本地 parquet 缓存并检查缺口，回测引擎按手续费、价差与滑点建模，遗传搜索（GA）演化策略，ML 与 GA 各有一套可信度门，FastAPI + ECharts 的 Web 控制台把行情、下单、回测、GA 进度放在同一批页面里，`/manual` 把仓库里的 markdown 当站内手册读。
 
 `VERSION` 2.0.1 · Python 3.12（实测 3.12.10）· Windows / Linux · 默认只监听 `127.0.0.1:8899`。所有交易能力以关闭状态出货，默认 `--mode sim` 在本地模拟成交。
