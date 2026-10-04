@@ -38,7 +38,7 @@ Web 只绑 `127.0.0.1`，`app/main.py` 里没有 `--host` 参数；要从别的�
 
 ### 回测引擎
 
-两套引擎共用一个评估内核。legacy（`core/backtest/engine.py`）逐 tick 遍历时间线，支持 LightGBM / TFT / PatchTST 与部分减仓条件；hybrid（`core/backtest/engine_hybrid.py`）先用 `SignalMatrixBuilder` 预生成信号矩阵再回放，不支持 ML，也不支持 `reduce_conditions`。`backtest.engine_mode: auto` 在策略数 ≥ 3 且无 ML、无减仓条件时选 hybrid，运行期异常会记 warning 并回退 legacy。legacy、hybrid 与信号矩阵三条路径在缺数据时报同一句 canonical 文案。成本模型把手续费分档、半价差与滑点作用到成交价或平仓价上，并在每次运行开始时冻结本次用到的每个 symbol 的价差，交易循环里不再做 I/O。
+两套引擎共用一个评估内核。legacy（`core/backtest/engine.py`）逐 tick 遍历时间线，支持 LightGBM / TFT / PatchTST 与部分减仓条件；hybrid（`core/backtest/engine_hybrid.py`）先用 `SignalMatrixBuilder` 预生成信号矩阵再回放，不支持 ML，也不支持 `reduce_conditions`。`backtest.engine_mode: auto` 在策略数 ≥ 3 且无 ML、无减仓条件时选 hybrid，运行期异常会记 warning 并回退 legacy。legacy、hybrid 与信号矩阵三条路径在缺数据时报同一句 canonical 文案。成本模型把手续费分档、半价差与滑点作用到成交价或平仓价上，并在每次运行开始时冻结本次用到的每个 symbol 的价差，交易循环里不再做 I/O。成交口径 `backtest.fill_convention` 出厂为 `next_open`：信号仍按 `ts` 那根 bar 判定，开仓与平仓都按同一序列下一根 bar 的开盘价成交；`close`（信号那根 bar 自己的收盘价，零执行延迟）仍可显式选择，本次翻转之前记录的回测、GA 与冠军数字都是在该口径下产生的，复现它们需要显式设 `close`。
 
 ![回测页](docs/images/backtest.png)
 

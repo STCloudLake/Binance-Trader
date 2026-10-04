@@ -679,15 +679,18 @@ class Config:
         self.backtest_ml_enabled = bt.get("ml_enabled", False) if isinstance(bt, dict) else False
 
         # ── P9: the fill convention (`backtest.fill_convention`) ──────────────
-        # WHEN a fill is priced: `close` (shipped — the signal bar's own close,
-        # zero execution latency, bit-identical to the pre-P9 engine) or
-        # `next_open` (signal unchanged, fill = the open of the bar one row later
-        # on the same series; entry AND exit shift together).  Parsed here — at
-        # config load — so an unknown value raises the NAMED
+        # WHEN a fill is priced: `next_open` (shipped default — the fill is the
+        # open of the bar one row later on the same series; signal unchanged,
+        # entry AND exit shift together; one bar of execution latency) or
+        # `close` (the historical convention: the signal bar's own close, zero
+        # execution latency, bit-identical to the pre-P9 engine — kept so numbers
+        # recorded before the flip stay reproducible).  Parsed here — at config
+        # load — so an unknown value raises the NAMED
         # `UnknownFillConventionError` where the operator can see it, instead of
         # silently selecting a convention and producing different numbers.
-        # The key being absent means `close`, so a config written before P9 keeps
-        # the historical behaviour exactly.
+        # The key being absent means the code default (`next_open`), so a config
+        # written before P9 gets the honest convention rather than the optimistic
+        # one; `close` must be selected explicitly.
         from core.backtest.fill_convention import parse_fill_convention
         self.backtest_fill_convention = parse_fill_convention(
             bt.get("fill_convention") if isinstance(bt, dict) else None)

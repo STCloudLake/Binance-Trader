@@ -684,6 +684,13 @@ if hasattr(cfg, "ga_benchmark_mode"):
         del cfg.ga_benchmark_mode
     else:
         cfg.ga_benchmark_mode = "buy_hold"
+# P9 re-pin: the GA path passes no `fill_convention` kwarg, so the config decides
+# — and the shipped default is now `next_open`, while every number this
+# comparison was built on (and the baseline tree it compares against) was priced
+# under `close`.  Pin the historical convention explicitly where the attribute
+# exists; the baseline tree has no fill-convention seam and prices `close` anyway.
+if hasattr(cfg, "backtest_fill_convention"):
+    cfg.backtest_fill_convention = "close"
 
 bus = EventBus()
 engine = BacktestEngine(cfg, None, RiskManager(cfg, bus), OrderExecutor(cfg, bus))

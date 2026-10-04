@@ -15,10 +15,13 @@ What this tool measures
 -----------------------
 The same candidates, the same window, the same costs, run twice:
 
-``A: close``      the shipped behaviour (``backtest.fill_convention: close``).
+``A: close``      the historical behaviour (``backtest.fill_convention: close``)
+                  — every pre-flip recorded number was produced under it.  Both
+                  arms are requested explicitly; the shipped default is
+                  ``next_open``, so neither arm is inherited from the config.
 ``B: next_open``  the same signals; the fill price — entry **and** exit — is the
                   open of the bar one row later on the series that priced it
-                  (``backtest.fill_convention: next_open``).
+                  (``backtest.fill_convention: next_open``, the shipped default).
 
 Per arm and per timeframe it reports trade count, total return, Sharpe, max
 drawdown, the mean per-trade fill-price difference in **basis points** (entry and

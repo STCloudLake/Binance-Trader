@@ -89,21 +89,24 @@ auth:
   session_hours: 24
 backtest:
   # ── P9: the fill convention — WHEN a fill is priced ────────────────────────
-  # `close`     (SHIPPED DEFAULT) the signal bar's own close is the fill price.
-  #             Zero execution latency: the engine sees the close of bar `ts` and
-  #             trades at exactly that price.  Bit-identical to the pre-P9 engine.
-  # `next_open` the signal is unchanged (still evaluated on the bar at `ts`), but
-  #             the fill — entry **and** exit — is the OPEN of the bar one row
-  #             later on the *same* series (the strategy's primary/shortest
-  #             timeframe for an entry; the timeframe that supplied the exit price
-  #             for an exit).  The measured cost of that one bar of latency is in
-  #             docs/overhaul/P9_FILL_CONVENTION_EVIDENCE.md.
-  # ⚠ FLIPPING THIS INVALIDATES EVERY PREVIOUSLY RECORDED BACKTEST/CHAMPION
-  #   NUMBER (the difference is not noise; it grows as the timeframe shortens).
-  #   `close` stays shipped on purpose — the owner decides.
+  # `next_open` (SHIPPED DEFAULT) the signal is unchanged (still evaluated on the
+  #             bar at `ts`), but the fill — entry **and** exit — is the OPEN of
+  #             the bar one row later on the *same* series (the strategy's
+  #             primary/shortest timeframe for an entry; the timeframe that
+  #             supplied the exit price for an exit).  One bar of execution
+  #             latency: the honest convention, and the default because a
+  #             measurement platform must not ship the optimistic one.
+  # `close`     the historical convention: the signal bar's own close is the fill
+  #             price.  Zero execution latency — the engine sees the close of bar
+  #             `ts` and trades at exactly that price, which flatters results.
+  #             Kept, and bit-identical to the pre-P9 engine, **only** so that
+  #             measurements recorded before this default was flipped can be
+  #             reproduced: set `close` explicitly to do that (the measured
+  #             difference is in docs/overhaul/P9_FILL_CONVENTION_EVIDENCE.md).
   # An unknown value raises the NAMED `UnknownFillConventionError` at config load
-  # (`core/backtest/fill_convention.py`), never a silent fallback.
-  fill_convention: close
+  # (`core/backtest/fill_convention.py`), never a silent fallback.  A config with
+  # no `fill_convention` key at all resolves to `next_open` as well.
+  fill_convention: next_open
   # NOTE: the backtest cost model is deliberately kept separate from `sim:` below
   # (it charges fees at close time only, on top of the entry/exit prices, so that
   # stop-loss / take-profit levels are untouched).  Do not merge the two.

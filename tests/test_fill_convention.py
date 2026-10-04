@@ -2,25 +2,27 @@
 
 The convention decides **when a fill is priced**:
 
-``close``      (shipped default) the signal bar's own close — zero execution
-               latency, and bit-identical to the pre-P9 engine.
-``next_open``  the signal is unchanged (still the bar at ``ts``) and the fill —
-               entry AND exit — is the OPEN of the bar one row later on the same
-               series.
+``next_open``  (shipped default) the signal is unchanged (still the bar at
+               ``ts``) and the fill — entry AND exit — is the OPEN of the bar one
+               row later on the same series.
+``close``      the historical convention: the signal bar's own close — zero
+               execution latency, and bit-identical to the pre-P9 engine.
 
 These tests pin, in order:
 
-1. the config contract (default is ``close``; anything else raises the NAMED
-   ``UnknownFillConventionError`` at config load, never a silent fallback);
+1. the config contract (the code default is ``next_open``, an **absent** key
+   resolves to ``next_open``, the shipped YAML says ``next_open``, and anything
+   else raises the NAMED ``UnknownFillConventionError`` at config load — never a
+   silent fallback);
 2. the primitive (``next_bar_open``) on a hand-computable frame;
 3. the end-to-end shift on a synthetic series whose prices are known by hand —
    entry and exit each move by exactly one bar;
 4. the two window-end cases (an entry that cannot be filled is refused; an exit
    that cannot be filled falls back to the close) — both COUNTED, never silent;
 5. the provenance field on the result and in the metrics;
-6. the strongest claim: the default is **bit-identical** to a ``git worktree`` at
-   the pre-P9 revision, compared as bytes over trades, equity points and a fixed
-   metrics digest (``tools/p9_fill_convention_identity.py``).
+6. the strongest claim: an **explicit ``close``** is **bit-identical** to a
+   ``git worktree`` at the pre-P9 revision, compared as bytes over trades, equity
+   points and a fixed metrics digest (``tools/p9_fill_convention_identity.py``).
 """
 from __future__ import annotations
 
@@ -126,17 +128,18 @@ def _engine(config):
 
 def _run(market_dir, *, convention, date_start="2026-01-05",
          date_end="2026-02-01", symbols=("BTCUSDT",), strategy=None,
-         per_genome_ledger=False, with_fill_kwarg=True):
+         per_genome_ledger=False):
+    """One run with the convention selected through the RUN KWARG.
+
+    The config path (no kwarg) is exercised by ``_run_with_config`` below.
+    """
     engine = _engine(_config(market_dir))
-    kwargs = {}
-    if with_fill_kwarg:
-        kwargs["fill_convention"] = convention
     return engine.run_with_exit_evaluation(
         strategies=[strategy or _strategy()], symbols=list(symbols),
         date_start=date_start, date_end=date_end, initial_balance=10_000.0,
         mode="full", simulate_ai_weights=False, use_live_spread=False,
         per_strategy_isolation=True, per_genome_ledger=per_genome_ledger,
-        benchmark_mode="none", **kwargs)
+        benchmark_mode="none", fill_convention=convention)
 
 
 def _frame_pos(ts) -> int:
@@ -148,14 +151,18 @@ def _frame_pos(ts) -> int:
 # ══════════════════════════════════════════════════════════════════════════
 
 def test_the_two_conventions_and_the_code_default():
+    """The shipped default is the honest one; `close` is explicit, never implied."""
     from core.backtest.fill_convention import (
         DEFAULT_FILL_CONVENTION, FILL_CONVENTIONS, parse_fill_convention)
 
     assert FILL_CONVENTIONS == ("close", "next_open")
-    assert DEFAULT_FILL_CONVENTION == "close"
-    assert parse_fill_convention(None) == "close"          # key absent
-    assert parse_fill_convention("close") == "close"
+    assert DEFAULT_FILL_CONVENTION == "next_open"
+    assert parse_fill_convention(None) == "next_open"      # key absent
+    assert parse_fill_convention("next_open") == "next_open"
     assert parse_fill_convention(" NEXT_OPEN ") == "next_open"
+    # The historical convention still resolves, and only when asked for by name.
+    assert parse_fill_convention("close") == "close"
+    assert parse_fill_convention(" CLOSE ") == "close"
 
 
 def test_an_unknown_convention_is_refused_by_name():
@@ -171,17 +178,47 @@ def test_an_unknown_convention_is_refused_by_name():
     assert issubclass(UnknownFillConventionError, ValueError)
 
 
-def test_the_shipped_key_is_close(monkeypatch):
-    """The shipped YAML says `close` and the loaded config agrees."""
+def test_the_shipped_key_is_next_open(monkeypatch):
+    """The shipped YAML says `next_open` and the loaded config agrees.
+
+    Guard: the shipped default is the honest convention, and it cannot silently
+    regress to the optimistic one without failing here.
+    """
     import yaml
     from app.config import Config
 
     shipped = yaml.safe_load(
         (ROOT / "config" / "config.yaml").read_text(encoding="utf-8"))
-    assert (shipped.get("backtest") or {}).get("fill_convention") == "close"
+    assert (shipped.get("backtest") or {}).get("fill_convention") == "next_open"
     Config._instance = None
     try:
-        assert Config.load("sim").backtest_fill_convention == "close"
+        assert Config.load("sim").backtest_fill_convention == "next_open"
+    finally:
+        Config._instance = None
+
+
+def test_an_absent_key_resolves_to_next_open(tmp_path, monkeypatch):
+    """Guard: a config written before P9 gets the honest convention.
+
+    Deleting the key from the shipped YAML (the pre-P9 shape) must resolve to
+    `next_open` at config load, and an engine run against a config object that
+    has no such attribute must do the same — no implicit `close`.
+    """
+    import yaml
+    import app.config as config_mod
+    from app.config import Config
+
+    data = yaml.safe_load(
+        (ROOT / "config" / "config.yaml").read_text(encoding="utf-8"))
+    data["backtest"].pop("fill_convention")
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "config.yaml").write_text(yaml.safe_dump(data), encoding="utf-8")
+    monkeypatch.setattr(config_mod, "PROJECT_ROOT", tmp_path)
+
+    Config._instance = None
+    try:
+        assert Config.load("sim").backtest_fill_convention == "next_open"
     finally:
         Config._instance = None
 
@@ -333,19 +370,51 @@ def test_the_result_and_the_metrics_name_the_convention(market_dir, convention):
     assert run["metrics"]["fill_convention_accounting"]["convention"] == convention
 
 
-def test_the_config_key_is_honoured_without_the_explicit_kwarg(market_dir):
-    """The GA path passes no kwarg: the convention must come from the config."""
-    default_run = _run(market_dir, convention=None, with_fill_kwarg=False)
-    assert default_run["fill_convention"] == "close"
-
-    engine = _engine(_config(market_dir, convention="next_open"))
-    run = engine.run_with_exit_evaluation(
-        strategies=[_strategy()], symbols=["BTCUSDT"], date_start="2026-01-05",
+def _run_with_config(config, market_dir, *, symbols=("BTCUSDT",)):
+    """One run that passes NO `fill_convention` kwarg: the config decides."""
+    engine = _engine(config)
+    return engine.run_with_exit_evaluation(
+        strategies=[_strategy()], symbols=list(symbols), date_start="2026-01-05",
         date_end="2026-02-01", initial_balance=10_000.0, mode="full",
         simulate_ai_weights=False, use_live_spread=False,
-        benchmark_mode="none")
-    assert run["fill_convention"] == "next_open"
+        per_strategy_isolation=True, benchmark_mode="none")
+
+
+def test_the_config_key_is_honoured_without_the_explicit_kwarg(market_dir):
+    """The GA path passes no kwarg: the convention must come from the config.
+
+    Both values, so this stays a test of the config seam rather than of the
+    default: an explicit `close` config still prices at the decision bar's close
+    (the historical convention did not change), and an explicit `next_open`
+    config really shifts — and the values are compared against the same
+    hand-computed bars as before.
+    """
+    frame = _frame()
+    close_run = _run_with_config(_config(market_dir, convention="close"), market_dir)
+    assert close_run["fill_convention"] == "close"
+    k = _frame_pos(close_run["trades"][0]["opened_at"])
+    assert close_run["trades"][0]["entry_price"] == pytest.approx(
+        float(frame["close"].iloc[k]))
+
+    next_run = _run_with_config(
+        _config(market_dir, convention="next_open"), market_dir)
+    assert next_run["fill_convention"] == "next_open"
     # …and it really shifted: the first entry is the next bar's open, not a close.
+    assert next_run["trades"][0]["entry_price"] == pytest.approx(
+        float(frame["open"].iloc[k + 1]))
+
+
+def test_an_absent_config_attribute_resolves_to_next_open(market_dir):
+    """Guard, end to end: no attribute and no kwarg ⇒ `next_open`, not `close`.
+
+    This is the shape a pre-P9 config object has (the attribute does not exist at
+    all), and it is the path a stale caller would take.  It must price the honest
+    convention.
+    """
+    config = _config(market_dir)
+    del config.backtest_fill_convention          # the pre-P9 shape
+    run = _run_with_config(config, market_dir)
+    assert run["fill_convention"] == "next_open"
     frame = _frame()
     k = _frame_pos(run["trades"][0]["opened_at"])
     assert run["trades"][0]["entry_price"] == pytest.approx(
@@ -400,9 +469,11 @@ def _run_identity(tree: Path, tmp_path: Path, tag: str, data_dir: str):
     harness.write_text(IDENTITY_HARNESS.read_text(encoding="utf-8"),
                        encoding="utf-8", newline="\n")
     out = tmp_path / f"p9_identity_{tag}.json"
+    # `--fill-convention close` is explicit on purpose: the shipped default is
+    # `next_open`, and the claim proven here is the HISTORICAL path's identity.
     proc = subprocess.run(
         [sys.executable, str(harness), "--tree", str(tree),
-         "--data-dir", data_dir, "--out", str(out)],
+         "--data-dir", data_dir, "--fill-convention", "close", "--out", str(out)],
         cwd=str(tree), capture_output=True, text=True, timeout=900)
     assert proc.returncode == 0, f"identity harness failed in {tree}:\n{proc.stderr}"
     return out.read_bytes(), proc.stdout.strip()
@@ -412,10 +483,17 @@ def test_close_is_bit_identical_to_the_pre_p9_worktree(market_dir, tmp_path):
     """The same harness, the same synthetic market, two trees, one digest.
 
     Compares every trade (timestamps, prices, PnL, cost), every per-genome equity
-    point and a **fixed** metrics digest as bytes.  The pre-P9 tree has no
-    ``backtest.fill_convention`` key at all — that is the "key absent" case — and
-    the payload therefore excludes P9's own two metrics (whose presence in the
-    working tree is asserted separately, so the exclusion cannot hide a change).
+    point and a **fixed** metrics digest as bytes.  The working tree runs
+    ``--fill-convention close`` — an **explicit** selection of the historical
+    convention, which is the point of the test: the shipped default is now
+    ``next_open``, and what must stay reproducible is the path that produced every
+    number recorded before the flip.  The pre-P9 tree has no
+    ``backtest.fill_convention`` key at all — the harness gives it the config
+    attribute (which the pre-P9 engine ignores, because ``close`` is the only
+    behaviour it has) and cannot pass the kwarg, so the "explicit" side of the
+    comparison is the working tree.  The payload excludes P9's own two metrics
+    (whose presence in the working tree is asserted separately, so the exclusion
+    cannot hide a change).
     """
     worktree = tmp_path / "pre_p9_tree"
     add = subprocess.run(["git", "worktree", "add", "--detach", str(worktree),
@@ -442,5 +520,5 @@ def test_close_is_bit_identical_to_the_pre_p9_worktree(market_dir, tmp_path):
           f"equity_points={len(next(iter(payload['equity'].values())))} "
           f"payload_sha16={hashlib.sha256(tree_bytes).hexdigest()[:16]}")
     assert head_digest == tree_digest, (
-        "the default (`close`) path is no longer bit-identical to "
+        "the explicit `close` path is no longer bit-identical to "
         f"{BASELINE_REVISION}: baseline={head_digest} working={tree_digest}")

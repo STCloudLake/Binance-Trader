@@ -50,6 +50,11 @@ def _config(mode="legacy"):
     config.backtest_engine_mode = mode
     config.backtest_ml_enabled = False
     config.signal_weights = SignalWeights(indicator=1.0, ml=0.0, news=0.0)
+    # P9 re-pin: the shipped default is now `next_open`, but the hybrid engine has
+    # no fill seam and prices every fill at the decision bar's close.  The parity
+    # contract between the two engines is therefore defined on the historical
+    # `close` convention, which is requested explicitly here (values unchanged).
+    config.backtest_fill_convention = "close"
     return config
 
 

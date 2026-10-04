@@ -1,23 +1,38 @@
 """The backtest **fill convention** (P9): when is a fill priced?
 
-The engine decides and fills on the same bar's close: the entry signal is
-evaluated on the bar at ``ts`` and the fill price is *that same bar's* close
-(``core/backtest/engine.py``: ``price = float(df_primary["close"].iloc[-1])``).
+Historically the engine decided and filled on the same bar's close: the entry
+signal is evaluated on the bar at ``ts`` and the fill price is *that same bar's*
+close (``core/backtest/engine.py``: ``price = float(df_primary["close"].iloc[-1])``).
 That is **zero execution latency** — it assumes you can see a close and trade at
-exactly that price.  The conventional treatment is: signal at the close of
-``ts``, fill at the **open of the next bar**.
+exactly that price — and it flatters every result.  The conventional treatment is:
+signal at the close of ``ts``, fill at the **open of the next bar**, and that is
+what the platform now ships by default.
 
 This module is the single, testable definition of the two conventions:
 
-``close``      the shipped default — the fill is the close of the decision bar.
-               Bit-identical to the pre-P9 engine.
-``next_open``  the fill is the *open of the bar immediately following* the
-               decision bar, on the **same series** that priced the fill (the
-               strategy's primary/shortest timeframe for an entry; the timeframe
-               whose close supplied the exit price for an exit).  "One bar" is
-               therefore always one row of the *fill timeframe's own* frame, not
-               one row of the feeder's union grid — which matters as soon as
-               several timeframes are loaded (a 4h filter never prices a fill).
+``next_open``  the **shipped default** — the fill is the *open of the bar
+               immediately following* the decision bar, on the **same series**
+               that priced the fill (the strategy's primary/shortest timeframe
+               for an entry; the timeframe whose close supplied the exit price
+               for an exit).  "One bar" is therefore always one row of the *fill
+               timeframe's own* frame, not one row of the feeder's union grid —
+               which matters as soon as several timeframes are loaded (a 4h
+               filter never prices a fill).  One bar of execution latency.
+``close``      the **historical** convention — the fill is the close of the
+               decision bar (zero execution latency).  Bit-identical to the
+               pre-P9 engine, which is why it is kept: it is the only way to
+               reproduce any backtest/champion number recorded before the
+               default was flipped.
+
+**Resolution rule** (one rule, no other fallback): the key being *absent* means
+:data:`DEFAULT_FILL_CONVENTION` (``next_open``) — so a config written before P9
+gets the honest convention, not the optimistic one; an explicit value selects it,
+and ``close`` selects the historical convention.  A value that is neither is
+refused by name, never silently mapped to a default.
+
+The measurements recorded before this flip (``docs/overhaul/
+P9_FILL_CONVENTION_EVIDENCE.md``) were all produced under ``close``; to reproduce
+any of them, set ``backtest.fill_convention: close`` explicitly.
 
 Nothing here computes indicators, sizes positions or reads the database: it
 parses the config value and turns a price frame + a decision timestamp into the
@@ -41,8 +56,13 @@ import math
 #: Every accepted ``backtest.fill_convention`` value, in contract order.
 FILL_CONVENTIONS: tuple[str, ...] = ("close", "next_open")
 
-#: The shipped default.  Changing this **changes every backtest number**.
-DEFAULT_FILL_CONVENTION = "close"
+#: The shipped default, and the value an **absent** key resolves to: the honest
+#: convention (one bar of execution latency).  It was flipped from ``close`` to
+#: ``next_open`` because ``close`` prices a fill at a bar the signal came from —
+#: zero execution latency, which flatters every backtest.  Changing this
+#: **changes every backtest number**; ``close`` stays selectable so numbers
+#: recorded before the flip remain reproducible.
+DEFAULT_FILL_CONVENTION = "next_open"
 
 
 class UnknownFillConventionError(ValueError):
@@ -64,12 +84,16 @@ class FillConventionUnsupportedError(ValueError):
 def parse_fill_convention(raw) -> str:
     """Return the validated convention for a raw config/job value.
 
-    ``None`` (the key absent) → :data:`DEFAULT_FILL_CONVENTION`, so a config
-    written before P9 keeps the historical ``close`` behaviour.  Anything that is
-    not one of :data:`FILL_CONVENTIONS` raises
-    :class:`UnknownFillConventionError` naming both the bad value and the valid
-    ones — never a silent fallback, because the two conventions produce
-    different numbers.
+    The resolution rule, stated once: ``None`` (the key **absent**) →
+    :data:`DEFAULT_FILL_CONVENTION`, which is ``next_open`` — a config written
+    before P9 (or any caller that omits the key) gets the honest convention, not
+    the optimistic one.  An explicit value selects itself: ``close`` is the
+    **historical** convention (the decision bar's own close, zero execution
+    latency, bit-identical to the pre-P9 engine) and stays supported so numbers
+    recorded before the flip can be reproduced.  Anything that is not one of
+    :data:`FILL_CONVENTIONS` raises :class:`UnknownFillConventionError` naming
+    both the bad value and the valid ones — never a silent fallback, because the
+    two conventions produce different numbers.
     """
     if raw is None:
         return DEFAULT_FILL_CONVENTION

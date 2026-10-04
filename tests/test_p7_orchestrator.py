@@ -945,6 +945,13 @@ def main(out_path):
     if "orchestrator" in params:
         from core.ai.orchestrator import RegimeOrchestrator
         kwargs["orchestrator"] = RegimeOrchestrator({"enabled": False})
+    # P9 re-pin: the shipped default is now `next_open`, but every number this
+    # comparison was built on (and the pre-S3 baseline it compares against) was
+    # priced under `close`.  The historical convention is requested explicitly
+    # where the tree has the seam; the baseline has no such parameter and prices
+    # `close` anyway, which is exactly the behaviour being compared.
+    if "fill_convention" in params:
+        kwargs["fill_convention"] = "close"
     result = engine.run_with_exit_evaluation(**kwargs)
     # P9 added two metrics keys (`fill_convention`, `fill_convention_accounting`).
     # They are not part of the S3 contract and cannot exist in the baseline tree,

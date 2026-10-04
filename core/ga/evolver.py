@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from loguru import logger
 
+from core.backtest.fill_convention import DEFAULT_FILL_CONVENTION
 from core.ga.genome import (
     strategy_to_chromosome, chromosome_to_strategy,
     random_chromosome, confine_timeframe_gene, confine_regime_gene,
@@ -1024,13 +1025,15 @@ class GAStrategyEvolver:
             # recorded under `close` is NOT comparable with one recorded under
             # `next_open` (`backtest.fill_convention`, see
             # docs/overhaul/P9_FILL_CONVENTION_EVIDENCE.md), so the artefact names
-            # the convention its own numbers were produced under.
+            # the convention its own numbers were produced under.  A config
+            # object without the attribute resolves to the code default
+            # (`next_open`) — the same rule as `parse_fill_convention(None)`.
             "eval": {
                 "engine_mode": "legacy",
                 "use_live_spread": False,
                 "fill_convention": getattr(
                     getattr(self.engine, "config", None),
-                    "backtest_fill_convention", "close"),
+                    "backtest_fill_convention", DEFAULT_FILL_CONVENTION),
             },
 
             "written_at": time.strftime("%Y-%m-%dT%H:%M:%S"),

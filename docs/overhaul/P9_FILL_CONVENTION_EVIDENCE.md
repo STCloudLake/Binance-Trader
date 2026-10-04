@@ -1,10 +1,19 @@
 # P9 — the fill convention: what "one bar of execution latency" costs
 
-**Status:** measured. The convention is now **configurable** (`backtest.fill_convention`),
-the shipped default stays **`close`** (unchanged behaviour, bit-identical to the
-pre-P9 engine), and the measured cost of the conventional alternative
-(`next_open`) is on the table below. **The default is not flipped** — that is the
-owner's call, and §7 states what flipping it would invalidate.
+**Status:** measured, and the default has been **flipped by the operator**. The
+convention is configurable (`backtest.fill_convention`) and the **shipped default
+is now `next_open`** — one bar of execution latency, the honest convention. The
+measured cost of `next_open` relative to `close` is on the table below.
+`close` (the signal bar's own close, zero execution latency, bit-identical to the
+pre-P9 engine) stays selectable; it is no longer the default.
+
+**Reproducing anything recorded before the flip.** Every champion / fitness /
+Sharpe / DSR / P8 number, and every table in this document, was produced under
+`close`. To reproduce any of them, set `backtest.fill_convention: close`
+**explicitly** and re-run: the key being absent now resolves to `next_open`, so a
+pre-P9 config, a tool that passes no value, or a reader assuming the old default
+gets different numbers. The `close` path itself is unchanged (the bit-identity in
+§3 still holds at the P9-landing revision `9571008`).
 
 ```powershell
 # every number in this document
@@ -16,8 +25,8 @@ python tools/p9_fill_convention_measure.py --out data/p9_evidence/fill_conventio
 python tools/p9_champion_regate.py --out data/p9_evidence/champion_regate.json
 python data/p9_evidence/p8_fill_convention.py --fill-convention close     --out data/p9_evidence/p8_close.json
 python data/p9_evidence/p8_fill_convention.py --fill-convention next_open --out data/p9_evidence/p8_next_open.json
-python tools/p9_fill_convention_identity.py --tree <HEAD worktree> --data-dir data --out %TEMP%\p9_id_head.json
-python tools/p9_fill_convention_identity.py --tree .               --data-dir data --out %TEMP%\p9_id_work.json
+python tools/p9_fill_convention_identity.py --tree <9571008 worktree> --data-dir data --fill-convention close --out %TEMP%\p9_id_head.json
+python tools/p9_fill_convention_identity.py --tree .                  --data-dir data --fill-convention close --out %TEMP%\p9_id_work.json
 ```
 
 ---
@@ -40,8 +49,8 @@ fill at the **open of `ts+1`** — is now selectable:
 
 | value | meaning |
 |---|---|
-| `close` **(shipped default)** | the signal bar's own close (or the barrier level) — today's behaviour |
-| `next_open` | signals unchanged; the fill price, **entry and exit**, is the `open` of the bar one row later on the same series |
+| `next_open` **(shipped default)** | signals unchanged; the fill price, **entry and exit**, is the `open` of the bar one row later on the same series |
+| `close` (historical, explicit) | the signal bar's own close (or the barrier level) — the pre-P9 behaviour, kept reproducible |
 
 ### The mechanism, computed by hand
 
@@ -229,22 +238,26 @@ tool. Total exposure of this rule: **1 trade at 1h and 6 at 15m** out of 5 134 /
 
 ---
 
-## 3. Deliverable 2 — configurable, default unchanged
+## 3. Deliverable 2 — configurable, and the default is now `next_open`
 
 ### The key
 
 ```yaml
 backtest:
-  # close = the signal bar's own close (SHIPPED DEFAULT, bit-identical to pre-P9)
   # next_open = signal unchanged, fill = the open of the bar one row later
-  fill_convention: close
+  #             (SHIPPED DEFAULT: one bar of execution latency)
+  # close     = the signal bar's own close (historical; explicit only, so the
+  #             pre-flip numbers stay reproducible)
+  fill_convention: next_open
 ```
 
 * validated **at config load** (`app/config.py`) through
   `core/backtest/fill_convention.py::parse_fill_convention`, which raises the
   NAMED `UnknownFillConventionError` naming the bad value and the valid ones for
-  anything else (including a non-string). The key being **absent** means `close`,
-  so a config written before P9 keeps the historical behaviour exactly.
+  anything else (including a non-string). The resolution rule: the key being
+  **absent** means the code default, which is **`next_open`** — a config written
+  before P9 gets the honest convention, not the optimistic one — and **`close`**
+  is selected only by naming it, which is the historical convention.
 * threaded through `BacktestEngine.run` / `run_with_exit_evaluation`
   (`fill_convention=` kwarg overrides the config for one run — the GA path passes
   no kwarg and therefore follows the config).
@@ -260,26 +273,35 @@ backtest:
   provenance `eval` block gained `fill_convention` as well, so a champion YAML
   says which convention produced its fitness.
 
-### The `close` arm is bit-identical — measured, not asserted
+### The `close` arm is bit-identical — measured, not asserted, and re-pinned to explicit `close`
 
 Same harness, two trees, byte comparison of **trades (timestamps, prices,
 quantity, PnL, cost), every per-genome equity point, and a fixed metrics digest**
-(`tools/p9_fill_convention_identity.py`):
+(`tools/p9_fill_convention_identity.py`, `--fill-convention close`). The shipped
+default is now `next_open`, so the historical convention is **requested by name**:
+the claim is "explicit `close` ≡ the pre-P9 engine", not "the default is
+`close`" — a default can be flipped back by accident, a named convention cannot.
 
 ```powershell
-python tools/p9_fill_convention_identity.py --tree C:\Users\23302\AppData\Local\Temp\p9_head_worktree --data-dir data --out %TEMP%\p9_id_head.json
-python tools/p9_fill_convention_identity.py --tree .                                            --data-dir data --out %TEMP%\p9_id_work.json
+python tools/p9_fill_convention_identity.py --tree %TEMP%\p9_landing_worktree --data-dir data --fill-convention close --out %TEMP%\p9_id_head.json
+python tools/p9_fill_convention_identity.py --tree .                              --data-dir data --fill-convention close --out %TEMP%\p9_id_work.json
 ```
 
 | run | tree | digest (sha256 of the payload) | trades | equity points |
 |---|---|---|---|---|
-| baseline | `git worktree` @ `cafdc1d` (HEAD, no `fill_convention` key at all) | `0d454ec490a45e030e32e901891de2e4825fba8a6d20d15c95f7abe1da072fdc` | 39 | 648 |
-| working | this tree, `fill_convention: close` | `0d454ec490a45e030e32e901891de2e4825fba8a6d20d15c95f7abe1da072fdc` | 39 | 648 |
+| baseline | `git worktree` @ `9571008` (P9-landing revision), explicit `close` | `0d454ec490a45e030e32e901891de2e4825fba8a6d20d15c95f7abe1da072fdc` | 39 | 648 |
+| working | this tree, explicit `close` | `0d454ec490a45e030e32e901891de2e4825fba8a6d20d15c95f7abe1da072fdc` | 39 | 648 |
+| working | this tree, explicit `next_open` | `8e67be53e59af17921da88be194d76af1bc8939686ef1913439d1225fa9951fb` | 39 | 648 |
 
-The payloads are **byte-identical** (real cached parquet, 2026-01-05→2026-02-01,
-BTCUSDT 1h, `sma`/`rsi` rules with `risk_exit`, isolated per-genome ledger,
-`benchmark_mode: none`). The same comparison runs as a standing test on a
-synthetic market (304 trades, digest
+The two `close` payloads are **byte-identical** (real cached parquet,
+2026-01-05→2026-02-01, BTCUSDT 1h, `sma`/`rsi` rules with `risk_exit`, isolated
+per-genome ledger, `benchmark_mode: none`) — the same digest recorded for the
+pre-P9 tree at `cafdc1d` when P9 landed, which is why the historical numbers are
+still reproducible. `next_open` on the same run is a **different digest with the
+same trade count and the same equity-point count** (return `−0.29 %` vs `−0.08 %`,
+Sharpe `−7.39` vs `−2.58`, max DD `0.35 %` vs `0.16 %`): the convention moves
+prices, not the number of decisions. The same `close` comparison also runs as a
+standing test on a synthetic market (304 trades, digest
 `1dbeb98857238263c7da185c8a69a3f868eeaa4bc9df5d99b280656f47eaf8a8` in both trees),
 so it cannot rot when the cache changes.
 
@@ -300,6 +322,12 @@ This is the same contract `reduce_conditions` already has with the hybrid engine
 ---
 
 ## 4. Deliverable 3 — the documented headline numbers, re-evaluated
+
+**Every number in this section (recorded champions, the P9 arm tables and the P8
+tables) was produced under `close`.** None of it was re-measured when the default
+was flipped: to reproduce any of it, set `backtest.fill_convention: close`
+explicitly (the shipped default is now `next_open`). The `close` arm of each
+comparison is the reproduction; the `next_open` arm is the measurement.
 
 ### 4.1 The champions behind the gate verdicts
 
@@ -415,14 +443,15 @@ gap is the basket, not the convention — stated rather than papered over.
 
 ## 5. Tests
 
-`tests/test_fill_convention.py` — **14 tests**, no network, no real-cache
+`tests/test_fill_convention.py` — **16 tests**, no network, no real-cache
 dependency except the identity harness's short run:
 
 | test | pins |
 |---|---|
-| `test_the_two_conventions_and_the_code_default` | `FILL_CONVENTIONS`, the code default `close`, key-absent ⇒ `close`, case/space tolerance |
+| `test_the_two_conventions_and_the_code_default` | `FILL_CONVENTIONS`, the code default **`next_open`**, key-absent ⇒ **`next_open`**, explicit `close` ⇒ `close`, case/space tolerance |
 | `test_an_unknown_convention_is_refused_by_name` | `UnknownFillConventionError` for `nextopen`/`open`/`next`/`""`/non-string |
-| `test_the_shipped_key_is_close` | `config/config.yaml` ships `close` and `Config.load` agrees |
+| `test_the_shipped_key_is_next_open` | **guard**: `config/config.yaml` ships `next_open` and `Config.load` agrees |
+| `test_an_absent_key_resolves_to_next_open` | **guard**: the key deleted from the shipped YAML (the pre-P9 shape) still resolves to `next_open` at config load |
 | `test_an_unknown_convention_is_rejected_at_config_load` | a temp `config.yaml` with `next-bar-open` raises **at load** |
 | `test_next_bar_open_is_the_following_row_and_none_at_the_window_end` | the primitive on a hand-computable frame (+23.81 bps); last bar ⇒ `None`; mid-bar timestamp resolves to the bar at/before it |
 | `test_next_open_shifts_entry_and_exit_by_exactly_one_bar` | engine-level: entry `close[k] → open[k+1]`, exit `close[k+1] → open[k+2]`, same decision bar, sizing follows the fill |
@@ -430,13 +459,17 @@ dependency except the identity harness's short run:
 | `test_an_entry_on_the_last_window_bar_is_refused_and_counted` | window-end entry: 1 trade at `close`, 0 at `next_open`, `unfilled_entries == 1` |
 | `test_an_exit_on_the_last_window_bar_falls_back_and_is_counted` | window-end exit: priced at the last close, `window_end_fallback_by_reason["max_hold"] == 1` |
 | `test_the_result_and_the_metrics_name_the_convention` (×2) | provenance field on the result **and** in the metrics |
-| `test_the_config_key_is_honoured_without_the_explicit_kwarg` | the GA path (no kwarg) follows the config, and really shifts |
+| `test_the_config_key_is_honoured_without_the_explicit_kwarg` | the GA path (no kwarg) follows the config — **both** values, with the `close` entry price asserted against `close[k]` (values unchanged) |
+| `test_an_absent_config_attribute_resolves_to_next_open` | **guard**, end to end: no attribute, no kwarg ⇒ `next_open` and the entry really is `open[k+1]` |
 | `test_the_hybrid_engine_never_prices_a_next_open_fill` | explicit `hybrid` raises; `auto` falls back to legacy, records it, and shifts |
-| `test_close_is_bit_identical_to_the_pre_p9_worktree` | the `git worktree` byte comparison of §3 |
+| `test_close_is_bit_identical_to_the_pre_p9_worktree` | the **explicit `close`** `git worktree` byte comparison of §3 |
 
 ---
 
 ## 6. Suite counts and hashes
+
+> This section is the **P9-landing session's** record (default `close`). The
+> default flip's own counts and hashes are in §6b, below.
 
 **Suite** (both runs on the final tree):
 
@@ -487,30 +520,138 @@ own table: every edit to it changes its own hash.)
 
 ---
 
-## 7. Recommendation, and the README wording for the Lead
+## 6b. The default flip — counts and hashes (this revision)
 
-**Recommendation: leave `backtest.fill_convention: close` shipped.** The convention
-is a *modelling assumption*, not a bug: `close` is the historical baseline every
-recorded number was produced under. The measurement says the conventional
-alternative is **worse for 10 of the 12 arm × timeframe pairs** on this cache (and
-for 3/3 champions and 4/4 P8 windows), so flipping it would
-(a) invalidate every previously recorded champion/fitness/DSR/P8 number and
-(b) make the strategies look worse, without any compensating claim. The honest
-statement is: **the engine's numbers carry a one-bar-free execution assumption, and
-the alternative costs 2.7–7.1 bps per trade and 0.19–0.36 pp of two-month return
-on the tested sample.** If the owner wants a latency-realistic headline, the
-measurement is the input; the switch is theirs.
+**Suite** (two consecutive runs on the flipped tree):
 
-**README wording for the Lead** (not edited here — `README.md` is owned by the
-Lead):
+```powershell
+python -m pytest tests/ -q -p no:cacheprovider
+#   1544 passed, 4 warnings in 388.72 s
+#   1544 passed, 4 warnings in 388.29 s
+python -m compileall -q app core web db scripts tools     # exit 0
+python scripts/regen_route_baseline.py --check            # 121 / 121, added 0, removed 0
+```
 
-> **Backtest fills are latency-free by default.** The backtest engine prices every
-> fill — entry and exit — at the close of the bar that produced the signal (zero
-> execution latency). `backtest.fill_convention: next_open` moves the fill to the
-> open of the following bar (signals unchanged); it costs **2.7–7.1 bps per trade**
-> and **0.19–0.36 pp of two-month return** on the tested sample and invalidates
-> every previously recorded backtest/champion number, so it ships **off**. See
-> `docs/overhaul/P9_FILL_CONVENTION_EVIDENCE.md`.
+1542 → **1544**: `tests/test_fill_convention.py` gains two guard tests
+(`test_an_absent_key_resolves_to_next_open`,
+`test_an_absent_config_attribute_resolves_to_next_open`) and no test is deleted.
+
+**Re-pinned, not deleted** (every `close` value unchanged):
+
+| file | what changed | what it still proves |
+|---|---|---|
+| `tests/test_fill_convention.py` | code default + absent-key ⇒ `next_open`; shipped-key guard renamed; the bit-identity test runs the harness with `--fill-convention close`; the config-seam test now pins **both** values | explicit `close` ≡ pre-P9 engine (byte digest); the default cannot silently regress |
+| `tests/test_engine_parity_variants.py` | `_config()` pins `backtest_fill_convention = "close"` | legacy ↔ hybrid parity, which is only defined on `close` (hybrid has no fill seam) |
+| `tests/test_hybrid_equivalence.py` | same pin in the trade-for-trade gate | idem |
+| `tests/test_hybrid_condition_logic.py` | same pin in `_config()` | idem |
+| `tests/test_p7_orchestrator.py` | the worktree harness passes `fill_convention="close"` where the signature has it | pre-S3 byte identity, on the convention those numbers used |
+| `tests/test_ga_benchmark_mode.py` | the worktree harness pins the config attribute to `close` | pre-`benchmark_mode` byte identity, idem |
+| `tests/test_p7_symbol_mode.py` | comment only (the harness stubs the scorer; the key is scrubbed) | unchanged |
+
+**Identity (the `close` path), re-run — §3:**
+
+```
+python tools/p9_fill_convention_identity.py --tree <worktree@9571008> --data-dir data --fill-convention close
+    0d454ec490a45e030e32e901891de2e4825fba8a6d20d15c95f7abe1da072fdc   (39 trades, 648 equity points)
+python tools/p9_fill_convention_identity.py --tree .                  --data-dir data --fill-convention close
+    0d454ec490a45e030e32e901891de2e4825fba8a6d20d15c95f7abe1da072fdc   (39 trades, 648 equity points)
+python tools/p9_fill_convention_identity.py --tree .                  --data-dir data --fill-convention next_open
+    8e67be53e59af17921da88be194d76af1bc8939686ef1913439d1225fa9951fb   (39 trades, 648 equity points)
+```
+
+The `close` digest is the one recorded when P9 landed, so the numbers in §4 (and
+in `ALGO_UPGRADE_EVIDENCE.md` / the P8 tables) are reproduced **by setting `close`
+explicitly** — no re-measurement was performed for the flip.
+
+**One short real run, shipped default vs explicit `close`** (cached parquet,
+BTCUSDT 1h, 2026-01-05→2026-02-01, the §3 strategy and inputs):
+
+| arm | resolved convention (result / metrics / accounting) | trades | return % | Sharpe | max DD % |
+|---|---|---|---|---|---|
+| shipped config, no kwarg | `next_open` / `next_open` / `next_open` | 39 | −0.29 | −7.39 | 0.35 |
+| explicit `close` | `close` / `close` / `close` | 39 | −0.08 | −2.58 | 0.16 |
+| Δ (`next_open` − `close`) | — | 0 | **−0.21 pp** | **−4.81** | **+0.19 pp** |
+
+Mean per-trade entry-price shift over the 39 matched trades: **−0.0013 bps** — the
+level is untouched, the cost is timing, exactly the §2 finding.
+
+**`sha256_16` per file (before → after), measured in this session** (the worktree
+mixes LF and CRLF checkouts, so each "before" is the on-disk byte hash of the file
+as it stood before this session's edit; it equals the LF blob or the CRLF checkout
+of `9195045` accordingly):
+
+| file | before | after |
+|---|---|---|
+| `config/config.yaml` | `0d51ae38801770d2` | `7ecfcd7596bb400b` |
+| `app/config.py` | `3be3631f625bda34` | `25a42fb938ffccef` |
+| `core/backtest/engine.py` | `6bcd09bfe27a91e9` | `2a5c54dbc0deebf1` |
+| `core/backtest/fill_convention.py` | `61002b4518faba46` | `2c720b10cc1cfd7b` |
+| `core/ga/evolver.py` | `4bf3b12453bccda0` | `558a823db43552d0` |
+| `tools/p9_fill_convention_identity.py` | `716afde3002ed612` | `1b50a46ec276e6b7` |
+| `tools/p9_fill_convention_measure.py` | `c92d0e385ad51306` | `7550a5255c3a68ef` |
+| `tools/p9_champion_regate.py` | `ea6df4d92cf3054b` | `6fb9c5c57a8eac26` |
+| `tests/test_fill_convention.py` | `36befc0d1fad75dd` | `b152700344c5ae8d` |
+| `tests/test_p7_orchestrator.py` | `96a1ed8215f2fa7c` | `25208d3054a00fd9` |
+| `tests/test_ga_benchmark_mode.py` | `76819cd064bbeda5` | `f22c6783d77d3b11` |
+| `tests/test_p7_symbol_mode.py` | `3026796092dd0d7c` | `7d8157672c1ff08a` |
+| `tests/test_engine_parity_variants.py` | `a6769d02c8871c9e` | `c4e656ecad79a9ea` |
+| `tests/test_hybrid_equivalence.py` | `d397c006437b7cfa` | `24da5b2e9088469e` |
+| `tests/test_hybrid_condition_logic.py` | `b5b0155dc055537c` | `e6571202a49fe3d6` |
+| `docs/operations.md` | `b27e94ff33d7ea0a` | `2d33f13c5bf1cf9d` |
+| `docs/research/CORE_ALGORITHMS.md` | `ec2443964eafa391` | `8e8725dc93c8f553` |
+| `README.md` | `d72b59dd36459f2e` | `5dd5eed97ba27346` |
+| `README_EN.md` | `efe3a716aa93a345` | `fbd862691a66e891` |
+
+`config/config.yaml` is the only shipped *behaviour* input that changed, and the
+value moved `close → next_open`. `data/binance_trader.db`, `strategies/**`,
+`docs/overhaul/ALGO_UPGRADE_EVIDENCE.md` and `docs/overhaul/P7_REGIME_PLAN.md`
+were not written; the GA was not re-run and no measurement in §4 was redone.
+
+---
+
+## 7. The decision: the default is flipped
+
+**Operator decision (this revision): the shipped default is `next_open`.** The
+measurement above was the input, not the verdict: it says the conventional
+alternative is **worse for 10 of the 12 arm × timeframe pairs** on this cache
+(and for 3/3 champions and 4/4 P8 windows) — and that is exactly why a platform
+whose value is *measurement discipline* must not ship the convention that
+flatters results. `close` is a modelling assumption, not a bug, and it remains
+selectable and bit-identical to the pre-P9 engine; it is simply no longer the
+value a config gets by staying silent.
+
+The consequence, stated plainly: **every backtest / GA / champion / P8 number
+recorded before this flip was produced under `close`, and can only be compared
+with a run that sets `close` explicitly.** Nothing is invalidated as a
+measurement — the label on it changes from "default" to "historical".
+
+The paragraph below is the pre-flip recommendation, kept as the record of what the
+measurement argued (it argued against flipping; the operator decided otherwise):
+
+> **Recommendation (superseded): leave `backtest.fill_convention: close` shipped.**
+> The convention is a *modelling assumption*, not a bug: `close` is the historical
+> baseline every recorded number was produced under. The measurement says the
+> conventional alternative is **worse for 10 of the 12 arm × timeframe pairs** on
+> this cache (and for 3/3 champions and 4/4 P8 windows), so flipping it would
+> (a) invalidate every previously recorded champion/fitness/DSR/P8 number and
+> (b) make the strategies look worse, without any compensating claim. The honest
+> statement is: **the engine's numbers carry a one-bar-free execution assumption,
+> and the alternative costs 2.7–7.1 bps per trade and 0.19–0.36 pp of two-month
+> return on the tested sample.** If the owner wants a latency-realistic headline,
+> the measurement is the input; the switch is theirs.
+
+**README wording actually shipped** (see `README.md` / `README_EN.md`, backtest
+engine section):
+
+> **Backtest fills are not latency-free: the shipped convention is `next_open`.**
+> The backtest engine prices every fill — entry and exit — at the **open of the
+> bar after the signal bar** (`backtest.fill_convention: next_open`, the shipped
+> default). `close` — the signal bar's own close, i.e. zero execution latency —
+> stays selectable and is bit-identical to the pre-P9 engine, because every
+> backtest / GA / P8 number recorded before this default was flipped was produced
+> under it; set `close` explicitly to reproduce those. The one-bar shift costs
+> **2.7–7.1 bps per trade** and **0.19–0.36 pp of two-month return** on the tested
+> sample. See `docs/overhaul/P9_FILL_CONVENTION_EVIDENCE.md`.
 
 ---
 

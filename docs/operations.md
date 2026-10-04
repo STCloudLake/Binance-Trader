@@ -89,7 +89,7 @@ usage: main.py [-h] [--mode {sim,live,backtest}] [--port PORT] [--db DB]
 | `ai.mode` / `ai.model` | `full_auto` / `deepseek-v4-flash` | `semi_auto` / `full_auto`；LLM 模型名 |
 | `signal_weights.*` | `indicator 0.5 / ml 0.3 / news 0.2` | 信号融合权重 |
 | `backtest.engine_mode` / `ml_enabled` | `auto` / `false` | 引擎选择（非法值回退 `auto`）；false 时会就地关掉策略的 `ml_config.enabled` |
-| `backtest.fill_convention` | `close` | **成交口径**：`close` = 信号那根 bar 自己的收盘价（零执行延迟，出厂默认）；`next_open` = 信号不变、成交价（**开仓与平仓同时**）取同一序列上一根 bar 的 `open`。非法值在**配置加载时**抛具名 `UnknownFillConventionError`。**翻成 `next_open` 会让所有历史回测/冠军数字作废**（实测差额见 `docs/overhaul/P9_FILL_CONVENTION_EVIDENCE.md`）。窗口最后一根 bar 无下一根时：开仓拒绝并计数、平仓回落收盘价并计数（`metrics["fill_convention_accounting"]`）；hybrid 引擎不支持 `next_open`，会具名报错 |
+| `backtest.fill_convention` | `next_open` | **成交口径**：`next_open` = 信号不变、成交价（**开仓与平仓同时**）取同一序列上一根 bar 的 `open`（**出厂默认**，一根 bar 的执行延迟）；`close` = 信号那根 bar 自己的收盘价（零执行延迟，**历史口径**，只能显式指定）。非法值在**配置加载时**抛具名 `UnknownFillConventionError`；**缺键解析为 `next_open`**（改动前的配置不会静默用回旧口径）。**本键翻转前记录的所有回测/冠军/P8 数字都在 `close` 下产生，只有显式设 `close` 才能复现**（实测差额见 `docs/overhaul/P9_FILL_CONVENTION_EVIDENCE.md`）。窗口最后一根 bar 无下一根时：开仓拒绝并计数、平仓回落收盘价并计数（`metrics["fill_convention_accounting"]`）；hybrid 引擎不支持 `next_open`，会具名报错 |
 | `ga.benchmark_mode` | `exposure_matched` | 发布门消费哪个基准，见 §5.4 |
 | `ga.keep_checkpoint` | `true` | 干净完成后是否保留检查点，见 §5.5 |
 | `sim.cost_model.*` | `enabled: true`、`fee_tier: VIP0`、`slippage_bps: 2` | 模拟盘成本模型 |
@@ -432,7 +432,7 @@ python scripts/download_history.py --symbols BTCUSDT,ETHUSDT --intervals 1h --st
 | 结构 | 单循环遍历时间线 | `SignalMatrixBuilder` 预生成信号矩阵 → `EventDrivenExecutor` 回放 |
 | ML | 支持 LightGBM / TFT / PatchTST | **不支持**（`_select_engine` 直接抛 `ValueError`） |
 | 部分减仓 `reduce_conditions` | 支持 | **不支持** |
-| 成交口径 `backtest.fill_convention` | `close` 与 `next_open` 都支持 | **只支持 `close`**；`next_open` 抛具名 `FillConventionUnsupportedError`（它没有这条缝，而不是静默按旧口径成交） |
+| 成交口径 `backtest.fill_convention` | `close` 与 `next_open` 都支持 | **只支持 `close`**；`next_open` 抛具名 `FillConventionUnsupportedError`（它没有这条缝，而不是静默按旧口径成交）。出厂默认已是 `next_open`，因此显式 `engine_mode: hybrid` 会在配置加载后直接报错，`auto` 则回退 legacy 并把回退记进 `fill_convention_accounting["engine_fallback"]` |
 
 两者共用 `core/strategy/evaluation_kernel.py` 与 `core/backtest/trade_book.py::close_position`。
 `backtest.engine_mode: auto`（默认）下：策略数 ≥ 3 且无 ML、无 `reduce_conditions` → hybrid，否则 legacy；

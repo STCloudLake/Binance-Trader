@@ -79,6 +79,11 @@ def _config(mode: str):
     # Neutralise fusion (100 % indicator) so the matrix threshold is the
     # indicator sign — the same neutralisation the other parity gates use.
     config.signal_weights = SignalWeights(indicator=1.0, ml=0.0, news=0.0)
+    # P9 re-pin: this gate compares legacy against the hybrid engine, which has no
+    # fill seam and prices the decision bar's close.  The shipped default is now
+    # `next_open`, so the one convention both engines share is requested
+    # explicitly here (values unchanged, the comparison stays apples-to-apples).
+    config.backtest_fill_convention = "close"
     return config
 
 

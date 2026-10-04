@@ -1,17 +1,18 @@
 """P9 bit-identity harness — the same run, two trees, one digest.
 
 This file is BOTH a runnable tool and the harness the test
-``tests/test_fill_convention.py::test_close_is_bit_identical_to_the_head_worktree``
+``tests/test_fill_convention.py::test_close_is_bit_identical_to_the_pre_p9_worktree``
 copies into a temp dir and executes inside a ``git worktree`` checked out at the
 pre-P9 revision.  One source of truth, so the proof in the evidence document and
 the standing test can never drift apart.
 
 What it does
 ------------
-Runs ONE deterministic backtest with the default fill convention (the config's
-``backtest.fill_convention``; the pre-P9 baseline has no such key at all, which is
-the "key absent" case) and writes every *traded fact* to a JSON payload, then
-prints its ``sha256``:
+Runs ONE deterministic backtest with an **explicitly selected fill convention**
+(``--fill-convention``, default ``close``: the historical convention whose
+bit-identity with the pre-P9 engine is the claim being checked — the shipped
+default is now ``next_open``, which by construction produces different bytes) and
+writes every *traded fact* to a JSON payload, then prints its ``sha256``:
 
 * every trade's signal/exit timestamps, prices, PnL and cost;
 * every per-genome equity point (the GA ledger shape);
@@ -19,18 +20,24 @@ prints its ``sha256``:
   (``fill_convention`` / ``fill_convention_accounting`` are excluded, because the
   baseline cannot have them — their presence is asserted separately).
 
-Two trees producing the same digest means the default path is bit-identical: not
-"equivalent", the same bytes.
+The convention is requested through the ``fill_convention=`` kwarg where the
+target tree's engine has that parameter, and through
+``config.backtest_fill_convention`` where it does not (the pre-P9 tree has
+neither; there ``close`` is the only behaviour there is, so the requested value is
+asserted to be ``close`` and nothing is passed).  Two trees producing the same
+digest means the selected path is bit-identical: not "equivalent", the same bytes.
 
 Usage::
 
     python tools/p9_fill_convention_identity.py --tree . --data-dir data --out %TEMP%\\id.json
     python tools/p9_fill_convention_identity.py --tree <worktree> --data-dir data --out %TEMP%\\id_head.json
+    python tools/p9_fill_convention_identity.py --tree . --fill-convention next_open --out %TEMP%\\id_next.json
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -62,6 +69,10 @@ def main() -> int:
     parser.add_argument("--start", default="2026-01-05")
     parser.add_argument("--end", default="2026-02-01")
     parser.add_argument("--timeframe", default="1h")
+    parser.add_argument("--fill-convention", default="close",
+                        help="explicit convention for this run (default: close, "
+                             "the historical convention this harness proves "
+                             "reproducible; the shipped default is next_open)")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
@@ -82,9 +93,27 @@ def main() -> int:
     cfg.backtest_engine_mode = "legacy"
     cfg.backtest_ml_enabled = False
     cfg.backtest_live_spread_enabled = False
+    # EXPLICIT convention.  The shipped default is `next_open`; the claim checked
+    # here is the `close` path's bit-identity with the pre-P9 engine, so the
+    # historical convention is requested by name rather than inherited.  A tree
+    # with the P9 seam honours this; a pre-P9 tree ignores the attribute (there
+    # `close` is the only behaviour that exists).
+    cfg.backtest_fill_convention = args.fill_convention
     bus = EventBus()
     engine = BacktestEngine(cfg, None, RiskManager(cfg, bus),
                             OrderExecutor(cfg, bus))
+
+    # Passed as the run kwarg where the tree's signature has the parameter (the
+    # strongest form of "explicit"); a pre-P9 tree cannot accept it, and there the
+    # request must be `close` — the convention it already prices.
+    run_kwargs = {}
+    if "fill_convention" in inspect.signature(
+            engine.run_with_exit_evaluation).parameters:
+        run_kwargs["fill_convention"] = args.fill_convention
+    elif args.fill_convention != "close":
+        raise SystemExit(
+            f"this tree has no fill-convention seam: {args.fill_convention!r} "
+            "cannot be run here (only the historical 'close')")
 
     strategy = StrategyConfig(
         name="p9_identity", enabled=True, mode="trend",
@@ -101,9 +130,21 @@ def main() -> int:
         strategies=[strategy], symbols=[args.symbols],
         date_start=args.start, date_end=args.end, initial_balance=10_000.0,
         mode="full", simulate_ai_weights=False, per_strategy_isolation=True,
-        per_genome_ledger=True, use_live_spread=False, benchmark_mode="none")
+        per_genome_ledger=True, use_live_spread=False, benchmark_mode="none",
+        **run_kwargs)
 
     metrics = result.get("metrics") or {}
+
+    # The convention the run actually resolved is part of the PROOF, not of the
+    # compared payload (the baseline tree cannot report it) — printed on stderr so
+    # a reader of this tool's output can see the historical path was selected.
+    resolved = (result.get("fill_convention")
+                or (metrics.get("fill_convention_accounting") or {}).get("convention")
+                or "unreported (pre-P9 tree)")
+    sys.stderr.write(
+        f"resolved fill_convention = {resolved} "
+        f"(requested {args.fill_convention!r})\n")
+
     payload = {
         "trades": [{"opened_at": str(t.get("opened_at")),
                     "closed_at": str(t.get("closed_at")),

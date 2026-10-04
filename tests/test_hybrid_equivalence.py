@@ -119,6 +119,11 @@ def test_hybrid_matches_legacy_trade_for_trade():
     config.backtest_ml_enabled = False
     # Neutralise signal fusion: 100 % indicator, 0 % ML, 0 % news.
     config.signal_weights = SignalWeights(indicator=1.0, ml=0.0, news=0.0)
+    # P9 re-pin: the shipped default is now `next_open`, but the hybrid engine has
+    # no fill seam (it prices the decision bar's close).  This gate compares the
+    # two engines on the ONE convention they share, so `close` is explicit here
+    # and every previously compared value stays identical.
+    config.backtest_fill_convention = "close"
 
     # Create a loader pointing to a temp dir for strategy storage only.
     import tempfile

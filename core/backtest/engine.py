@@ -311,17 +311,19 @@ class BacktestEngine:
                 ``d9849a2``).  The orchestrator **never** sizes or routes.
             fill_convention: ``backtest.fill_convention`` for THIS run (``None``
                 = read ``config.backtest_fill_convention``, which itself defaults
-                to the code default ``close``).  See
+                to the code default ``next_open``).  See
                 :mod:`core.backtest.fill_convention`:
-                ``close`` (the shipped default) fills at the decision bar's own
-                close — bit-identical to the pre-P9 engine; ``next_open`` leaves
-                every signal exactly where it was and prices the fill (entry AND
-                exit) from the open of the bar **one row later on the same
-                series** — the strategy's primary/shortest timeframe for an
-                entry, the timeframe whose close supplied the exit price for an
-                exit.  An entry whose next bar falls outside the loaded window is
-                REFUSED and counted (``unfilled_entries``); an exit with no next
-                bar is priced at the decision bar's close and counted
+                ``next_open`` (the shipped default) leaves every signal exactly
+                where it was and prices the fill (entry AND exit) from the open of
+                the bar **one row later on the same series** — the strategy's
+                primary/shortest timeframe for an entry, the timeframe whose close
+                supplied the exit price for an exit.  ``close`` is the
+                **historical** convention — the fill is the decision bar's own
+                close, bit-identical to the pre-P9 engine, kept so numbers
+                recorded before the flip can be reproduced by selecting it
+                explicitly.  An entry whose next bar falls outside the loaded
+                window is REFUSED and counted (``unfilled_entries``); an exit with
+                no next bar is priced at the decision bar's close and counted
                 (``window_end_fallback_fills``).  Both counters, the convention
                 and the exit-reason breakdown are reported under
                 ``metrics["fill_convention_accounting"]`` and returned as

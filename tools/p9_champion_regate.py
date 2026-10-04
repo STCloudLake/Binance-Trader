@@ -2,11 +2,12 @@
 
 The champions in ``strategies/`` carry the numbers they were selected and gated
 on (``provenance.fitness_components`` + ``provenance.validation``).  Those numbers
-were produced under the shipped fill convention ``close`` (the engine priced every
-fill at the decision bar's own close).  This tool re-evaluates the **same champion
-strategies, on the same windows, symbols and costs, with the GA's own scoring
-path**, twice — once per convention — and reports the deltas plus whether the
-publication-gate verdict changes.
+were produced under the historical fill convention ``close`` (the engine priced
+every fill at the decision bar's own close; it was the shipped default until the
+P9 follow-up flipped that default to ``next_open``).  This tool re-evaluates the
+**same champion strategies, on the same windows, symbols and costs, with the GA's
+own scoring path**, twice — once per convention — and reports the deltas plus
+whether the publication-gate verdict changes.
 
 What is *exactly* reproduced, and what is not
 ---------------------------------------------

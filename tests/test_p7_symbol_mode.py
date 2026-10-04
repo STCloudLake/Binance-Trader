@@ -718,8 +718,9 @@ VOLATILE = {"written_at", "elapsed", "elapsed_seconds", "saved_at",
             "symbols_evaluated",
             # P9: the champion provenance `eval` block gained `fill_convention`.
             # It is not part of the S2 contract, the baseline tree cannot have it,
-            # and it is constant ("close") in every tree here — so it is scrubbed
-            # from both sides rather than compared.
+            # and this harness runs no backtest at all (the scorer is stubbed), so
+            # its value here is whatever the stub config resolves to and carries no
+            # result — it is scrubbed from both sides rather than compared.
             "fill_convention"}
 
 

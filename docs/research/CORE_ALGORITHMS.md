@@ -2431,9 +2431,9 @@ $med(t)$ 在 $v(t)$ 追加**之前**计算，所以当前样本不会移动自�
 
 ## 13. 成交口径（P9：fill convention）
 
-**一句话.** `backtest.fill_convention` 决定**一笔成交按哪根 bar 的哪个价成交**：`close`（出厂默认）用**信号那根 bar 自己的收盘价**——即"看见收盘价就按这个价成交"，**零执行延迟**；`next_open` 信号不动（仍在 `ts` 那根 bar 上判定），但成交价（**开仓与平仓同时**）取**同一时间序列上前一根 bar 的 `open`**。这条口径**只影响回测/GA 的计价**，不改任何信号、仓位规则或实盘路径。
+**一句话.** `backtest.fill_convention` 决定**一笔成交按哪根 bar 的哪个价成交**：`next_open`（**出厂默认**）信号不动（仍在 `ts` 那根 bar 上判定），但成交价（**开仓与平仓同时**）取**同一时间序列上前一根 bar 的 `open`**（一根 bar 的执行延迟，诚实的口径）；`close` 用**信号那根 bar 自己的收盘价**——即"看见收盘价就按这个价成交"，**零执行延迟**，是**历史口径**，只能显式指定。这条口径**只影响回测/GA 的计价**，不改任何信号、仓位规则或实盘路径。
 
-**为什么必须知道它.** `close` 是这套引擎历史上唯一的计价方式（`core/backtest/engine.py:1541` 的 `price = float(df_primary["close"].iloc[-1])`），因此**所有已记录的冠军、fitness、Sharpe、DSR、P8 对照数字都是在零延迟假设下得到的**。把它翻成 `next_open` 会**让这些数字全部作废**（不同口径不可比），所以出厂值保持 `close`，是否翻转由 owner 决定；实测差额与每个数字的逐条对照见 `docs/overhaul/P9_FILL_CONVENTION_EVIDENCE.md`。
+**为什么必须知道它.** `close` 是这套引擎历史上唯一的计价方式（`core/backtest/engine.py:1541` 的 `price = float(df_primary["close"].iloc[-1])`），因此**所有在本次翻转之前记录的冠军、fitness、Sharpe、DSR、P8 对照数字都是在零延迟假设下、即 `close` 口径下得到的**；`close` 与改前引擎逐位一致，**只有显式设 `backtest.fill_convention: close` 才能复现它们**（缺键现在解析为 `next_open`，不再回落到旧口径）。翻转本身不改这些测量的数值，只改它们与"默认配置"的关系；实测差额与每个数字的逐条对照见 `docs/overhaul/P9_FILL_CONVENTION_EVIDENCE.md`。
 
 **边界（明写的）.** 窗口最后一根 bar 没有下一根：**开仓被拒绝并计数**（`unfilled_entries`），**平仓回落到该 bar 收盘价并计数**（`window_end_fallback_fills`，按 exit reason 分解）——两者都不静默。hybrid 引擎没有这条缝，`next_open` 跑到 hybrid 上会**具名报错**（`FillConventionUnsupportedError`）而不是假装按新口径成交。
 
