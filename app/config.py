@@ -678,6 +678,20 @@ class Config:
             self.backtest_engine_mode = "auto"
         self.backtest_ml_enabled = bt.get("ml_enabled", False) if isinstance(bt, dict) else False
 
+        # ── P9: the fill convention (`backtest.fill_convention`) ──────────────
+        # WHEN a fill is priced: `close` (shipped — the signal bar's own close,
+        # zero execution latency, bit-identical to the pre-P9 engine) or
+        # `next_open` (signal unchanged, fill = the open of the bar one row later
+        # on the same series; entry AND exit shift together).  Parsed here — at
+        # config load — so an unknown value raises the NAMED
+        # `UnknownFillConventionError` where the operator can see it, instead of
+        # silently selecting a convention and producing different numbers.
+        # The key being absent means `close`, so a config written before P9 keeps
+        # the historical behaviour exactly.
+        from core.backtest.fill_convention import parse_fill_convention
+        self.backtest_fill_convention = parse_fill_convention(
+            bt.get("fill_convention") if isinstance(bt, dict) else None)
+
         # Cost model: trading fees + spread.  ``spread_pct`` is only the
         # *override* table now — a symbol that is not listed there is resolved
         # live from the public order book and finally falls back to

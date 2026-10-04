@@ -1020,7 +1020,19 @@ class GAStrategyEvolver:
             "validation": validation,
             "published": published,
             "rejection_reasons": rejection_reasons,
-            "eval": {"engine_mode": "legacy", "use_live_spread": False},
+            # `fill_convention` (P9) travels with the champion: a fitness/Sharpe
+            # recorded under `close` is NOT comparable with one recorded under
+            # `next_open` (`backtest.fill_convention`, see
+            # docs/overhaul/P9_FILL_CONVENTION_EVIDENCE.md), so the artefact names
+            # the convention its own numbers were produced under.
+            "eval": {
+                "engine_mode": "legacy",
+                "use_live_spread": False,
+                "fill_convention": getattr(
+                    getattr(self.engine, "config", None),
+                    "backtest_fill_convention", "close"),
+            },
+
             "written_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
         if self._symbol_mode == PER_SYMBOL:

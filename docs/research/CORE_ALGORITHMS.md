@@ -71,6 +71,7 @@
     - 12.5 [P6-C 广度：市场级量能](#125-p6-c-广度市场级量能)
     - 12.6 [P6-D：GA 量能模板、基因与可执行性模型](#126-p6-dga-量能模板基因与可执行性模型)
     - 12.7 [P6 没有做到的事](#127-p6-没有做到的事)
+13. [成交口径（P9：fill convention）](#13-成交口径p9fill-convention)
 
 ---
 
@@ -2425,6 +2426,16 @@ $med(t)$ 在 $v(t)$ 追加**之前**计算，所以当前样本不会移动自�
 **诚实结论.** 编排器**降低了回撤（2.5145 → 2.2615 %）与在场时间（70.69 → 66.74 %）**，但**也降低了收益（−1.76 → −2.00 %）和 Sharpe（−2.74 → −4.29）**：它拒掉的是**净盈利**的敞口（+24.3 USDT，胜率 44 %），而不是净亏损的敞口；两臂的 **DSR 都是 0.0**（不存在可发表的显著性）。这与 S1 的结论一致——**削曝光是稳的，削对曝光不是**。本条是 S4 的预览而非 S4：组合体资金曲线契约、对 `exposure_matched`/`buy_hold` 的同口径比较、`--holdout` 一次性访问计数都还是 S4 的交付物。
 
 **未接线 / 未启用.** `ai.orchestrator.enabled: false`（shipped）时 `decide` 恒为 allow 且**不读**波动率序列与广度序列；实盘 `StrategyEngine` 另需 `experimental.regime_orchestrator_live: true` **且**调用方 `wire_regime_orchestrator(...)` 注册（生产链路**没有**注册者）；回测引擎只在调用方显式传 `orchestrator=` 时读取。关闭路径的逐位一致由 `tests/test_p7_orchestrator.py` 用 `git worktree` 在 `d9849a2` 上比对成交、逐点资金曲线与指标键集合。
+
+---
+
+## 13. 成交口径（P9：fill convention）
+
+**一句话.** `backtest.fill_convention` 决定**一笔成交按哪根 bar 的哪个价成交**：`close`（出厂默认）用**信号那根 bar 自己的收盘价**——即"看见收盘价就按这个价成交"，**零执行延迟**；`next_open` 信号不动（仍在 `ts` 那根 bar 上判定），但成交价（**开仓与平仓同时**）取**同一时间序列上前一根 bar 的 `open`**。这条口径**只影响回测/GA 的计价**，不改任何信号、仓位规则或实盘路径。
+
+**为什么必须知道它.** `close` 是这套引擎历史上唯一的计价方式（`core/backtest/engine.py:1541` 的 `price = float(df_primary["close"].iloc[-1])`），因此**所有已记录的冠军、fitness、Sharpe、DSR、P8 对照数字都是在零延迟假设下得到的**。把它翻成 `next_open` 会**让这些数字全部作废**（不同口径不可比），所以出厂值保持 `close`，是否翻转由 owner 决定；实测差额与每个数字的逐条对照见 `docs/overhaul/P9_FILL_CONVENTION_EVIDENCE.md`。
+
+**边界（明写的）.** 窗口最后一根 bar 没有下一根：**开仓被拒绝并计数**（`unfilled_entries`），**平仓回落到该 bar 收盘价并计数**（`window_end_fallback_fills`，按 exit reason 分解）——两者都不静默。hybrid 引擎没有这条缝，`next_open` 跑到 hybrid 上会**具名报错**（`FillConventionUnsupportedError`）而不是假装按新口径成交。
 
 ---
 

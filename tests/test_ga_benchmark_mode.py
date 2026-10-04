@@ -743,10 +743,16 @@ FIT_KEYS = ["fitness", "fitness_base", "fitness_alpha", "sharpe", "deflated_shar
             "max_dd", "trade_count", "profit_factor", "raw_profit_factor",
             "buy_hold_pct", "alpha_vs_buy_hold_pct"]
 provenance = run["provenance"]
+# P9: `eval` gained a `fill_convention` key (the convention the fitness was
+# produced under).  It is not part of the `benchmark_mode` contract this harness
+# compares, and the baseline revision cannot have it, so it is removed from BOTH
+# sides before the byte comparison; every other key of `eval` is still compared.
+eval_block = {k: v for k, v in (provenance.get("eval") or {}).items()
+              if k != "fill_convention"}
 payload = {
     "scored": scored,
     "gate": {"published": published, "reasons": reasons},
-    "provenance": {k: provenance.get(k) for k in PROV_KEYS},
+    "provenance": {**{k: provenance.get(k) for k in PROV_KEYS}, "eval": eval_block},
     "fitness_components": {k: provenance["fitness_components"].get(k) for k in FIT_KEYS},
     "run": {"published": run["published"], "rejection_reasons": run["rejection_reasons"],
             "fitness": run["fitness"], "sharpe": run["sharpe"]},

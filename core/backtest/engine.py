@@ -9,6 +9,11 @@ from core.backtest.metrics import calculate_metrics
 from core.backtest.engine_hybrid import run_hybrid
 from core.backtest.signal_matrix import NO_MARKET_DATA_MESSAGE
 from core.backtest.cost_model import apply_trading_costs
+from core.backtest.fill_convention import (
+    FillConventionUnsupportedError,
+    next_bar_open,
+    parse_fill_convention,
+)
 from core.backtest.trade_book import close_position
 from core.ga.benchmark import (
     COMPUTED_BENCHMARK_MODES,
@@ -232,7 +237,8 @@ class BacktestEngine:
             progress_callback=None,
             strategy_symbols: dict[str, list[str]] = None,
             simulate_ai_weights: bool = True,
-            spread_overrides: dict | None = None) -> dict:
+            spread_overrides: dict | None = None,
+            fill_convention: str | None = None) -> dict:
         """Alias for run_with_exit_evaluation (parameter order matches)."""
         return self.run_with_exit_evaluation(
             strategies, symbols, date_start, date_end,
@@ -240,7 +246,8 @@ class BacktestEngine:
             progress_callback=progress_callback,
             strategy_symbols=strategy_symbols,
             simulate_ai_weights=simulate_ai_weights,
-            spread_overrides=spread_overrides)
+            spread_overrides=spread_overrides,
+            fill_convention=fill_convention)
 
     def run_with_exit_evaluation(self, strategies, symbols, date_start, date_end,
                                   initial_balance=10000.0, mode="full",
@@ -254,7 +261,8 @@ class BacktestEngine:
                                   use_live_spread: bool = True,
                                   per_genome_ledger: bool | None = None,
                                   benchmark_mode: str | None = None,
-                                  orchestrator=None):
+                                  orchestrator=None,
+                                  fill_convention: str | None = None):
         """Full backtest with ML predictions, signal fusion, and risk controls.
 
         Args:
@@ -301,8 +309,44 @@ class BacktestEngine:
                 default run is bit-identical to the pre-S3 build
                 (``tests/test_p7_orchestrator.py`` pins a ``git worktree`` at
                 ``d9849a2``).  The orchestrator **never** sizes or routes.
+            fill_convention: ``backtest.fill_convention`` for THIS run (``None``
+                = read ``config.backtest_fill_convention``, which itself defaults
+                to the code default ``close``).  See
+                :mod:`core.backtest.fill_convention`:
+                ``close`` (the shipped default) fills at the decision bar's own
+                close — bit-identical to the pre-P9 engine; ``next_open`` leaves
+                every signal exactly where it was and prices the fill (entry AND
+                exit) from the open of the bar **one row later on the same
+                series** — the strategy's primary/shortest timeframe for an
+                entry, the timeframe whose close supplied the exit price for an
+                exit.  An entry whose next bar falls outside the loaded window is
+                REFUSED and counted (``unfilled_entries``); an exit with no next
+                bar is priced at the decision bar's close and counted
+                (``window_end_fallback_fills``).  Both counters, the convention
+                and the exit-reason breakdown are reported under
+                ``metrics["fill_convention_accounting"]`` and returned as
+                ``result["fill_convention"]``.  The hybrid engine has no such
+                seam: ``next_open`` on a run routed to it raises rather than
+                silently pricing the old way.
         """
         t0 = time.time()
+        # ── P9: the fill convention for THIS run ──────────────────────────────
+        # Resolved once, before any data is read, so every fill site below reads
+        # one local boolean.  `next_open` on the hybrid engine is refused here
+        # (below, once the engine is selected) instead of producing a run whose
+        # label says `next_open` and whose prices are `close`.
+        _fill_convention = parse_fill_convention(
+            fill_convention if fill_convention is not None
+            else getattr(self.config, "backtest_fill_convention", None))
+        _next_open = _fill_convention == "next_open"
+        #: Per-run accounting for the fills the convention could not place inside
+        #: the loaded window — reported, never a silent substitution.
+        _fill_accounting: dict = {
+            "convention": _fill_convention,
+            "unfilled_entries": 0,
+            "window_end_fallback_fills": 0,
+            "window_end_fallback_by_reason": {},
+        }
         if per_genome_ledger is None:
             per_genome_ledger = False
 
@@ -358,6 +402,29 @@ class BacktestEngine:
         try:
             use_hybrid = self._select_engine(strategies, _engine_mode) == "hybrid"
         except ValueError:
+            use_hybrid = False
+
+        if use_hybrid and _next_open:
+            # P9: the hybrid executor prices every fill from the decision bar's
+            # close, so it cannot honour `next_open`.  An EXPLICIT
+            # `engine_mode: hybrid` is refused by name; `auto` (which merely
+            # *picked* hybrid because there are ≥3 strategies) falls back to
+            # legacy with a warning — the same contract `reduce_conditions`
+            # already has (`_select_engine`), and the run then really does price
+            # the convention the operator asked for.
+            if _engine_mode == "hybrid":
+                raise FillConventionUnsupportedError(
+                    "backtest.fill_convention='next_open' is not implemented by "
+                    "the hybrid engine (engine_hybrid/EventDrivenExecutor price "
+                    "every fill at the decision bar's close); run this backtest "
+                    "with backtest.engine_mode='legacy'")
+            logger.warning(
+                "backtest.fill_convention='next_open' is not supported by the "
+                "hybrid engine — using the legacy engine for this run "
+                "(backtest.engine_mode='auto')")
+            _fill_accounting["engine_fallback"] = (
+                "auto selected hybrid, which cannot price next_open fills; "
+                "the run was executed by the legacy engine instead")
             use_hybrid = False
 
         if use_hybrid:
@@ -935,6 +1002,51 @@ class BacktestEngine:
                 balance = new_balance
             return new_balance
 
+        # ── P9: the fill convention's two lookup helpers ──────────────────
+        # ``_next_open`` is False for the shipped `close` convention, and both
+        # helpers are then no-ops: every call site below keeps its historical
+        # close-priced expression untouched, which is what makes `close`
+        # bit-identical to the pre-P9 engine rather than merely equal.
+        #: One entry per (decision bar, symbol, timeframe), cleared with
+        #: ``_price_slice_cache`` at the end of every bar.
+        _next_open_cache: dict[tuple, float | None] = {}
+
+        def _next_open_for(sym: str, interval: str, ts) -> float | None:
+            """Open of the bar after the decision bar at ``ts`` (None at window end).
+
+            The frame is the feeder's own (trimmed-to-``date_end``) frame for that
+            ``(symbol, interval)``, so "one bar" is one row of the **same series
+            that priced the fill** and never a row of the union timestamp grid —
+            with 5m+1h loaded, a 1h fill moves one 1h row, not one 5m row.
+            """
+            key = (ts, sym, interval)
+            if key in _next_open_cache:
+                return _next_open_cache[key]
+            value = next_bar_open(feeder.get_all_data_for_symbol(sym, interval), ts)
+            _next_open_cache[key] = value
+            return value
+
+        def _shifted_fill(sym: str, interval: str, ts, fallback: float,
+                          reason: str) -> float:
+            """The fill price for a decision taken at ``ts`` under the run's convention.
+
+            ``close`` (or a non-``next_open`` value) returns ``fallback`` — the
+            decision bar's own close/level, i.e. today's behaviour.  Under
+            ``next_open`` it returns the next bar's open; when that bar lies
+            outside the loaded window the fallback is used **and counted**, so the
+            window-end case is reported instead of silently reverting to the
+            close convention for the last trade of every series.
+            """
+            if not _next_open:
+                return fallback
+            value = _next_open_for(sym, interval, ts)
+            if value is None:
+                _fill_accounting["window_end_fallback_fills"] += 1
+                by_reason = _fill_accounting["window_end_fallback_by_reason"]
+                by_reason[reason] = by_reason.get(reason, 0) + 1
+                return fallback
+            return value
+
         # ── Entry conditions: ONE evaluator for live, GA and backtest ────
         # ``StrategyConfig.entry_sides`` is the shared rule (P1.6): it delegates to
         # the OR kernel for ``condition_logic == "or"`` and requires every
@@ -1185,7 +1297,11 @@ class BacktestEngine:
                             try:
                                 mask = evaluate_condition(df, cond_str)
                                 if hasattr(mask, 'iloc') and mask.iloc[-1]:
-                                    price = float(df["close"].iloc[-1])
+                                    # P9: the reduce fill moves with the run's
+                                    # convention exactly like an entry/exit fill.
+                                    price = _shifted_fill(
+                                        sym, interval, ts,
+                                        float(df["close"].iloc[-1]), "reduce")
                                     qty = pos["quantity"]
                                     reduce_qty = qty * rpct / 100.0
                                     if reduce_qty <= 0:
@@ -1294,7 +1410,15 @@ class BacktestEngine:
                     if sl_price > 0:
                         if (pos["side"] == "long" and price_now <= sl_price) or \
                            (pos["side"] == "short" and price_now >= sl_price):
-                            _close_and_credit(pos_key, pos, sl_price, ts, "stop_loss")
+                            # P9: the *trigger* is unchanged (the decision bar's
+                            # close against the level — signals never move); only
+                            # the fill price follows the convention.  Under
+                            # `next_open` that means the stop is executed one bar
+                            # later at the open rather than at the level, which is
+                            # the honest cost of a one-bar execution delay.
+                            _close_and_credit(pos_key, pos, _shifted_fill(
+                                sym, pos_tf, ts, sl_price, "stop_loss"),
+                                ts, "stop_loss")
                             continue
 
                     # ---- TAKE-PROFIT CHECK ----
@@ -1302,8 +1426,11 @@ class BacktestEngine:
                     for tp_price, tp_pct in tp_levels:
                         if (pos["side"] == "long" and price_now >= tp_price) or \
                            (pos["side"] == "short" and price_now <= tp_price):
+                            _tp_reason = f"tp_{int(tp_pct*100)}pct"
                             _close_and_credit(
-                                pos_key, pos, tp_price, ts, f"tp_{int(tp_pct*100)}pct")
+                                pos_key, pos,
+                                _shifted_fill(sym, pos_tf, ts, tp_price, _tp_reason),
+                                ts, _tp_reason)
                             break
 
                 if pos_key not in positions:
@@ -1333,7 +1460,9 @@ class BacktestEngine:
                         opened = pd.Timestamp(pos["opened_at"])
                         held_hours = (ts - opened).total_seconds() / 3600
                         if held_hours >= max_hours:
-                            _close_and_credit(pos_key, pos, price_now, ts, "max_hold")
+                            _close_and_credit(pos_key, pos, _shifted_fill(
+                                sym, pos_tf, ts, price_now, "max_hold"),
+                                ts, "max_hold")
                             continue
                     except Exception:
                         pass
@@ -1359,8 +1488,14 @@ class BacktestEngine:
                             if evaluate_exit_conditions(
                                 df, strategy.exit_conditions, pos["side"]):
                                 exit_price = float(df["close"].iloc[-1])
+                                # The triggering timeframe (``interval``) is the
+                                # series that priced this exit, so it is also the
+                                # series whose next bar prices it under `next_open`.
                                 _close_and_credit(
-                                    pos_key, pos, exit_price, ts, "indicator")
+                                    pos_key, pos,
+                                    _shifted_fill(sym, interval, ts, exit_price,
+                                                  "indicator"),
+                                    ts, "indicator")
                             if pos_key not in positions:
                                 break
                         if pos_key not in positions:
@@ -1538,7 +1673,23 @@ class BacktestEngine:
                         continue
 
                     side = "long" if final_score > 0 else "short"
-                    price = float(df_primary["close"].iloc[-1])
+                    # ── P9: the ENTRY fill price ──────────────────────────────
+                    # `close` (shipped): the signal bar's own close — zero
+                    # execution latency, bit-identical to the pre-P9 engine.
+                    # `next_open`: the open of the next bar of the *primary*
+                    # (shortest configured) timeframe, i.e. exactly one bar later
+                    # on the series that produced the signal.  A signal on the
+                    # last bar of the loaded window has no next bar, so the entry
+                    # is REFUSED and counted — a trade that cannot be filled must
+                    # not be booked at a price it could not have got.
+                    if _next_open:
+                        _entry_next_open = _next_open_for(sym, primary_tf, ts)
+                        if _entry_next_open is None:
+                            _fill_accounting["unfilled_entries"] += 1
+                            continue
+                        price = _entry_next_open
+                    else:
+                        price = float(df_primary["close"].iloc[-1])
 
                     # ---- POSITION SIZING (volatility-aware) ----
                     # Sizing uses THIS genome's ledger balance when isolated: with
@@ -1641,6 +1792,9 @@ class BacktestEngine:
             # hoisted cache would hold one frame per (bar × symbol × timeframe).
             if _price_slice_cache:
                 _price_slice_cache.clear()
+            # P9: the next-open lookups are keyed by `ts` too — same lifecycle.
+            if _next_open_cache:
+                _next_open_cache.clear()
             invested = sum(p.get("amount_usdt", 0) for p in positions.values())
             if per_genome_ledger:
                 # One equity point per genome + an aggregate point.  The aggregate
@@ -1685,7 +1839,12 @@ class BacktestEngine:
                         final_price = float(df_slice.iloc[-1]["close"])
                 except Exception:
                     pass
-                _close_and_credit(pos_key, pos, final_price, last_ts, "end_of_backtest")
+                # P9: the forced liquidation happens AT the window end, so there is
+                # (by construction) no next bar to fill from — the last close is
+                # used and the fallback is counted under `end_of_backtest`.
+                _close_and_credit(pos_key, pos, _shifted_fill(
+                    sym, pos.get("timeframe", "1h"), last_ts, final_price,
+                    "end_of_backtest"), last_ts, "end_of_backtest")
             # Reflect the realised cash in the final equity point.
             if per_genome_ledger:
                 for _s_name in ledger_balances:
@@ -1734,6 +1893,21 @@ class BacktestEngine:
         metrics["ml_predictions"] = ml_total
         metrics["ml_abstained"] = int(sum(1 for v in ml_abstained.values() if v))
         metrics["runtime_seconds"] = round(time.time() - t0, 1)
+        # ── P9: record WHICH convention produced these numbers ────────────────
+        # A backtest result that cannot name its fill convention is not
+        # reproducible: `close` and `next_open` differ by real money (see
+        # docs/overhaul/P9_FILL_CONVENTION_EVIDENCE.md), so the convention, the
+        # refused entries and the window-end fallbacks travel with the metrics.
+        metrics["fill_convention"] = _fill_convention
+        metrics["fill_convention_accounting"] = {
+            **_fill_accounting,
+            "convention": _fill_convention,
+            "unfilled_entries": int(_fill_accounting["unfilled_entries"]),
+            "window_end_fallback_fills": int(
+                _fill_accounting["window_end_fallback_fills"]),
+            "window_end_fallback_by_reason": dict(
+                _fill_accounting["window_end_fallback_by_reason"]),
+        }
 
         # ── Buy & hold benchmark of the SAME window and symbols ──
         # GA selection used to score pure market drift as alpha (a synthetic
@@ -1903,6 +2077,8 @@ class BacktestEngine:
             "per_matrix": per_matrix,
             "per_strategy_equity": per_strategy_equity,
             "monte_carlo": mc_result,
+            # P9 provenance: the fill convention this run was priced under.
+            "fill_convention": _fill_convention,
         }
 
     def _benchmark_frames(self, symbols) -> dict:

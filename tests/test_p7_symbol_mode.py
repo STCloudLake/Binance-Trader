@@ -715,7 +715,12 @@ SEED = 20261009
 LEDGER = 1440
 VOLATILE = {"written_at", "elapsed", "elapsed_seconds", "saved_at",
             "champion_name", "path", "name", "checkpoint_note",
-            "symbols_evaluated"}
+            "symbols_evaluated",
+            # P9: the champion provenance `eval` block gained `fill_convention`.
+            # It is not part of the S2 contract, the baseline tree cannot have it,
+            # and it is constant ("close") in every tree here — so it is scrubbed
+            # from both sides rather than compared.
+            "fill_convention"}
 
 
 def scrub(value):

@@ -88,6 +88,22 @@ auth:
   jwt_secret: ''
   session_hours: 24
 backtest:
+  # ── P9: the fill convention — WHEN a fill is priced ────────────────────────
+  # `close`     (SHIPPED DEFAULT) the signal bar's own close is the fill price.
+  #             Zero execution latency: the engine sees the close of bar `ts` and
+  #             trades at exactly that price.  Bit-identical to the pre-P9 engine.
+  # `next_open` the signal is unchanged (still evaluated on the bar at `ts`), but
+  #             the fill — entry **and** exit — is the OPEN of the bar one row
+  #             later on the *same* series (the strategy's primary/shortest
+  #             timeframe for an entry; the timeframe that supplied the exit price
+  #             for an exit).  The measured cost of that one bar of latency is in
+  #             docs/overhaul/P9_FILL_CONVENTION_EVIDENCE.md.
+  # ⚠ FLIPPING THIS INVALIDATES EVERY PREVIOUSLY RECORDED BACKTEST/CHAMPION
+  #   NUMBER (the difference is not noise; it grows as the timeframe shortens).
+  #   `close` stays shipped on purpose — the owner decides.
+  # An unknown value raises the NAMED `UnknownFillConventionError` at config load
+  # (`core/backtest/fill_convention.py`), never a silent fallback.
+  fill_convention: close
   # NOTE: the backtest cost model is deliberately kept separate from `sim:` below
   # (it charges fees at close time only, on top of the entry/exit prices, so that
   # stop-loss / take-profit levels are untouched).  Do not merge the two.

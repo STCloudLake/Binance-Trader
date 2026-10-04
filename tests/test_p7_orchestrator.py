@@ -946,6 +946,12 @@ def main(out_path):
         from core.ai.orchestrator import RegimeOrchestrator
         kwargs["orchestrator"] = RegimeOrchestrator({"enabled": False})
     result = engine.run_with_exit_evaluation(**kwargs)
+    # P9 added two metrics keys (`fill_convention`, `fill_convention_accounting`).
+    # They are not part of the S3 contract and cannot exist in the baseline tree,
+    # so the KEY SET is compared without them — every value the baseline produced
+    # is still compared above (trades, equity, buy_hold_pct) and the old keys are
+    # still required to be present, key for key.
+    _p9_metrics = {"fill_convention", "fill_convention_accounting"}
     payload = {
         "trades": [{"opened_at": str(t.get("opened_at")),
                     "closed_at": str(t.get("closed_at")),
@@ -956,7 +962,8 @@ def main(out_path):
                    for name, entry in
                    (result.get("per_strategy_equity") or {}).items()},
         "buy_hold_pct": (result.get("metrics") or {}).get("buy_hold_pct"),
-        "metrics_keys": sorted((result.get("metrics") or {}).keys()),
+        "metrics_keys": sorted(k for k in (result.get("metrics") or {})
+                               if k not in _p9_metrics),
     }
     text = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
     with open(out_path, "w", encoding="utf-8", newline="\n") as handle:
