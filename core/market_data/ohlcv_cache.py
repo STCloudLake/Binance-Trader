@@ -51,6 +51,9 @@ kline's trade count).  The two extra columns were added by P6-B; their rules:
 """
 from __future__ import annotations
 
+import os
+import tempfile
+
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -421,11 +424,165 @@ def merge_history(existing: pd.DataFrame | None,
     return combined[~combined.index.duplicated(keep="last")]
 
 
+class CacheUnreadable(RuntimeError):
+    """An **existing** cache file could not be read (distinct from "absent").
+
+    The distinction is the point of :meth:`OHLVCache._read_disk` after the
+    2026-11-21 incident: "absent" lets a writer create the file, while "present
+    but unreadable" means the file must be left exactly as it is.  A force-kill
+    in the middle of a non-atomic ``to_parquet`` (``taskkill /F`` cannot be
+    caught) produces precisely this second state.
+    """
+
+    def __init__(self, path, error: BaseException):
+        self.path = Path(path)
+        self.error = error
+        super().__init__("cache file is unreadable, refusing to touch it: "
+                         f"{self.path}: {error}")
+
+
+class CacheWriteRefused(RuntimeError):
+    """A cache write was refused because it would have destroyed history.
+
+    Carries both row counts so a caller can log a precise message.  Raised by
+    :func:`guard_no_shrink`; :meth:`OHLVCache.save` and :meth:`OHLVCache.dedupe`
+    record it on the cache (``refused_writes``) and skip the write rather than
+    letting one bad frame take a whole flush down.
+    """
+
+    def __init__(self, path, reason: str, *, existing_rows: int = 0,
+                 incoming_rows: int = 0):
+        self.path = Path(path)
+        self.reason = reason
+        self.existing_rows = int(existing_rows)
+        self.incoming_rows = int(incoming_rows)
+        super().__init__(f"{reason} [{self.path}]: existing_rows="
+                         f"{self.existing_rows} incoming_rows="
+                         f"{self.incoming_rows}")
+
+
+#: Prefix of every refusal log line, so an operator (or a test) can grep the log
+#: for the cache's own damage report instead of guessing from a shorter file.
+CACHE_REFUSED_LOG = "CACHE WRITE REFUSED"
+
+#: Prefix of every "present but unreadable" log line.
+CACHE_UNREADABLE_LOG = "CACHE FILE UNREADABLE"
+
+
+def _distinct_bars(frame: pd.DataFrame | None, interval: str | None) -> int:
+    """How many **distinct bars** a frame holds (0 for ``None``/empty).
+
+    A row count is not the right measure of "history" for this store: the
+    interval-aware union deliberately collapses the same bar stored under the two
+    timestamp conventions, so a legitimate write can have fewer *rows* than the
+    file while holding exactly the same *bars*.  Measured on the live ``1h``
+    cache, 455 rows were 401 bars — 55 twins.  The shrink guard therefore
+    compares bars, and only when the row count went down.
+    """
+    if frame is None or len(frame) == 0:
+        return 0
+    try:
+        keys = bar_keys(frame.index, interval)
+        if keys is None:
+            return int(pd.Index(frame.index).nunique())
+        return int(np.unique(keys.asi8).size)
+    except Exception:
+        # An index that cannot be gridded (a caller handing in an odd frame) must
+        # not crash the guard; fall back to the strictest reading — every row is
+        # its own bar, so any row loss is refused.
+        return int(len(frame))
+
+
+def guard_no_shrink(path, existing: pd.DataFrame | None,
+                    combined: pd.DataFrame | None, *,
+                    interval: str | None = None,
+                    where: str = "save") -> int:
+    """Refuse a write that would leave the file with fewer **bars** than it has.
+
+    The module's durability rule is "every write is the union of the on-disk
+    frame and the in-memory frame", which :func:`merge_history` implements.  This
+    is the second, independent line of defence: even if a bug, a future caller or
+    a stubbed merge hands the store a shorter frame, the store does not lose a
+    bar.
+
+    The comparison is on distinct bars (:func:`_distinct_bars`), not raw rows,
+    because collapsing one bar stored under both timestamp conventions is a
+    legitimate reduction (:func:`merge_history`'s documented job).  A genuine
+    truncation removes *bars*, so it is still caught.
+
+    ``existing is None`` (the file is **absent**) permits any size — the only
+    case in which a short write is legitimate.  Returns the row count that may be
+    written; raises :class:`CacheWriteRefused` otherwise.
+
+    Measured defect it closes: the 2026-11-21 cache where a 5 000-row ``1m`` file
+    became the 120-row window the writer held
+    (``tests/test_cache_write_safety.py``).
+    """
+    existing_rows = 0 if existing is None else len(existing)
+    incoming_rows = 0 if combined is None else len(combined)
+    if existing is None:
+        return incoming_rows
+    if incoming_rows >= existing_rows:
+        return incoming_rows
+    # Fewer rows.  That is allowed only when no *bar* disappeared (twin stamps
+    # collapsed); the bar count is only computed on this rare path.
+    existing_bars = _distinct_bars(existing, interval)
+    incoming_bars = _distinct_bars(combined, interval)
+    if incoming_bars < existing_bars:
+        raise CacheWriteRefused(
+            path,
+            f"{where}: refusing to shrink the parquet cache "
+            f"({existing_bars} bars in {existing_rows} rows on disk, "
+            f"{incoming_bars} bars in {incoming_rows} rows in the frame)",
+            existing_rows=existing_rows, incoming_rows=incoming_rows)
+    return incoming_rows
+
+
+def atomic_write_parquet(frame: pd.DataFrame, path) -> Path:
+    """Write ``frame`` to ``path`` through a sibling temp file + ``os.replace``.
+
+    ``DataFrame.to_parquet`` truncates the authoritative path before the footer
+    exists, so a ``SIGKILL``/``taskkill /F`` in the middle leaves an unreadable
+    file.  That is half of the 2026-11-21 incident: a half-written file read back
+    as ``None`` (the old ``_read_disk``), and the next start wrote its short
+    window over it.
+
+    Writing to a temp file in the **same directory** (``os.replace`` is atomic
+    only within one filesystem) and replacing keeps the old file readable
+    whatever happens to the process: at worst a stray ``*.parquet.tmp`` is left
+    behind, and the ``*.parquet`` glob every reader uses cannot match it.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp",
+                                    dir=str(path.parent))
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        frame.to_parquet(tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        # The authoritative file was never opened, so it is still the old one.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    return path
+
+
 class OHLVCache:
     def __init__(self, data_dir: str):
         self.data_dir = Path(data_dir)
         self._cache: dict[str, dict[str, pd.DataFrame]] = defaultdict(dict)
         self._dirty: set[tuple[str, str]] = set()
+        #: Write refusals since this instance was created (``path: reason``).
+        #: Non-empty means this process holds data it could not persist — the
+        #: condition that was silent before the 2026-11-21 incident.
+        self.refused_writes: list[str] = []
+        #: Existing files that could not be read (``path: error``).  A file here
+        #: was left untouched; it has to be inspected by an operator.
+        self.read_failures: list[str] = []
 
     def _path(self, symbol: str, interval: str) -> Path:
         symbol_dir = self.data_dir / "market" / symbol
@@ -437,17 +594,21 @@ class OHLVCache:
             return self._cache[symbol][interval]
 
         path = self._path(symbol, interval)
-        if path.exists():
-            df = pd.read_parquet(path)
-            if not df.empty:
-                # Schema order/dtype is normalised on the way out (P6-B), so a
-                # reader never sees two different column orders for one layout.
-                # The columns themselves are NOT widened: a pre-P6-B file keeps
-                # exactly the columns it has (absent = absent, documented).
-                df = canonical_columns(df)
-                self._cache[symbol][interval] = df
-            return df
-        return None
+        if not path.exists():
+            return None
+        # Routed through `_read_disk` so a read failure is counted and logged at
+        # ERROR (and raises `CacheUnreadable`) instead of being reported as data
+        # that is merely absent — the caller must not be told "empty" about a
+        # file that exists but cannot be read.
+        df = self._read_disk(path)
+        if df is not None and not df.empty:
+            # Schema order/dtype is normalised on the way out (P6-B), so a
+            # reader never sees two different column orders for one layout.
+            # The columns themselves are NOT widened: a pre-P6-B file keeps
+            # exactly the columns it has (absent = absent, documented).
+            df = canonical_columns(df)
+            self._cache[symbol][interval] = df
+        return df
 
     def update(self, symbol: str, interval: str, df: pd.DataFrame):
         self._cache[symbol][interval] = df
@@ -473,13 +634,25 @@ class OHLVCache:
         self._dirty.add((symbol, interval))
 
     def _read_disk(self, path: Path) -> pd.DataFrame | None:
-        """Frame currently on disk (``None`` when absent or unreadable).
+        """Frame currently on disk; ``None`` **only** when the file is absent.
 
-        A corrupt file must never take the periodic flush down, so a read error
-        is logged and reported as "no existing history" — the same behaviour as
-        a missing file.  The returned frame is **not** reordered here: a read is
-        also how :meth:`dedupe` decides whether a write would change the file,
-        and normalising a pre-P6-B file's column *order* would report a spurious
+        "Absent" and "present but unreadable" are different answers, and keeping
+        them apart is the fix for the 2026-11-21 incident.  The old code logged a
+        warning and returned ``None`` for a read error, so :meth:`save` treated a
+        corrupt full-history file as a new file and wrote its short in-memory
+        window over it — a 5 000-row ``1m`` cache became 120 rows
+        (``tests/test_cache_write_safety.py`` re-measures exactly that).
+
+        Now a read error is logged at ERROR with :data:`CACHE_UNREADABLE_LOG`,
+        recorded on the instance (``read_failures``) and raised as
+        :class:`CacheUnreadable`.  The write paths catch it and **skip the
+        write**, leaving the file byte-identical for an operator or
+        ``scripts/check_data_integrity.py`` to inspect; they never replace a file
+        they could not read.
+
+        The returned frame is **not** reordered here: a read is also how
+        :meth:`dedupe` decides whether a write would change the file, and
+        normalising a pre-P6-B file's column *order* would report a spurious
         change (and rewrite it) on every flush.  Normalisation happens on the way
         *out* (:meth:`get`) and on the way *in* (the write paths).
         """
@@ -488,8 +661,16 @@ class OHLVCache:
         try:
             return pd.read_parquet(path)
         except Exception as e:
-            logger.warning(f"Could not read existing cache {path}: {e}")
-            return None
+            entry = f"{path}: {e}"
+            self.read_failures.append(entry)
+            logger.error(f"{CACHE_UNREADABLE_LOG} — {entry} (left untouched)")
+            raise CacheUnreadable(path, e) from e
+
+    def _refuse(self, path, reason: str) -> None:
+        """Record and log one skipped write (never silently drops data)."""
+        entry = f"{path}: {reason}"
+        self.refused_writes.append(entry)
+        logger.error(f"{CACHE_REFUSED_LOG} — {entry}")
 
     def save(self, symbol: str, interval: str):
         """Write one ``symbol/interval`` to disk, **merging with what is there**.
@@ -532,17 +713,50 @@ class OHLVCache:
         walk-forward, the web routes, ``scripts/check_data_integrity.py``), so a
         second file would push the "union the two" rule into all of them.  Merging
         here keeps one authoritative file and fixes all three writers at once.
+
+        Refusal (the 2026-11-21 rule)
+        -----------------------------
+        A write is **skipped** — the file left byte-identical — when the file is
+        present but unreadable (:class:`CacheUnreadable`) or when the frame is
+        smaller than the file (:func:`guard_no_shrink` → :class:`CacheWriteRefused`).
+        Both cases are logged at ERROR (``CACHE WRITE REFUSED`` /
+        ``CACHE FILE UNREADABLE``) and recorded on the instance
+        (``refused_writes`` / ``read_failures``), because a writer that holds data
+        it could not persist must not look like a writer that succeeded.  The key
+        stays dirty so the next flush retries once the file is repaired.
+
+        Returns ``True`` when the file was written, ``False`` when nothing was
+        written (refused, or nothing to write).
         """
         if symbol in self._cache and interval in self._cache[symbol]:
             path = self._path(symbol, interval)
-            existing = self._read_disk(path)
+            try:
+                existing = self._read_disk(path)
+            except CacheUnreadable:
+                # `_read_disk` already logged + recorded it.  Never replace a
+                # file we could not read: that is how a full history became a
+                # prefetch window.
+                self._refuse(path, "save: existing file is unreadable "
+                                   "(left untouched, frame NOT written)")
+                return False
             combined = merge_history(existing, self._cache[symbol][interval],
                                      interval)
-            if combined is not None:
-                combined = canonical_columns(combined, reorder=False)
-                combined.to_parquet(path)
-                self._cache[symbol][interval] = combined
+            try:
+                guard_no_shrink(path, existing, combined, interval=interval,
+                                 where="save")
+            except CacheWriteRefused as e:
+                self._refuse(path, e.reason)
+                return False
+            if combined is None:
+                self._dirty.discard((symbol, interval))
+                return False
+            combined = canonical_columns(combined, reorder=False)
+            # Atomic: a kill here cannot corrupt the authoritative file.
+            atomic_write_parquet(combined, path)
+            self._cache[symbol][interval] = combined
             self._dirty.discard((symbol, interval))
+            return True
+        return False
 
     def flush_all(self):
         """Write dirty entries, and dedupe **already-written** files in place.
@@ -573,7 +787,12 @@ class OHLVCache:
 
         Cost: one parquet read per cached key per flush (every 300 s in the
         service), and a write only for the keys that actually changed.
+
+        Refusals are counted across both passes and summarised once at ERROR, so
+        a flush that could not persist data is visible in the log instead of
+        being indistinguishable from a flush that had nothing to do.
         """
+        refused_before = len(self.refused_writes)
         for symbol, interval in list(self._dirty):
             try:
                 self.save(symbol, interval)
@@ -588,6 +807,12 @@ class OHLVCache:
                 except Exception as e:
                     logger.warning(
                         f"Failed to dedupe cache {symbol}/{interval}: {e}")
+        refused = len(self.refused_writes) - refused_before
+        if refused:
+            logger.error(
+                f"{CACHE_REFUSED_LOG} — {refused} cache write(s) refused this "
+                f"flush; those files were left exactly as they were and the "
+                f"in-memory frames were NOT persisted")
 
     def dedupe(self, symbol: str, interval: str) -> bool:
         """Collapse twin-convention rows in one **already stored** file.
@@ -602,7 +827,11 @@ class OHLVCache:
         path = base / f"{interval}.parquet"
         if not path.exists():
             return False  # never create a directory for a file that is not there
-        existing = self._read_disk(path)
+        try:
+            existing = self._read_disk(path)
+        except CacheUnreadable:
+            # Logged + recorded by `_read_disk`; leave the file alone.
+            return False
         if existing is None or len(existing) == 0:
             return False
         # `reorder=False`: the frame the hash compares against is the *on-disk*
@@ -615,10 +844,17 @@ class OHLVCache:
                                         reorder=False), interval)
         if combined is None:
             return False
+        try:
+            guard_no_shrink(path, existing, combined, interval=interval,
+                               where="dedupe")
+        except CacheWriteRefused as e:
+            self._refuse(path, e.reason)
+            return False
         # The in-memory frame converges on the deduped store either way, so the
         # next flush sees a frame that already matches the file.
         self._cache[symbol][interval] = combined
         if not changed:
             return False
-        canonical_columns(combined, extended=None).to_parquet(path)
+        # Atomic: a kill mid-write cannot corrupt the authoritative file.
+        atomic_write_parquet(canonical_columns(combined, extended=None), path)
         return True

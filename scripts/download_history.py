@@ -59,6 +59,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.config import Config  # noqa: E402
 from core.market_data.data_client import KLINES_MAX_LIMIT, MarketDataClient, MarketDataError  # noqa: E402
+from core.market_data.ohlcv_cache import atomic_write_parquet  # noqa: E402
 from core.market_data.universe import MARKET_CACHE_SUBDIR  # noqa: E402
 
 #: Intervals the CLI accepts (Binance spot).
@@ -322,8 +323,18 @@ async def download_interval(client: MarketDataClient, symbol: str, interval: str
             old.index = pd.to_datetime(old.index)
             df = merge_bars(old, df, interval)
         except Exception as e:
-            print(f"      {symbol} {interval}: could not merge ({e}); overwriting")
-    df.to_parquet(path)
+            # `--merge` says "widen the file".  A file we cannot read is NOT a
+            # file we may replace: the old fallback printed "overwriting" and
+            # wrote the fetched window over an unreadable full history — the same
+            # truncation-to-window the live cache path is now guarded against.
+            print(f"      {symbol} {interval}: could not merge ({e}); "
+                  f"REFUSING to overwrite the existing file — left untouched. "
+                  f"Inspect it (scripts/check_data_integrity.py) or delete it "
+                  f"deliberately to re-download.")
+            return {"symbol": symbol, "interval": interval, "rows": 0,
+                    "error": f"existing file unreadable, not overwritten: {e}"}
+    # Atomic: a kill mid-write (taskkill /F) cannot corrupt the authoritative file.
+    atomic_write_parquet(df, path)
 
     return {
         "symbol": symbol, "interval": interval, "rows": len(df),
@@ -652,7 +663,9 @@ async def backfill_cache(client: MarketDataClient, symbol: str, interval: str,
             f"{symbol} {interval}: cache changed while backfilling "
             f"({rows_before}→{rows_after} rows, last {last_before}→{last_after}); "
             f"nothing written — re-run the backfill")
-    merged.to_parquet(path)
+    # Atomic: the file the backfill is patching must never be left half-written
+    # if the process is killed between here and the footer.
+    atomic_write_parquet(merged, path)
     return {"symbol": symbol, "interval": interval, "rows": int(len(merged)),
             "missing_before": missing_before, "filled": filled, "pages": pages,
             "done": False}

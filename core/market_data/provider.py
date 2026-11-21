@@ -230,59 +230,73 @@ class MarketDataProvider:
 
         for symbol in symbols:
             for interval in intervals:
-                # Per-interval specs come from the single registry above.
-                spec = interval_spec(interval)
-                # Check existing data
-                existing = self.cache.get(symbol, interval)
-                min_candles = spec["min_candles"]
-                if existing is not None and len(existing) >= min_candles:
-                    continue  # already has enough data
+                # One unreadable/corrupt file must not abort the other 24 pairs:
+                # the per-pair guard logs and moves on (the write path itself
+                # refuses to touch the file — see `OHLVCache._read_disk`).
+                try:
+                    # Per-interval specs come from the single registry above.
+                    spec = interval_spec(interval)
+                    # Check existing data
+                    existing = self.cache.get(symbol, interval)
+                    min_candles = spec["min_candles"]
+                    if existing is not None and len(existing) >= min_candles:
+                        continue  # already has enough data
 
-                batches = spec["batches"]
-                all_klines = []
-                end_time = None
+                    batches = spec["batches"]
+                    all_klines = []
+                    end_time = None
 
-                for batch in range(batches):
-                    try:
-                        klines = await self.data_client.klines(
-                            symbol, interval, limit=LIMIT, end_time=end_time)
-                        if not klines or len(klines) <= 1:
+                    for batch in range(batches):
+                        try:
+                            klines = await self.data_client.klines(
+                                symbol, interval, limit=LIMIT, end_time=end_time)
+                            if not klines or len(klines) <= 1:
+                                break
+                            all_klines = klines + all_klines
+                            end_time = klines[0][0] - 1
+                            if batch < batches - 1:
+                                await asyncio.sleep(0.2)
+                        except Exception:
                             break
-                        all_klines = klines + all_klines
-                        end_time = klines[0][0] - 1
-                        if batch < batches - 1:
-                            await asyncio.sleep(0.2)
-                    except Exception:
-                        break
 
-                if all_klines:
-                    df = pd.DataFrame([{
-                        "close_time": k[6],
-                        "open": float(k[1]), "high": float(k[2]),
-                        "low": float(k[3]), "close": float(k[4]),
-                        "volume": float(k[5]),
-                        # P6-B: the kline's quote-asset notional (field 7) and
-                        # trade count (field 8) are persisted with the bar, so a
-                        # reader of the cache gets the source's USDT volume
-                        # instead of the `volume × close` proxy.  A short/odd
-                        # payload leaves them NaN (the documented "absent").
-                        "quote_volume": _kline_float(k, 7),
-                        "trade_count": _kline_float(k, 8),
-                    } for k in all_klines])
-                    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
-                    df.set_index("close_time", inplace=True)
-                    df = df[~df.index.duplicated(keep='last')]
-                    df.sort_index(inplace=True)
-                    # Union with the history already known (disk + memory): the
-                    # fetched window is a *widening*, never a replacement.  The
-                    # interval is passed so the **in-memory** merge is the same
-                    # bar-aware one `OHLVCache.save` writes (re-audit finding 3):
-                    # an exact-timestamp union leaves the twin-convention rows in
-                    # memory, so every later flush of this key rewrites the file
-                    # before the write path collapses them.
-                    self.cache.update(symbol, interval,
-                                      merge_history(existing, df, interval))
-                    self.cache.save(symbol, interval)
+                    if all_klines:
+                        df = pd.DataFrame([{
+                            "close_time": k[6],
+                            "open": float(k[1]), "high": float(k[2]),
+                            "low": float(k[3]), "close": float(k[4]),
+                            "volume": float(k[5]),
+                            # P6-B: the kline's quote-asset notional (field 7) and
+                            # trade count (field 8) are persisted with the bar, so a
+                            # reader of the cache gets the source's USDT volume
+                            # instead of the `volume × close` proxy.  A short/odd
+                            # payload leaves them NaN (the documented "absent").
+                            "quote_volume": _kline_float(k, 7),
+                            "trade_count": _kline_float(k, 8),
+                        } for k in all_klines])
+                        df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
+                        df.set_index("close_time", inplace=True)
+                        df = df[~df.index.duplicated(keep='last')]
+                        df.sort_index(inplace=True)
+                        # Union with the history already known (disk + memory): the
+                        # fetched window is a *widening*, never a replacement.  The
+                        # interval is passed so the **in-memory** merge is the same
+                        # bar-aware one `OHLVCache.save` writes (re-audit finding 3):
+                        # an exact-timestamp union leaves the twin-convention rows in
+                        # memory, so every later flush of this key rewrites the file
+                        # before the write path collapses them.
+                        self.cache.update(symbol, interval,
+                                          merge_history(existing, df, interval))
+                        if self.cache.save(symbol, interval) is False:
+                            # The write path refused (unreadable file / shrink
+                            # guard).  It already logged the reason; say here that
+                            # this pair is not persisted so it is not mistaken for
+                            # a successful widening.
+                            logger.error(
+                                f"Prefetch for {symbol}/{interval} was NOT "
+                                f"persisted: the cache write was refused "
+                                f"(see CACHE WRITE REFUSED above)")
+                except Exception as e:
+                    logger.warning(f"Prefetch skipped {symbol}/{interval}: {e}")
 
         logger.info(f"Pre-fetched history for {len(symbols)} symbols x {len(intervals)} intervals")
 
@@ -384,12 +398,16 @@ class MarketDataProvider:
 
     async def _run_cache_flush(self):
         """Periodically flush in-memory candle cache to parquet files."""
+        from loguru import logger
+
         while self._running:
             await asyncio.sleep(300)  # flush every 5 minutes
             try:
                 self.cache.flush_all()
-            except Exception:
-                pass
+            except Exception as e:
+                # Never silent: a swallowed flush failure is how a cache can stop
+                # persisting without anyone noticing (2026-11-21 post-mortem).
+                logger.error(f"Periodic cache flush failed: {e}")
 
     async def _run_price_tracker(self):
         while self._running:
@@ -406,11 +424,15 @@ class MarketDataProvider:
             await asyncio.sleep(1)
 
     async def get_historical(self, symbol: str, interval: str, limit: int = 500) -> pd.DataFrame | None:
-        cached = self.cache.get(symbol, interval)
-        if cached is not None and len(cached) >= limit:
-            return cached.tail(limit)
-
+        cached = None
         try:
+            # A present-but-unreadable file raises `CacheUnreadable` (logged and
+            # recorded by the cache); it is *not* reported as "no data" and the
+            # write below then refuses to replace it.
+            cached = self.cache.get(symbol, interval)
+            if cached is not None and len(cached) >= limit:
+                return cached.tail(limit)
+
             # Public market data host, not the (testnet) trading client.
             klines = await self.data_client.klines(symbol, interval, limit=limit)
             if not klines:
