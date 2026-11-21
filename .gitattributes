@@ -1,0 +1,5 @@
+/.gitattributes text eol=lf
+# 批处理必须 CRLF，shell 脚本必须是 LF，否则各自在目标平台上无法执行
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
+*.sh    text eol=lf

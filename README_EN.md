@@ -120,6 +120,8 @@ Start it and open <http://127.0.0.1:8899>:
 python -m app.main --mode sim
 ```
 
+For day-to-day use, the launchers in the repository root do the same thing and add a check for an instance already listening: `start.cmd` on Windows (double-click it, or pass `--no-browser` to keep the browser closed) and `./start.sh` on Linux and macOS. If the port is already serving they only open the page instead of starting a second instance; logs go to `run_logs/start.log`, `start.cmd stop` / `./start.sh stop` stops it and `start.cmd status` reports it. A cold start takes about 30 seconds before the port binds.
+
 On first start, if the `users` table is empty, an `admin` account is created and its random password is printed to stderr only; change it in `/settings` immediately. `--mode live` places real orders through the testnet client. `--mode backtest` is not a backtest; its orders are silently dropped. Real backtests run from the `/backtest` page or `POST /api/backtest/run`.
 
 Run the tests:

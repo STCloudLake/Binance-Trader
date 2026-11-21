@@ -120,6 +120,8 @@ python scripts/download_history.py --symbols BTCUSDT,ETHUSDT --intervals 1h,4h -
 python -m app.main --mode sim
 ```
 
+日常启动用仓库根目录的启动脚本就行：Windows 双击 `start.cmd`（命令行里加 `--no-browser` 可以不弹浏览器），Linux / macOS 用 `./start.sh`。它会先看 8899 是否已在监听，已在就只把页面打开，不会起第二个实例；日志写到 `run_logs/start.log`，停止用 `start.cmd stop` 或 `./start.sh stop`，状态用 `start.cmd status`。首次冷启动大约要 30 秒才绑定端口。
+
 首次启动时若 `users` 表为空，会创建 `admin` 并把随机密码只打印到 stderr，请立刻在 `/settings` 改掉。`--mode live` 用 testnet 客户端真实下单；`--mode backtest` 不是回测，订单会被静默丢弃，真正的回测走 `/backtest` 页或 `POST /api/backtest/run`。
 
 跑测试：
